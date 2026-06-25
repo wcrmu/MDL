@@ -90,7 +90,7 @@ def build_tenrec_feature_specs(vocabs: dict[str, dict[str, int]]) -> list[dict[s
                 "name": column,
                 "encoder": "categorical_embedding",
                 "vocab_size": len(vocabs[column]) + 1,
-                "source": {"type": "csv_column", "column": column},
+                "source": {"type": "csv_column", "column": column, "dtype": "int64"},
             }
         )
     for column in NUMERIC_COLUMNS:
@@ -99,7 +99,7 @@ def build_tenrec_feature_specs(vocabs: dict[str, dict[str, int]]) -> list[dict[s
                 "name": column,
                 "encoder": "numeric_value",
                 "dim": 1,
-                "source": {"type": "csv_column", "column": column},
+                "source": {"type": "csv_column", "column": column, "dtype": "float32"},
             }
         )
     return specs

@@ -195,8 +195,8 @@ The manifest must use the latest tokenization contract:
     "version": 2,
     "kind": "encoder_registry",
     "features": [
-      {"name": "some_id", "encoder": "categorical_embedding", "vocab_size": 100000, "source": {"type": "csv_column", "column": "user_col"}},
-      {"name": "some_score", "encoder": "numeric_value", "dim": 1, "source": {"type": "csv_column", "column": "score_col"}}
+      {"name": "some_id", "encoder": "categorical_embedding", "vocab_size": 100000, "source": {"type": "csv_column", "column": "user_col", "dtype": "int64"}},
+      {"name": "some_score", "encoder": "numeric_value", "dim": 1, "source": {"type": "csv_column", "column": "score_col", "dtype": "float32"}}
     ],
     "token_specs": [
       {"token_id": 0, "projection": "linear", "inputs": ["some_id", "some_score"]}
@@ -216,7 +216,7 @@ PYTHONNOUSERSITE=1 conda run -n torch python -m mdl.train_tabular \
   --eval-max-batches 10
 ```
 
-Built-in feature encoders currently include `categorical_embedding`, `numeric_value`, `sequence_mean_pooling`, and `dense_vector`. The current generic CSV reader supports `categorical_embedding` and `numeric_value` end-to-end through manifest-declared `source.column` mappings. Sequence and dense features are supported by `FeatureTokenCompiler`, but they require a custom reader/collate path until the generic disk format is extended. See [docs/adapter_guide.md](docs/adapter_guide.md) for details.
+Built-in feature encoders currently include `categorical_embedding`, `numeric_value`, `sequence_mean_pooling`, and `dense_vector`. CSV parsing is declared by each feature's `source` (`column`, `dtype`, optional `shape`/`delimiter`) rather than inferred from the encoder name. Sequence CSV cells use `source.shape = "sequence"`; the generic collate path pads them and passes `values` plus `lengths` to `sequence_mean_pooling`. Feature grouping is declared by the input manifest in `tokenization.token_specs`. See [docs/adapter_guide.md](docs/adapter_guide.md) for details.
 
 ## Smoke Tests
 

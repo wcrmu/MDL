@@ -67,13 +67,13 @@ The corresponding manifest maps semantic roles to physical CSV columns:
         "name": "user_id",
         "encoder": "categorical_embedding",
         "vocab_size": 100000,
-        "source": {"type": "csv_column", "column": "user_id"}
+        "source": {"type": "csv_column", "column": "user_id", "dtype": "int64"}
       },
       {
         "name": "score",
         "encoder": "numeric_value",
         "dim": 1,
-        "source": {"type": "csv_column", "column": "score"}
+        "source": {"type": "csv_column", "column": "score", "dtype": "float32"}
       }
     ]
   }
@@ -84,8 +84,10 @@ Rules:
 
 - The scenario column value is a zero-based integer index into `manifest.scenario_names`.
 - The group column is used for QAUC grouping. Use a query/session/user id when available.
-- Categorical feature source columns must already be integer encoded. Reserve `0` for padding/unknown.
-- Numeric feature source columns should already be normalized if normalization is desired.
+- Feature CSV parsing is declared by each feature's `source`, not inferred from `encoder`.
+- Scalar integer-like features should use `source.dtype = "int64"`; reserve `0` for padding/unknown when the encoder treats zero specially.
+- Scalar numeric features should use `source.dtype = "float32"` and should already be normalized if normalization is desired.
+- Vector/list features can use `source.shape = "vector"` plus an optional `source.delimiter`; rows must have a consistent padded length for the generic collate path.
 - Label mask columns must be `1` when the task label is valid for that row and `0` when unavailable.
 
 ## Manifest Format
@@ -107,9 +109,9 @@ Rules:
     "version": 2,
     "kind": "encoder_registry",
     "features": [
-      {"name": "user_id", "encoder": "categorical_embedding", "vocab_size": 100000, "source": {"type": "csv_column", "column": "user_id"}},
-      {"name": "item_id", "encoder": "categorical_embedding", "vocab_size": 500000, "source": {"type": "csv_column", "column": "item_id"}},
-      {"name": "score", "encoder": "numeric_value", "dim": 1, "source": {"type": "csv_column", "column": "score"}}
+      {"name": "user_id", "encoder": "categorical_embedding", "vocab_size": 100000, "source": {"type": "csv_column", "column": "user_id", "dtype": "int64"}},
+      {"name": "item_id", "encoder": "categorical_embedding", "vocab_size": 500000, "source": {"type": "csv_column", "column": "item_id", "dtype": "int64"}},
+      {"name": "score", "encoder": "numeric_value", "dim": 1, "source": {"type": "csv_column", "column": "score", "dtype": "float32"}}
     ],
     "token_specs": [
       {"token_id": 0, "projection": "linear", "inputs": ["user_id", "score"]},
@@ -138,8 +140,10 @@ Required manifest fields:
 
 ## Tokenization Configuration
 
-`tokenization.features` declares how each named feature is encoded. The main compiler
-does not hard-code feature types; it builds encoders from this registry config.
+`tokenization.features` declares how each named feature is read and encoded. The
+`source` object is owned by the input adapter and controls CSV parsing (`column`, `dtype`,
+optional `shape`, optional `delimiter`). The `encoder` object controls model-side encoding.
+The data reader must not infer parsing behavior from the encoder name.
 
 Built-in encoders:
 
@@ -157,21 +161,43 @@ Built-in encoders:
 ]
 ```
 
-Grouping is a manifest-only change as long as all input names exist in `features`.
+Grouping is defined by the input manifest. It is a manifest-only change as long as all input names exist in `features`; no core-code feature grouping should be hard-coded.
 
 ## Current Generic CSV Support
 
 The current `mdl.train_tabular` path reads feature values through `tokenization.features[*].source`. For CSV-backed features, use:
 
 ```json
-"source": {"type": "csv_column", "column": "physical_column_name"}
+"source": {"type": "csv_column", "column": "physical_column_name", "dtype": "float32"}
 ```
 
-That means `categorical_embedding` and `numeric_value` work end-to-end through the generic CSV reader today without any required `cat__` or `num__` prefix.
+The generic CSV reader supports scalar, fixed-length vector/list, and variable-length sequence cells based on `source.dtype` and `source.shape`; it does not branch on `categorical_embedding`, `numeric_value`, or any other encoder name. There are no required `cat__` or `num__` prefixes.
 
-`sequence_mean_pooling` and `dense_vector` are supported by `FeatureTokenCompiler`, but the
-generic CSV reader does not yet load sequence or dense tensors from disk. To use them today, add
-a dataset-specific reader/collate function or interface that passes:
+A sequence feature is declared with `source.shape = "sequence"`. The CSV cell stores one row's sequence using the declared delimiter. The generic collate path pads each batch to the batch-local max length and passes `{"values": LongTensor[B, L], "lengths": LongTensor[B]}` to the encoder.
+
+```json
+{
+  "name": "hist_item_ids",
+  "encoder": "sequence_mean_pooling",
+  "vocab_size": 500000,
+  "source": {
+    "type": "csv_column",
+    "column": "hist_items",
+    "dtype": "int64",
+    "shape": "sequence",
+    "delimiter": "|"
+  }
+}
+```
+
+```csv
+hist_items
+12|33|91
+44
+```
+
+For custom sequence or dense interfaces, a dataset-specific reader/collate function can also
+pass explicit tensors directly:
 
 ```python
 features={
@@ -187,12 +213,13 @@ features={
 
 1. Decide scenario names and encode each row's `scenario_id`.
 2. Decide task names, emit physical label/mask columns, and map them in `data_columns`.
-3. Encode categorical features into integer ids, reserving `0` for padding/unknown, and declare their physical CSV columns in `source.column`.
-4. Normalize numeric features if needed and declare their physical CSV columns in `source.column`.
-5. Write `train.csv`, `val.csv`, and `test.csv` with identical headers.
-6. Write `manifest.json` with `tokenization.version = 2`.
-7. Make sure every token input name exists in `tokenization.features`.
-8. Run a smoke training command against the processed directory.
+3. Declare every feature source with `source.type`, `source.column`, and `source.dtype`; add `source.shape`/`source.delimiter` for vector or sequence cells when needed.
+4. Encode categorical-like inputs into integer ids when their chosen encoder expects ids, reserving `0` for padding/unknown when relevant.
+5. Normalize numeric-like inputs if needed before writing CSV.
+6. Write `train.csv`, `val.csv`, and `test.csv` with identical headers.
+7. Write `manifest.json` with `tokenization.version = 2`.
+8. Define feature grouping in `tokenization.token_specs` and make sure every token input name exists in `tokenization.features`.
+9. Run a smoke training command against the processed directory.
 
 ## Minimal Adapter Skeleton
 

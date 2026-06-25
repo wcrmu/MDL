@@ -1,3 +1,5 @@
+import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,7 +30,154 @@ class TenrecPipelineTest(unittest.TestCase):
             self.assertEqual(manifest["tokenization"]["kind"], "encoder_registry")
             self.assertEqual(len(manifest["tokenization"]["features"]), 17)
             self.assertEqual(len(manifest["tokenization"]["token_specs"]), 4)
+            for feature in manifest["tokenization"]["features"]:
+                source = feature["source"]
+                self.assertEqual(source["type"], "csv_column")
+                self.assertIn(source["dtype"], {"int64", "float32"})
 
+    def test_csv_feature_sources_must_declare_dtype(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            manifest = {
+                "dataset": "dtype_contract",
+                "scenario_names": ["default"],
+                "task_names": ["click"],
+                "data_columns": {
+                    "scenario_id": "scenario_id",
+                    "group_id": "group_id",
+                    "labels": {"click": "label_click"},
+                    "label_masks": {"click": "mask_click"},
+                },
+                "tokenization": {
+                    "version": 2,
+                    "kind": "encoder_registry",
+                    "features": [
+                        {
+                            "name": "user_id",
+                            "encoder": "categorical_embedding",
+                            "vocab_size": 10,
+                            "source": {"type": "csv_column", "column": "user_id"},
+                        }
+                    ],
+                    "token_specs": [
+                        {"token_id": 0, "projection": "linear", "inputs": ["user_id"]}
+                    ],
+                },
+                "splits": {"train": 1, "val": 0, "test": 0},
+            }
+            (path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with (path / "train.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "scenario_id",
+                        "group_id",
+                        "user_id",
+                        "label_click",
+                        "mask_click",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "scenario_id": 0,
+                        "group_id": "g",
+                        "user_id": 1,
+                        "label_click": 1,
+                        "mask_click": 1,
+                    }
+                )
+
+            dataset = EncodedTabularDataset(path, "train")
+            with self.assertRaisesRegex(ValueError, "must declare dtype"):
+                next(iter(dataset))
+
+    def test_csv_sequence_source_collates_values_and_lengths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            manifest = {
+                "dataset": "sequence_contract",
+                "scenario_names": ["default"],
+                "task_names": ["click"],
+                "data_columns": {
+                    "scenario_id": "scenario_id",
+                    "group_id": "group_id",
+                    "labels": {"click": "label_click"},
+                    "label_masks": {"click": "mask_click"},
+                },
+                "tokenization": {
+                    "version": 2,
+                    "kind": "encoder_registry",
+                    "features": [
+                        {
+                            "name": "hist_ids",
+                            "encoder": "sequence_mean_pooling",
+                            "vocab_size": 10,
+                            "source": {
+                                "type": "csv_column",
+                                "column": "hist_ids",
+                                "dtype": "int64",
+                                "shape": "sequence",
+                                "delimiter": "|",
+                            },
+                        }
+                    ],
+                    "token_specs": [
+                        {"token_id": 0, "projection": "linear", "inputs": ["hist_ids"]}
+                    ],
+                },
+                "splits": {"train": 2, "val": 0, "test": 0},
+            }
+            (path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with (path / "train.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "scenario_id",
+                        "group_id",
+                        "hist_ids",
+                        "label_click",
+                        "mask_click",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "scenario_id": 0,
+                        "group_id": "g1",
+                        "hist_ids": "1|2|3",
+                        "label_click": 1,
+                        "mask_click": 1,
+                    }
+                )
+                writer.writerow(
+                    {
+                        "scenario_id": 0,
+                        "group_id": "g2",
+                        "hist_ids": "4",
+                        "label_click": 0,
+                        "mask_click": 1,
+                    }
+                )
+
+            dataset = EncodedTabularDataset(path, "train")
+            loader = DataLoader(dataset, batch_size=2, collate_fn=collate_tabular_batch)
+            batch = next(iter(loader))
+            sequence = batch["features"]["hist_ids"]
+
+            self.assertTrue(torch.equal(sequence["values"], torch.tensor([[1, 2, 3], [4, 0, 0]])))
+            self.assertTrue(torch.equal(sequence["lengths"], torch.tensor([3, 1])))
+
+            config = FeatureCompilerConfig(
+                feature_specs=manifest["tokenization"]["features"],
+                token_specs=manifest["tokenization"]["token_specs"],
+                embedding_dim=4,
+                token_dim=6,
+            )
+            compiler = FeatureTokenCompiler(config)
+            feature_tokens = compiler(batch["features"])
+
+            self.assertEqual(feature_tokens.shape, (2, 1, 6))
 
     def test_feature_token_compiler_uses_encoder_registry_config(self) -> None:
         config = FeatureCompilerConfig(
