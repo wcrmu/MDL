@@ -1,0 +1,361 @@
+%%% -*-BibTeX-*-
+%%% Do NOT edit. File created by BibTeX with style
+%%% ACM-Reference-Format-Journals [18-Jan-2012].
+
+\begin{thebibliography}{42}
+
+%%% ====================================================================
+%%% NOTE TO THE USER: you can override these defaults by providing
+%%% customized versions of any of these macros before the \bibliography
+%%% command.  Each of them MUST provide its own final punctuation,
+%%% except for \shownote{} and \showURL{}.  The latter two
+%%% do not use final punctuation, in order to avoid confusing it with
+%%% the Web address.
+%%%
+%%% To suppress output of a particular field, define its macro to expand
+%%% to an empty string, or better, \unskip, like this:
+%%%
+%%% \newcommand{\showURL}[1]{\unskip}   % LaTeX syntax
+%%%
+%%% \def \showURL #1{\unskip}           % plain TeX syntax
+%%%
+%%% ====================================================================
+
+\ifx \showCODEN    \undefined \def \showCODEN     #1{\unskip}     \fi
+\ifx \showISBNx    \undefined \def \showISBNx     #1{\unskip}     \fi
+\ifx \showISBNxiii \undefined \def \showISBNxiii  #1{\unskip}     \fi
+\ifx \showISSN     \undefined \def \showISSN      #1{\unskip}     \fi
+\ifx \showLCCN     \undefined \def \showLCCN      #1{\unskip}     \fi
+\ifx \shownote     \undefined \def \shownote      #1{#1}          \fi
+\ifx \showarticletitle \undefined \def \showarticletitle #1{#1}   \fi
+\ifx \showURL      \undefined \def \showURL       {\relax}        \fi
+% The following commands are used for tagged output and should be
+% invisible to TeX
+\providecommand\bibfield[2]{#2}
+\providecommand\bibinfo[2]{#2}
+\providecommand\natexlab[1]{#1}
+\providecommand\showeprint[2][]{arXiv:#2}
+
+\bibitem[Achiam et~al\mbox{.}(2023)]%
+        {achiam2023gpt}
+\bibfield{author}{\bibinfo{person}{Josh Achiam}, \bibinfo{person}{Steven Adler}, \bibinfo{person}{Sandhini Agarwal}, \bibinfo{person}{Lama Ahmad}, \bibinfo{person}{Ilge Akkaya}, \bibinfo{person}{Florencia~Leoni Aleman}, \bibinfo{person}{Diogo Almeida}, \bibinfo{person}{Janko Altenschmidt}, \bibinfo{person}{Sam Altman}, \bibinfo{person}{Shyamal Anadkat}, {et~al\mbox{.}}} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{Gpt-4 technical report}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2303.08774}} (\bibinfo{year}{2023}).
+\newblock
+
+
+\bibitem[Ardalani et~al\mbox{.}(2022)]%
+        {ardalani2022understanding}
+\bibfield{author}{\bibinfo{person}{Newsha Ardalani}, \bibinfo{person}{Carole-Jean Wu}, \bibinfo{person}{Zeliang Chen}, \bibinfo{person}{Bhargav Bhushanam}, {and} \bibinfo{person}{Adnan Aziz}.} \bibinfo{year}{2022}\natexlab{}.
+\newblock \showarticletitle{Understanding scaling laws for recommendation models}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2208.08489}} (\bibinfo{year}{2022}).
+\newblock
+
+
+\bibitem[Borisyuk et~al\mbox{.}(2024)]%
+        {DBLP:conf/kdd/BorisyukZSZTPDH24}
+\bibfield{author}{\bibinfo{person}{Fedor Borisyuk}, \bibinfo{person}{Mingzhou Zhou}, \bibinfo{person}{Qingquan Song}, \bibinfo{person}{Siyu Zhu}, \bibinfo{person}{Birjodh Tiwana}, \bibinfo{person}{Ganesh Parameswaran}, \bibinfo{person}{Siddharth Dangi}, \bibinfo{person}{Lars Hertel}, \bibinfo{person}{Qiang~Charles Xiao}, \bibinfo{person}{Xiaochen Hou}, \bibinfo{person}{Yunbo Ouyang}, \bibinfo{person}{Aman Gupta}, \bibinfo{person}{Sheallika Singh}, \bibinfo{person}{Dan Liu}, \bibinfo{person}{Hailing Cheng}, \bibinfo{person}{Lei Le}, \bibinfo{person}{Jonathan Hung}, \bibinfo{person}{S.~Sathiya Keerthi}, \bibinfo{person}{Ruoyan Wang}, \bibinfo{person}{Fengyu Zhang}, \bibinfo{person}{Mohit Kothari}, \bibinfo{person}{Chen Zhu}, \bibinfo{person}{Daqi Sun}, \bibinfo{person}{Yun Dai}, \bibinfo{person}{Xun Luan}, \bibinfo{person}{Sirou Zhu}, \bibinfo{person}{Zhiwei Wang}, \bibinfo{person}{Neil Daftary}, \bibinfo{person}{Qianqi Shen}, \bibinfo{person}{Chengming Jiang}, \bibinfo{person}{Haichao Wei},
+  \bibinfo{person}{Maneesh Varshney}, \bibinfo{person}{Amol Ghoting}, {and} \bibinfo{person}{Souvik Ghosh}.} \bibinfo{year}{2024}\natexlab{}.
+\newblock \showarticletitle{LiRank: Industrial Large Scale Ranking Models at LinkedIn}. In \bibinfo{booktitle}{\emph{Proceedings of the 30th {ACM} {SIGKDD} Conference on Knowledge Discovery and Data Mining, {KDD} 2024, Barcelona, Spain, August 25-29, 2024}}. \bibinfo{pages}{4804--4815}.
+\newblock
+
+
+\bibitem[Chai et~al\mbox{.}(2025)]%
+        {longer}
+\bibfield{author}{\bibinfo{person}{Zheng Chai}, \bibinfo{person}{Qin Ren}, \bibinfo{person}{Xijun Xiao}, \bibinfo{person}{Huizhi Yang}, \bibinfo{person}{Bo Han}, \bibinfo{person}{Sijun Zhang}, \bibinfo{person}{Di Chen}, \bibinfo{person}{Hui Lu}, \bibinfo{person}{Wenlin Zhao}, \bibinfo{person}{Lele Yu}, \bibinfo{person}{Xionghang Xie}, \bibinfo{person}{Shiru Ren}, \bibinfo{person}{Xiang Sun}, \bibinfo{person}{Yaocheng Tan}, \bibinfo{person}{Peng Xu}, \bibinfo{person}{Yuchao Zheng}, {and} \bibinfo{person}{Di Wu}.} \bibinfo{year}{2025}\natexlab{}.
+\newblock \bibinfo{title}{LONGER: Scaling Up Long Sequence Modeling in Industrial Recommenders}.
+\newblock
+\showeprint[arxiv]{2505.04421}~[cs.IR]
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2505.04421}
+\showURL{%
+\tempurl}
+
+
+\bibitem[Cheng et~al\mbox{.}(2016)]%
+        {cheng2016wide}
+\bibfield{author}{\bibinfo{person}{Heng-Tze Cheng}, \bibinfo{person}{Levent Koc}, \bibinfo{person}{Jeremiah Harmsen}, \bibinfo{person}{Tal Shaked}, \bibinfo{person}{Tushar Chandra}, \bibinfo{person}{Hrishi Aradhye}, \bibinfo{person}{Glen Anderson}, \bibinfo{person}{Greg Corrado}, \bibinfo{person}{Wei Chai}, \bibinfo{person}{Mustafa Ispir}, {et~al\mbox{.}}} \bibinfo{year}{2016}\natexlab{}.
+\newblock \showarticletitle{Wide \& deep learning for recommender systems}. In \bibinfo{booktitle}{\emph{Proceedings of the 1st workshop on deep learning for recommender systems}}. \bibinfo{pages}{7--10}.
+\newblock
+
+
+\bibitem[Chitlangia et~al\mbox{.}(2023)]%
+        {chitlangia2023scaling}
+\bibfield{author}{\bibinfo{person}{Sharad Chitlangia}, \bibinfo{person}{Krishna~Reddy Kesari}, {and} \bibinfo{person}{Rajat Agarwal}.} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{Scaling generative pre-training for user ad activity sequences}.
+\newblock  (\bibinfo{year}{2023}).
+\newblock
+
+
+\bibitem[Covington et~al\mbox{.}(2016)]%
+        {covington2016deep}
+\bibfield{author}{\bibinfo{person}{Paul Covington}, \bibinfo{person}{Jay Adams}, {and} \bibinfo{person}{Emre Sargin}.} \bibinfo{year}{2016}\natexlab{}.
+\newblock \showarticletitle{Deep neural networks for youtube recommendations}. In \bibinfo{booktitle}{\emph{Proceedings of the 10th ACM conference on recommender systems}}. \bibinfo{pages}{191--198}.
+\newblock
+
+
+\bibitem[Dosovitskiy(2020)]%
+        {dosovitskiy2020image}
+\bibfield{author}{\bibinfo{person}{Alexey Dosovitskiy}.} \bibinfo{year}{2020}\natexlab{}.
+\newblock \showarticletitle{An image is worth 16x16 words: Transformers for image recognition at scale}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2010.11929}} (\bibinfo{year}{2020}).
+\newblock
+
+
+\bibitem[Fang et~al\mbox{.}(2024)]%
+        {fang2024scaling}
+\bibfield{author}{\bibinfo{person}{Yan Fang}, \bibinfo{person}{Jingtao Zhan}, \bibinfo{person}{Qingyao Ai}, \bibinfo{person}{Jiaxin Mao}, \bibinfo{person}{Weihang Su}, \bibinfo{person}{Jia Chen}, {and} \bibinfo{person}{Yiqun Liu}.} \bibinfo{year}{2024}\natexlab{}.
+\newblock \showarticletitle{Scaling laws for dense retrieval}. In \bibinfo{booktitle}{\emph{Proceedings of the 47th International ACM SIGIR Conference on Research and Development in Information Retrieval}}. \bibinfo{pages}{1339--1349}.
+\newblock
+
+
+\bibitem[Gui et~al\mbox{.}(2023)]%
+        {gui2023hiformer}
+\bibfield{author}{\bibinfo{person}{Huan Gui}, \bibinfo{person}{Ruoxi Wang}, \bibinfo{person}{Ke Yin}, \bibinfo{person}{Long Jin}, \bibinfo{person}{Maciej Kula}, \bibinfo{person}{Taibai Xu}, \bibinfo{person}{Lichan Hong}, {and} \bibinfo{person}{Ed~H Chi}.} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{Hiformer: Heterogeneous Feature Interactions Learning with Transformers for Recommender Systems}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2311.05884}} (\bibinfo{year}{2023}).
+\newblock
+
+
+\bibitem[Guo et~al\mbox{.}(2017)]%
+        {guo2017deepfm}
+\bibfield{author}{\bibinfo{person}{Huifeng Guo}, \bibinfo{person}{Ruiming Tang}, \bibinfo{person}{Yunming Ye}, \bibinfo{person}{Zhenguo Li}, {and} \bibinfo{person}{Xiuqiang He}.} \bibinfo{year}{2017}\natexlab{}.
+\newblock \showarticletitle{DeepFM: a factorization-machine based neural network for CTR prediction}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:1703.04247}} (\bibinfo{year}{2017}).
+\newblock
+
+
+\bibitem[Guo et~al\mbox{.}(2024)]%
+        {guo2024scaling}
+\bibfield{author}{\bibinfo{person}{Wei Guo}, \bibinfo{person}{Hao Wang}, \bibinfo{person}{Luankang Zhang}, \bibinfo{person}{Jin~Yao Chin}, \bibinfo{person}{Zhongzhou Liu}, \bibinfo{person}{Kai Cheng}, \bibinfo{person}{Qiushi Pan}, \bibinfo{person}{Yi~Quan Lee}, \bibinfo{person}{Wanqi Xue}, \bibinfo{person}{Tingjia Shen}, {et~al\mbox{.}}} \bibinfo{year}{2024}\natexlab{}.
+\newblock \showarticletitle{Scaling New Frontiers: Insights into Large Recommendation Models}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2412.00714}} (\bibinfo{year}{2024}).
+\newblock
+
+
+\bibitem[He et~al\mbox{.}(2016)]%
+        {he2016deep}
+\bibfield{author}{\bibinfo{person}{Kaiming He}, \bibinfo{person}{Xiangyu Zhang}, \bibinfo{person}{Shaoqing Ren}, {and} \bibinfo{person}{Jian Sun}.} \bibinfo{year}{2016}\natexlab{}.
+\newblock \showarticletitle{Deep residual learning for image recognition}. In \bibinfo{booktitle}{\emph{Proceedings of the IEEE conference on computer vision and pattern recognition}}. \bibinfo{pages}{770--778}.
+\newblock
+
+
+\bibitem[Hoffmann et~al\mbox{.}(2022)]%
+        {hoffmann2022training}
+\bibfield{author}{\bibinfo{person}{Jordan Hoffmann}, \bibinfo{person}{Sebastian Borgeaud}, \bibinfo{person}{Arthur Mensch}, \bibinfo{person}{Elena Buchatskaya}, \bibinfo{person}{Trevor Cai}, \bibinfo{person}{Eliza Rutherford}, \bibinfo{person}{Diego de~Las Casas}, \bibinfo{person}{Lisa~Anne Hendricks}, \bibinfo{person}{Johannes Welbl}, \bibinfo{person}{Aidan Clark}, {et~al\mbox{.}}} \bibinfo{year}{2022}\natexlab{}.
+\newblock \showarticletitle{Training compute-optimal large language models}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2203.15556}} (\bibinfo{year}{2022}).
+\newblock
+
+
+\bibitem[Huang et~al\mbox{.}(2022)]%
+        {huang2022neural}
+\bibfield{author}{\bibinfo{person}{Yanhua Huang}, \bibinfo{person}{Hangyu Wang}, \bibinfo{person}{Yiyun Miao}, \bibinfo{person}{Ruiwen Xu}, \bibinfo{person}{Lei Zhang}, {and} \bibinfo{person}{Weinan Zhang}.} \bibinfo{year}{2022}\natexlab{}.
+\newblock \showarticletitle{Neural statistics for click-through rate prediction}. In \bibinfo{booktitle}{\emph{Proceedings of the 45th International ACM SIGIR Conference on Research and Development in Information Retrieval}}. \bibinfo{pages}{1849--1853}.
+\newblock
+
+
+\bibitem[Kaplan et~al\mbox{.}(2020)]%
+        {kaplan2020scaling}
+\bibfield{author}{\bibinfo{person}{Jared Kaplan}, \bibinfo{person}{Sam McCandlish}, \bibinfo{person}{Tom Henighan}, \bibinfo{person}{Tom~B Brown}, \bibinfo{person}{Benjamin Chess}, \bibinfo{person}{Rewon Child}, \bibinfo{person}{Scott Gray}, \bibinfo{person}{Alec Radford}, \bibinfo{person}{Jeffrey Wu}, {and} \bibinfo{person}{Dario Amodei}.} \bibinfo{year}{2020}\natexlab{}.
+\newblock \showarticletitle{Scaling laws for neural language models}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2001.08361}} (\bibinfo{year}{2020}).
+\newblock
+
+
+\bibitem[Li et~al\mbox{.}(2019)]%
+        {li2019fi}
+\bibfield{author}{\bibinfo{person}{Zekun Li}, \bibinfo{person}{Zeyu Cui}, \bibinfo{person}{Shu Wu}, \bibinfo{person}{Xiaoyu Zhang}, {and} \bibinfo{person}{Liang Wang}.} \bibinfo{year}{2019}\natexlab{}.
+\newblock \showarticletitle{Fi-gnn: Modeling feature interactions via graph neural networks for ctr prediction}. In \bibinfo{booktitle}{\emph{Proceedings of the 28th ACM international conference on information and knowledge management}}. \bibinfo{pages}{539--548}.
+\newblock
+
+
+\bibitem[Lian et~al\mbox{.}(2018)]%
+        {lian2018xdeepfm}
+\bibfield{author}{\bibinfo{person}{Jianxun Lian}, \bibinfo{person}{Xiaohuan Zhou}, \bibinfo{person}{Fuzheng Zhang}, \bibinfo{person}{Zhongxia Chen}, \bibinfo{person}{Xing Xie}, {and} \bibinfo{person}{Guangzhong Sun}.} \bibinfo{year}{2018}\natexlab{}.
+\newblock \showarticletitle{xdeepfm: Combining explicit and implicit feature interactions for recommender systems}. In \bibinfo{booktitle}{\emph{Proceedings of the 24th ACM SIGKDD international conference on knowledge discovery \& data mining}}. \bibinfo{pages}{1754--1763}.
+\newblock
+
+
+\bibitem[Lin et~al\mbox{.}(2023)]%
+        {lin2023can}
+\bibfield{author}{\bibinfo{person}{Jianghao Lin}, \bibinfo{person}{Xinyi Dai}, \bibinfo{person}{Yunjia Xi}, \bibinfo{person}{Weiwen Liu}, \bibinfo{person}{Bo Chen}, \bibinfo{person}{Hao Zhang}, \bibinfo{person}{Yong Liu}, \bibinfo{person}{Chuhan Wu}, \bibinfo{person}{Xiangyang Li}, \bibinfo{person}{Chenxu Zhu}, {et~al\mbox{.}}} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{How can recommender systems benefit from large language models: A survey}.
+\newblock \bibinfo{journal}{\emph{ACM Transactions on Information Systems}} (\bibinfo{year}{2023}).
+\newblock
+
+
+\bibitem[Liu et~al\mbox{.}(2019)]%
+        {liu2019feature}
+\bibfield{author}{\bibinfo{person}{Bin Liu}, \bibinfo{person}{Ruiming Tang}, \bibinfo{person}{Yingzhi Chen}, \bibinfo{person}{Jinkai Yu}, \bibinfo{person}{Huifeng Guo}, {and} \bibinfo{person}{Yuzhou Zhang}.} \bibinfo{year}{2019}\natexlab{}.
+\newblock \showarticletitle{Feature generation by convolutional neural network for click-through rate prediction}. In \bibinfo{booktitle}{\emph{The World Wide Web Conference}}. \bibinfo{pages}{1119--1129}.
+\newblock
+
+
+\bibitem[Pan et~al\mbox{.}(2024)]%
+        {pan2024ads}
+\bibfield{author}{\bibinfo{person}{Junwei Pan}, \bibinfo{person}{Wei Xue}, \bibinfo{person}{Ximei Wang}, \bibinfo{person}{Haibin Yu}, \bibinfo{person}{Xun Liu}, \bibinfo{person}{Shijie Quan}, \bibinfo{person}{Xueming Qiu}, \bibinfo{person}{Dapeng Liu}, \bibinfo{person}{Lei Xiao}, {and} \bibinfo{person}{Jie Jiang}.} \bibinfo{year}{2024}\natexlab{}.
+\newblock \showarticletitle{Ads recommendation in a collapsed and entangled world}. In \bibinfo{booktitle}{\emph{Proceedings of the 30th ACM SIGKDD Conference on Knowledge Discovery and Data Mining}}. \bibinfo{pages}{5566--5577}.
+\newblock
+
+
+\bibitem[Qu et~al\mbox{.}(2018)]%
+        {qu2018product}
+\bibfield{author}{\bibinfo{person}{Yanru Qu}, \bibinfo{person}{Bohui Fang}, \bibinfo{person}{Weinan Zhang}, \bibinfo{person}{Ruiming Tang}, \bibinfo{person}{Minzhe Niu}, \bibinfo{person}{Huifeng Guo}, \bibinfo{person}{Yong Yu}, {and} \bibinfo{person}{Xiuqiang He}.} \bibinfo{year}{2018}\natexlab{}.
+\newblock \showarticletitle{Product-based neural networks for user response prediction over multi-field categorical data}.
+\newblock \bibinfo{journal}{\emph{ACM Transactions on Information Systems (TOIS)}} \bibinfo{volume}{37}, \bibinfo{number}{1} (\bibinfo{year}{2018}), \bibinfo{pages}{1--35}.
+\newblock
+
+
+\bibitem[Radford et~al\mbox{.}(2021)]%
+        {radford2021learning}
+\bibfield{author}{\bibinfo{person}{Alec Radford}, \bibinfo{person}{Jong~Wook Kim}, \bibinfo{person}{Chris Hallacy}, \bibinfo{person}{Aditya Ramesh}, \bibinfo{person}{Gabriel Goh}, \bibinfo{person}{Sandhini Agarwal}, \bibinfo{person}{Girish Sastry}, \bibinfo{person}{Amanda Askell}, \bibinfo{person}{Pamela Mishkin}, \bibinfo{person}{Jack Clark}, {et~al\mbox{.}}} \bibinfo{year}{2021}\natexlab{}.
+\newblock \showarticletitle{Learning transferable visual models from natural language supervision}. In \bibinfo{booktitle}{\emph{International conference on machine learning}}. PMLR, \bibinfo{pages}{8748--8763}.
+\newblock
+
+
+\bibitem[Ramesh et~al\mbox{.}(2021)]%
+        {ramesh2021zero}
+\bibfield{author}{\bibinfo{person}{Aditya Ramesh}, \bibinfo{person}{Mikhail Pavlov}, \bibinfo{person}{Gabriel Goh}, \bibinfo{person}{Scott Gray}, \bibinfo{person}{Chelsea Voss}, \bibinfo{person}{Alec Radford}, \bibinfo{person}{Mark Chen}, {and} \bibinfo{person}{Ilya Sutskever}.} \bibinfo{year}{2021}\natexlab{}.
+\newblock \showarticletitle{Zero-shot text-to-image generation}. In \bibinfo{booktitle}{\emph{International conference on machine learning}}. Pmlr, \bibinfo{pages}{8821--8831}.
+\newblock
+
+
+\bibitem[Rendle et~al\mbox{.}(2020)]%
+        {rendle2020neural}
+\bibfield{author}{\bibinfo{person}{Steffen Rendle}, \bibinfo{person}{Walid Krichene}, \bibinfo{person}{Li Zhang}, {and} \bibinfo{person}{John Anderson}.} \bibinfo{year}{2020}\natexlab{}.
+\newblock \showarticletitle{Neural collaborative filtering vs. matrix factorization revisited}. In \bibinfo{booktitle}{\emph{Proceedings of the 14th ACM Conference on Recommender Systems}}. \bibinfo{pages}{240--248}.
+\newblock
+
+
+\bibitem[Shan et~al\mbox{.}(2016)]%
+        {shan2016deep}
+\bibfield{author}{\bibinfo{person}{Ying Shan}, \bibinfo{person}{T~Ryan Hoens}, \bibinfo{person}{Jian Jiao}, \bibinfo{person}{Haijing Wang}, \bibinfo{person}{Dong Yu}, {and} \bibinfo{person}{JC Mao}.} \bibinfo{year}{2016}\natexlab{}.
+\newblock \showarticletitle{Deep crossing: Web-scale modeling without manually crafted combinatorial features}. In \bibinfo{booktitle}{\emph{Proceedings of the 22nd ACM SIGKDD international conference on knowledge discovery and data mining}}. \bibinfo{pages}{255--262}.
+\newblock
+
+
+\bibitem[Shin et~al\mbox{.}(2023)]%
+        {shin2023scaling}
+\bibfield{author}{\bibinfo{person}{Kyuyong Shin}, \bibinfo{person}{Hanock Kwak}, \bibinfo{person}{Su~Young Kim}, \bibinfo{person}{Max~Nihl{\'e}n Ramstr{\"o}m}, \bibinfo{person}{Jisu Jeong}, \bibinfo{person}{Jung-Woo Ha}, {and} \bibinfo{person}{Kyung-Min Kim}.} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{Scaling law for recommendation models: Towards general-purpose user representations}. In \bibinfo{booktitle}{\emph{Proceedings of the AAAI Conference on Artificial Intelligence}}, Vol.~\bibinfo{volume}{37}. \bibinfo{pages}{4596--4604}.
+\newblock
+
+
+\bibitem[Song et~al\mbox{.}(2019)]%
+        {song2019autoint}
+\bibfield{author}{\bibinfo{person}{Weiping Song}, \bibinfo{person}{Chence Shi}, \bibinfo{person}{Zhiping Xiao}, \bibinfo{person}{Zhijian Duan}, \bibinfo{person}{Yewen Xu}, \bibinfo{person}{Ming Zhang}, {and} \bibinfo{person}{Jian Tang}.} \bibinfo{year}{2019}\natexlab{}.
+\newblock \showarticletitle{Autoint: Automatic feature interaction learning via self-attentive neural networks}. In \bibinfo{booktitle}{\emph{Proceedings of the 28th ACM international conference on information and knowledge management}}. \bibinfo{pages}{1161--1170}.
+\newblock
+
+
+\bibitem[Team et~al\mbox{.}(2024)]%
+        {team2024gemma}
+\bibfield{author}{\bibinfo{person}{Gemma Team}, \bibinfo{person}{Thomas Mesnard}, \bibinfo{person}{Cassidy Hardin}, \bibinfo{person}{Robert Dadashi}, \bibinfo{person}{Surya Bhupatiraju}, \bibinfo{person}{Shreya Pathak}, \bibinfo{person}{Laurent Sifre}, \bibinfo{person}{Morgane Rivi{\`e}re}, \bibinfo{person}{Mihir~Sanjay Kale}, \bibinfo{person}{Juliette Love}, {et~al\mbox{.}}} \bibinfo{year}{2024}\natexlab{}.
+\newblock \showarticletitle{Gemma: Open models based on gemini research and technology}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2403.08295}} (\bibinfo{year}{2024}).
+\newblock
+
+
+\bibitem[Touvron et~al\mbox{.}(2023)]%
+        {touvron2023llama}
+\bibfield{author}{\bibinfo{person}{Hugo Touvron}, \bibinfo{person}{Louis Martin}, \bibinfo{person}{Kevin Stone}, \bibinfo{person}{Peter Albert}, \bibinfo{person}{Amjad Almahairi}, \bibinfo{person}{Yasmine Babaei}, \bibinfo{person}{Nikolay Bashlykov}, \bibinfo{person}{Soumya Batra}, \bibinfo{person}{Prajjwal Bhargava}, \bibinfo{person}{Shruti Bhosale}, {et~al\mbox{.}}} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{Llama 2: Open foundation and fine-tuned chat models}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2307.09288}} (\bibinfo{year}{2023}).
+\newblock
+
+
+\bibitem[Wang et~al\mbox{.}(2024b)]%
+        {wang2024flip}
+\bibfield{author}{\bibinfo{person}{Hangyu Wang}, \bibinfo{person}{Jianghao Lin}, \bibinfo{person}{Xiangyang Li}, \bibinfo{person}{Bo Chen}, \bibinfo{person}{Chenxu Zhu}, \bibinfo{person}{Ruiming Tang}, \bibinfo{person}{Weinan Zhang}, {and} \bibinfo{person}{Yong Yu}.} \bibinfo{year}{2024}\natexlab{b}.
+\newblock \showarticletitle{FLIP: Fine-grained Alignment between ID-based Models and Pretrained Language Models for CTR Prediction}. In \bibinfo{booktitle}{\emph{Proceedings of the 18th ACM Conference on Recommender Systems}}. \bibinfo{pages}{94--104}.
+\newblock
+
+
+\bibitem[Wang et~al\mbox{.}(2017)]%
+        {wang2017deep}
+\bibfield{author}{\bibinfo{person}{Ruoxi Wang}, \bibinfo{person}{Bin Fu}, \bibinfo{person}{Gang Fu}, {and} \bibinfo{person}{Mingliang Wang}.} \bibinfo{year}{2017}\natexlab{}.
+\newblock \showarticletitle{Deep \& cross network for ad click predictions}.
+\newblock In \bibinfo{booktitle}{\emph{Proceedings of the ADKDD'17}}. \bibinfo{pages}{1--7}.
+\newblock
+
+
+\bibitem[Wang et~al\mbox{.}(2021)]%
+        {wang2021dcn}
+\bibfield{author}{\bibinfo{person}{Ruoxi Wang}, \bibinfo{person}{Rakesh Shivanna}, \bibinfo{person}{Derek Cheng}, \bibinfo{person}{Sagar Jain}, \bibinfo{person}{Dong Lin}, \bibinfo{person}{Lichan Hong}, {and} \bibinfo{person}{Ed Chi}.} \bibinfo{year}{2021}\natexlab{}.
+\newblock \showarticletitle{Dcn v2: Improved deep \& cross network and practical lessons for web-scale learning to rank systems}. In \bibinfo{booktitle}{\emph{Proceedings of the web conference 2021}}. \bibinfo{pages}{1785--1797}.
+\newblock
+
+
+\bibitem[Wang et~al\mbox{.}(2024c)]%
+        {wang2024scaling}
+\bibfield{author}{\bibinfo{person}{Yunli Wang}, \bibinfo{person}{Zixuan Yang}, \bibinfo{person}{Zhen Zhang}, \bibinfo{person}{Zhiqiang Wang}, \bibinfo{person}{Jian Yang}, \bibinfo{person}{Shiyang Wen}, \bibinfo{person}{Peng Jiang}, {and} \bibinfo{person}{Kun Gai}.} \bibinfo{year}{2024}\natexlab{c}.
+\newblock \showarticletitle{Scaling Laws for Online Advertisement Retrieval}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2411.13322}} (\bibinfo{year}{2024}).
+\newblock
+
+
+\bibitem[Wang et~al\mbox{.}(2024a)]%
+        {Wang2024remoe}
+\bibfield{author}{\bibinfo{person}{Ziteng Wang}, \bibinfo{person}{Jianfei Chen}, {and} \bibinfo{person}{Jun Zhu}.} \bibinfo{year}{2024}\natexlab{a}.
+\newblock \showarticletitle{ReMoE: Fully Differentiable Mixture-of-Experts with ReLU Routing}.
+\newblock \bibinfo{journal}{\emph{CoRR}}  \bibinfo{volume}{abs/2412.14711} (\bibinfo{year}{2024}).
+\newblock
+\href{https://doi.org/10.48550/ARXIV.2412.14711}{doi:\nolinkurl{10.48550/ARXIV.2412.14711}}
+\showeprint[arXiv]{2412.14711}
+
+
+\bibitem[Zhai et~al\mbox{.}({[n.\,d.]})]%
+        {zhaiactions}
+\bibfield{author}{\bibinfo{person}{Jiaqi Zhai}, \bibinfo{person}{Lucy Liao}, \bibinfo{person}{Xing Liu}, \bibinfo{person}{Yueming Wang}, \bibinfo{person}{Rui Li}, \bibinfo{person}{Xuan Cao}, \bibinfo{person}{Leon Gao}, \bibinfo{person}{Zhaojie Gong}, \bibinfo{person}{Fangda Gu}, \bibinfo{person}{Jiayuan He}, {et~al\mbox{.}}} \bibinfo{year}{[n.\,d.]}\natexlab{}.
+\newblock \showarticletitle{Actions Speak Louder than Words: Trillion-Parameter Sequential Transducers for Generative Recommendations}. In \bibinfo{booktitle}{\emph{Forty-first International Conference on Machine Learning}}.
+\newblock
+
+
+\bibitem[Zhai et~al\mbox{.}(2022)]%
+        {zhai2022scaling}
+\bibfield{author}{\bibinfo{person}{Xiaohua Zhai}, \bibinfo{person}{Alexander Kolesnikov}, \bibinfo{person}{Neil Houlsby}, {and} \bibinfo{person}{Lucas Beyer}.} \bibinfo{year}{2022}\natexlab{}.
+\newblock \showarticletitle{Scaling vision transformers}. In \bibinfo{booktitle}{\emph{Proceedings of the IEEE/CVF conference on computer vision and pattern recognition}}. \bibinfo{pages}{12104--12113}.
+\newblock
+
+
+\bibitem[Zhang et~al\mbox{.}({[n.\,d.]})]%
+        {zhangwukong}
+\bibfield{author}{\bibinfo{person}{Buyun Zhang}, \bibinfo{person}{Liang Luo}, \bibinfo{person}{Yuxin Chen}, \bibinfo{person}{Jade Nie}, \bibinfo{person}{Xi Liu}, \bibinfo{person}{Shen Li}, \bibinfo{person}{Yanli Zhao}, \bibinfo{person}{Yuchen Hao}, \bibinfo{person}{Yantao Yao}, \bibinfo{person}{Ellie~Dingqiao Wen}, {et~al\mbox{.}}} \bibinfo{year}{[n.\,d.]}\natexlab{}.
+\newblock \showarticletitle{Wukong: Towards a Scaling Law for Large-Scale Recommendation}. In \bibinfo{booktitle}{\emph{Forty-first International Conference on Machine Learning}}.
+\newblock
+
+
+\bibitem[Zhang et~al\mbox{.}(2022)]%
+        {zhang2022dhen}
+\bibfield{author}{\bibinfo{person}{Buyun Zhang}, \bibinfo{person}{Liang Luo}, \bibinfo{person}{Xi Liu}, \bibinfo{person}{Jay Li}, \bibinfo{person}{Zeliang Chen}, \bibinfo{person}{Weilin Zhang}, \bibinfo{person}{Xiaohan Wei}, \bibinfo{person}{Yuchen Hao}, \bibinfo{person}{Michael Tsang}, \bibinfo{person}{Wenjun Wang}, {et~al\mbox{.}}} \bibinfo{year}{2022}\natexlab{}.
+\newblock \showarticletitle{DHEN: A deep and hierarchical ensemble network for large-scale click-through rate prediction}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2203.11014}} (\bibinfo{year}{2022}).
+\newblock
+
+
+\bibitem[Zhang et~al\mbox{.}(2024)]%
+        {zhang2024scaling}
+\bibfield{author}{\bibinfo{person}{Gaowei Zhang}, \bibinfo{person}{Yupeng Hou}, \bibinfo{person}{Hongyu Lu}, \bibinfo{person}{Yu Chen}, \bibinfo{person}{Wayne~Xin Zhao}, {and} \bibinfo{person}{Ji-Rong Wen}.} \bibinfo{year}{2024}\natexlab{}.
+\newblock \showarticletitle{Scaling law of large sequential recommendation models}. In \bibinfo{booktitle}{\emph{Proceedings of the 18th ACM Conference on Recommender Systems}}. \bibinfo{pages}{444--453}.
+\newblock
+
+
+\bibitem[Zhang et~al\mbox{.}(2021)]%
+        {zhang2021deep}
+\bibfield{author}{\bibinfo{person}{Weinan Zhang}, \bibinfo{person}{Jiarui Qin}, \bibinfo{person}{Wei Guo}, \bibinfo{person}{Ruiming Tang}, {and} \bibinfo{person}{Xiuqiang He}.} \bibinfo{year}{2021}\natexlab{}.
+\newblock \showarticletitle{Deep learning for click-through rate estimation}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2104.10584}} (\bibinfo{year}{2021}).
+\newblock
+
+
+\bibitem[Zhou et~al\mbox{.}(2018)]%
+        {din}
+\bibfield{author}{\bibinfo{person}{Guorui Zhou}, \bibinfo{person}{Xiaoqiang Zhu}, \bibinfo{person}{Chenru Song}, \bibinfo{person}{Ying Fan}, \bibinfo{person}{Han Zhu}, \bibinfo{person}{Xiao Ma}, \bibinfo{person}{Yanghui Yan}, \bibinfo{person}{Junqi Jin}, \bibinfo{person}{Han Li}, {and} \bibinfo{person}{Kun Gai}.} \bibinfo{year}{2018}\natexlab{}.
+\newblock \showarticletitle{Deep Interest Network for Click-Through Rate Prediction}. In \bibinfo{booktitle}{\emph{Proceedings of the 24th ACM SIGKDD International Conference on Knowledge Discovery \& Data Mining}} (London, United Kingdom) \emph{(\bibinfo{series}{KDD '18})}. \bibinfo{publisher}{Association for Computing Machinery}, \bibinfo{address}{New York, NY, USA}, \bibinfo{pages}{1059–1068}.
+\newblock
+\showISBNx{9781450355520}
+\href{https://doi.org/10.1145/3219819.3219823}{doi:\nolinkurl{10.1145/3219819.3219823}}
+
+
+\end{thebibliography}

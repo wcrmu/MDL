@@ -1,0 +1,568 @@
+%%
+%% This is file `sample-sigconf.tex',
+%% generated with the docstrip utility.
+%%
+%% The original source files were:
+%%
+%% samples.dtx  (with options: `all,proceedings,bibtex,sigconf')
+%% 
+%% IMPORTANT NOTICE:
+%% 
+%% For the copyright see the source file. 
+%% 
+%% Any modified versions of this file must be renamed
+%% with new filenames distinct from sample-sigconf.tex.
+%% 
+%% For distribution of the original source see the terms
+%% for copying and modification in the file samples.dtx.
+%% 
+%% This generated file may be distributed as long as the
+%% original source files, as listed above, are part of the
+%% same distribution. (The sources need not necessarily be
+%% in the same archive or directory.)
+%%
+%%
+%% Commands for TeXCount
+%TC:macro \cite [option:text,text]
+%TC:macro \citep [option:text,text]
+%TC:macro \citet [option:text,text]
+%TC:envir table 0 1
+%TC:envir table* 0 1
+%TC:envir tabular [ignore] word
+%TC:envir displaymath 0 word
+%TC:envir math 0 word
+%TC:envir comment 0 0
+%%
+%% The first command in your LaTeX source must be the \documentclass
+%% command.
+%%
+%% For submission and review of your manuscript please change the
+%% command to \documentclass[manuscript, screen, review]{acmart}.
+%%
+%% When submitting camera ready or to TAPS, please change the command
+%% to \documentclass[sigconf]{acmart} or whichever template is required
+%% for your publication.
+%%
+%%
+\documentclass[sigconf]{acmart}
+%%
+%% \BibTeX command to typeset BibTeX logo in the docs
+\AtBeginDocument{%
+  \providecommand\BibTeX{{%
+    Bib\TeX}}}
+
+%% Rights management information.  This information is sent to you
+%% when you complete the rights form.  These commands have SAMPLE
+%% values in them; it is your responsibility as an author to replace
+%% the commands and values with those provided to you when you
+%% complete the rights form.
+\setcopyright{acmlicensed}
+\copyrightyear{2018}
+\acmYear{2018}
+\acmDOI{XXXXXXX.XXXXXXX}
+%% These commands are for a PROCEEDINGS abstract or paper.
+\acmConference[Conference acronym 'XX]{Make sure to enter the correct
+  conference title from your rights confirmation email}{June 03--05,
+  2018}{Woodstock, NY}
+%%
+%%  Uncomment \acmBooktitle if the title of the proceedings is different
+%%  from ``Proceedings of ...''!
+%%
+%%\acmBooktitle{Woodstock '18: ACM Symposium on Neural Gaze Detection,
+%%  June 03--05, 2018, Woodstock, NY}
+\acmISBN{978-1-4503-XXXX-X/2018/06}
+
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\settopmatter{printacmref=false}
+
+%%
+%% Submission ID.
+%% Use this when submitting an article to a sponsored event. You'll
+%% receive a unique submission ID from the organizers
+%% of the event, and this ID should be used as the parameter to this command.
+%%\acmSubmissionID{123-A56-BU3}
+
+%%
+%% For managing citations, it is recommended to use bibliography
+%% files in BibTeX format.
+%%
+%% You can then either use BibTeX with the ACM-Reference-Format style,
+%% or BibLaTeX with the acmnumeric or acmauthoryear sytles, that include
+%% support for advanced citation of software artefact from the
+%% biblatex-software package, also separately available on CTAN.
+%%
+%% Look at the sample-*-biblatex.tex files for templates showcasing
+%% the biblatex styles.
+%%
+
+%%
+%% The majority of ACM publications use numbered citations and
+%% references.  The command \citestyle{authoryear} switches to the
+%% "author year" style.
+%%
+%% If you are preparing content for an event
+%% sponsored by ACM SIGGRAPH, you must use the "author year" style of
+%% citations and references.
+%% Uncommenting
+%% the next command will enable that style.
+%%\citestyle{acmauthoryear}
+
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{subfigure}
+\usepackage{tabularx}
+
+
+\usepackage{makecell}
+\usepackage{siunitx}    % 可选，对数字进行对齐
+\usepackage{graphicx}   % 若需要 \resizebox
+
+%%
+%% end of the preamble, start of the body of the document source.
+\begin{document}
+
+%%
+%% The "title" command has an optional parameter,
+%% allowing the author to define a "short title" to be used in page headers.
+\title[RankMixer: Scaling Up Ranking Models in Industrial Recommenders]{RankMixer: Scaling Up Ranking Models in  \\Industrial Recommenders}
+
+
+%%
+%% The "author" command and its associated commands are used to define
+%% the authors and their affiliations.
+%% Of note is the shared affiliation of the first two authors, and the
+%% "authornote" and "authornotemark" commands
+%% used to denote shared contribution to the research.
+% \author{Ben Trovato}
+% \authornote{Both authors contributed equally to this research.}
+% \email{trovato@corporation.com}
+% \orcid{1234-5678-9012}
+% \author{G.K.M. Tobin}
+% \authornotemark[1]
+% \email{webmaster@marysville-ohio.com}
+% \affiliation{%
+%   \institution{Institute for Clarity in Documentation}
+%   \city{Dublin}
+%   \state{Ohio}
+%   \country{USA}
+% }
+
+% \author{Jie Zhu}
+% \authornotemark[1]
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Hangzhou, China}
+% }
+% \email{zhujie.zj@bytedance.com}
+
+% \author{Zhifang Fan}
+% \authornote{authors contributed equally to this research.}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Shanghai, China}
+% }
+% \email{fanzhifangfzf@gmail.com}
+
+
+
+% \author{Xiaoxie Zhu}
+% \authornotemark[1]
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Shanghai, China}
+% }
+% \email{zhuxiaoxie.777@bytedance.com}
+
+
+% \author{Yuchen Jiang}
+% \authornotemark[1]
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Beijing, China}
+% }
+% \email{jiangyuchen.jyc@bytedance.com}
+
+% \author{Hangyu Wang}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Shanghai, China}
+% }
+% \email{wanghangyu.123@bytedance.com}
+
+
+% \author{Xintian Han}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Hangzhou, China}
+% }
+% \email{hanxintian@bytedance.com}
+
+
+% \author{Haoran Ding}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Beijing, China}
+% }
+% \email{dinghaoran@bytedance.com}
+
+% \author{Xinmin Wang}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Shanghai, China}
+% }
+% \email{xinmin.wang@bytedance.com}
+
+
+
+
+% \author{Wenlin Zhao}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Beijing, China}
+% }
+% \email{zhaowenlin@bytedance.com}
+
+
+% \author{Zhen Gong}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Shanghai, China}
+% }
+% \email{gongzhen.666@bytedance.com}
+
+% \author{Huizhi Yang}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Beijing, China}
+% }
+% \email{yanghuizhi@bytedance.com}
+
+
+
+% \author{Zheng Chai}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Hangzhou, China}
+% }
+% \email{chaizheng.cz@bytedance.com}
+
+
+% \author{Zhe Chen}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Beijing, China}
+% }
+% \email{chenzhe.john@bytedance.com}
+
+% \author{Yuchao Zheng}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Hangzhou, China}
+% }
+% \email{zhengyuchao.yc@bytedance.com}
+
+% \author{Qiwei Chen}
+% \authornote{Corresponding author.}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Shanghai, China}
+% }
+% \email{chenqiwei05@gmail.com}
+
+
+% \author{Feng Zhang}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Shanghai, China}
+% }
+% \email{feng.zhang@bytedance.com}
+
+
+% \author{Xun Zhou}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Beijing, China}
+% }
+% \email{zhouxun@bytedance.com}
+
+% \author{Peng Xu}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{San Jose, USA}
+% }
+% \email{xupeng@bytedance.com}
+
+% \author{Xiao Yang}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Beijing, China}
+% }
+% \email{wuqi.shaw@bytedance.com}
+
+
+% \author{Di Wu}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Beijing, China}
+% }
+% \email{di.wu@bytedance.com}
+
+
+% \author{Zuotao Liu}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Shanghai, China}
+% }
+% \email{michael.liu@bytedance.com}
+
+% \author{Jie Zhu}
+% \authornotemark[1]
+% \email{zhujie.zj@bytedance.com}
+% \author{Zhifang Fan}
+% \authornote{authors contributed equally to this research.}
+% \email{fanzhifangfzf@gmail.com}
+% \author{Xiaoxie Zhu}
+% \email{zhuxiaoxie.777@bytedance.com}
+% \authornotemark[1]
+% \author{Yuchen Jiang}
+% \authornotemark[1]
+% \email{jiangyuchen.jyc@bytedance.com}
+% \author{Hangyu Wang}
+% \email{wanghangyu.123@bytedance.com}
+% \author{Xintian Han}
+% \email{hanxintian@bytedance.com}
+% \author{Haoran Ding}
+% \email{dinghaoran@bytedance.com}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Shanghai, China}
+% }
+
+
+
+\author{Jie Zhu*, Zhifang Fan*, Xiaoxie Zhu*, Yuchen Jiang*, Hangyu Wang, Xintian Han, Haoran Ding, Xinmin Wang, Wenlin Zhao, Zhen Gong, Huizhi Yang, Zheng Chai, Zhe Chen, Yuchao Zheng, \\ Qiwei Chen$^{\dagger}$, Feng Zhang, Xun Zhou, Peng Xu, Xiao Yang, Di Wu, Zuotao Liu}
+
+\affiliation{
+	\country{ByteDance\\
+    \{zhujie.zj, zhuxiaoxie.777, jiangyuchen.jyc, wanghangyu.123, hanxintian, dinghaoran, xinmin.wang,
+zhaowenlin, gongzhen.666, yanghuizhi, chaizheng.cz, chenzhe.john, zhengyuchao.yc, feng.zhang, zhouxun, xupeng, wuqi.shaw, di.wu, michael.liu\}@bytedance.com, \{fanzhifangfzf, chenqiwei05\}@gmail.com}}
+
+\thanks{* Equal Contributions. \\ $\dagger$ Corresponding authors.}
+
+
+% \author{Xinmin Wang}
+% \email{xinmin.wang@bytedance.com}
+% \author{Wenlin Zhao}
+% \email{zhaowenlin@bytedance.com}
+% \author{Zhen Gong}
+% \email{gongzhen.666@bytedance.com}
+% \author{Huizhi Yang}
+% \email{yanghuizhi@bytedance.com}
+% \author{Zheng Chai}
+% \email{chaizheng.cz@bytedance.com}
+% \author{Zhe Chen}
+% \email{chenzhe.john@bytedance.com}
+% \author{Yuchao Zheng}
+% \email{zhengyuchao.yc@bytedance.com}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Hangzhou, China}
+% }
+
+% \author{Qiwei Chen}
+% \email{chenqiwei05@gmail.com}
+% \authornote{Corresponding author.}
+% \author{Feng Zhang}
+% \email{feng.zhang@bytedance.com}
+% \author{Xun Zhou}
+% \email{zhouxun@bytedance.com}
+% \author{Peng Xu}
+% \email{xupeng@bytedance.com}
+% \author{Xiao Yang}
+% \email{wuqi.shaw@bytedance.com}
+% \author{Di Wu}
+% \email{di.wu@bytedance.com}
+% \author{Zuotao Liu}
+% \email{michael.liu@bytedance.com}
+% \affiliation{%
+%   \institution{ByteDance}
+%   \country{Beijing, China}
+% }
+
+
+
+
+
+
+% \author{Lars Th{\o}rv{\"a}ld}
+% \affiliation{%
+%   \institution{The Th{\o}rv{\"a}ld Group}
+%   \city{Hekla}
+%   \country{Iceland}}
+% \email{larst@affiliation.org}
+
+% \author{Valerie B\'eranger}
+% \affiliation{%
+%   \institution{Inria Paris-Rocquencourt}
+%   \city{Rocquencourt}
+%   \country{France}
+% }
+
+% \author{Aparna Patel}
+% \affiliation{%
+%  \institution{Rajiv Gandhi University}
+%  \city{Doimukh}
+%  \state{Arunachal Pradesh}
+%  \country{India}}
+
+% \author{Huifen Chan}
+% \affiliation{%
+%   \institution{Tsinghua University}
+%   \city{Haidian Qu}
+%   \state{Beijing Shi}
+%   \country{China}}
+
+% \author{Charles Palmer}
+% \affiliation{%
+%   \institution{Palmer Research Laboratories}
+%   \city{San Antonio}
+%   \state{Texas}
+%   \country{USA}}
+% \email{cpalmer@prl.com}
+
+% \author{John Smith}
+% \affiliation{%
+%   \institution{The Th{\o}rv{\"a}ld Group}
+%   \city{Hekla}
+%   \country{Iceland}}
+% \email{jsmith@affiliation.org}
+
+% \author{Julius P. Kumquat}
+% \affiliation{%
+%   \institution{The Kumquat Consortium}
+%   \city{New York}
+%   \country{USA}}
+% \email{jpkumquat@consortium.net}
+
+%%
+%% By default, the full list of authors will be used in the page
+%% headers. Often, this list is too long, and will overlap
+%% other information printed in the page headers. This command allows
+%% the author to define a more concise list
+%% of authors' names for this purpose.
+% \renewcommand{\shortauthors}{Trovato et al.}
+\renewcommand{\shortauthors}{Zhifang Fan et al.}
+
+%%
+%% The abstract is a short summary of the work to be presented in the
+%% article.
+\begin{abstract}
+  Recent progress on large language models (LLMs) has spurred interest in scaling up recommendation systems, yet two practical obstacles remain. First, training and serving cost on industrial Recommenders must respect strict latency bounds and high QPS demands. Second, most human-designed feature-crossing modules in ranking models were inherited from the CPU era and fail to exploit modern GPUs, resulting in low Model Flops Utilization (MFU) and poor scalability. We introduce RankMixer, a hardware-aware model design tailored towards a unified and scalable feature-interaction architecture. RankMixer retains the transformer’s high parallelism while replacing quadratic self-attention with multi-head token mixing module for higher efficiency. Besides, RankMixer maintains both the modeling for distinct feature subspaces and cross-feature-space interactions with Per-token FFNs. We further extend it to one billion parameters with a Sparse-MoE variant for higher ROI. A dynamic routing strategy is adapted to address the inadequacy and imbalance of experts training. Experiments show RankMixer's superior scaling abilities on a trillion-scale production dataset. By replacing previously diverse handcrafted low-MFU modules with RankMixer, we boost the model MFU from \textbf{4.5\%} to \textbf{45\%}, and scale our online ranking model parameters by two orders of magnitude while maintaining roughly the same inference latency. We verify RankMixer's universality with online A/B tests across two core application scenarios (Recommendation and Advertisement). Finally, we launch 1B Dense-Parameters RankMixer for full traffic serving without increasing the serving cost, which improves user active days by \textbf{0.3\%} and total in-app usage duration by \textbf{1.08\%}.
+
+\end{abstract}
+
+
+
+\begin{CCSXML}
+<ccs2012>
+ <concept>
+  <concept_id>00000000.0000000.0000000</concept_id>
+  <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+  <concept_significance>500</concept_significance>
+ </concept>
+ <concept>
+  <concept_id>00000000.00000000.00000000</concept_id>
+  <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+  <concept_significance>300</concept_significance>
+ </concept>
+ <concept>
+  <concept_id>00000000.00000000.00000000</concept_id>
+  <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+  <concept_significance>100</concept_significance>
+ </concept>
+ <concept>
+  <concept_id>00000000.00000000.00000000</concept_id>
+  <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+  <concept_significance>100</concept_significance>
+ </concept>
+</ccs2012>
+\end{CCSXML}
+
+\ccsdesc[500]{Information systems~Recommender systems}
+
+%%
+%% The code below is generated by the tool at http://dl.acm.org/ccs.cfm.
+%% Please copy and paste the code instead of the example below.
+%%
+% \begin{CCSXML}
+% <ccs2012>
+%  <concept>
+%   <concept_id>00000000.0000000.0000000</concept_id>
+%   <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+%   <concept_significance>500</concept_significance>
+%  </concept>
+%  <concept>
+%   <concept_id>00000000.00000000.00000000</concept_id>
+%   <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+%   <concept_significance>300</concept_significance>
+%  </concept>
+%  <concept>
+%   <concept_id>00000000.00000000.00000000</concept_id>
+%   <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+%   <concept_significance>100</concept_significance>
+%  </concept>
+%  <concept>
+%   <concept_id>00000000.00000000.00000000</concept_id>
+%   <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+%   <concept_significance>100</concept_significance>
+%  </concept>
+% </ccs2012>
+% \end{CCSXML}
+
+% \ccsdesc[500]{Do Not Use This Code~Generate the Correct Terms for Your Paper}
+% \ccsdesc[300]{Do Not Use This Code~Generate the Correct Terms for Your Paper}
+% \ccsdesc{Do Not Use This Code~Generate the Correct Terms for Your Paper}
+% \ccsdesc[100]{Do Not Use This Code~Generate the Correct Terms for Your Paper}
+
+%%
+%% Keywords. The author(s) should pick words that accurately describe
+%% the work being presented. Separate the keywords with commas.
+\keywords{Scaling Laws, Ranking Model, Recommender System}
+%% A "teaser" image appears between the author and affiliation
+%% information and the body of the document, and typically spans the
+% %% page.
+% \begin{teaserfigure}
+%   \includegraphics[width=\textwidth]{sampleteaser}
+%   \caption{Seattle Mariners at Spring Training, 2010.}
+%   \Description{Enjoying the baseball game from the third-base
+%   seats. Ichiro Suzuki preparing to bat.}
+%   \label{fig:teaser}
+% \end{teaserfigure}
+
+% \received{20 February 2007}
+% \received[revised]{12 March 2009}
+% \received[accepted]{5 June 2009}
+
+%%
+%% This command processes the author and affiliation and title
+%% information and builds the first part of the formatted document.
+\maketitle
+
+\input{text/introduction}
+\input{text/related_work}
+\input{text/method}
+\input{text/experiment}
+
+\input{text/conclusion}
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{software}
+
+\end{document}
+\endinput
+%%
+%% End of file `sample-sigconf.tex'.

@@ -1,0 +1,31 @@
+\section{Introduction}
+
+Recommender System (RS) is essential in the process of distributing information. As a significant machine learning scenario, RS predicts users' behaviors towards items based on a large amount of multi-field feature data, including numerical features such as diverse statistics, categorical features such as user and item IDs, user behavior features and content features~\cite{zhang2021deep,lin2023can}. The state-of-the-art recommendation methods are based on Deep Learning Recommendation Models (DLRMs), which flexibly capture feature interactions based on neural networks as the dense interaction layers above the input embeddings from features. The Dense interaction layer in DLRM is critical for RS performance and diverse model structures are proposed~\cite{covington2016deep,din,guo2017deepfm,wang2021dcn,zhangwukong}.
+
+Driven by advancements in Large Language Models (LLMs) that benefit from increasing parameters~\cite{achiam2023gpt,kaplan2020scaling,hoffmann2022training}, scaling up DLRMs to take full advantage of the volume of data is an urgent need. 
+Previous research has yielded numerous outcomes on the scaling DLRMs, early studies~\cite{zhang2024scaling,ardalani2022understanding,chitlangia2023scaling} just widen or stack feature interaction layers without modifying the structure. The benefits achieved in this way are modest and occasionally negative~\cite{wang2017deep,lian2018xdeepfm}. Then the follow-up efforts, such as DHEN~\cite{zhang2022dhen} and Wukong~\cite{zhangwukong}, focus on designing innovative DNN structures to boost the scaling performance. However, leveraging model scale to improve performance in recommendation presents unique practical challenges. Unlike NLP or vision tasks, industrial-scale recommendation systems must strictly adhere to tight latency constraints and support extremely high QPS (queries per second). As a result, the core challenge lies in finding a sweet spot that balances model effectiveness and computational efficiency.
+
+Historically, the architecture of ranking models in recommendation has been shaped by CPU-era design principles. These models typically relied on combining heterogeneous diverse handcrafted cross-feature modules to extract feature interactions, but many of their core operators are memory-bound rather than compute-bound on modern GPUs, leading to poor GPU parallelism and extremely low MFU(Model Flops Utilization) often in the single-digit percentage range.Moreover, since the computational cost of CPU-era models was approximately proportional to the number of parameters, the potential ROI from aggressive scaling—as suggested by scaling laws—was difficult to realize in practice.
+
+
+In summary, the research on scaling laws of DLRMs must overcome the following problems:
+\begin{itemize}[leftmargin=10pt]
+    \item Architectures should be hardware-aligned, maximizing MFU and compute throughput on modern GPUs.
+
+    \item The model design must leverage the characteristics of recommendation data, such as the heterogeneous feature spaces and personalized cross-feature interactions among hundreds of fields.
+\end{itemize}
+
+
+To address these challenges, we propose a hardware-aware model design method, RankMixer. The core design of RankMixer is based on two scalable components: 1. \textit{Multi-head token mixing} achieves cross-token feature interactions only through the parameter-free operator. This strategy outperforms the self-attention mechanism in terms of performance and computational efficiency. 2. \textit{Per-token feed-forward networks (FFNs)} expand model capacity significantly and tackle inter-feature-space domination problem by allocating independent parameters for different feature subspace modeling. These FFNs also align well with the recommendation data patterns, enabling a better scaling behavior.
+To further boost the ROI of large-scale models, we extend the per-token FFN modules into a \textit{Sparse Mixture-of-Experts (MoE)} structure. By dynamically activating only a subset of experts per token for different data, we can significantly increase the model capacity with a minimal increase in computational cost. 
+RankMixer adopts a highly parallel architecture similar to transformers, but overcomes several critical limitations of self-attention based feature-interaction: low training efficiency, the combinatorial explosion when modeling cross-space ID similarity and severe memory-bound caused by attention weights matrix. At the same time, RankMixer offers greater model capacity and learning capability under the same Flops compared with Vanilla Transformer.
+
+In production deployment on Douyin’s recommendation system, we demonstrate that it is feasible to scale model parameters by over 100× while maintaining shorter inference latency compared with previous baseline. This is made possible by the RankMixer architecture’s ability to decouple parameter growth from FLOPs, and decouple FLOPs growth from actual cost through high MFU and engineering optimization.
+
+The main contributions can be summarized as follows:
+\begin{itemize}[leftmargin=6pt]
+    \item We propose a novel architecture called RankMixer follows a hardware-aware model-design philosophy. We design the multi-head token mixing and per-token FFN strategies to capture heterogeneous feature interactions efficiently, and using dynamic routing strategy to improve the scalability of SparseMoE in RankMixer.
+    \item Leveraging levers of high MFU and performance-optimization, we scale the model parameters by 70× without increasing the inference cost, including improving MFU and Quantization.
+    \item We conduct extensive offline and online experiments and investigate the model's scaling law on the trillion-scale industrial recommendation dataset. The RankMixer model has been successfully deployed on the Douyin Feed Recommendation Ranking for full-traffic serving, achieving 0.3\% and  1.08\% increase on active days and App duration, respectively.
+\end{itemize}
+

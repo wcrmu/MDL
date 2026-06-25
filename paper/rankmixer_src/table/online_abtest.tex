@@ -1,0 +1,39 @@
+
+\begin{table*}[h]
+\caption{Online AB test result for Feed Recommendation Scenarios in both Douyin and Douyin lite app and the improvements are all statistically significant. According to long-term reverse A/B tests and continuous observations over long-term reverse experiments, the gains provided by RankMixer-1B have not yet converged, and the results presented here are still improving.}
+\resizebox{\textwidth}{!}{
+\renewcommand\arraystretch{1.08}
+\begin{tabular}{lcccclccccl}
+\hline
+                       & \multicolumn{5}{c}{\textbf{Douyin app}}                                                      & \multicolumn{4}{c}{\textbf{Douyin lite}}                                  &                  \\ \cmidrule(lr){2-6}\cmidrule{7-11} 
+                       & \textbf{Active Day}$\uparrow$ & \textbf{Duration}$\uparrow$ & \textbf{Like}$\uparrow$ & \textbf{Finish}$\uparrow$ & \textbf{Comment}$\uparrow$ & \textbf{Active Day}$\uparrow$ & \textbf{Duration}$\uparrow$ & \textbf{Like}$\uparrow$ & \textbf{Finish}$\uparrow$ & \textbf{Comment}$\uparrow$ \\ \hline
+
+\textbf{Overall}       & +0.2908\%           & +1.0836\%         & +2.3852\%     & +1.9874\%       & +0.7886\%        & +0.1968\%           & +0.9869\%          & +1.1318\%     & +2.0744\%        & +1.1338\%        \\ \hline 
+\textbf{Low-active}    & +1.7412\%            & +3.6434\%         & 
++8.1641\%     & +4.5393\%       & +2.9368\%         & +0.5389\%           & +2.1831\%         & +4.4486\%      & +3.3958\%       & +0.9595\%        \\
+\textbf{Middle-active} & +0.7081\%           & +1.5269\%         & +2.5823\%     & +2.5062\%       & +1.2266\%         & +0.4235\%           & +1.9011\%         & +1.7491\%      & +2.6568\%         & +0.6782\%        \\
+\textbf{High-active}   & +0.1445\%           & +0.6259\%         & +1.828\%      & +1.4939\%       & +0.4151\%          & +0.0929\%           & +1.1356\%         & +1.8212\%      & +1.7683\%        & +2.3683\% 
+\\ \hline
+\end{tabular}
+}
+\label{online_ab}
+\end{table*}
+
+\begin{table}[t]
+\centering
+\caption{Online lift of RankMixer in Advertising}
+\label{tab:ads-search}
+% \resizebox{0.9\linewidth}{!}{%
+\footnotesize
+\renewcommand\arraystretch{0.95}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+ & \multicolumn{2}{c}{\textbf{Advertising}}\\
+\cmidrule(lr){2-3}
+Metric & $\Delta$AUC$\uparrow$ & ADVV$\uparrow$  \\
+\midrule
+Lift  & +0.73\% & +3.90\%\\
+\bottomrule
+\end{tabular}%
+\label{ad_search}
+\end{table}

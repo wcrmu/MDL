@@ -1,0 +1,198 @@
+% \documentclass[sigconf, review, anonymous]{acmart}
+% \documentclass[sigconf, review]{acmart}
+\documentclass[sigconf]{acmart}
+
+\AtBeginDocument{%
+  \providecommand\BibTeX{{%
+    Bib\TeX}}}
+
+\usepackage{algorithmic}
+\usepackage[ruled,linesnumbered]{algorithm2e}
+\usepackage{array}
+\usepackage{amsfonts}
+\let\Bbbk\relax\usepackage{amssymb}
+\usepackage{amsmath}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{color}
+\usepackage{epstopdf}
+\usepackage{enumitem}
+\usepackage{footmisc}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{multirow}
+\usepackage{mathrsfs}
+\usepackage{pifont}
+\usepackage{subfigure}
+\usepackage{setspace}
+\usepackage{soul}
+\usepackage{textcomp}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{xspace}
+\usepackage[normalem]{ulem}
+\usepackage[np, autolanguage]{numprint}
+\usepackage[skip=0pt]{caption}
+\usepackage{marvosym}
+\let\Cross\relax
+\usepackage{bbding}
+
+\newcommand{\paratitle}[1]{\vspace{1.5ex}\noindent\textbf{#1}}
+\newcommand{\ie}{\emph{i.e.,}\xspace}
+\newcommand{\aka}{\emph{a.k.a.,}\xspace}
+\newcommand{\eg}{\emph{e.g.,}\xspace}
+\newcommand{\etal}{\emph{et al.}\xspace}
+\newcommand{\wrt}{w.r.t.\xspace}
+\newcommand{\ignore}[1]{}
+\newcommand{\todo}[1]{\textcolor{red}{#1}}
+\newcommand{\changed}[1]{\textcolor{blue}{#1}}
+\newcommand{\remove}[1]{\sout{\textcolor{orange}{#1}}}
+\newcommand{\replace}[2]{\remove{#1}/\changed{#2}}
+\newcommand\mathbox[1]{\mbox{$#1$}}
+\newcommand{\tabincell}[2]{\begin{tabular}{@{}#1@{}}#2\end{tabular}}
+\newcommand{\placeholder}[1]{\textcolor{blue}{#1}}
+\newcommand{\shanlei}[1]{\textcolor{purple}{#1}}
+\newcommand{\modelname}{MDL}
+
+\begin{document}
+
+\title{MDL: A Unified Multi-Distribution Learner in Large-scale Industrial Recommendation through Tokenization}
+
+
+\author{Shanlei Mu}
+\email{mushanlei@bytedance.com}
+\authornote{Equal contribution.}
+\affiliation{
+    \institution{ByteDance Search}
+    \city{Beijing}
+    \country{China}
+}
+
+\author{Yuchen Jiang}
+\email{jiangyuchen.jyc@bytedance.com}
+\authornotemark[1]
+\affiliation{
+    \institution{ByteDance AML}
+    \city{Beijing}
+    \country{China}
+}
+
+\author{Shikang Wu}
+\email{wushikang@bytedance.com}
+\authornotemark[1]
+\affiliation{
+    \institution{ByteDance Search}
+    \city{Beijing}
+    \country{China}
+}
+
+\author{Shiyong Hong}
+\email{hongshiyong.66@bytedance.com}
+\affiliation{
+    \institution{ByteDance Search}
+    \city{Beijing}
+    \country{China}
+}
+
+
+\author{Tianmu Sha}
+\email{shatianmu@bytedance.com}
+\affiliation{
+    \institution{ByteDance Search}
+    \city{Beijing}
+    \country{China}
+}
+
+\author{Junjie Zhang}
+\email{zhangjunjie.leo@bytedance.com}
+\affiliation{
+    \institution{ByteDance Search}
+    \city{Beijing}
+    \country{China}
+}
+
+\author{Jie Zhu}
+\email{zhujie.zj@bytedance.com}
+\affiliation{
+    \institution{ByteDance AML}
+    \city{Hangzhou}
+    \country{China}
+}
+
+\author{Zhe Chen}
+\email{chenzhe.john@bytedance.com}
+\affiliation{
+    \institution{ByteDance AML}
+    \city{Beijing}
+    \country{China}
+}
+
+\author{Zhe Wang}
+\authornote{Corresponding author.}
+\email{zhewang.tim@gmail.com}
+\affiliation{
+    \institution{ByteDance Search}
+    \city{Beijing}
+    \country{China}
+}
+
+\author{Jingjian Lin}
+\email{linjingjian000@gmail.com}
+\affiliation{
+    \institution{ByteDance Search}
+    \city{Beijing}
+    \country{China}
+}
+
+\renewcommand{\shortauthors}{Shanlei Mu, et al.}
+
+\begin{abstract}
+Industrial recommender systems increasingly adopt multi-scenario learning (MSL) and multi-task learning (MTL) to handle diverse user interactions and contexts, but existing approaches suffer from two critical drawbacks: (1) underutilization of large-scale model parameters due to limited interaction with complex feature modules, and (2) difficulty in jointly modeling scenario and task information in a unified framework.
+To address these challenges, we propose a unified \textbf{M}ulti-\textbf{D}istribution \textbf{L}earning (MDL) framework, 
+inspired by the "prompting" paradigm in large language models (LLMs).
+MDL treats scenario and task information as specialized tokens rather than auxiliary inputs or gating signals.
+Specifically, we introduce a unified information tokenization module that transforms features, scenarios, and tasks into a unified tokenized format.
+To facilitate deep interaction, we design three synergistic mechanisms: (1) feature token self-attention for rich feature interactions, (2) domain-feature attention for scenario/task-adaptive feature activation, and (3) domain-fused aggregation for joint distribution prediction.
+By stacking these interactions, MDL enables scenario and task information to "prompt" and activate the model's vast parameter space in a bottom-up, layer-wise manner.
+Extensive experiments on real-world industrial datasets demonstrate that MDL significantly outperforms state-of-the-art MSL and MTL baselines.
+Online A/B testing on Douyin Search platform over one month yields +0.0626\% improvement in LT30 and -0.3267\% reduction in change query rate.
+MDL has been fully deployed in production, serving hundreds of millions of users daily.
+\end{abstract}
+
+\begin{CCSXML}
+<ccs2012>
+ <concept>
+ <concept_id>10002951.10003317.10003347.10003350</concept_id>
+ <concept_desc>Information systems~Recommender systems</concept_desc>
+ <concept_significance>500</concept_significance>
+ </concept>
+ </ccs2012>
+\end{CCSXML}
+
+\ccsdesc[500]{Information systems~Recommender systems}
+
+\keywords{Recommender System; Large Recommendation Model; Multi-Scenario Learning; Multi-Task Learning; Tokenization}
+
+
+\maketitle
+
+\input{subfile/sec-intro}
+\input{subfile/sec-pre}
+\input{subfile/sec-model}
+\input{subfile/sec-exp}
+\input{subfile/sec-rel}
+
+\section{Conclusion}
+\label{sec-con}
+In this paper, we propose a novel multi-distribution learning framework for multi-scenario learning (MSL) and multi-task learning (MTL) in large-scale industrial recommender system, named \textbf{MDL}.
+Unlike existing MSL and MTL recommendation methods that are based on a \emph{shared-specific} architecture, the proposed approach inspired by large language models (LLMs) is to leverage prompt-based tokenization to achieve model predictions in various scenarios and tasks settings.
+Specifically, MDL tokenizes feature, scenario, and task information into a unified tokenized format, and elobrates three key interaction mechanisms among these tokens.
+Extensive experiments on both offline evaluation and online test have demonstrated the effectiveness.
+The proposed approach MDL has been fully deployed on Douyin Search platform.
+
+\balance
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{main}
+
+\end{document}
