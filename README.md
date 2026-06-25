@@ -1,6 +1,5 @@
 # MDL Reproduction
 
-This repository contains a minimal PyTorch reproduction of the core MDL method from `paper/2602.07520v2_src/` plus a public-data adapter for Tenrec.
 
 ## What Is Implemented
 
