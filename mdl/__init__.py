@@ -1,16 +1,16 @@
-from .training import multitask_bce_loss
-from .training import qauc
+from .utils import multitask_bce_loss
+from .utils import qauc
 from .models import MDLConfig, MDLModel
 from .tokenization import FeatureCompilerConfig, FeatureTokenCompiler
-from .tabular_model import TabularMDLConfig, TabularMDLModel
+from .ranking import RankingConfig, RankingModel
 
 __all__ = [
     "MDLConfig",
     "MDLModel",
     "FeatureCompilerConfig",
     "FeatureTokenCompiler",
-    "TabularMDLConfig",
-    "TabularMDLModel",
+    "RankingConfig",
+    "RankingModel",
     "multitask_bce_loss",
     "qauc",
 ]

@@ -1,7 +1,7 @@
 # Adapter Guide
 
 This guide defines the output contract for dataset adapters. An adapter converts a raw
-dataset into the standard processed format consumed by the generic MDL tabular training
+dataset into the standard processed format consumed by the generic MDL manifest training
 pipeline.
 
 ## Pipeline Position
@@ -11,14 +11,14 @@ raw dataset
   -> adapter
   -> processed splits + manifest
   -> mdl/data
-  -> mdl/interfaces or tabular wrapper
+  -> mdl/interfaces or manifest wrapper
   -> mdl/tokenization
   -> feature_tokens
   -> mdl/models
 ```
 
-Adapters live outside the core `mdl` package. For example, Tenrec-specific code lives in
-`adapters/tenrec/`.
+Adapters live outside the core `mdl` package. Dataset-specific code should live under
+`adapters/<dataset_name>/` and produce the generic processed format described here.
 
 ## Required Output Directory
 
@@ -30,13 +30,13 @@ processed_dataset/
   train.csv
   val.csv
   test.csv
-  vocab__<feature_name>.json   # optional, recommended for categorical features
+  vocab__<feature_name>.json   # optional, recommended for id features
 ```
 
 The generic training command consumes the directory through `--data-dir`:
 
 ```bash
-PYTHONNOUSERSITE=1 conda run -n torch python -m mdl.train_tabular \
+PYTHONNOUSERSITE=1 conda run -n torch python -m mdl.train \
   --data-dir processed_dataset
 ```
 
@@ -86,7 +86,7 @@ Rules:
 - The group column is used for QAUC grouping. Use a query/session/user id when available.
 - Feature CSV parsing is declared by each feature's `source`, not inferred from `encoder`.
 - Scalar integer-like features should use `source.dtype = "int64"`; reserve `0` for padding/unknown when the encoder treats zero specially.
-- Scalar numeric features should use `source.dtype = "float32"` and should already be normalized if normalization is desired.
+- Scalar float-valued features should use `source.dtype = "float32"` and should already be normalized if normalization is desired.
 - Vector/list features can use `source.shape = "vector"` plus an optional `source.delimiter`; rows must have a consistent padded length for the generic collate path.
 - Label mask columns must be `1` when the task label is valid for that row and `0` when unavailable.
 
@@ -164,7 +164,7 @@ Grouping is defined by the input manifest. It is a manifest-only change as long 
 
 ## Current Generic CSV Support
 
-The current `mdl.train_tabular` path reads feature values through `tokenization.features[*].source`. For CSV-backed features, use:
+The current `mdl.train` path reads feature values through `tokenization.features[*].source`. For CSV-backed features, use:
 
 ```json
 "source": {"type": "csv_column", "column": "physical_column_name", "dtype": "float32"}
@@ -253,8 +253,8 @@ features={
 1. Decide scenario names and encode each row's `scenario_id`.
 2. Decide task names, emit physical label/mask columns, and map them in `data_columns`.
 3. Declare every feature source with `source.type`, `source.column`, and `source.dtype`; add `source.shape`/`source.delimiter` for vector or sequence cells when needed.
-4. Encode categorical-like inputs into integer ids when their chosen encoder expects ids, reserving `0` for padding/unknown when relevant.
-5. Normalize numeric-like inputs if needed before writing CSV.
+4. Encode id-like inputs into integer ids when their chosen encoder expects ids, reserving `0` for padding/unknown when relevant.
+5. Normalize float-valued inputs if needed before writing CSV.
 6. Write `train.csv`, `val.csv`, and `test.csv` with identical headers.
 7. Write `manifest.json` with `tokenization.version = 2`.
 8. Define feature grouping in `tokenization.token_specs` and make sure every token input name exists in `tokenization.features`.
@@ -268,12 +268,12 @@ from pathlib import Path
 
 def prepare_my_dataset(raw_dir: str | Path, out_dir: str | Path) -> dict[str, object]:
     # 1. Read raw files.
-    # 2. Build categorical vocabularies.
-    # 3. Compute numeric normalization statistics if needed.
+    # 2. Build id vocabularies or other feature transforms if needed.
+    # 3. Compute normalization/statistics if needed.
     # 4. Write train.csv, val.csv, test.csv.
     # 5. Write manifest.json using tokenization version 2.
     # 6. Return the manifest dictionary.
     raise NotImplementedError
 ```
 
-Use `adapters/tenrec/adapter.py` as a concrete example of a dataset adapter.
+Keep dataset-specific parsing, vocabulary construction, filtering, and split policy inside the adapter. The core `mdl` package should only consume the processed directory and manifest.

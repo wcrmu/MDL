@@ -16,7 +16,7 @@ from .models import MDLConfig, MDLModel
 
 
 @dataclass(frozen=True)
-class TabularMDLConfig:
+class RankingConfig:
     token_specs: list[dict[str, Any]]
     feature_specs: list[dict[str, Any]]
     num_scenarios: int
@@ -47,8 +47,8 @@ def config_from_manifest(
     ffn_hidden_dim: int = 64,
     dropout: float = 0.0,
     feature_backbone: str = "rankmixer",
-) -> TabularMDLConfig:
-    return TabularMDLConfig(
+) -> RankingConfig:
+    return RankingConfig(
         token_specs=token_specs_from_manifest(manifest),
         feature_specs=feature_specs_from_manifest(manifest),
         num_scenarios=len(manifest["scenario_names"]),
@@ -63,8 +63,8 @@ def config_from_manifest(
     )
 
 
-class TabularMDLModel(nn.Module):
-    def __init__(self, config: TabularMDLConfig) -> None:
+class RankingModel(nn.Module):
+    def __init__(self, config: RankingConfig) -> None:
         super().__init__()
         self.config = config
         self.feature_compiler = FeatureTokenCompiler(config.feature_compiler_config())

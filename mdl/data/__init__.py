@@ -1,3 +1,3 @@
-from .encoded import EncodedTabularDataset, collate_tabular_batch, load_manifest
+from .manifest import ManifestDataset, collate_manifest_batch, load_manifest
 
-__all__ = ["EncodedTabularDataset", "collate_tabular_batch", "load_manifest"]
+__all__ = ["ManifestDataset", "collate_manifest_batch", "load_manifest"]

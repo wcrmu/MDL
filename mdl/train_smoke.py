@@ -4,10 +4,10 @@ import argparse
 
 import torch
 
-from .training import multitask_bce_loss
-from .training import qauc
+from .utils import multitask_bce_loss
+from .utils import qauc
 from .models import MDLConfig, MDLModel
-from .training import make_synthetic_batch
+from .utils import make_synthetic_batch
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

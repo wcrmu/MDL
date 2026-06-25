@@ -118,7 +118,7 @@ def _collate_sequence(values: list[list[Any]], source: dict[str, Any]) -> dict[s
     }
 
 
-class EncodedTabularDataset(IterableDataset[dict[str, Any]]):
+class ManifestDataset(IterableDataset[dict[str, Any]]):
     def __init__(self, data_dir: str | Path, split: str) -> None:
         self.data_dir = Path(data_dir)
         self.split = split
@@ -155,7 +155,7 @@ class EncodedTabularDataset(IterableDataset[dict[str, Any]]):
                 }
 
 
-def collate_tabular_batch(rows: list[dict[str, Any]]) -> dict[str, Tensor | list[str] | dict[str, Any]]:
+def collate_manifest_batch(rows: list[dict[str, Any]]) -> dict[str, Tensor | list[str] | dict[str, Any]]:
     feature_names = list(rows[0]["features"].keys()) if rows else []
     feature_sources = rows[0].get("feature_sources", {}) if rows else {}
     features: dict[str, Any] = {}

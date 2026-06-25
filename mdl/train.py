@@ -8,14 +8,14 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
 
-from .data.encoded import EncodedTabularDataset, collate_tabular_batch, load_manifest
-from .training import multitask_bce_loss
-from .training import binary_auc, qauc
-from .tabular_model import TabularMDLModel, config_from_manifest
+from .data.manifest import ManifestDataset, collate_manifest_batch, load_manifest
+from .utils import multitask_bce_loss
+from .utils import binary_auc, qauc
+from .ranking import RankingModel, config_from_manifest
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train MDL on an encoded tabular dataset.")
+    parser = argparse.ArgumentParser(description="Train MDL on a manifest dataset.")
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=2048)
@@ -45,7 +45,7 @@ def move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
 
 @torch.no_grad()
 def evaluate(
-    model: TabularMDLModel,
+    model: RankingModel,
     data_dir: str,
     split: str,
     manifest: dict[str, Any],
@@ -53,8 +53,8 @@ def evaluate(
     device: torch.device,
     max_batches: int,
 ) -> None:
-    dataset = EncodedTabularDataset(data_dir, split)
-    loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_tabular_batch)
+    dataset = ManifestDataset(data_dir, split)
+    loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_manifest_batch)
     task_names = manifest["task_names"]
     labels_by_task = [[] for _ in task_names]
     scores_by_task = [[] for _ in task_names]
@@ -113,13 +113,13 @@ def main() -> None:
         ffn_hidden_dim=args.ffn_hidden_dim,
         feature_backbone=args.feature_backbone,
     )
-    model = TabularMDLModel(config).to(device)
+    model = RankingModel(config).to(device)
     optimizer = torch.optim.RMSprop(model.parameters(), lr=args.lr)
 
     global_step = 0
     for epoch in range(1, args.epochs + 1):
-        dataset = EncodedTabularDataset(args.data_dir, "train")
-        loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collate_tabular_batch)
+        dataset = ManifestDataset(args.data_dir, "train")
+        loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collate_manifest_batch)
         model.train()
         for batch in loader:
             batch = move_batch(batch, device)
