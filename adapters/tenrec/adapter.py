@@ -88,7 +88,7 @@ def build_tenrec_feature_specs(vocabs: dict[str, dict[str, int]]) -> list[dict[s
         specs.append(
             {
                 "name": column,
-                "encoder": "categorical_embedding",
+                "encoder": "embedding",
                 "vocab_size": len(vocabs[column]) + 1,
                 "source": {"type": "csv_column", "column": column, "dtype": "int64"},
             }
@@ -97,7 +97,7 @@ def build_tenrec_feature_specs(vocabs: dict[str, dict[str, int]]) -> list[dict[s
         specs.append(
             {
                 "name": column,
-                "encoder": "numeric_value",
+                "encoder": "identity",
                 "dim": 1,
                 "source": {"type": "csv_column", "column": column, "dtype": "float32"},
             }

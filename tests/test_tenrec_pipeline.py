@@ -54,7 +54,7 @@ class TenrecPipelineTest(unittest.TestCase):
                     "features": [
                         {
                             "name": "user_id",
-                            "encoder": "categorical_embedding",
+                            "encoder": "embedding",
                             "vocab_size": 10,
                             "source": {"type": "csv_column", "column": "user_id"},
                         }
@@ -181,7 +181,7 @@ class TenrecPipelineTest(unittest.TestCase):
 
     def test_feature_token_compiler_uses_encoder_registry_config(self) -> None:
         config = FeatureCompilerConfig(
-            feature_specs=[{"name": "image_embedding", "encoder": "dense_vector", "dim": 3}],
+            feature_specs=[{"name": "image_embedding", "encoder": "identity", "dim": 3}],
             token_specs=[{"token_id": 0, "projection": "linear", "inputs": ["image_embedding"]}],
             token_dim=5,
         )

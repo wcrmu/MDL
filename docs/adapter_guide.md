@@ -65,13 +65,13 @@ The corresponding manifest maps semantic roles to physical CSV columns:
     "features": [
       {
         "name": "user_id",
-        "encoder": "categorical_embedding",
+        "encoder": "embedding",
         "vocab_size": 100000,
         "source": {"type": "csv_column", "column": "user_id", "dtype": "int64"}
       },
       {
         "name": "score",
-        "encoder": "numeric_value",
+        "encoder": "identity",
         "dim": 1,
         "source": {"type": "csv_column", "column": "score", "dtype": "float32"}
       }
@@ -109,9 +109,9 @@ Rules:
     "version": 2,
     "kind": "encoder_registry",
     "features": [
-      {"name": "user_id", "encoder": "categorical_embedding", "vocab_size": 100000, "source": {"type": "csv_column", "column": "user_id", "dtype": "int64"}},
-      {"name": "item_id", "encoder": "categorical_embedding", "vocab_size": 500000, "source": {"type": "csv_column", "column": "item_id", "dtype": "int64"}},
-      {"name": "score", "encoder": "numeric_value", "dim": 1, "source": {"type": "csv_column", "column": "score", "dtype": "float32"}}
+      {"name": "user_id", "encoder": "embedding", "vocab_size": 100000, "source": {"type": "csv_column", "column": "user_id", "dtype": "int64"}},
+      {"name": "item_id", "encoder": "embedding", "vocab_size": 500000, "source": {"type": "csv_column", "column": "item_id", "dtype": "int64"}},
+      {"name": "score", "encoder": "identity", "dim": 1, "source": {"type": "csv_column", "column": "score", "dtype": "float32"}}
     ],
     "token_specs": [
       {"token_id": 0, "projection": "linear", "inputs": ["user_id", "score"]},
@@ -147,10 +147,9 @@ The data reader must not infer parsing behavior from the encoder name.
 
 Built-in encoders:
 
-- `categorical_embedding`: reads one named feature tensor and applies `nn.Embedding`.
-- `numeric_value`: reads one named feature tensor and projects one or more numeric dimensions.
-- `sequence_mean_pooling`: pools padded categorical id sequences with a mask or lengths.
-- `dense_vector`: consumes an already dense tensor from a custom interface.
+- `embedding`: reads one named id tensor and applies `nn.Embedding`.
+- `identity`: reads one scalar/vector tensor, casts it to float, validates `dim`, and passes it through unchanged.
+- `sequence_mean_pooling`: embeds padded id sequences and mean-pools them with a mask or lengths.
 
 `tokenization.token_specs` declares feature grouping:
 
@@ -171,9 +170,39 @@ The current `mdl.train_tabular` path reads feature values through `tokenization.
 "source": {"type": "csv_column", "column": "physical_column_name", "dtype": "float32"}
 ```
 
-The generic CSV reader supports scalar, fixed-length vector/list, and variable-length sequence cells based on `source.dtype` and `source.shape`; it does not branch on `categorical_embedding`, `numeric_value`, or any other encoder name. There are no required `cat__` or `num__` prefixes.
+The generic CSV reader supports scalar, fixed-length vector/list, and variable-length sequence cells based on `source.dtype` and `source.shape`; it does not branch on `embedding`, `identity`, or any other encoder name. There are no required `cat__` or `num__` prefixes.
 
-A sequence feature is declared with `source.shape = "sequence"`. The CSV cell stores one row's sequence using the declared delimiter. The generic collate path pads each batch to the batch-local max length and passes `{"values": LongTensor[B, L], "lengths": LongTensor[B]}` to the encoder.
+Supported `source` fields:
+
+- `type`: must be `"csv_column"` for the generic CSV reader.
+- `column`: physical CSV column name.
+- `dtype`: one of `"int64"`, `"float32"`, `"double"`, or `"bool"`. Aliases `"int"`, `"long"`, `"float"`, and `"boolean"` are accepted.
+- `shape`: optional. Omit it for scalar cells; use `"vector"`/`"list"` for fixed-length dense cells; use `"sequence"` for variable-length sequence cells.
+- `delimiter`: optional for vector/list/sequence cells. If omitted, whitespace splitting is used.
+- `missing_value`: optional scalar or list used when a CSV cell is empty. Defaults are `0`, `0.0`, or `false` based on `dtype`.
+- `padding_value`: optional sequence padding value used during collation. Defaults to the dtype missing value, usually `0` for id sequences.
+
+Scalar cells produce tensors shaped `[B]` before encoder-specific reshaping. Example:
+
+```json
+{"type": "csv_column", "column": "score", "dtype": "float32"}
+```
+
+Fixed vector/list cells produce tensors shaped `[B, D]`. Every row in a batch must have the same length. Example:
+
+```json
+{"type": "csv_column", "column": "image_vec", "dtype": "float32", "shape": "vector", "delimiter": "|"}
+```
+
+```csv
+image_vec
+0.1|0.3|-0.2
+0.0|0.5|0.4
+```
+
+A sequence feature is declared with `source.shape = "sequence"`. The CSV cell stores one row's sequence using the declared delimiter. The generic collate path pads each batch to the batch-local max length and passes `{"values": LongTensor[B, L], "lengths": LongTensor[B]}` to the encoder. Empty cells become length-0 sequences and are padded within the batch.
+
+For `sequence_mean_pooling`, use integer ids (`dtype = "int64"`), provide `vocab_size` or `cardinality`, and reserve padding id `0` unless you override `padding_value` and the encoder supports that convention.
 
 ```json
 {
@@ -194,6 +223,16 @@ A sequence feature is declared with `source.shape = "sequence"`. The CSV cell st
 hist_items
 12|33|91
 44
+
+```
+
+The two non-empty rows above collate as:
+
+```python
+features["hist_item_ids"] = {
+    "values": LongTensor([[12, 33, 91], [44, 0, 0]]),
+    "lengths": LongTensor([3, 1]),
+}
 ```
 
 For custom sequence or dense interfaces, a dataset-specific reader/collate function can also

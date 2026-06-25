@@ -43,8 +43,8 @@ class FeatureEncoder(nn.Module):
         raise NotImplementedError
 
 
-@register_encoder("categorical_embedding")
-class CategoricalEmbeddingEncoder(FeatureEncoder):
+@register_encoder("embedding")
+class EmbeddingEncoder(FeatureEncoder):
     def __init__(self, spec: dict[str, Any], context: EncoderBuildContext) -> None:
         super().__init__()
         self.name = spec["name"]
@@ -57,8 +57,8 @@ class CategoricalEmbeddingEncoder(FeatureEncoder):
         return self.embedding(values)
 
 
-@register_encoder("numeric_value")
-class NumericValueEncoder(FeatureEncoder):
+@register_encoder("identity")
+class IdentityEncoder(FeatureEncoder):
     def __init__(self, spec: dict[str, Any], context: EncoderBuildContext) -> None:
         super().__init__()
         self.name = spec["name"]
@@ -70,7 +70,7 @@ class NumericValueEncoder(FeatureEncoder):
             value = value.unsqueeze(1)
         if value.size(1) != self.output_dim:
             raise ValueError(
-                f"numeric feature {self.name!r} expected dim {self.output_dim}, got {value.size(1)}"
+                f"identity feature {self.name!r} expected dim {self.output_dim}, got {value.size(1)}"
             )
         return value
 
@@ -91,19 +91,3 @@ class SequenceMeanPoolingEncoder(FeatureEncoder):
         return masked_mean_sequence_embedding(self.embedding, features[self.name], batch["device"])
 
 
-@register_encoder("dense_vector")
-class DenseVectorEncoder(FeatureEncoder):
-    def __init__(self, spec: dict[str, Any], context: EncoderBuildContext) -> None:
-        super().__init__()
-        self.name = spec["name"]
-        self.output_dim = int(spec["dim"])
-
-    def forward(self, batch: dict[str, Any]) -> Tensor:
-        value = batch["features"][self.name].to(device=batch["device"], dtype=torch.float32)
-        if value.ndim == 1:
-            value = value.unsqueeze(1)
-        if value.size(1) != self.output_dim:
-            raise ValueError(
-                f"dense feature {self.name!r} expected dim {self.output_dim}, got {value.size(1)}"
-            )
-        return value
