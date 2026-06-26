@@ -1,0 +1,8 @@
+name: mdl
+embedding_dim: 32
+token_dim: 36
+feature_backbone: rankmixer
+num_layers: 2
+num_heads: 4
+ffn_hidden_dim: 64
+dropout: 0.0

@@ -1,0 +1,25 @@
+project:
+  name: mdl-recsys
+  seed: 2026
+
+dataset:
+  data_dir: data/processed
+  format: manifest_csv
+
+model:
+  name: mdl
+  embedding_dim: 32
+  token_dim: 36
+  feature_backbone: rankmixer
+  num_layers: 2
+  num_heads: 4
+  ffn_hidden_dim: 64
+  dropout: 0.0
+
+training:
+  epochs: 1
+  batch_size: 2048
+  lr: 0.001
+  device: cpu
+  eval_max_batches: 100
+  checkpoint_path: experiments/checkpoints/mdl.pt

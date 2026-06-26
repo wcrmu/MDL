@@ -1,0 +1,7 @@
+name: deepfm
+num_fields: 0
+field_dim: 0
+hidden_dims:
+  - 128
+  - 64
+dropout: 0.0
