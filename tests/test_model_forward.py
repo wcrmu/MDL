@@ -67,3 +67,205 @@ def test_model_from_manifest_forward() -> None:
         torch.tensor([0, 1, 0]),
     )
     assert output["logits"].shape == (3, 1)
+
+
+def test_model_from_manifest_with_din_sequence_encoder() -> None:
+    manifest = {
+        "scenario_names": ["default"],
+        "task_names": ["click"],
+        "tokenization": {
+            "version": 2,
+            "kind": "encoder_registry",
+            "features": [
+                {"name": "item_id", "encoder": "embedding", "vocab_size": 20},
+                {
+                    "name": "history_items",
+                    "encoder": "din",
+                    "vocab_size": 20,
+                    "target_feature": "item_id",
+                    "attention_hidden_dims": [8],
+                },
+            ],
+            "token_specs": [
+                {"token_id": 0, "projection": "linear", "inputs": ["item_id"]},
+                {"token_id": 1, "projection": "linear", "inputs": ["history_items"]},
+            ],
+        },
+    }
+    config = config_from_manifest(
+        manifest,
+        embedding_dim=8,
+        token_dim=16,
+        num_layers=1,
+        num_heads=4,
+        ffn_hidden_dim=32,
+    )
+    model = ModelFromManifest(config)
+    din_encoder = model.feature_compiler.encoders[1]
+    assert din_encoder.attention_normalization == "none"
+    assert any(layer.__class__.__name__ == "Dice" for layer in din_encoder.activation_unit.network)
+    output = model(
+        {
+            "item_id": torch.tensor([3, 4, 5]),
+            "history_items": {
+                "values": torch.tensor([[1, 2, 3], [4, 0, 0], [0, 0, 0]]),
+                "lengths": torch.tensor([3, 1, 0]),
+            },
+        },
+        torch.tensor([0, 0, 0]),
+    )
+    assert output["logits"].shape == (3, 1)
+    assert torch.isfinite(output["logits"]).all()
+
+
+def test_model_from_manifest_with_multifield_din_sequence_encoder() -> None:
+    manifest = {
+        "scenario_names": ["default"],
+        "task_names": ["click"],
+        "tokenization": {
+            "version": 2,
+            "kind": "encoder_registry",
+            "features": [
+                {"name": "item_id", "encoder": "embedding", "vocab_size": 20},
+                {"name": "cate_id", "encoder": "embedding", "vocab_size": 8, "embedding_dim": 4},
+                {"name": "price", "encoder": "identity", "dim": 1},
+                {
+                    "name": "history_behavior",
+                    "encoder": "din",
+                    "fusion": "concat",
+                    "attention_hidden_dims": [8],
+                    "sequence_features": [
+                        {
+                            "name": "hist_item_id",
+                            "target_feature": "item_id",
+                            "encoder": "embedding",
+                            "vocab_size": 20,
+                            "embedding_dim": 8,
+                        },
+                        {
+                            "name": "hist_cate_id",
+                            "target_feature": "cate_id",
+                            "encoder": "embedding",
+                            "vocab_size": 8,
+                            "embedding_dim": 4,
+                        },
+                        {
+                            "name": "hist_price",
+                            "target_feature": "price",
+                            "encoder": "identity",
+                            "dim": 1,
+                            "projection_dim": 2,
+                        },
+                    ],
+                },
+            ],
+            "token_specs": [
+                {"token_id": 0, "projection": "linear", "inputs": ["item_id"]},
+                {"token_id": 1, "projection": "linear", "inputs": ["history_behavior"]},
+            ],
+        },
+    }
+    config = config_from_manifest(
+        manifest,
+        embedding_dim=8,
+        token_dim=16,
+        num_layers=1,
+        num_heads=4,
+        ffn_hidden_dim=32,
+    )
+    model = ModelFromManifest(config)
+    din_encoder = model.feature_compiler.encoders[3]
+    assert din_encoder.output_dim == 14
+    output = model(
+        {
+            "item_id": torch.tensor([3, 4]),
+            "cate_id": torch.tensor([2, 5]),
+            "price": torch.tensor([0.2, 0.5]),
+            "hist_item_id": {
+                "values": torch.tensor([[1, 2, 3], [4, 5, 0]]),
+                "lengths": torch.tensor([3, 2]),
+            },
+            "hist_cate_id": {
+                "values": torch.tensor([[2, 2, 1], [5, 4, 0]]),
+                "lengths": torch.tensor([3, 2]),
+            },
+            "hist_price": {
+                "values": torch.tensor([[0.1, 0.2, 0.3], [0.5, 0.4, 0.0]]),
+                "lengths": torch.tensor([3, 2]),
+            },
+        },
+        torch.tensor([0, 0]),
+    )
+    assert output["logits"].shape == (2, 1)
+    assert torch.isfinite(output["logits"]).all()
+
+
+def test_model_from_manifest_with_multifield_sequence_mean_pooling() -> None:
+    manifest = {
+        "scenario_names": ["default"],
+        "task_names": ["click"],
+        "tokenization": {
+            "version": 2,
+            "kind": "encoder_registry",
+            "features": [
+                {
+                    "name": "history_behavior",
+                    "encoder": "sequence_mean_pooling",
+                    "fusion": "concat",
+                    "sequence_features": [
+                        {
+                            "name": "hist_item_id",
+                            "encoder": "embedding",
+                            "vocab_size": 20,
+                            "embedding_dim": 8,
+                        },
+                        {
+                            "name": "hist_cate_id",
+                            "encoder": "embedding",
+                            "vocab_size": 8,
+                            "embedding_dim": 4,
+                        },
+                        {
+                            "name": "hist_price",
+                            "encoder": "identity",
+                            "dim": 1,
+                            "projection_dim": 2,
+                        },
+                    ],
+                },
+            ],
+            "token_specs": [
+                {"token_id": 0, "projection": "linear", "inputs": ["history_behavior"]},
+            ],
+        },
+    }
+    config = config_from_manifest(
+        manifest,
+        embedding_dim=8,
+        token_dim=16,
+        num_layers=1,
+        num_heads=4,
+        ffn_hidden_dim=32,
+    )
+    model = ModelFromManifest(config)
+    pooling_encoder = model.feature_compiler.encoders[0]
+    assert pooling_encoder.output_dim == 14
+    output = model(
+        {
+            "hist_item_id": {
+                "values": torch.tensor([[1, 2, 3], [4, 5, 0]]),
+                "lengths": torch.tensor([3, 2]),
+            },
+            "hist_cate_id": {
+                "values": torch.tensor([[2, 2, 1], [5, 4, 0]]),
+                "lengths": torch.tensor([3, 2]),
+            },
+            "hist_price": {
+                "values": torch.tensor([[0.1, 0.2, 0.3], [0.5, 0.4, 0.0]]),
+                "lengths": torch.tensor([3, 2]),
+            },
+        },
+        torch.tensor([0, 0]),
+    )
+    assert output["logits"].shape == (2, 1)
+    assert torch.isfinite(output["logits"]).all()

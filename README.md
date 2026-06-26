@@ -93,7 +93,7 @@ The manifest declares scenario columns, group columns, labels, label masks, feat
 }
 ```
 
-Built-in encoders are `embedding`, `identity`, and `sequence_mean_pooling`.
+Built-in encoders are `embedding`, `identity`, multi-field `sequence_mean_pooling`, and multi-field target-aware `din`.
 
 ## Commands
 

@@ -315,7 +315,7 @@ scene,query,click_label,click_mask,user_id,item_id,price,history_items
 
 ### 4.4 built-in encoders
 
-当前内置 encoder 有三个：
+当前内置 encoder 有四个：
 
 `embedding`
 : 用于整数 ID 特征。需要 `vocab_size` 或 `cardinality`。
@@ -340,13 +340,140 @@ scene,query,click_label,click_mask,user_id,item_id,price,history_items
 ```
 
 `sequence_mean_pooling`
-: 用于整数 ID 序列。需要 `vocab_size` 或 `cardinality`，输入 source 通常设置 `shape: sequence`。
+: 用于行为序列的平均池化。它和 `din` 一样先按 manifest 声明把每个历史 step 内的多个字段融合成一个 behavior embedding，然后对这些 step embeddings 做 masked mean pooling。`fusion` 当前支持 `concat`。
+
+推荐的 multi-field 写法：
+
+```json
+{
+  "name": "history_behavior_mean",
+  "encoder": "sequence_mean_pooling",
+  "fusion": "concat",
+  "sequence_features": [
+    {
+      "name": "hist_item_id",
+      "encoder": "embedding",
+      "vocab_size": 500000,
+      "embedding_dim": 32,
+      "source": {
+        "type": "csv_column",
+        "column": "hist_item_id",
+        "dtype": "int64",
+        "shape": "sequence",
+        "delimiter": "|"
+      }
+    },
+    {
+      "name": "hist_price",
+      "encoder": "identity",
+      "dim": 1,
+      "projection_dim": 8,
+      "source": {
+        "type": "csv_column",
+        "column": "hist_price",
+        "dtype": "float32",
+        "shape": "sequence",
+        "delimiter": "|"
+      }
+    }
+  ]
+}
+```
+
+为了兼容简单数据集，`sequence_mean_pooling` 也保留 single-field 简写：
 
 ```json
 {
   "name": "history_items",
   "encoder": "sequence_mean_pooling",
-  "vocab_size": 500000
+  "vocab_size": 500000,
+  "source": {
+    "type": "csv_column",
+    "column": "history_items",
+    "dtype": "int64",
+    "shape": "sequence",
+    "delimiter": "|"
+  }
+}
+```
+
+`din`
+: 用于 target-aware 的行为序列兴趣建模。它先按 manifest 声明把每个历史 step 内的多个字段融合成一个 behavior embedding，再使用标准 DIN local activation unit：对每个历史 step 拼接 `[behavior_emb, target_emb, behavior_emb - target_emb, behavior_emb * target_emb]`，经过 MLP + Dice 得到 activation weight，并默认不做 softmax 归一化，直接对历史 behavior embedding 加权求和。
+
+推荐的 multi-field 写法：
+
+```json
+{
+  "name": "history_behavior",
+  "encoder": "din",
+  "fusion": "concat",
+  "attention_hidden_dims": [80, 40],
+  "activation": "dice",
+  "attention_normalization": "none",
+  "sequence_features": [
+    {
+      "name": "hist_item_id",
+      "target_feature": "item_id",
+      "encoder": "embedding",
+      "vocab_size": 500000,
+      "embedding_dim": 32,
+      "source": {
+        "type": "csv_column",
+        "column": "hist_item_id",
+        "dtype": "int64",
+        "shape": "sequence",
+        "delimiter": "|"
+      }
+    },
+    {
+      "name": "hist_cate_id",
+      "target_feature": "cate_id",
+      "encoder": "embedding",
+      "vocab_size": 20000,
+      "embedding_dim": 16,
+      "source": {
+        "type": "csv_column",
+        "column": "hist_cate_id",
+        "dtype": "int64",
+        "shape": "sequence",
+        "delimiter": "|"
+      }
+    },
+    {
+      "name": "hist_price",
+      "target_feature": "price",
+      "encoder": "identity",
+      "dim": 1,
+      "projection_dim": 8,
+      "source": {
+        "type": "csv_column",
+        "column": "hist_price",
+        "dtype": "float32",
+        "shape": "sequence",
+        "delimiter": "|"
+      }
+    }
+  ]
+}
+```
+
+`sequence_features[*].target_feature` 必须指向当前 batch 中对应的 target 字段，例如 `item_id`、`cate_id`、`price`。ID 类历史字段和 target 字段必须来自同一个 vocab。`fusion` 当前支持 `concat`；因此所有 step 字段会按声明顺序 concat 成 `behavior_emb`，target 侧对应字段也按相同顺序 concat 成 `target_emb`。`attention_normalization` 默认为 `none`，这是 DIN 默认；只有做对照实验时才建议显式改成 `softmax`。
+
+为了兼容简单数据集，`din` 也保留 single-field 简写：
+
+```json
+{
+  "name": "history_items",
+  "encoder": "din",
+  "vocab_size": 500000,
+  "target_feature": "item_id",
+  "source": {
+    "type": "csv_column",
+    "column": "history_items",
+    "dtype": "int64",
+    "shape": "sequence",
+    "delimiter": "|"
+  }
 }
 ```
 
@@ -650,7 +777,7 @@ manifest feature：
 }
 ```
 
-通用 collate 会把序列 padding 成 batch 内等长，并传入：
+通用 collate 会把序列 padding 成 batch 内等长。`sequence_mean_pooling` 和 `din` 都使用同一套序列 payload。collate 会传入：
 
 ```python
 {
@@ -659,7 +786,7 @@ manifest feature：
 }
 ```
 
-`sequence_mean_pooling` 会基于 `lengths` 做 masked mean。
+`sequence_mean_pooling` 会先融合每个 step 内的 `sequence_features`，再基于 `lengths` 对 step embeddings 做 masked mean。`din` 会使用同样的 step 内融合结果，并基于 `target_feature` 对未 padding 的历史位置计算 activation weight；默认不做 softmax，而是直接 weighted sum。
 
 ## 9. Adapter 测试建议
 
@@ -677,7 +804,7 @@ manifest feature：
 ## 10. 常见错误
 
 `unknown feature encoder`
-: manifest 中的 `encoder` 名称不是内置 encoder。当前支持 `embedding`、`identity`、`sequence_mean_pooling`。
+: manifest 中的 `encoder` 名称不是内置 encoder。当前支持 `embedding`、`identity`、`sequence_mean_pooling`、`din`。
 
 `feature ... csv_column source must declare dtype`
 : 每个 feature source 都必须声明 dtype。

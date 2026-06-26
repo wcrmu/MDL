@@ -35,6 +35,41 @@ def _csv_column_source(spec: dict[str, Any]) -> dict[str, Any]:
     return source
 
 
+def _add_source_spec(
+    specs: list[dict[str, Any]],
+    seen: set[str],
+    spec: dict[str, Any],
+) -> None:
+    if "source" not in spec:
+        return
+    name = spec["name"]
+    if name in seen:
+        return
+    specs.append(spec)
+    seen.add(name)
+
+
+def _feature_source_specs(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for spec in feature_specs_from_manifest(manifest):
+        _add_source_spec(specs, seen, spec)
+        if spec.get("encoder") not in {"din", "sequence_mean_pooling"}:
+            continue
+        for field_spec in spec.get("sequence_features", []):
+            _add_source_spec(specs, seen, field_spec)
+            target_feature = field_spec.get("target_feature")
+            if isinstance(target_feature, dict):
+                _add_source_spec(specs, seen, target_feature)
+            elif isinstance(target_feature, str) and "target_source" in field_spec:
+                _add_source_spec(
+                    specs,
+                    seen,
+                    {"name": target_feature, "source": field_spec["target_source"]},
+                )
+    return specs
+
+
 def _default_missing_value(dtype: str) -> int | float | bool:
     if dtype in {"int", "int64", "long"}:
         return 0
@@ -122,7 +157,7 @@ class ManifestDataset(IterableDataset[dict[str, Any]]):
     def __iter__(self) -> Iterator[dict[str, Any]]:
         task_names = self.manifest["task_names"]
         data_columns = _data_columns(self.manifest)
-        feature_specs = feature_specs_from_manifest(self.manifest)
+        feature_specs = _feature_source_specs(self.manifest)
         label_columns = data_columns["labels"]
         label_mask_columns = data_columns["label_masks"]
 

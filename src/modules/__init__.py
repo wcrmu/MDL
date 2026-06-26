@@ -1,5 +1,6 @@
 from .embedding import (
     DEFAULT_ENCODER_REGISTRY,
+    DINSequenceEncoder,
     EmbeddingEncoder,
     EncoderBuildContext,
     EncoderRegistry,
@@ -14,6 +15,7 @@ from .tokenizer import FeatureCompilerConfig, FeatureTokenCompiler
 
 __all__ = [
     "DEFAULT_ENCODER_REGISTRY",
+    "DINSequenceEncoder",
     "EmbeddingEncoder",
     "EncoderBuildContext",
     "EncoderRegistry",

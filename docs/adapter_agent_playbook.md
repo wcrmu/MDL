@@ -2,7 +2,7 @@
 
 本文档给 agent 使用。目标是让 agent 在内部机器上分析本地原始数据，并实现一个外部 dataset adapter，同时不修改 `MDL/` 仓库中的任何文件。
 
-如果你是人类开发者，请先读 [adapter_development.md](adapter_development.md)。如果你要把任务交给一个较弱的 agent，请把本文档中的 prompt 和步骤交给它。
+如果你是人类开发者，请先读 [adapter_development.md](adapter_development.md)。如果你要把任务交给一个 agent，请把本文档中的 prompt 和步骤交给它。
 
 ## 1. 总原则
 
@@ -285,6 +285,7 @@ adapter_design.md 必须包含：
 - ID 特征无法可靠转整数时，建立 vocab。
 - 未见过的 val/test ID 映射到 `0`。
 - `0` 永远保留给 unknown/padding。
+- 普通历史序列优先使用 `sequence_mean_pooling`。如果一个历史行为 step 内有多个字段，例如 item、category、shop、price、sales、time_gap，应在 `sequence_mean_pooling.sequence_features` 中逐个声明，并使用 `fusion: concat` 先融合 step 内字段，再做 masked mean。若存在候选 target ID，例如 `item_id`，且需要 target-aware 兴趣建模，可以使用 `din.sequence_features`；`din` 默认使用标准 DIN 的 Dice activation 和非 softmax weighted sum。
 
 ## 8. 阶段 4：Adapter 脚手架
 
