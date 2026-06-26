@@ -497,6 +497,53 @@ scene,query,click_label,click_mask,user_id,item_id,price,history_items
 - 一个 token 可以包含一个或多个 feature。
 - RankMixer backbone 要求 `token_dim % num_feature_tokens == 0`。如果 token 数量变化，需要相应调整训练参数 `--token-dim`。
 
+### 4.6 scenario/task tokenization
+
+MDL 论文里的完整路径不只是 feature tokens。除了 `features` + `token_specs` 生成 `T_f`，还应该用独立 encoder 生成 scenario tokens `T_s` 和 task tokens `T_t`。manifest 支持四个可选字段：
+
+- `scenario_features`: scenario token 使用的原始特征编码声明。
+- `scenario_token_specs`: 每个 scenario token 由哪些 encoded features 组成。数量必须等于 `len(scenario_names) + 1`，前面按 `scenario_names` 顺序对应各场景，最后一个是 global scenario token。
+- `task_features`: task token 使用的原始特征编码声明。
+- `task_token_specs`: 每个 task token 由哪些 encoded features 组成。数量必须等于 `len(task_names)`，顺序按 `task_names`。
+
+这四个字段要么成对出现，要么都不写。如果不写，框架会使用旧的兼容 fallback：scenario 用 `scenario_id` embedding，task 用可学习共享上下文。这个 fallback 能跑通训练，但不是论文中“由重要特征和 scenario/task prior 特征经 per-token FFN token 化”的完整实现。
+
+推荐写法：
+
+```json
+{
+  "scenario_features": [
+    {"name": "user_id", "encoder": "embedding", "vocab_size": 100000},
+    {"name": "item_id", "encoder": "embedding", "vocab_size": 500000},
+    {"name": "home_ctr_prior", "encoder": "identity", "dim": 1},
+    {"name": "search_ctr_prior", "encoder": "identity", "dim": 1}
+  ],
+  "scenario_token_specs": [
+    {"token_id": 0, "inputs": ["user_id", "item_id", "home_ctr_prior"]},
+    {"token_id": 1, "inputs": ["user_id", "item_id", "search_ctr_prior"]},
+    {"token_id": 2, "inputs": ["user_id", "item_id"]}
+  ],
+  "task_features": [
+    {"name": "user_id", "encoder": "embedding", "vocab_size": 100000},
+    {"name": "item_id", "encoder": "embedding", "vocab_size": 500000},
+    {"name": "price", "encoder": "identity", "dim": 1}
+  ],
+  "task_token_specs": [
+    {"token_id": 0, "inputs": ["user_id", "item_id", "price"]},
+    {"token_id": 1, "inputs": ["user_id", "item_id"]}
+  ]
+}
+```
+
+注意：
+
+- `scenario_features`、`task_features` 会各自建立独立 encoder。即使复用同名原始字段，例如 `user_id`，也会拥有独立 embedding 参数，符合论文里“extra embeddings different from feature token input embeddings”的要求。
+- scenario/task token specs 默认使用 `ffn_relu` 投影，即 `Relu(FFN(...))`。不要显式写 `projection: "linear"`，除非是在做消融实验。
+- 每个 `inputs` 名称只能引用同一段里的 features。例如 `scenario_token_specs[*].inputs` 必须来自 `scenario_features[*].name`。
+- CSV reader 会读取 `features`、`scenario_features`、`task_features` 中声明了 `source` 的字段。复用同一原始字段时，可以在每个 feature spec 中重复同一个 `source`，也可以确保至少有一处同名 spec 声明了 `source`。
+- 如果没有多场景，也仍然建议写一个业务场景 token 和一个 global token，即 `scenario_names: ["default"]` 时 `scenario_token_specs` 数量为 2。
+- 当前通用 CSV reader 支持单场景列 `data_columns.scenario_id`，也支持多场景重叠列 `data_columns.scenario_ids`。多场景列里的值用 `data_columns.scenario_ids_delimiter` 分隔，默认 `|`，例如 `0|2`。
+
 ## 5. Adapter 实现步骤
 
 ### Step 1: 明确任务和粒度
@@ -523,6 +570,9 @@ scene,query,click_label,click_mask,user_id,item_id,price,history_items
 - 哪些连续值需要归一化。
 - 哪些序列需要截断长度。
 - 哪些字段缺失时如何填充。
+- 哪些特征进入 feature tokens。
+- 哪些重要 extra 特征和 scenario prior 特征进入 scenario tokens。
+- 哪些重要 extra 特征和 task-related 特征进入 task tokens。
 
 ### Step 3: 建立 ID 映射
 

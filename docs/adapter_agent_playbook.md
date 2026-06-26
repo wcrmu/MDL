@@ -264,8 +264,10 @@ adapter_design.md 必须包含：
 7. sparse ID 特征列表及 vocab 规则。
 8. dense numeric 特征列表及缺失值/归一化规则。
 9. sequence 特征列表、delimiter、截断长度、padding 规则。
-10. token_specs 设计。
-11. 不能确定的问题。
+10. feature token_specs 设计。
+11. scenario_features 和 scenario_token_specs 设计；如果没有多场景，也必须说明 default scenario token 和 global scenario token。
+12. task_features 和 task_token_specs 设计。
+13. 不能确定的问题。
 
 禁止：
 - 不要写 adapter 代码。
@@ -286,6 +288,11 @@ adapter_design.md 必须包含：
 - 未见过的 val/test ID 映射到 `0`。
 - `0` 永远保留给 unknown/padding。
 - 普通历史序列优先使用 `sequence_mean_pooling`。如果一个历史行为 step 内有多个字段，例如 item、category、shop、price、sales、time_gap，应在 `sequence_mean_pooling.sequence_features` 中逐个声明，并使用 `fusion: concat` 先融合 step 内字段，再做 masked mean。若存在候选 target ID，例如 `item_id`，且需要 target-aware 兴趣建模，可以使用 `din.sequence_features`；`din` 默认使用标准 DIN 的 Dice activation 和非 softmax weighted sum。
+- 完整 MDL manifest 必须优先设计三类 tokens：`features/token_specs` 生成 feature tokens，`scenario_features/scenario_token_specs` 生成 scenario tokens，`task_features/task_token_specs` 生成 task tokens。不要只写 feature `token_specs` 后就结束。
+- `scenario_token_specs` 数量必须等于 `len(scenario_names) + 1`，最后一个 token 是 global scenario token。`task_token_specs` 数量必须等于 `len(task_names)`。
+- scenario/task token specs 默认使用 per-token FFN 投影；不要显式写 `projection: "linear"`，除非 adapter_design.md 明确这是消融实验。
+- 一个样本如果属于多个场景，在 manifest 的 `data_columns` 中使用 `scenario_ids` 和可选 `scenario_ids_delimiter`，CSV 值例如 `0|2`。只有单场景时使用 `scenario_id`。
+- 如果无法用 manifest 表达所需 scenario/task token 输入，停止并输出 NEEDS_FRAMEWORK_CHANGE；不要修改 MDL 源码。
 
 ## 8. 阶段 4：Adapter 脚手架
 

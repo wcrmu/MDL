@@ -9,7 +9,11 @@ import torch
 from torch import Tensor
 from torch.utils.data import IterableDataset
 
-from .feature_schema import feature_specs_from_manifest
+from .feature_schema import (
+    feature_specs_from_manifest,
+    scenario_feature_specs_from_manifest,
+    task_feature_specs_from_manifest,
+)
 
 
 def load_manifest(data_dir: str | Path) -> dict[str, Any]:
@@ -49,10 +53,12 @@ def _add_source_spec(
     seen.add(name)
 
 
-def _feature_source_specs(manifest: dict[str, Any]) -> list[dict[str, Any]]:
-    specs: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for spec in feature_specs_from_manifest(manifest):
+def _add_encoder_source_specs(
+    specs: list[dict[str, Any]],
+    seen: set[str],
+    feature_specs: list[dict[str, Any]],
+) -> None:
+    for spec in feature_specs:
         _add_source_spec(specs, seen, spec)
         if spec.get("encoder") not in {"din", "sequence_mean_pooling"}:
             continue
@@ -67,6 +73,20 @@ def _feature_source_specs(manifest: dict[str, Any]) -> list[dict[str, Any]]:
                     seen,
                     {"name": target_feature, "source": field_spec["target_source"]},
                 )
+
+
+def _feature_source_specs(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    feature_groups = [feature_specs_from_manifest(manifest)]
+    scenario_features = scenario_feature_specs_from_manifest(manifest)
+    if scenario_features is not None:
+        feature_groups.append(scenario_features)
+    task_features = task_feature_specs_from_manifest(manifest)
+    if task_features is not None:
+        feature_groups.append(task_features)
+    for feature_group in feature_groups:
+        _add_encoder_source_specs(specs, seen, feature_group)
     return specs
 
 
@@ -119,6 +139,17 @@ def _parse_feature_value(value: str, spec: dict[str, Any]) -> Any:
             return []
         return [_cast_value(part, dtype) for part in _split_vector(value, source)]
     raise ValueError(f"feature {spec['name']!r} has unsupported csv source shape {shape!r}")
+
+
+def _parse_scenario_value(row: dict[str, str], data_columns: dict[str, Any]) -> int | list[int]:
+    if "scenario_ids" in data_columns:
+        delimiter = str(data_columns.get("scenario_ids_delimiter", "|"))
+        value = row[data_columns["scenario_ids"]]
+        scenario_ids = [int(part.strip()) for part in value.split(delimiter) if part.strip() != ""]
+        if not scenario_ids:
+            raise ValueError("scenario_ids column must contain at least one scenario id")
+        return scenario_ids
+    return int(row[data_columns["scenario_id"]])
 
 
 def _torch_dtype(dtype: str) -> torch.dtype:
@@ -175,7 +206,8 @@ class ManifestDataset(IterableDataset[dict[str, Any]]):
                 yield {
                     "features": features,
                     "feature_sources": feature_sources,
-                    "scenario_id": int(row[data_columns["scenario_id"]]),
+                    "scenario_id": _parse_scenario_value(row, data_columns),
+                    "num_scenarios": len(self.manifest["scenario_names"]),
                     "labels": [float(row[label_columns[name]]) for name in task_names],
                     "label_mask": [float(row[label_mask_columns[name]]) for name in task_names],
                     "group_id": row[data_columns["group_id"]],
@@ -198,9 +230,17 @@ def collate_manifest_batch(rows: list[dict[str, Any]]) -> dict[str, Tensor | lis
         else:
             dtype = _torch_dtype(str(source["dtype"]).lower()) if "dtype" in source else None
             features[name] = torch.tensor(values, dtype=dtype)
+    scenario_values = [row["scenario_id"] for row in rows]
+    if scenario_values and isinstance(scenario_values[0], list):
+        num_scenarios = int(rows[0]["num_scenarios"])
+        scenario_id = torch.zeros(len(rows), num_scenarios, dtype=torch.float32)
+        for row_index, ids in enumerate(scenario_values):
+            scenario_id[row_index, torch.tensor(ids, dtype=torch.long)] = 1.0
+    else:
+        scenario_id = torch.tensor(scenario_values, dtype=torch.long)
     return {
         "features": features,
-        "scenario_id": torch.tensor([row["scenario_id"] for row in rows], dtype=torch.long),
+        "scenario_id": scenario_id,
         "labels": torch.tensor([row["labels"] for row in rows], dtype=torch.float32),
         "label_mask": torch.tensor([row["label_mask"] for row in rows], dtype=torch.float32),
         "group_id": [row["group_id"] for row in rows],

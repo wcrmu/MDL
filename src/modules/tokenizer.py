@@ -15,6 +15,9 @@ class FeatureCompilerConfig:
     feature_specs: list[dict[str, Any]]
     embedding_dim: int = 32
     token_dim: int = 36
+    hidden_dim: int = 64
+    dropout: float = 0.0
+    default_projection: str = "linear"
 
 
 class FeatureTokenCompiler(nn.Module):
@@ -25,6 +28,8 @@ class FeatureTokenCompiler(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        if config.default_projection not in {"linear", "ffn_relu"}:
+            raise ValueError("default_projection must be 'linear' or 'ffn_relu'")
         self.token_specs = sorted(
             config.token_specs,
             key=lambda spec: int(spec.get("token_id", len(config.token_specs))),
@@ -43,7 +48,7 @@ class FeatureTokenCompiler(nn.Module):
             self.encoders.append(registry.build(feature_spec, context))
 
         self.projections = nn.ModuleList(
-            nn.Linear(self._token_input_dim(spec), config.token_dim) for spec in self.token_specs
+            self._build_projection(spec) for spec in self.token_specs
         )
 
     def _token_input_names(self, spec: dict[str, Any]) -> list[str]:
@@ -54,16 +59,32 @@ class FeatureTokenCompiler(nn.Module):
                 raise ValueError(f"unknown token input feature {name!r}")
             names.append(name)
         if not names:
-            raise ValueError("each feature token spec must contain at least one input")
+            raise ValueError("each token spec must contain at least one input")
         return names
 
     def _token_input_dim(self, spec: dict[str, Any]) -> int:
-        projection = spec.get("projection", "linear")
-        if projection != "linear":
-            raise ValueError(f"unsupported token projection {projection!r}")
         return sum(
             int(self.encoders[self.feature_index[name]].output_dim)
             for name in self._token_input_names(spec)
+        )
+
+    def _projection_name(self, spec: dict[str, Any]) -> str:
+        projection = str(spec.get("projection", self.config.default_projection))
+        if projection not in {"linear", "ffn_relu"}:
+            raise ValueError(f"unsupported token projection {projection!r}")
+        return projection
+
+    def _build_projection(self, spec: dict[str, Any]) -> nn.Module:
+        input_dim = self._token_input_dim(spec)
+        projection = self._projection_name(spec)
+        if projection == "linear":
+            return nn.Linear(input_dim, self.config.token_dim)
+        return nn.Sequential(
+            nn.Linear(input_dim, self.config.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.config.dropout),
+            nn.Linear(self.config.hidden_dim, self.config.token_dim),
+            nn.ReLU(),
         )
 
     def _batch_size_and_device(self, features: dict[str, Any]) -> tuple[int, torch.device]:

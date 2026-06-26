@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor, nn
+
+from .mlp import PerTokenLinear
 
 
 class RankMixerTokenMixing(nn.Module):
@@ -70,14 +74,35 @@ class FeatureInteraction(nn.Module):
 
 
 class DomainAwareAttention(nn.Module):
-    def __init__(self, token_dim: int, num_heads: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        token_dim: int,
+        num_heads: int,
+        num_domain_tokens: int,
+        num_feature_tokens: int,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
-        self.attention = nn.MultiheadAttention(
-            embed_dim=token_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
+        if token_dim % num_heads != 0:
+            raise ValueError("token_dim must be divisible by num_heads")
+        self.token_dim = token_dim
+        self.num_heads = num_heads
+        self.num_domain_tokens = num_domain_tokens
+        self.num_feature_tokens = num_feature_tokens
+        self.head_dim = token_dim // num_heads
+        self.query_projection = PerTokenLinear(num_domain_tokens, token_dim, token_dim)
+        self.key_projection = PerTokenLinear(num_feature_tokens, token_dim, token_dim)
+        self.value_projection = PerTokenLinear(num_feature_tokens, token_dim, token_dim)
+        self.output_projection = PerTokenLinear(num_domain_tokens, token_dim, token_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def _split_heads(self, tokens: Tensor) -> Tensor:
+        batch_size, num_tokens, _token_dim = tokens.shape
+        return tokens.view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def _merge_heads(self, tokens: Tensor) -> Tensor:
+        batch_size, _num_heads, num_tokens, _head_dim = tokens.shape
+        return tokens.transpose(1, 2).contiguous().view(batch_size, num_tokens, self.token_dim)
 
     def forward(
         self,
@@ -85,13 +110,23 @@ class DomainAwareAttention(nn.Module):
         feature_tokens: Tensor,
         need_weights: bool = False,
     ) -> tuple[Tensor, Tensor | None]:
-        output, weights = self.attention(
-            query=domain_tokens,
-            key=feature_tokens,
-            value=feature_tokens,
-            need_weights=need_weights,
-            average_attn_weights=False,
-        )
+        if domain_tokens.size(1) != self.num_domain_tokens:
+            raise ValueError(
+                f"expected {self.num_domain_tokens} domain tokens, got {domain_tokens.size(1)}"
+            )
+        if feature_tokens.size(1) != self.num_feature_tokens:
+            raise ValueError(
+                f"expected {self.num_feature_tokens} feature tokens, got {feature_tokens.size(1)}"
+            )
+
+        query = self._split_heads(self.query_projection(domain_tokens))
+        key = self._split_heads(self.key_projection(feature_tokens))
+        value = self._split_heads(self.value_projection(feature_tokens))
+
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        weights = torch.softmax(scores, dim=-1)
+        attended = torch.matmul(self.dropout(weights), value)
+        output = self.output_projection(self._merge_heads(attended))
         return output, weights if need_weights else None
 
 

@@ -1,5 +1,12 @@
 from .build_dataset import ManifestDataset, build_dataset, collate_manifest_batch, load_manifest
-from .feature_schema import feature_specs_from_manifest, token_specs_from_manifest
+from .feature_schema import (
+    feature_specs_from_manifest,
+    scenario_feature_specs_from_manifest,
+    scenario_token_specs_from_manifest,
+    task_feature_specs_from_manifest,
+    task_token_specs_from_manifest,
+    token_specs_from_manifest,
+)
 
 __all__ = [
     "ManifestDataset",
@@ -7,5 +14,9 @@ __all__ = [
     "collate_manifest_batch",
     "feature_specs_from_manifest",
     "load_manifest",
+    "scenario_feature_specs_from_manifest",
+    "scenario_token_specs_from_manifest",
+    "task_feature_specs_from_manifest",
+    "task_token_specs_from_manifest",
     "token_specs_from_manifest",
 ]

@@ -310,3 +310,153 @@ def test_manifest_dataset_collate_multifield_sequence_mean_pooling_sources(tmp_p
 
     assert batch["features"]["hist_item_id"]["values"].tolist() == [[1, 2, 3]]
     assert batch["features"]["hist_price"]["values"].shape == (1, 3)
+
+
+
+def test_manifest_dataset_reads_domain_tokenization_sources(tmp_path: Path) -> None:
+    manifest = {
+        "splits": ["train"],
+        "scenario_names": ["home", "search"],
+        "task_names": ["click"],
+        "data_columns": {
+            "scenario_id": "scenario_id",
+            "group_id": "group_id",
+            "labels": {"click": "click"},
+            "label_masks": {"click": "click_mask"},
+        },
+        "tokenization": {
+            "version": 2,
+            "kind": "encoder_registry",
+            "features": [
+                {
+                    "name": "item_id",
+                    "encoder": "embedding",
+                    "vocab_size": 20,
+                    "source": {"type": "csv_column", "column": "item_id", "dtype": "int64"},
+                }
+            ],
+            "token_specs": [
+                {"token_id": 0, "projection": "linear", "inputs": ["item_id"]},
+            ],
+            "scenario_features": [
+                {
+                    "name": "scene_prior",
+                    "encoder": "identity",
+                    "dim": 1,
+                    "source": {"type": "csv_column", "column": "scene_prior", "dtype": "float32"},
+                }
+            ],
+            "scenario_token_specs": [
+                {"token_id": 0, "inputs": ["scene_prior"]},
+                {"token_id": 1, "inputs": ["scene_prior"]},
+                {"token_id": 2, "inputs": ["scene_prior"]},
+            ],
+            "task_features": [
+                {
+                    "name": "task_bias",
+                    "encoder": "identity",
+                    "dim": 1,
+                    "source": {"type": "csv_column", "column": "task_bias", "dtype": "float32"},
+                }
+            ],
+            "task_token_specs": [
+                {"token_id": 0, "inputs": ["task_bias"]},
+            ],
+        },
+    }
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with (tmp_path / "train.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "scenario_id",
+                "group_id",
+                "click",
+                "click_mask",
+                "item_id",
+                "scene_prior",
+                "task_bias",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "scenario_id": 1,
+                "group_id": "q1",
+                "click": 1,
+                "click_mask": 1,
+                "item_id": 3,
+                "scene_prior": 0.75,
+                "task_bias": 0.25,
+            }
+        )
+
+    rows = list(ManifestDataset(tmp_path, "train"))
+    batch = collate_manifest_batch(rows)
+
+    assert batch["features"]["item_id"].tolist() == [3]
+    assert batch["features"]["scene_prior"].shape == (1,)
+    assert batch["features"]["task_bias"].shape == (1,)
+
+
+
+def test_manifest_dataset_collate_multi_scenario_ids(tmp_path: Path) -> None:
+    manifest = {
+        "splits": ["train"],
+        "scenario_names": ["home", "search", "banner"],
+        "task_names": ["click"],
+        "data_columns": {
+            "scenario_ids": "scenario_ids",
+            "scenario_ids_delimiter": "|",
+            "group_id": "group_id",
+            "labels": {"click": "click"},
+            "label_masks": {"click": "click_mask"},
+        },
+        "tokenization": {
+            "version": 2,
+            "kind": "encoder_registry",
+            "features": [
+                {
+                    "name": "item_id",
+                    "encoder": "embedding",
+                    "vocab_size": 20,
+                    "source": {"type": "csv_column", "column": "item_id", "dtype": "int64"},
+                }
+            ],
+            "token_specs": [
+                {"token_id": 0, "projection": "linear", "inputs": ["item_id"]},
+            ],
+        },
+    }
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with (tmp_path / "train.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["scenario_ids", "group_id", "click", "click_mask", "item_id"],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "scenario_ids": "0|2",
+                "group_id": "q1",
+                "click": 1,
+                "click_mask": 1,
+                "item_id": 3,
+            }
+        )
+        writer.writerow(
+            {
+                "scenario_ids": "1",
+                "group_id": "q2",
+                "click": 0,
+                "click_mask": 1,
+                "item_id": 4,
+            }
+        )
+
+    rows = list(ManifestDataset(tmp_path, "train"))
+    batch = collate_manifest_batch(rows)
+
+    assert batch["scenario_id"].tolist() == [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]

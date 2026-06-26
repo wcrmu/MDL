@@ -73,6 +73,8 @@ The manifest declares scenario columns, group columns, labels, label masks, feat
 
 ```json
 {
+  "scenario_names": ["default"],
+  "task_names": ["click"],
   "data_columns": {
     "scenario_id": "scene",
     "group_id": "query",
@@ -88,12 +90,25 @@ The manifest declares scenario columns, group columns, labels, label masks, feat
     ],
     "token_specs": [
       {"token_id": 0, "projection": "linear", "inputs": ["user_id", "score"]}
+    ],
+    "scenario_features": [
+      {"name": "user_id", "encoder": "embedding", "vocab_size": 100000}
+    ],
+    "scenario_token_specs": [
+      {"token_id": 0, "inputs": ["user_id"]},
+      {"token_id": 1, "inputs": ["user_id"]}
+    ],
+    "task_features": [
+      {"name": "score", "encoder": "identity", "dim": 1}
+    ],
+    "task_token_specs": [
+      {"token_id": 0, "inputs": ["score"]}
     ]
   }
 }
 ```
 
-Built-in encoders are `embedding`, `identity`, multi-field `sequence_mean_pooling`, and multi-field target-aware `din`.
+Built-in encoders are `embedding`, `identity`, multi-field `sequence_mean_pooling`, and multi-field target-aware `din`. For the full MDL paper path, declare `scenario_features/scenario_token_specs` and `task_features/task_token_specs`; otherwise the model uses a compatibility fallback for domain/task tokens. Single-scenario CSVs use `data_columns.scenario_id`; overlapping scenarios can use `data_columns.scenario_ids` with `scenario_ids_delimiter` such as `|`.
 
 ## Commands
 

@@ -24,3 +24,27 @@ def token_specs_from_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     if "token_specs" not in tokenization:
         raise ValueError("tokenization must contain token_specs")
     return list(tokenization["token_specs"])
+
+
+def scenario_feature_specs_from_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]] | None:
+    tokenization = _latest_tokenization(manifest)
+    specs = tokenization.get("scenario_features")
+    return None if specs is None else list(specs)
+
+
+def scenario_token_specs_from_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]] | None:
+    tokenization = _latest_tokenization(manifest)
+    specs = tokenization.get("scenario_token_specs")
+    return None if specs is None else list(specs)
+
+
+def task_feature_specs_from_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]] | None:
+    tokenization = _latest_tokenization(manifest)
+    specs = tokenization.get("task_features")
+    return None if specs is None else list(specs)
+
+
+def task_token_specs_from_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]] | None:
+    tokenization = _latest_tokenization(manifest)
+    specs = tokenization.get("task_token_specs")
+    return None if specs is None else list(specs)
