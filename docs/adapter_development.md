@@ -14,7 +14,9 @@
   tests/
 ```
 
-具体数据集的原始字段、清洗逻辑、负采样逻辑、ID 映射、时间切分、任务定义等，全部放在 adapter 里。adapter 不应该写进 `<project-root>/src`，也不应该在 `MDL` 内部硬编码某个数据集名称。
+具体数据集的原始字段、清洗逻辑、负采样逻辑、ID 映射、时间切分、任务定义等，全部放在 adapter 里。普通 adapter 开发者不应该修改 `MDL/` 仓库下的任何文件，包括 `src/`、`scripts/`、`configs/`、`tests/` 和本文档。adapter 不应该写进 `<project-root>/src`，也不应该在 `MDL` 内部硬编码某个数据集名称。
+
+如果适配某个数据集时发现当前通用协议不够用，例如需要新增通用 encoder、支持新的输入 shape、支持新的文件格式 reader，应该把它作为框架能力扩展单独讨论和提交，而不是混在普通 dataset adapter 中。
 
 推荐把 adapter 放在 `MDL` 同级目录：
 
@@ -692,6 +694,8 @@ QAUC 有大量 skipped groups
 
 ## 11. 不应该做什么
 
+不要修改 `MDL/` 仓库下的任何文件来适配单个数据集。普通 adapter 只能在外部 adapter 目录中新增或修改代码。
+
 不要把某个数据集的字段名写进 `<project-root>/src`。
 
 不要把 raw 大文件提交进 `MDL` 仓库。
@@ -724,4 +728,5 @@ your_dataset/
 - 输出的任务和场景。
 - 特征列表和 vocab 规则。
 - 如何用 `<project-root>/scripts/train.py` 做 smoke train。
+- 确认 adapter 不要求修改 `MDL/` 仓库中的任何文件。
 
