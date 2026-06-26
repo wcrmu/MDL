@@ -10,6 +10,7 @@ from .embedding import (
     register_encoder,
 )
 from .loss import multitask_bce_loss
+from .mlp import PerTokenFFN, PerTokenLinear, SparseMoEPerTokenFFN
 from .metrics import QAUCResult, binary_auc, qauc
 from .tokenizer import FeatureCompilerConfig, FeatureTokenCompiler
 
@@ -23,8 +24,11 @@ __all__ = [
     "FeatureEncoder",
     "FeatureTokenCompiler",
     "IdentityEncoder",
+    "PerTokenFFN",
+    "PerTokenLinear",
     "QAUCResult",
     "SequenceMeanPoolingEncoder",
+    "SparseMoEPerTokenFFN",
     "binary_auc",
     "multitask_bce_loss",
     "qauc",

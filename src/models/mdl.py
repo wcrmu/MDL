@@ -15,7 +15,7 @@ from src.datasets.feature_schema import (
     token_specs_from_manifest,
 )
 from src.modules.attention import DomainAwareAttention, DomainFusedModule, FeatureInteraction
-from src.modules.mlp import ContextTokenizer, PerTokenFFN
+from src.modules.mlp import ContextTokenizer, PerTokenFFN, SparseMoEPerTokenFFN
 from src.modules.tokenizer import FeatureCompilerConfig, FeatureTokenCompiler
 
 from .base import BaseRecommender
@@ -34,6 +34,10 @@ class MDLConfig:
     ffn_hidden_dim: int = 64
     dropout: float = 0.0
     feature_backbone: str = "rankmixer"
+    ffn_type: str = "dense"
+    sparse_moe_num_experts: int = 4
+    sparse_moe_use_dtsi: bool = True
+    sparse_moe_inference_threshold: float = 0.0
 
     def __post_init__(self) -> None:
         if self.num_feature_tokens <= 0:
@@ -60,10 +64,37 @@ class MDLConfig:
             raise ValueError("dropout must be non-negative")
         if self.feature_backbone not in {"rankmixer", "attention"}:
             raise ValueError("feature_backbone must be 'rankmixer' or 'attention'")
+        if self.ffn_type not in {"dense", "sparse_moe"}:
+            raise ValueError("ffn_type must be 'dense' or 'sparse_moe'")
+        if self.sparse_moe_num_experts <= 0:
+            raise ValueError("sparse_moe_num_experts must be positive")
+        if self.sparse_moe_inference_threshold < 0:
+            raise ValueError("sparse_moe_inference_threshold must be non-negative")
         if self.feature_backbone == "rankmixer" and self.token_dim % self.num_feature_tokens != 0:
             raise ValueError(
                 "rankmixer backbone requires token_dim divisible by number of feature tokens"
             )
+
+
+def _build_per_token_ffn(num_tokens: int, config: MDLConfig) -> nn.Module:
+    if config.ffn_type == "dense":
+        return PerTokenFFN(
+            num_tokens,
+            config.token_dim,
+            config.ffn_hidden_dim,
+            config.dropout,
+            activation="gelu",
+        )
+    return SparseMoEPerTokenFFN(
+        num_tokens=num_tokens,
+        token_dim=config.token_dim,
+        hidden_dim=config.ffn_hidden_dim,
+        num_experts=config.sparse_moe_num_experts,
+        dropout=config.dropout,
+        activation="gelu",
+        use_dtsi=config.sparse_moe_use_dtsi,
+        inference_threshold=config.sparse_moe_inference_threshold,
+    )
 
 
 class MDLBlock(nn.Module):
@@ -80,13 +111,7 @@ class MDLBlock(nn.Module):
             backbone=config.feature_backbone,
         )
         self.feature_norm_1 = nn.LayerNorm(config.token_dim)
-        self.feature_ffn = PerTokenFFN(
-            num_feature_tokens,
-            config.token_dim,
-            config.ffn_hidden_dim,
-            config.dropout,
-            activation="gelu",
-        )
+        self.feature_ffn = _build_per_token_ffn(num_feature_tokens, config)
         self.feature_norm_2 = nn.LayerNorm(config.token_dim)
 
         self.scenario_attention = DomainAwareAttention(
@@ -96,13 +121,7 @@ class MDLBlock(nn.Module):
             num_feature_tokens,
             config.dropout,
         )
-        self.scenario_ffn = PerTokenFFN(
-            num_scenario_tokens,
-            config.token_dim,
-            config.ffn_hidden_dim,
-            config.dropout,
-            activation="gelu",
-        )
+        self.scenario_ffn = _build_per_token_ffn(num_scenario_tokens, config)
 
         self.task_attention = DomainAwareAttention(
             config.token_dim,
@@ -112,13 +131,7 @@ class MDLBlock(nn.Module):
             config.dropout,
         )
         self.domain_fused = DomainFusedModule()
-        self.task_ffn = PerTokenFFN(
-            config.num_tasks,
-            config.token_dim,
-            config.ffn_hidden_dim,
-            config.dropout,
-            activation="gelu",
-        )
+        self.task_ffn = _build_per_token_ffn(config.num_tasks, config)
 
     def forward(
         self,
@@ -182,6 +195,26 @@ class MDLModel(BaseRecommender):
         self.logit_layers = nn.ModuleList(
             nn.Linear(config.token_dim, 1) for _ in range(config.num_tasks)
         )
+
+    def sparse_moe_regularization_loss(self, reference: Tensor) -> Tensor:
+        losses = [
+            module.regularization_loss(reference).to(device=reference.device)
+            for module in self.modules()
+            if isinstance(module, SparseMoEPerTokenFFN)
+        ]
+        if not losses:
+            return reference.new_zeros(())
+        return torch.stack(losses).sum()
+
+    def sparse_moe_active_ratio(self, reference: Tensor) -> Tensor:
+        ratios = [
+            module.active_ratio(reference).to(device=reference.device)
+            for module in self.modules()
+            if isinstance(module, SparseMoEPerTokenFFN)
+        ]
+        if not ratios:
+            return reference.new_zeros(())
+        return torch.stack(ratios).mean().detach()
 
     def _validate_tokens(self, tokens: Tensor, name: str, expected_tokens: int) -> None:
         expected_shape = (expected_tokens, self.config.token_dim)
@@ -248,6 +281,9 @@ class MDLModel(BaseRecommender):
             dim=1,
         )
         output: dict[str, Tensor | list[dict[str, Tensor | None]]] = {"logits": logits}
+        if self.config.ffn_type == "sparse_moe":
+            output["moe_regularization_loss"] = self.sparse_moe_regularization_loss(logits)
+            output["moe_active_ratio"] = self.sparse_moe_active_ratio(logits)
         if return_attention:
             output["attentions"] = attentions
         return output
@@ -280,6 +316,11 @@ class ModelConfig:
     ffn_hidden_dim: int = 64
     dropout: float = 0.0
     feature_backbone: str = "rankmixer"
+    ffn_type: str = "dense"
+    sparse_moe_num_experts: int = 4
+    sparse_moe_loss_weight: float = 0.0
+    sparse_moe_use_dtsi: bool = True
+    sparse_moe_inference_threshold: float = 0.0
     scenario_token_specs: list[dict[str, Any]] | None = None
     scenario_feature_specs: list[dict[str, Any]] | None = None
     task_token_specs: list[dict[str, Any]] | None = None
@@ -338,6 +379,11 @@ def config_from_manifest(
     ffn_hidden_dim: int = 64,
     dropout: float = 0.0,
     feature_backbone: str = "rankmixer",
+    ffn_type: str = "dense",
+    sparse_moe_num_experts: int = 4,
+    sparse_moe_loss_weight: float = 0.0,
+    sparse_moe_use_dtsi: bool = True,
+    sparse_moe_inference_threshold: float = 0.0,
 ) -> ModelConfig:
     return ModelConfig(
         token_specs=token_specs_from_manifest(manifest),
@@ -351,6 +397,11 @@ def config_from_manifest(
         ffn_hidden_dim=ffn_hidden_dim,
         dropout=dropout,
         feature_backbone=feature_backbone,
+        ffn_type=ffn_type,
+        sparse_moe_num_experts=sparse_moe_num_experts,
+        sparse_moe_loss_weight=sparse_moe_loss_weight,
+        sparse_moe_use_dtsi=sparse_moe_use_dtsi,
+        sparse_moe_inference_threshold=sparse_moe_inference_threshold,
         scenario_token_specs=scenario_token_specs_from_manifest(manifest),
         scenario_feature_specs=scenario_feature_specs_from_manifest(manifest),
         task_token_specs=task_token_specs_from_manifest(manifest),
@@ -398,6 +449,10 @@ class ModelFromManifest(BaseRecommender):
             ffn_hidden_dim=config.ffn_hidden_dim,
             dropout=config.dropout,
             feature_backbone=config.feature_backbone,
+            ffn_type=config.ffn_type,
+            sparse_moe_num_experts=config.sparse_moe_num_experts,
+            sparse_moe_use_dtsi=config.sparse_moe_use_dtsi,
+            sparse_moe_inference_threshold=config.sparse_moe_inference_threshold,
         )
         self.mdl = MDLModel(mdl_config)
 

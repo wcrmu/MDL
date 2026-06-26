@@ -4,3 +4,8 @@ token_dim: 36
 num_layers: 2
 num_heads: 4
 ffn_hidden_dim: 64
+ffn_type: dense
+sparse_moe_num_experts: 4
+sparse_moe_loss_weight: 0.0
+sparse_moe_use_dtsi: true
+sparse_moe_inference_threshold: 0.0

@@ -135,6 +135,18 @@ python scripts/train.py \
   --eval-max-batches 10
 ```
 
+Enable RankMixer-style Sparse-MoE per-token FFNs:
+
+```bash
+python scripts/train.py \
+  --data-dir processed_dataset \
+  --ffn-type sparse_moe \
+  --sparse-moe-num-experts 4 \
+  --sparse-moe-loss-weight 1e-4
+```
+
+Sparse-MoE uses ReLU routing, DTSI training by default, L1 regularization on the inference router, and sparse expert execution during `eval()`/prediction. Use `--disable-sparse-moe-dtsi` only for ablation.
+
 Evaluate:
 
 ```bash

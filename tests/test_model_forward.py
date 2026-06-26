@@ -374,3 +374,93 @@ def test_manifest_driven_domain_tokens_validate_token_counts() -> None:
         assert "one token per scenario plus one global token" in str(error)
     else:
         raise AssertionError("expected scenario token count validation to fail")
+
+
+
+def test_mdl_sparse_moe_forward_regularization_and_inference() -> None:
+    config = MDLConfig(
+        num_feature_tokens=4,
+        scenario_context_dim=8,
+        task_context_dim=6,
+        num_scenarios=2,
+        num_tasks=2,
+        token_dim=16,
+        num_layers=1,
+        num_heads=4,
+        ffn_hidden_dim=32,
+        ffn_type="sparse_moe",
+        sparse_moe_num_experts=3,
+    )
+    model = MDLModel(config)
+    feature_tokens = torch.randn(3, 4, 16)
+    scenario_context = torch.randn(3, 8)
+    task_context = torch.randn(3, 6)
+    scenario_mask = torch.tensor(
+        [[1, 0], [0, 1], [1, 0]],
+        dtype=torch.float32,
+    )
+
+    model.train()
+    output = model(
+        feature_tokens=feature_tokens,
+        scenario_context=scenario_context,
+        task_context=task_context,
+        scenario_mask=scenario_mask,
+    )
+    assert output["logits"].shape == (3, 2)
+    assert output["moe_regularization_loss"].ndim == 0
+    assert output["moe_regularization_loss"].requires_grad
+    assert 0.0 <= float(output["moe_active_ratio"]) <= 1.0
+    (output["logits"].sum() + 0.01 * output["moe_regularization_loss"]).backward()
+    first_infer_router = model.blocks[0].feature_ffn.infer_routers[0]
+    assert first_infer_router.weight.grad is not None
+
+    model.eval()
+    with torch.no_grad():
+        inference_output = model(
+            feature_tokens=feature_tokens,
+            scenario_context=scenario_context,
+            task_context=task_context,
+            scenario_mask=scenario_mask,
+        )
+    assert inference_output["logits"].shape == (3, 2)
+    assert inference_output["moe_regularization_loss"].shape == ()
+
+
+def test_model_from_manifest_sparse_moe_config_forward() -> None:
+    manifest = {
+        "scenario_names": ["default"],
+        "task_names": ["click"],
+        "tokenization": {
+            "version": 2,
+            "kind": "encoder_registry",
+            "features": [
+                {"name": "user_id", "encoder": "embedding", "vocab_size": 10},
+                {"name": "score", "encoder": "identity", "dim": 1},
+            ],
+            "token_specs": [
+                {"token_id": 0, "projection": "linear", "inputs": ["user_id"]},
+                {"token_id": 1, "projection": "linear", "inputs": ["score"]},
+            ],
+        },
+    }
+    config = config_from_manifest(
+        manifest,
+        embedding_dim=8,
+        token_dim=16,
+        num_layers=1,
+        num_heads=4,
+        ffn_hidden_dim=32,
+        ffn_type="sparse_moe",
+        sparse_moe_num_experts=2,
+        sparse_moe_loss_weight=0.05,
+    )
+    assert config.ffn_type == "sparse_moe"
+    assert config.sparse_moe_loss_weight == 0.05
+    model = ModelFromManifest(config)
+    output = model(
+        {"user_id": torch.tensor([1, 2]), "score": torch.tensor([0.1, 0.2])},
+        torch.tensor([0, 0]),
+    )
+    assert output["logits"].shape == (2, 1)
+    assert output["moe_regularization_loss"].ndim == 0

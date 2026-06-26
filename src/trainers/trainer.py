@@ -32,6 +32,11 @@ class TrainingConfig:
     num_heads: int = 4
     ffn_hidden_dim: int = 64
     dropout: float = 0.0
+    ffn_type: str = "dense"
+    sparse_moe_num_experts: int = 4
+    sparse_moe_loss_weight: float = 0.0
+    sparse_moe_use_dtsi: bool = True
+    sparse_moe_inference_threshold: float = 0.0
     checkpoint_path: str | None = None
 
 
@@ -49,6 +54,11 @@ class Trainer:
             ffn_hidden_dim=config.ffn_hidden_dim,
             dropout=config.dropout,
             feature_backbone=config.feature_backbone,
+            ffn_type=config.ffn_type,
+            sparse_moe_num_experts=config.sparse_moe_num_experts,
+            sparse_moe_loss_weight=config.sparse_moe_loss_weight,
+            sparse_moe_use_dtsi=config.sparse_moe_use_dtsi,
+            sparse_moe_inference_threshold=config.sparse_moe_inference_threshold,
         )
         self.model_config = model_config
         self.model = ModelFromManifest(model_config).to(self.device)
@@ -73,6 +83,13 @@ class Trainer:
                 if not isinstance(logits, Tensor):
                     raise TypeError("model output logits must be a tensor")
                 loss = multitask_bce_loss(logits, batch["labels"], batch["label_mask"])
+                moe_regularization_loss = output.get("moe_regularization_loss")
+                if (
+                    self.model_config.ffn_type == "sparse_moe"
+                    and self.model_config.sparse_moe_loss_weight > 0
+                    and isinstance(moe_regularization_loss, Tensor)
+                ):
+                    loss = loss + self.model_config.sparse_moe_loss_weight * moe_regularization_loss
                 loss.backward()
                 self.optimizer.step()
                 global_step += 1
