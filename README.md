@@ -56,7 +56,7 @@ This repository is organized as a standard recommendation-system project. The ma
 
 ## Data Contract
 
-The core model package does not hard-code any dataset. Dataset-specific raw conversion should live in an adapter that writes the generic processed format. For full adapter implementation guidance, see [docs/adapter_development.md](docs/adapter_development.md).
+The core model package does not hard-code any dataset. Dataset-specific raw conversion should live in an adapter that writes the generic processed format. For full adapter implementation guidance, see [docs/adapter_development.md](docs/adapter_development.md). For agent execution prompts and step-by-step acceptance gates, see [docs/adapter_agent_playbook.md](docs/adapter_agent_playbook.md).
 
 The processed format is:
 

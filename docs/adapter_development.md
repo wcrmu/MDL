@@ -2,6 +2,8 @@
 
 本文档说明如何为新的推荐系统数据集编写 adapter、adapter 应该放在哪里、目录如何组织，以及最终需要输出什么格式的数据，才能被当前 `MDL` 项目直接训练、评估和预测。
 
+如果要让 agent 在内部机器上实现 adapter，请使用 [adapter_agent_playbook.md](adapter_agent_playbook.md) 中的 prompt、阶段拆分和验收标准。
+
 ## 1. 核心原则
 
 当前 `MDL` 仓库只保留通用训练框架、模型、数据读取器和脚本：
