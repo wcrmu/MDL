@@ -10,7 +10,7 @@ class DeepFM(BaseRecommender):
     """Small generic DeepFM block for dense feature tensors.
 
     The production manifest path currently uses MDL. This module exists as a
-    standard model slot and can be wired to a dataset adapter when dense
+    standard model slot and can be wired to a dataset-specific feature pipeline when dense
     feature-field tensors are available.
     """
 

@@ -30,6 +30,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--sparse-lr", type=float, default=None)
+    parser.add_argument("--gradient-clip-norm", type=float, default=None)
     parser.add_argument("--task-weights", type=_parse_float_list, default=None)
     parser.add_argument("--scenario-weights", type=_parse_float_list, default=None)
     parser.add_argument("--disable-data-validation", dest="validate_data", action="store_false")
@@ -90,6 +91,7 @@ def main() -> None:
             device=args.device,
             lr=args.lr,
             sparse_lr=args.sparse_lr,
+            gradient_clip_norm=args.gradient_clip_norm,
             task_weights=args.task_weights,
             scenario_weights=args.scenario_weights,
             validate_data=args.validate_data,

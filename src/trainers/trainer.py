@@ -28,6 +28,7 @@ class TrainingConfig:
     device: str = "cpu"
     lr: float = 1e-3
     sparse_lr: float | None = None
+    gradient_clip_norm: float | None = None
     task_weights: list[float] | None = None
     scenario_weights: list[float] | None = None
     validate_data: bool = True
@@ -61,6 +62,8 @@ class TrainingConfig:
             raise ValueError("lr must be positive")
         if self.sparse_lr is not None and self.sparse_lr <= 0:
             raise ValueError("sparse_lr must be positive")
+        if self.gradient_clip_norm is not None and self.gradient_clip_norm <= 0:
+            raise ValueError("gradient_clip_norm must be positive")
         if self.task_weights is not None and any(weight < 0 for weight in self.task_weights):
             raise ValueError("task_weights must be non-negative")
         if self.scenario_weights is not None and any(weight < 0 for weight in self.scenario_weights):
@@ -216,6 +219,14 @@ class Trainer:
         for optimizer in self.optimizers:
             optimizer.step()
 
+    def _clip_gradients(self) -> Tensor | None:
+        if self.config.gradient_clip_norm is None:
+            return None
+        return nn.utils.clip_grad_norm_(
+            self.model.parameters(),
+            max_norm=self.config.gradient_clip_norm,
+        )
+
     def _update_sparse_moe_loss_weight(self, output: dict[str, Any]) -> None:
         target = self.config.sparse_moe_target_active_ratio
         if target is None or self.config.ffn_type != "sparse_moe":
@@ -282,10 +293,14 @@ class Trainer:
                 ):
                     loss = loss + self.sparse_moe_loss_weight * moe_regularization_loss
                 loss.backward()
+                gradient_norm = self._clip_gradients()
                 self._step()
                 self._update_sparse_moe_loss_weight(output)
                 global_step += 1
                 log_parts = [f"epoch={epoch}", f"step={global_step}", f"loss={loss.item():.6f}"]
+                if isinstance(gradient_norm, Tensor):
+                    grad_norm_value = float(gradient_norm.detach().cpu().item())
+                    log_parts.append(f"grad_norm={grad_norm_value:.6f}")
                 moe_active_ratio = output.get("moe_active_ratio")
                 if isinstance(moe_active_ratio, Tensor):
                     active_ratio = float(moe_active_ratio.detach().cpu().item())

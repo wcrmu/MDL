@@ -32,6 +32,7 @@ training:
   batch_size: 2048
   lr: 0.001
   sparse_lr: null
+  gradient_clip_norm: null
   task_weights: null
   scenario_weights: null
   validate_data: true

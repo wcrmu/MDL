@@ -56,7 +56,7 @@ This repository is organized as a standard recommendation-system project. The ma
 
 ## Data Contract
 
-The core model package does not hard-code any dataset. Dataset-specific raw conversion should live in an adapter that writes the generic processed format. For full adapter implementation guidance, see [docs/adapter_development.md](docs/adapter_development.md). For agent execution prompts and step-by-step acceptance gates, see [docs/adapter_agent_playbook.md](docs/adapter_agent_playbook.md).
+The core model package does not hard-code any dataset. Dataset-specific raw conversion should live in a feature pipeline that writes the generic processed format. For full feature pipeline implementation guidance, see [docs/feature_pipeline_development.md](docs/feature_pipeline_development.md). For agent execution prompts and step-by-step acceptance gates, see [docs/feature_pipeline_agent_playbook.md](docs/feature_pipeline_agent_playbook.md).
 
 The processed format is:
 
@@ -125,7 +125,7 @@ Validate a processed manifest dataset:
 python scripts/preprocess.py --data-dir processed_dataset
 ```
 
-Use `--max-rows N` to validate only the first `N` rows per split during fast adapter iteration.
+Use `--max-rows N` to validate only the first `N` rows per split during fast feature pipeline iteration.
 
 Train MDL:
 
@@ -136,6 +136,7 @@ python scripts/train.py \
   --batch-size 256 \
   --max-steps 10 \
   --eval-max-batches 10 \
+  --gradient-clip-norm 5.0 \
   --task-weights 1.0 \
   --scenario-weights 1.0
 ```

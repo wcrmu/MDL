@@ -1,11 +1,11 @@
-# Adapter Feature Engineering Checklist
+# Feature Engineering Checklist
 
-本文档给下游 agent 使用，用于在实现 dataset adapter 前、中、后检查特征工程设计。目标不是追求特征越多越好，而是确保任务、场景、特征、序列和 MDL token 语义都能被稳定地写进 processed dataset 和 manifest。
+本文档给下游 agent 使用，用于在实现 dataset-specific feature pipeline 前、中、后检查特征工程设计。目标不是追求特征越多越好，而是确保任务、场景、特征、序列和 MDL token 语义都能被稳定地写进 processed dataset 和 manifest。
 
-下游 agent 在设计 adapter 时必须先阅读：
+下游 agent 在设计 feature pipeline 时必须先阅读：
 
-- [adapter_development.md](adapter_development.md)
-- [adapter_agent_playbook.md](adapter_agent_playbook.md)
+- [feature_pipeline_development.md](feature_pipeline_development.md)
+- [feature_pipeline_agent_playbook.md](feature_pipeline_agent_playbook.md)
 - 本文档
 
 ## 1. 任务定义先于特征
@@ -66,7 +66,7 @@ ID 类特征必须满足：
 检查点：
 
 - 每个 `embedding` feature 必须声明 `vocab_size` 或 `cardinality`。
-- adapter 测试要覆盖未见 ID 映射到 `0`。
+- feature pipeline 测试要覆盖未见 ID 映射到 `0`。
 - 不允许把原始字符串 ID 直接写入 CSV 给 `embedding` encoder。
 
 ## 4. Dense 特征规范
@@ -123,11 +123,11 @@ Target-aware 兴趣建模：
 
 - 序列 payload 会被 collate 成 `values` 和 `lengths`。
 - 所有 sequence 字段同一行的长度必须语义对齐。
-- 空序列必须能被 encoder 处理，不能让 adapter 崩溃。
+- 空序列必须能被 encoder 处理，不能让 feature pipeline 崩溃。
 
 ## 6. MDL Token 设计
 
-manifest 不能只声明 feature tokens。完整 MDL adapter 必须声明三类 tokens：
+manifest 不能只声明 feature tokens。完整 MDL feature pipeline 必须声明三类 tokens：
 
 - `features` + `token_specs` 生成 feature tokens `T_f`。
 - `scenario_features` + `scenario_token_specs` 生成 scenario tokens `T_s`。
@@ -144,7 +144,7 @@ manifest 不能只声明 feature tokens。完整 MDL adapter 必须声明三类 
 
 - 不允许依赖 fallback；缺字段应该让校验或模型构建直接报错。
 - scenario/task token specs 默认使用 per-token FFN-ReLU 投影。
-- 不要显式写 `projection: "linear"`，除非 adapter design 明确这是消融实验。
+- 不要显式写 `projection: "linear"`，除非 feature pipeline design 明确这是消融实验。
 - `scenario_token_specs[*].inputs` 只能引用 `scenario_features`。
 - `task_token_specs[*].inputs` 只能引用 `task_features`。
 
@@ -213,16 +213,16 @@ Task/scenario 权重：
 
 ## 10. Manifest 和 CSV 校验
 
-adapter 产物必须通过：
+feature pipeline 产物必须通过：
 
 ```bash
-python scripts/preprocess.py --data-dir <adapter-root>/processed
+python scripts/preprocess.py --data-dir <feature-pipeline-root>/processed
 ```
 
 快速迭代时可以先扫部分行：
 
 ```bash
-python scripts/preprocess.py --data-dir <adapter-root>/processed --max-rows 1000
+python scripts/preprocess.py --data-dir <feature-pipeline-root>/processed --max-rows 1000
 ```
 
 校验覆盖：
@@ -238,11 +238,11 @@ python scripts/preprocess.py --data-dir <adapter-root>/processed --max-rows 1000
 
 ## 11. Smoke Train 验收
 
-adapter 完成后，必须从 MDL 仓库根目录跑：
+feature pipeline 完成后，必须从 MDL 仓库根目录跑：
 
 ```bash
 python scripts/train.py \
-  --data-dir <adapter-root>/processed \
+  --data-dir <feature-pipeline-root>/processed \
   --epochs 1 \
   --batch-size 32 \
   --max-steps 2 \
@@ -253,7 +253,7 @@ python scripts/train.py \
 
 ```bash
 python scripts/train.py \
-  --data-dir <adapter-root>/processed \
+  --data-dir <feature-pipeline-root>/processed \
   --epochs 1 \
   --batch-size 32 \
   --max-steps 2 \

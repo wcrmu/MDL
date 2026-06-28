@@ -4,6 +4,9 @@ import csv
 import json
 from pathlib import Path
 
+import pytest
+import torch
+
 from src.trainers import Trainer, TrainingConfig
 
 
@@ -81,6 +84,7 @@ def test_trainer_sparse_moe_single_step(tmp_path: Path) -> None:
             ffn_type="sparse_moe",
             sparse_moe_num_experts=2,
             sparse_moe_loss_weight=0.01,
+            gradient_clip_norm=0.1,
             sparse_moe_target_active_ratio=0.99,
             sparse_moe_loss_weight_update_rate=0.5,
         )
@@ -90,6 +94,25 @@ def test_trainer_sparse_moe_single_step(tmp_path: Path) -> None:
     assert trainer.sparse_optimizer is not None
     assert trainer.sparse_optimizer.__class__.__name__ == "Adagrad"
 
+    for parameter in trainer.model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    pre_clip_norm = trainer._clip_gradients()
+    assert pre_clip_norm is not None
+    assert float(pre_clip_norm) > trainer.config.gradient_clip_norm
+    post_clip_terms = [
+        parameter.grad.detach().float().norm().square()
+        for parameter in trainer.model.parameters()
+        if parameter.grad is not None
+    ]
+    post_clip_norm = torch.stack(post_clip_terms).sum().sqrt()
+    assert float(post_clip_norm) <= trainer.config.gradient_clip_norm + 1e-5
+    trainer._zero_grad()
+
     trainer.train()
 
     assert trainer.sparse_moe_loss_weight != 0.01
+
+
+def test_training_config_rejects_invalid_gradient_clip_norm() -> None:
+    with pytest.raises(ValueError, match="gradient_clip_norm must be positive"):
+        TrainingConfig(data_dir="unused", gradient_clip_norm=0.0)

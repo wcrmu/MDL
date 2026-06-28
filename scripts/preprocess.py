@@ -13,7 +13,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Validate a processed manifest dataset. Dataset-specific raw conversion "
-            "belongs in an adapter outside the core model package."
+            "belongs in a feature pipeline outside the core model package."
         )
     )
     parser.add_argument("--data-dir", required=True)
