@@ -19,12 +19,27 @@ model:
   sparse_moe_num_experts: 4
   sparse_moe_loss_weight: 0.0
   sparse_moe_use_dtsi: true
+  sparse_moe_dtsi_infer_weight: 0.5
   sparse_moe_inference_threshold: 0.0
+  use_task_tokens: true
+  use_scenario_tokens: true
+  use_global_scenario_token: true
+  use_task_feature_interaction: true
+  use_scenario_feature_interaction: true
 
 training:
   epochs: 1
   batch_size: 2048
   lr: 0.001
+  sparse_lr: null
+  task_weights: null
+  scenario_weights: null
+  validate_data: true
+  validation_max_rows: 1000
+  sparse_moe_target_active_ratio: null
+  sparse_moe_loss_weight_update_rate: 0.05
+  sparse_moe_loss_weight_min: 0.0
+  sparse_moe_loss_weight_max: 1.0
   device: cpu
   eval_max_batches: 100
   checkpoint_path: experiments/checkpoints/mdl.pt

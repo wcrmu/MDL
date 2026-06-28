@@ -91,6 +91,7 @@ class SparseMoEPerTokenFFN(nn.Module):
         output_relu: bool = False,
         activation: str = "gelu",
         use_dtsi: bool = True,
+        dtsi_infer_weight: float = 0.5,
         inference_threshold: float = 0.0,
     ) -> None:
         super().__init__()
@@ -104,11 +105,14 @@ class SparseMoEPerTokenFFN(nn.Module):
             raise ValueError("num_experts must be positive")
         if inference_threshold < 0:
             raise ValueError("inference_threshold must be non-negative")
+        if not 0.0 <= dtsi_infer_weight <= 1.0:
+            raise ValueError("dtsi_infer_weight must be in [0, 1]")
         activation_layer = _activation_layer(activation)
         self.num_tokens = num_tokens
         self.token_dim = token_dim
         self.num_experts = num_experts
         self.use_dtsi = use_dtsi
+        self.dtsi_infer_weight = dtsi_infer_weight
         self.inference_threshold = inference_threshold
         self.experts = nn.ModuleList(
             nn.ModuleList(
@@ -193,7 +197,10 @@ class SparseMoEPerTokenFFN(nn.Module):
                         token_values,
                         train_gates,
                     )
-                    outputs.append(0.5 * (train_output + infer_output))
+                    outputs.append(
+                        (1.0 - self.dtsi_infer_weight) * train_output
+                        + self.dtsi_infer_weight * infer_output
+                    )
                 else:
                     outputs.append(infer_output)
             else:

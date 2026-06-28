@@ -58,6 +58,7 @@ processed/
 你必须阅读：
 - <project-root>/docs/adapter_development.md
 - <project-root>/docs/adapter_agent_playbook.md
+- <project-root>/docs/adapter_feature_engineering_checklist.md
 
 工作方式：
 每次只执行一个阶段。每个阶段结束后，必须输出：
@@ -260,14 +261,15 @@ adapter_design.md 必须包含：
 3. 每个 task 的 label_mask 规则。
 4. scenario_names 和 scenario_id 生成规则。如果无多场景，使用 ["default"]。
 5. group_id 使用哪一列，以及为什么。
-6. train/val/test 切分策略。
-7. sparse ID 特征列表及 vocab 规则。
-8. dense numeric 特征列表及缺失值/归一化规则。
-9. sequence 特征列表、delimiter、截断长度、padding 规则。
-10. feature token_specs 设计。
-11. scenario_features 和 scenario_token_specs 设计；如果没有多场景，也必须说明 default scenario token 和 global scenario token。
-12. task_features 和 task_token_specs 设计。
-13. 不能确定的问题。
+6. 是否需要 sample_weight；如果需要，说明权重列和生成规则。
+7. train/val/test 切分策略。
+8. sparse ID 特征列表及 vocab 规则。
+9. dense numeric 特征列表及缺失值/归一化规则。
+10. sequence 特征列表、delimiter、截断长度、padding 规则，以及使用 `sequence_mean_pooling`、`din`、`sim` 还是 `longer`。
+11. feature token_specs 设计。
+12. scenario_features 和 scenario_token_specs 设计；如果没有多场景，也必须说明 default scenario token 和 global scenario token。
+13. task_features 和 task_token_specs 设计。
+14. 不能确定的问题。
 
 禁止：
 - 不要写 adapter 代码。
@@ -287,7 +289,7 @@ adapter_design.md 必须包含：
 - ID 特征无法可靠转整数时，建立 vocab。
 - 未见过的 val/test ID 映射到 `0`。
 - `0` 永远保留给 unknown/padding。
-- 普通历史序列优先使用 `sequence_mean_pooling`。如果一个历史行为 step 内有多个字段，例如 item、category、shop、price、sales、time_gap，应在 `sequence_mean_pooling.sequence_features` 中逐个声明，并使用 `fusion: concat` 先融合 step 内字段，再做 masked mean。若存在候选 target ID，例如 `item_id`，且需要 target-aware 兴趣建模，可以使用 `din.sequence_features`；`din` 默认使用标准 DIN 的 Dice activation 和非 softmax weighted sum。
+- 普通历史序列优先使用 `sequence_mean_pooling`。如果一个历史行为 step 内有多个字段，例如 item、category、shop、price、sales、time_gap，应在 `sequence_mean_pooling.sequence_features` 中逐个声明，并使用 `fusion: concat` 先融合 step 内字段，再做 masked mean。若存在候选 target ID，例如 `item_id`，且需要 target-aware 兴趣建模，可以使用 `din.sequence_features`；`din` 默认使用标准 DIN 的 Dice activation 和非 softmax weighted sum。长历史序列需要先检索候选位置时，使用 `sim` 或 `longer`，并声明 `top_k`/`search_top_k`。
 - 完整 MDL manifest 必须优先设计三类 tokens：`features/token_specs` 生成 feature tokens，`scenario_features/scenario_token_specs` 生成 scenario tokens，`task_features/task_token_specs` 生成 task tokens。不要只写 feature `token_specs` 后就结束。
 - `scenario_token_specs` 数量必须等于 `len(scenario_names) + 1`，最后一个 token 是 global scenario token。`task_token_specs` 数量必须等于 `len(task_names)`。
 - scenario/task token specs 默认使用 per-token FFN 投影；不要显式写 `projection: "linear"`，除非 adapter_design.md 明确这是消融实验。
@@ -358,7 +360,7 @@ python scripts/preprocess.py \
 实现要求：
 - 代码必须有 main conversion function。
 - CSV header 必须和 manifest data_columns/source column 一致。
-- label 和 label_mask 必须可转 float。
+- label、label_mask 和可选 sample_weight 必须可转 float。
 - scenario_id 必须是 int，从 0 开始。
 - sequence 用明确 delimiter，例如 |。
 - 输出路径可配置。

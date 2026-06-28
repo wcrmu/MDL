@@ -60,7 +60,7 @@ def _add_encoder_source_specs(
 ) -> None:
     for spec in feature_specs:
         _add_source_spec(specs, seen, spec)
-        if spec.get("encoder") not in {"din", "sequence_mean_pooling"}:
+        if spec.get("encoder") not in {"din", "sequence_mean_pooling", "sim", "longer"}:
             continue
         for field_spec in spec.get("sequence_features", []):
             _add_source_spec(specs, seen, field_spec)
@@ -191,6 +191,7 @@ class ManifestDataset(IterableDataset[dict[str, Any]]):
         feature_specs = _feature_source_specs(self.manifest)
         label_columns = data_columns["labels"]
         label_mask_columns = data_columns["label_masks"]
+        sample_weight_column = data_columns.get("sample_weight")
 
         with self.path.open("r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -210,6 +211,7 @@ class ManifestDataset(IterableDataset[dict[str, Any]]):
                     "num_scenarios": len(self.manifest["scenario_names"]),
                     "labels": [float(row[label_columns[name]]) for name in task_names],
                     "label_mask": [float(row[label_mask_columns[name]]) for name in task_names],
+                    "sample_weight": float(row[sample_weight_column]) if sample_weight_column else 1.0,
                     "group_id": row[data_columns["group_id"]],
                 }
 
@@ -243,5 +245,6 @@ def collate_manifest_batch(rows: list[dict[str, Any]]) -> dict[str, Tensor | lis
         "scenario_id": scenario_id,
         "labels": torch.tensor([row["labels"] for row in rows], dtype=torch.float32),
         "label_mask": torch.tensor([row["label_mask"] for row in rows], dtype=torch.float32),
+        "sample_weight": torch.tensor([row["sample_weight"] for row in rows], dtype=torch.float32),
         "group_id": [row["group_id"] for row in rows],
     }

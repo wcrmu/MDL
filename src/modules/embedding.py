@@ -430,3 +430,53 @@ class DINSequenceEncoder(FeatureEncoder):
         else:
             weights = scores * mask.to(dtype=scores.dtype)
         return (sequence_embeddings * weights.unsqueeze(-1)).sum(dim=1)
+
+
+@register_encoder("sim")
+class SIMSequenceEncoder(DINSequenceEncoder):
+    def __init__(self, spec: dict[str, Any], context: EncoderBuildContext) -> None:
+        super().__init__(spec, context)
+        self.search_top_k = int(spec.get("top_k", spec.get("search_top_k", 50)))
+        if self.search_top_k <= 0:
+            raise ValueError("sim top_k must be positive")
+
+    def forward(self, batch: dict[str, Any]) -> Tensor:
+        features = batch["features"]
+        sequence_parts: list[Tensor] = []
+        target_parts: list[Tensor] = []
+        masks: list[Tensor] = []
+        for field_encoder in self.field_encoders:
+            if field_encoder.name not in features:
+                return torch.zeros(int(batch["batch_size"]), self.output_dim, device=batch["device"])
+            sequence_part, target_part, mask = field_encoder(features[field_encoder.name], batch)
+            sequence_parts.append(sequence_part)
+            target_parts.append(target_part)
+            masks.append(mask)
+
+        sequence_embeddings = torch.cat(sequence_parts, dim=-1)
+        target_embeddings = torch.cat(target_parts, dim=-1)
+        if sequence_embeddings.size(1) == 0:
+            return torch.zeros(int(batch["batch_size"]), self.output_dim, device=batch["device"])
+
+        mask = self._combine_mask(masks)
+        search_scores = (sequence_embeddings * target_embeddings.unsqueeze(1)).sum(dim=-1)
+        masked_search_scores = search_scores.masked_fill(~mask, -1e9)
+        top_k = min(self.search_top_k, sequence_embeddings.size(1))
+        _top_scores, top_indices = torch.topk(masked_search_scores, top_k, dim=1)
+        gather_index = top_indices.unsqueeze(-1).expand(-1, -1, sequence_embeddings.size(-1))
+        selected_embeddings = sequence_embeddings.gather(1, gather_index)
+        selected_mask = mask.gather(1, top_indices)
+
+        scores = self.activation_unit(selected_embeddings, target_embeddings)
+        if self.attention_normalization == "softmax":
+            masked_scores = scores.masked_fill(~selected_mask, -1e9)
+            weights = torch.softmax(masked_scores, dim=1) * selected_mask.to(dtype=scores.dtype)
+            weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        else:
+            weights = scores * selected_mask.to(dtype=scores.dtype)
+        return (selected_embeddings * weights.unsqueeze(-1)).sum(dim=1)
+
+
+@register_encoder("longer")
+class LongerSequenceEncoder(SIMSequenceEncoder):
+    pass

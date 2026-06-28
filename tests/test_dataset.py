@@ -460,3 +460,67 @@ def test_manifest_dataset_collate_multi_scenario_ids(tmp_path: Path) -> None:
     batch = collate_manifest_batch(rows)
 
     assert batch["scenario_id"].tolist() == [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]
+
+
+
+def test_manifest_dataset_collates_sample_weight(tmp_path: Path) -> None:
+    manifest = {
+        "splits": ["train"],
+        "scenario_names": ["default"],
+        "task_names": ["click"],
+        "data_columns": {
+            "scenario_id": "scenario_id",
+            "group_id": "group_id",
+            "sample_weight": "sample_weight",
+            "labels": {"click": "click"},
+            "label_masks": {"click": "click_mask"},
+        },
+        "tokenization": {
+            "version": 2,
+            "kind": "encoder_registry",
+            "features": [
+                {
+                    "name": "user_id",
+                    "encoder": "embedding",
+                    "vocab_size": 10,
+                    "source": {"type": "csv_column", "column": "user_id", "dtype": "int64"},
+                },
+            ],
+            "token_specs": [
+                {"token_id": 0, "projection": "linear", "inputs": ["user_id"]},
+            ],
+        },
+    }
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with (tmp_path / "train.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["scenario_id", "group_id", "sample_weight", "click", "click_mask", "user_id"],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "scenario_id": 0,
+                "group_id": "q1",
+                "sample_weight": 0.5,
+                "click": 1,
+                "click_mask": 1,
+                "user_id": 3,
+            }
+        )
+        writer.writerow(
+            {
+                "scenario_id": 0,
+                "group_id": "q2",
+                "sample_weight": 2.0,
+                "click": 0,
+                "click_mask": 1,
+                "user_id": 4,
+            }
+        )
+
+    rows = list(ManifestDataset(tmp_path, "train"))
+    batch = collate_manifest_batch(rows)
+
+    assert batch["sample_weight"].tolist() == [0.5, 2.0]

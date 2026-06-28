@@ -17,12 +17,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--data-dir", required=True)
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help="Maximum rows per split to validate; omit for a full scan.",
+    )
     return parser
 
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    validate_processed_dataset(args.data_dir)
+    validate_processed_dataset(args.data_dir, max_rows=args.max_rows)
     print(f"validated_processed_dataset={args.data_dir}")
 
 

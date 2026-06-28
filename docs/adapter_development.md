@@ -2,7 +2,7 @@
 
 本文档说明如何为新的推荐系统数据集编写 adapter、adapter 应该放在哪里、目录如何组织，以及最终需要输出什么格式的数据，才能被当前 `MDL` 项目直接训练、评估和预测。
 
-如果要让 agent 在内部机器上实现 adapter，请使用 [adapter_agent_playbook.md](adapter_agent_playbook.md) 中的 prompt、阶段拆分和验收标准。
+如果要让 agent 在内部机器上实现 adapter，请使用 [adapter_agent_playbook.md](adapter_agent_playbook.md) 中的 prompt、阶段拆分和验收标准。特征工程设计和检查请同时使用 [adapter_feature_engineering_checklist.md](adapter_feature_engineering_checklist.md)。
 
 ## 1. 核心原则
 
@@ -134,6 +134,7 @@ scene,query,click_label,click_mask,user_id,item_id,price,history_items
 
 - `scenario_id` 必须是从 `0` 开始的整数 ID。
 - `group_id` 用于 QAUC 分组，通常是 query/session/request/user-session。
+- 可选 `sample_weight` 列用于样本级训练/验证 loss 加权；如果在 `data_columns.sample_weight` 声明，CSV 中该列必须能转成 float。
 - 每个 task 都需要 label 列。
 - 每个 task 都需要 label mask 列，mask 为 `1` 表示该样本该任务有效，`0` 表示忽略。
 - 类别 ID 特征建议用整数，并保留 `0` 给 padding/unknown。
@@ -251,6 +252,7 @@ scene,query,click_label,click_mask,user_id,item_id,price,history_items
 {
   "scenario_id": "scene",
   "group_id": "query",
+  "sample_weight": "sample_weight",
   "labels": {"click": "click_label"},
   "label_masks": {"click": "click_mask"}
 }
@@ -259,6 +261,7 @@ scene,query,click_label,click_mask,user_id,item_id,price,history_items
 注意：
 
 - `labels` 和 `label_masks` 的 key 必须覆盖 `task_names` 中的每个任务。
+- `sample_weight` 是可选列名；声明后每一行必须能转成 float，并会参与 loss 分母归一化。
 - label 建议使用 `0/1` 或可转成 float 的值。
 - mask 建议使用 `0/1`。
 
@@ -315,7 +318,7 @@ scene,query,click_label,click_mask,user_id,item_id,price,history_items
 
 ### 4.4 built-in encoders
 
-当前内置 encoder 有四个：
+当前内置 encoder 有六个：
 
 `embedding`
 : 用于整数 ID 特征。需要 `vocab_size` 或 `cardinality`。
@@ -459,6 +462,27 @@ scene,query,click_label,click_mask,user_id,item_id,price,history_items
 
 `sequence_features[*].target_feature` 必须指向当前 batch 中对应的 target 字段，例如 `item_id`、`cate_id`、`price`。ID 类历史字段和 target 字段必须来自同一个 vocab。`fusion` 当前支持 `concat`；因此所有 step 字段会按声明顺序 concat 成 `behavior_emb`，target 侧对应字段也按相同顺序 concat 成 `target_emb`。`attention_normalization` 默认为 `none`，这是 DIN 默认；只有做对照实验时才建议显式改成 `softmax`。
 
+`sim` / `longer`
+: 用于更长行为序列的 target-aware 检索式兴趣建模。它们复用 DIN 的字段声明和 activation unit，但会先用 `behavior_emb` 与 `target_emb` 的点积相似度检索 top-k 历史位置，再只在候选集合上做 DIN attention。`top_k` 或 `search_top_k` 默认为 `50`，必须为正数。`longer` 当前作为同一套长序列检索 attention 实现的别名，方便 adapter 明确标注论文里的 Longer/SIM 类特征。
+
+```json
+{
+  "name": "long_history_items",
+  "encoder": "sim",
+  "vocab_size": 500000,
+  "target_feature": "item_id",
+  "top_k": 50,
+  "attention_hidden_dims": [80, 40],
+  "source": {
+    "type": "csv_column",
+    "column": "long_history_items",
+    "dtype": "int64",
+    "shape": "sequence",
+    "delimiter": "|"
+  }
+}
+```
+
 为了兼容简单数据集，`din` 也保留 single-field 简写：
 
 ```json
@@ -499,14 +523,14 @@ scene,query,click_label,click_mask,user_id,item_id,price,history_items
 
 ### 4.6 scenario/task tokenization
 
-MDL 论文里的完整路径不只是 feature tokens。除了 `features` + `token_specs` 生成 `T_f`，还应该用独立 encoder 生成 scenario tokens `T_s` 和 task tokens `T_t`。manifest 支持四个可选字段：
+MDL 论文里的完整路径不只是 feature tokens。除了 `features` + `token_specs` 生成 `T_f`，还必须用独立 encoder 生成 scenario tokens `T_s` 和 task tokens `T_t`。manifest 必须声明四个字段：
 
 - `scenario_features`: scenario token 使用的原始特征编码声明。
 - `scenario_token_specs`: 每个 scenario token 由哪些 encoded features 组成。数量必须等于 `len(scenario_names) + 1`，前面按 `scenario_names` 顺序对应各场景，最后一个是 global scenario token。
 - `task_features`: task token 使用的原始特征编码声明。
 - `task_token_specs`: 每个 task token 由哪些 encoded features 组成。数量必须等于 `len(task_names)`，顺序按 `task_names`。
 
-这四个字段要么成对出现，要么都不写。如果不写，框架会使用旧的兼容 fallback：scenario 用 `scenario_id` embedding，task 用可学习共享上下文。这个 fallback 能跑通训练，但不是论文中“由重要特征和 scenario/task prior 特征经 per-token FFN token 化”的完整实现。
+这四个字段缺一不可。`config_from_manifest` 会在缺少任意字段时直接报错，不再使用 scenario embedding 或共享 task context 的兼容 fallback。
 
 推荐写法：
 
@@ -541,7 +565,7 @@ MDL 论文里的完整路径不只是 feature tokens。除了 `features` + `toke
 - scenario/task token specs 默认使用 `ffn_relu` 投影，即 `Relu(FFN(...))`。不要显式写 `projection: "linear"`，除非是在做消融实验。
 - 每个 `inputs` 名称只能引用同一段里的 features。例如 `scenario_token_specs[*].inputs` 必须来自 `scenario_features[*].name`。
 - CSV reader 会读取 `features`、`scenario_features`、`task_features` 中声明了 `source` 的字段。复用同一原始字段时，可以在每个 feature spec 中重复同一个 `source`，也可以确保至少有一处同名 spec 声明了 `source`。
-- 如果没有多场景，也仍然建议写一个业务场景 token 和一个 global token，即 `scenario_names: ["default"]` 时 `scenario_token_specs` 数量为 2。
+- 如果没有多场景，也必须写一个业务场景 token 和一个 global token，即 `scenario_names: ["default"]` 时 `scenario_token_specs` 数量为 2。
 - 当前通用 CSV reader 支持单场景列 `data_columns.scenario_id`，也支持多场景重叠列 `data_columns.scenario_ids`。多场景列里的值用 `data_columns.scenario_ids_delimiter` 分隔，默认 `|`，例如 `0|2`。
 
 ## 5. Adapter 实现步骤
@@ -827,7 +851,7 @@ manifest feature：
 }
 ```
 
-通用 collate 会把序列 padding 成 batch 内等长。`sequence_mean_pooling` 和 `din` 都使用同一套序列 payload。collate 会传入：
+通用 collate 会把序列 padding 成 batch 内等长。`sequence_mean_pooling`、`din`、`sim` 和 `longer` 都使用同一套序列 payload。collate 会传入：
 
 ```python
 {
@@ -836,7 +860,7 @@ manifest feature：
 }
 ```
 
-`sequence_mean_pooling` 会先融合每个 step 内的 `sequence_features`，再基于 `lengths` 对 step embeddings 做 masked mean。`din` 会使用同样的 step 内融合结果，并基于 `target_feature` 对未 padding 的历史位置计算 activation weight；默认不做 softmax，而是直接 weighted sum。
+`sequence_mean_pooling` 会先融合每个 step 内的 `sequence_features`，再基于 `lengths` 对 step embeddings 做 masked mean。`din` 会使用同样的 step 内融合结果，并基于 `target_feature` 对未 padding 的历史位置计算 activation weight；默认不做 softmax，而是直接 weighted sum。`sim`/`longer` 会先检索 top-k，再在 top-k 上执行同样的 target-aware attention。
 
 ## 9. Adapter 测试建议
 
@@ -846,7 +870,7 @@ manifest feature：
 2. `manifest.json` 中 `splits` 对应的 CSV 都存在。
 3. CSV 中 manifest 声明的列都存在。
 4. `scenario_id` 不越界。
-5. label 和 mask 可以转成 float。
+5. label、mask 和可选 sample_weight 可以转成 float。
 6. embedding 特征 ID 在 `[0, vocab_size)` 范围内。
 7. 序列特征中的每个 ID 在 `[0, vocab_size)` 范围内。
 8. 用 `python scripts/train.py --max-steps 2` 能跑通。
@@ -854,7 +878,7 @@ manifest feature：
 ## 10. 常见错误
 
 `unknown feature encoder`
-: manifest 中的 `encoder` 名称不是内置 encoder。当前支持 `embedding`、`identity`、`sequence_mean_pooling`、`din`。
+: manifest 中的 `encoder` 名称不是内置 encoder。当前支持 `embedding`、`identity`、`sequence_mean_pooling`、`din`、`sim`、`longer`。
 
 `feature ... csv_column source must declare dtype`
 : 每个 feature source 都必须声明 dtype。

@@ -131,6 +131,10 @@ class DomainAwareAttention(nn.Module):
 
 
 class DomainFusedModule(nn.Module):
+    def __init__(self, include_global: bool = True) -> None:
+        super().__init__()
+        self.include_global = include_global
+
     def forward(self, task_tokens: Tensor, scenario_tokens: Tensor, scenario_mask: Tensor) -> Tensor:
         if scenario_mask.ndim != 2:
             raise ValueError("scenario_mask must have shape [batch, num_scenarios]")
@@ -140,8 +144,13 @@ class DomainFusedModule(nn.Module):
             raise ValueError("scenario_mask must exclude the global scenario token")
 
         mask = scenario_mask.to(dtype=scenario_tokens.dtype, device=scenario_tokens.device)
-        global_mask = torch.ones(mask.size(0), 1, dtype=mask.dtype, device=mask.device)
-        full_mask = torch.cat([mask, global_mask], dim=1)
+        if self.include_global:
+            global_mask = torch.ones(mask.size(0), 1, dtype=mask.dtype, device=mask.device)
+            full_mask = torch.cat([mask, global_mask], dim=1)
+            fused_scenario_tokens = scenario_tokens
+        else:
+            full_mask = mask
+            fused_scenario_tokens = scenario_tokens[:, :-1, :]
         denominator = full_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        scenario_average = (scenario_tokens * full_mask.unsqueeze(-1)).sum(dim=1) / denominator
+        scenario_average = (fused_scenario_tokens * full_mask.unsqueeze(-1)).sum(dim=1) / denominator
         return task_tokens + scenario_average.unsqueeze(1)

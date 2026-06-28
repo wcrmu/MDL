@@ -37,7 +37,13 @@ class MDLConfig:
     ffn_type: str = "dense"
     sparse_moe_num_experts: int = 4
     sparse_moe_use_dtsi: bool = True
+    sparse_moe_dtsi_infer_weight: float = 0.5
     sparse_moe_inference_threshold: float = 0.0
+    use_task_tokens: bool = True
+    use_scenario_tokens: bool = True
+    use_global_scenario_token: bool = True
+    use_task_feature_interaction: bool = True
+    use_scenario_feature_interaction: bool = True
 
     def __post_init__(self) -> None:
         if self.num_feature_tokens <= 0:
@@ -70,6 +76,8 @@ class MDLConfig:
             raise ValueError("sparse_moe_num_experts must be positive")
         if self.sparse_moe_inference_threshold < 0:
             raise ValueError("sparse_moe_inference_threshold must be non-negative")
+        if not 0.0 <= self.sparse_moe_dtsi_infer_weight <= 1.0:
+            raise ValueError("sparse_moe_dtsi_infer_weight must be in [0, 1]")
         if self.feature_backbone == "rankmixer" and self.token_dim % self.num_feature_tokens != 0:
             raise ValueError(
                 "rankmixer backbone requires token_dim divisible by number of feature tokens"
@@ -93,6 +101,7 @@ def _build_per_token_ffn(num_tokens: int, config: MDLConfig) -> nn.Module:
         dropout=config.dropout,
         activation="gelu",
         use_dtsi=config.sparse_moe_use_dtsi,
+        dtsi_infer_weight=config.sparse_moe_dtsi_infer_weight,
         inference_threshold=config.sparse_moe_inference_threshold,
     )
 
@@ -102,6 +111,11 @@ class MDLBlock(nn.Module):
         super().__init__()
         num_feature_tokens = config.num_feature_tokens
         num_scenario_tokens = config.num_scenarios + 1
+        self.use_task_tokens = config.use_task_tokens
+        self.use_scenario_tokens = config.use_scenario_tokens
+        self.use_global_scenario_token = config.use_global_scenario_token
+        self.use_task_feature_interaction = config.use_task_feature_interaction
+        self.use_scenario_feature_interaction = config.use_scenario_feature_interaction
 
         self.feature_interaction = FeatureInteraction(
             num_feature_tokens=num_feature_tokens,
@@ -130,7 +144,7 @@ class MDLBlock(nn.Module):
             num_feature_tokens,
             config.dropout,
         )
-        self.domain_fused = DomainFusedModule()
+        self.domain_fused = DomainFusedModule(include_global=config.use_global_scenario_token)
         self.task_ffn = _build_per_token_ffn(config.num_tasks, config)
 
     def forward(
@@ -148,21 +162,47 @@ class MDLBlock(nn.Module):
         feature_tokens = self.feature_norm_1(feature_tokens + mixed_features)
         feature_tokens = self.feature_norm_2(feature_tokens + self.feature_ffn(feature_tokens))
 
-        scenario_update, scenario_weights = self.scenario_attention(
-            scenario_tokens,
-            feature_tokens,
-            need_weights=need_attention,
-        )
-        scenario_hat = scenario_tokens + scenario_update
-        scenario_tokens = scenario_hat + self.scenario_ffn(scenario_hat)
+        if not self.use_scenario_tokens:
+            scenario_tokens = torch.zeros_like(scenario_tokens)
+        elif not self.use_global_scenario_token:
+            scenario_tokens = scenario_tokens.clone()
+            scenario_tokens[:, -1, :] = 0.0
 
-        task_update, task_weights = self.task_attention(
-            task_tokens,
-            feature_tokens,
-            need_weights=need_attention,
-        )
+        if not self.use_task_tokens:
+            task_tokens = torch.zeros_like(task_tokens)
+
+        if self.use_scenario_feature_interaction:
+            scenario_update, scenario_weights = self.scenario_attention(
+                scenario_tokens,
+                feature_tokens,
+                need_weights=need_attention,
+            )
+        else:
+            scenario_update = torch.zeros_like(scenario_tokens)
+            scenario_weights = None
+        scenario_hat = scenario_tokens + scenario_update
+        if not self.use_global_scenario_token:
+            scenario_hat = scenario_hat.clone()
+            scenario_hat[:, -1, :] = 0.0
+        scenario_tokens = scenario_hat + self.scenario_ffn(scenario_hat)
+        if not self.use_global_scenario_token:
+            scenario_tokens = scenario_tokens.clone()
+            scenario_tokens[:, -1, :] = 0.0
+
+        if self.use_task_feature_interaction:
+            task_update, task_weights = self.task_attention(
+                task_tokens,
+                feature_tokens,
+                need_weights=need_attention,
+            )
+        else:
+            task_update = torch.zeros_like(task_tokens)
+            task_weights = None
         task_hat = task_tokens + task_update
-        task_tokens = self.domain_fused(task_hat, scenario_hat, scenario_mask)
+        if self.use_scenario_tokens or self.use_scenario_feature_interaction:
+            task_tokens = self.domain_fused(task_hat, scenario_hat, scenario_mask)
+        else:
+            task_tokens = task_hat
         task_tokens = task_tokens + self.task_ffn(task_tokens)
 
         attention = {
@@ -320,7 +360,13 @@ class ModelConfig:
     sparse_moe_num_experts: int = 4
     sparse_moe_loss_weight: float = 0.0
     sparse_moe_use_dtsi: bool = True
+    sparse_moe_dtsi_infer_weight: float = 0.5
     sparse_moe_inference_threshold: float = 0.0
+    use_task_tokens: bool = True
+    use_scenario_tokens: bool = True
+    use_global_scenario_token: bool = True
+    use_task_feature_interaction: bool = True
+    use_scenario_feature_interaction: bool = True
     scenario_token_specs: list[dict[str, Any]] | None = None
     scenario_feature_specs: list[dict[str, Any]] | None = None
     task_token_specs: list[dict[str, Any]] | None = None
@@ -337,12 +383,10 @@ class ModelConfig:
             default_projection="linear",
         )
 
-    def scenario_compiler_config(self) -> FeatureCompilerConfig | None:
-        if self.scenario_token_specs is None and self.scenario_feature_specs is None:
-            return None
+    def scenario_compiler_config(self) -> FeatureCompilerConfig:
         if self.scenario_token_specs is None or self.scenario_feature_specs is None:
             raise ValueError(
-                "scenario_features and scenario_token_specs must be declared together"
+                "manifest tokenization must declare scenario_features and scenario_token_specs"
             )
         return FeatureCompilerConfig(
             token_specs=self.scenario_token_specs,
@@ -354,11 +398,11 @@ class ModelConfig:
             default_projection="ffn_relu",
         )
 
-    def task_compiler_config(self) -> FeatureCompilerConfig | None:
-        if self.task_token_specs is None and self.task_feature_specs is None:
-            return None
+    def task_compiler_config(self) -> FeatureCompilerConfig:
         if self.task_token_specs is None or self.task_feature_specs is None:
-            raise ValueError("task_features and task_token_specs must be declared together")
+            raise ValueError(
+                "manifest tokenization must declare task_features and task_token_specs"
+            )
         return FeatureCompilerConfig(
             token_specs=self.task_token_specs,
             feature_specs=self.task_feature_specs,
@@ -368,6 +412,36 @@ class ModelConfig:
             dropout=self.dropout,
             default_projection="ffn_relu",
         )
+
+
+def _required_domain_token_specs(
+    manifest: dict[str, Any],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    scenario_feature_specs = scenario_feature_specs_from_manifest(manifest)
+    scenario_token_specs = scenario_token_specs_from_manifest(manifest)
+    task_feature_specs = task_feature_specs_from_manifest(manifest)
+    task_token_specs = task_token_specs_from_manifest(manifest)
+    missing = []
+    if scenario_feature_specs is None:
+        missing.append("scenario_features")
+    if scenario_token_specs is None:
+        missing.append("scenario_token_specs")
+    if task_feature_specs is None:
+        missing.append("task_features")
+    if task_token_specs is None:
+        missing.append("task_token_specs")
+    if missing:
+        raise ValueError(
+            "manifest tokenization must declare "
+            "scenario_features, scenario_token_specs, task_features, and task_token_specs; "
+            f"missing: {', '.join(missing)}"
+        )
+    return scenario_feature_specs, scenario_token_specs, task_feature_specs, task_token_specs
 
 
 def config_from_manifest(
@@ -383,8 +457,20 @@ def config_from_manifest(
     sparse_moe_num_experts: int = 4,
     sparse_moe_loss_weight: float = 0.0,
     sparse_moe_use_dtsi: bool = True,
+    sparse_moe_dtsi_infer_weight: float = 0.5,
     sparse_moe_inference_threshold: float = 0.0,
+    use_task_tokens: bool = True,
+    use_scenario_tokens: bool = True,
+    use_global_scenario_token: bool = True,
+    use_task_feature_interaction: bool = True,
+    use_scenario_feature_interaction: bool = True,
 ) -> ModelConfig:
+    (
+        scenario_feature_specs,
+        scenario_token_specs,
+        task_feature_specs,
+        task_token_specs,
+    ) = _required_domain_token_specs(manifest)
     return ModelConfig(
         token_specs=token_specs_from_manifest(manifest),
         feature_specs=feature_specs_from_manifest(manifest),
@@ -401,11 +487,17 @@ def config_from_manifest(
         sparse_moe_num_experts=sparse_moe_num_experts,
         sparse_moe_loss_weight=sparse_moe_loss_weight,
         sparse_moe_use_dtsi=sparse_moe_use_dtsi,
+        sparse_moe_dtsi_infer_weight=sparse_moe_dtsi_infer_weight,
         sparse_moe_inference_threshold=sparse_moe_inference_threshold,
-        scenario_token_specs=scenario_token_specs_from_manifest(manifest),
-        scenario_feature_specs=scenario_feature_specs_from_manifest(manifest),
-        task_token_specs=task_token_specs_from_manifest(manifest),
-        task_feature_specs=task_feature_specs_from_manifest(manifest),
+        use_task_tokens=use_task_tokens,
+        use_scenario_tokens=use_scenario_tokens,
+        use_global_scenario_token=use_global_scenario_token,
+        use_task_feature_interaction=use_task_feature_interaction,
+        use_scenario_feature_interaction=use_scenario_feature_interaction,
+        scenario_token_specs=scenario_token_specs,
+        scenario_feature_specs=scenario_feature_specs,
+        task_token_specs=task_token_specs,
+        task_feature_specs=task_feature_specs,
     )
 
 
@@ -416,26 +508,18 @@ class ModelFromManifest(BaseRecommender):
         self.feature_compiler = FeatureTokenCompiler(config.feature_compiler_config())
 
         scenario_compiler_config = config.scenario_compiler_config()
-        if scenario_compiler_config is None:
-            self.scenario_token_compiler = None
-            self.scenario_embedding = nn.Embedding(config.num_scenarios, config.embedding_dim)
-        else:
-            if len(scenario_compiler_config.token_specs) != config.num_scenarios + 1:
-                raise ValueError(
-                    "scenario_token_specs must contain one token per scenario plus one global token"
-                )
-            self.scenario_token_compiler = FeatureTokenCompiler(scenario_compiler_config)
-            self.scenario_embedding = None
+        if len(scenario_compiler_config.token_specs) != config.num_scenarios + 1:
+            raise ValueError(
+                "scenario_token_specs must contain one token per scenario plus one global token"
+            )
+        self.scenario_token_compiler = FeatureTokenCompiler(scenario_compiler_config)
+        self.scenario_embedding = None
 
         task_compiler_config = config.task_compiler_config()
-        if task_compiler_config is None:
-            self.task_token_compiler = None
-            self.task_context = nn.Parameter(torch.zeros(config.embedding_dim))
-        else:
-            if len(task_compiler_config.token_specs) != config.num_tasks:
-                raise ValueError("task_token_specs must contain one token per task")
-            self.task_token_compiler = FeatureTokenCompiler(task_compiler_config)
-            self.register_parameter("task_context", None)
+        if len(task_compiler_config.token_specs) != config.num_tasks:
+            raise ValueError("task_token_specs must contain one token per task")
+        self.task_token_compiler = FeatureTokenCompiler(task_compiler_config)
+        self.register_parameter("task_context", None)
 
         mdl_config = MDLConfig(
             num_feature_tokens=len(config.token_specs),
@@ -452,7 +536,13 @@ class ModelFromManifest(BaseRecommender):
             ffn_type=config.ffn_type,
             sparse_moe_num_experts=config.sparse_moe_num_experts,
             sparse_moe_use_dtsi=config.sparse_moe_use_dtsi,
+            sparse_moe_dtsi_infer_weight=config.sparse_moe_dtsi_infer_weight,
             sparse_moe_inference_threshold=config.sparse_moe_inference_threshold,
+            use_task_tokens=config.use_task_tokens,
+            use_scenario_tokens=config.use_scenario_tokens,
+            use_global_scenario_token=config.use_global_scenario_token,
+            use_task_feature_interaction=config.use_task_feature_interaction,
+            use_scenario_feature_interaction=config.use_scenario_feature_interaction,
         )
         self.mdl = MDLModel(mdl_config)
 
@@ -465,17 +555,13 @@ class ModelFromManifest(BaseRecommender):
     def compile_scenario_tokens(
         self,
         features: dict[str, Tensor | dict[str, Tensor]],
-    ) -> Tensor | None:
-        if self.scenario_token_compiler is None:
-            return None
+    ) -> Tensor:
         return self.scenario_token_compiler(features)
 
     def compile_task_tokens(
         self,
         features: dict[str, Tensor | dict[str, Tensor]],
-    ) -> Tensor | None:
-        if self.task_token_compiler is None:
-            return None
+    ) -> Tensor:
         return self.task_token_compiler(features)
 
     def _scenario_mask(self, scenario_id: Tensor) -> Tensor:
@@ -501,20 +587,6 @@ class ModelFromManifest(BaseRecommender):
         mask.scatter_(1, scenario_indices, 1.0)
         return mask
 
-    def _scenario_context(self, scenario_id: Tensor, scenario_mask: Tensor) -> Tensor:
-        if self.scenario_embedding is None:
-            raise RuntimeError("scenario embedding is not initialized")
-        if scenario_id.ndim == 1:
-            return self.scenario_embedding(scenario_id.to(dtype=torch.long))
-        weights = scenario_mask.to(device=self.scenario_embedding.weight.device)
-        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1.0)
-        return weights @ self.scenario_embedding.weight
-
-    def _task_context(self, batch_size: int, device: torch.device) -> Tensor:
-        if self.task_context is None:
-            raise RuntimeError("task context is not initialized")
-        return self.task_context.view(1, -1).expand(batch_size, -1).to(device=device)
-
     def forward(
         self,
         features: dict[str, Tensor | dict[str, Tensor]],
@@ -526,18 +598,8 @@ class ModelFromManifest(BaseRecommender):
         scenario_tokens = self.compile_scenario_tokens(features)
         task_tokens = self.compile_task_tokens(features)
 
-        scenario_context = None
-        if scenario_tokens is None:
-            scenario_context = self._scenario_context(scenario_id, scenario_mask)
-
-        task_context = None
-        if task_tokens is None:
-            task_context = self._task_context(scenario_mask.size(0), scenario_mask.device)
-
         return self.mdl(
             feature_tokens,
-            scenario_context=scenario_context,
-            task_context=task_context,
             scenario_mask=scenario_mask,
             return_attention=return_attention,
             scenario_tokens=scenario_tokens,
@@ -550,20 +612,9 @@ class ModelFromManifest(BaseRecommender):
         scenario_id: Tensor,
         return_attention: bool = False,
     ) -> dict[str, Tensor | list[dict[str, Tensor | None]]]:
-        if self.scenario_token_compiler is not None or self.task_token_compiler is not None:
-            raise ValueError(
-                "forward_tokens is only available when scenario/task tokens use fallback contexts; "
-                "call forward(features, scenario_id) for manifest-driven tokenization"
-            )
-        scenario_mask = self._scenario_mask(scenario_id)
-        scenario_context = self._scenario_context(scenario_id, scenario_mask)
-        task_context = self._task_context(scenario_mask.size(0), scenario_mask.device)
-        return self.mdl(
-            feature_tokens,
-            scenario_context=scenario_context,
-            task_context=task_context,
-            scenario_mask=scenario_mask,
-            return_attention=return_attention,
+        raise ValueError(
+            "forward_tokens is unavailable for ModelFromManifest because manifest-driven "
+            "scenario/task tokenization is required; call forward(features, scenario_id)"
         )
 
 

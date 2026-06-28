@@ -78,6 +78,7 @@ The manifest declares scenario columns, group columns, labels, label masks, feat
   "data_columns": {
     "scenario_id": "scene",
     "group_id": "query",
+    "sample_weight": "sample_weight",
     "labels": {"click": "click_label"},
     "label_masks": {"click": "click_mask"}
   },
@@ -108,7 +109,7 @@ The manifest declares scenario columns, group columns, labels, label masks, feat
 }
 ```
 
-Built-in encoders are `embedding`, `identity`, multi-field `sequence_mean_pooling`, and multi-field target-aware `din`. For the full MDL paper path, declare `scenario_features/scenario_token_specs` and `task_features/task_token_specs`; otherwise the model uses a compatibility fallback for domain/task tokens. Single-scenario CSVs use `data_columns.scenario_id`; overlapping scenarios can use `data_columns.scenario_ids` with `scenario_ids_delimiter` such as `|`.
+Built-in encoders are `embedding`, `identity`, multi-field `sequence_mean_pooling`, multi-field target-aware `din`, and long-sequence target-aware `sim`/`longer`. MDL manifests must declare `scenario_features/scenario_token_specs` and `task_features/task_token_specs`; model construction raises an error if any of these fields is missing. Single-scenario CSVs use `data_columns.scenario_id`; overlapping scenarios can use `data_columns.scenario_ids` with `scenario_ids_delimiter` such as `|`. If `data_columns.sample_weight` is declared, training and evaluation loss use it together with optional task/scenario weights.
 
 ## Commands
 
@@ -124,6 +125,8 @@ Validate a processed manifest dataset:
 python scripts/preprocess.py --data-dir processed_dataset
 ```
 
+Use `--max-rows N` to validate only the first `N` rows per split during fast adapter iteration.
+
 Train MDL:
 
 ```bash
@@ -132,7 +135,9 @@ python scripts/train.py \
   --epochs 1 \
   --batch-size 256 \
   --max-steps 10 \
-  --eval-max-batches 10
+  --eval-max-batches 10 \
+  --task-weights 1.0 \
+  --scenario-weights 1.0
 ```
 
 Enable RankMixer-style Sparse-MoE per-token FFNs:
@@ -142,10 +147,12 @@ python scripts/train.py \
   --data-dir processed_dataset \
   --ffn-type sparse_moe \
   --sparse-moe-num-experts 4 \
-  --sparse-moe-loss-weight 1e-4
+  --sparse-moe-loss-weight 1e-4 \
+  --sparse-moe-target-active-ratio 0.25 \
+  --sparse-moe-dtsi-infer-weight 0.5
 ```
 
-Sparse-MoE uses ReLU routing, DTSI training by default, L1 regularization on the inference router, and sparse expert execution during `eval()`/prediction. Use `--disable-sparse-moe-dtsi` only for ablation.
+Sparse-MoE uses ReLU routing, DTSI training by default, L1 regularization on the inference router, adaptive loss-weight control when `--sparse-moe-target-active-ratio` is set, configurable train/infer-router mixing via `--sparse-moe-dtsi-infer-weight`, and sparse expert execution during `eval()`/prediction. Training uses RMSProp for dense parameters and Adagrad for embedding-table parameters; override the embedding optimizer learning rate with `--sparse-lr`. Use `--disable-sparse-moe-dtsi` and the `--disable-*-tokens` / `--disable-*-feature-interaction` flags only for ablation.
 
 Evaluate:
 

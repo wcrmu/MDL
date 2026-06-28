@@ -39,6 +39,19 @@ def test_trainer_sparse_moe_single_step(tmp_path: Path) -> None:
                 {"token_id": 0, "projection": "linear", "inputs": ["user_id"]},
                 {"token_id": 1, "projection": "linear", "inputs": ["score"]},
             ],
+            "scenario_features": [
+                {"name": "user_id", "encoder": "embedding", "vocab_size": 10},
+            ],
+            "scenario_token_specs": [
+                {"token_id": 0, "inputs": ["user_id"]},
+                {"token_id": 1, "inputs": ["user_id"]},
+            ],
+            "task_features": [
+                {"name": "score", "encoder": "identity", "dim": 1},
+            ],
+            "task_token_specs": [
+                {"token_id": 0, "inputs": ["score"]},
+            ],
         },
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -68,6 +81,15 @@ def test_trainer_sparse_moe_single_step(tmp_path: Path) -> None:
             ffn_type="sparse_moe",
             sparse_moe_num_experts=2,
             sparse_moe_loss_weight=0.01,
+            sparse_moe_target_active_ratio=0.99,
+            sparse_moe_loss_weight_update_rate=0.5,
         )
     )
+    assert trainer.dense_optimizer is not None
+    assert trainer.dense_optimizer.__class__.__name__ == "RMSprop"
+    assert trainer.sparse_optimizer is not None
+    assert trainer.sparse_optimizer.__class__.__name__ == "Adagrad"
+
     trainer.train()
+
+    assert trainer.sparse_moe_loss_weight != 0.01
