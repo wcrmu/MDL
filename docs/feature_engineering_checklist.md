@@ -216,13 +216,13 @@ Task/scenario 权重：
 feature pipeline 产物必须通过：
 
 ```bash
-python scripts/preprocess.py --data-dir <feature-pipeline-root>/processed
+python scripts/preprocess.py --data-dir data/processed/<dataset_name>
 ```
 
 快速迭代时可以先扫部分行：
 
 ```bash
-python scripts/preprocess.py --data-dir <feature-pipeline-root>/processed --max-rows 1000
+python scripts/preprocess.py --data-dir data/processed/<dataset_name> --max-rows 1000
 ```
 
 校验覆盖：
@@ -242,7 +242,7 @@ feature pipeline 完成后，必须从 MDL 仓库根目录跑：
 
 ```bash
 python scripts/train.py \
-  --data-dir <feature-pipeline-root>/processed \
+  --data-dir data/processed/<dataset_name> \
   --epochs 1 \
   --batch-size 32 \
   --max-steps 2 \
@@ -253,7 +253,7 @@ python scripts/train.py \
 
 ```bash
 python scripts/train.py \
-  --data-dir <feature-pipeline-root>/processed \
+  --data-dir data/processed/<dataset_name> \
   --epochs 1 \
   --batch-size 32 \
   --max-steps 2 \

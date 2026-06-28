@@ -2,13 +2,13 @@
 
   背景：
   MDL 项目已经不再使用 adapter 这个命名。统一术语是 feature pipeline。
-  目录建议从 MDL_adapters/<dataset_name> 迁移到 MDL_feature_pipelines/<dataset_name>。
+  目录建议从外部 MDL_feature_pipelines/<dataset_name> 迁移到 MDL/data/pipelines/<dataset_name>。
   文档、README、脚本说明、报告文件名和变量名也要同步改名。
 
   路径：
   - MDL 仓库根目录：<project-root>
   - 当前 adapter 根目录：<old-adapter-root>
-  - 新 feature pipeline 根目录：<new-feature-pipeline-root>
+  - 新 feature pipeline 根目录：<project-root>/data/pipelines/<dataset-name>
   - 数据集名称：<dataset-name>
 
   硬性边界：
@@ -21,8 +21,8 @@
   改名规则：
   - adapter -> feature pipeline
   - Adapter -> Feature Pipeline
-  - MDL_adapters -> MDL_feature_pipelines
-  - <adapter-root> -> <feature-pipeline-root>
+  - MDL_adapters 或 MDL_feature_pipelines -> data/pipelines
+  - <adapter-root> 或 <feature-pipeline-root> -> <project-root>/data/pipelines/<dataset-name>
   - adapter_design.md -> feature_pipeline_design.md
   - adapter validation -> feature pipeline validation
   - adapter CLI -> feature pipeline CLI
@@ -32,12 +32,13 @@
 
   执行步骤：
   1. 检查 <old-adapter-root> 的 git 状态和文件结构。
-  2. 如果目录仍在 MDL_adapters 下，把整个目录迁移到 MDL_feature_pipelines 下。
+  2. 如果目录仍在 MDL_adapters 或 MDL_feature_pipelines 下，把整个目录迁移到 <project-root>/data/pipelines/<dataset-name> 下。
   3. 全局搜索以下旧词并替换：
      - adapter
      - Adapter
      - ADAPTER
      - MDL_adapters
+     - MDL_feature_pipelines
      - adapter-root
      - adapter_design
      - adapter_development
@@ -48,11 +49,11 @@
   6. 保持 Python 包名、模块名、函数名稳定，除非它们明显包含 adapter 且改名不会破坏 import。
   7. 不要改 manifest.json 的协议字段。
   8. 跑检查：
-     - rg -n "adapter|Adapter|ADAPTER|MDL_adapters|adapter-root|adapter_design|adapter_development|adapter_agent" <new-feature-pipeline-root>
+     - rg -n "adapter|Adapter|ADAPTER|MDL_adapters|MDL_feature_pipelines|adapter-root|adapter_design|adapter_development|adapter_agent" <project-root>/data/pipelines/<dataset-name>
      - python scripts/preprocess.py --help
      - 如果存在 adapter/feature pipeline 自测：pytest tests 或 python -m pytest tests
      - 从 <project-root> 运行：
-       python scripts/preprocess.py --data-dir <new-feature-pipeline-root>/processed --max-rows 1000
+       python scripts/preprocess.py --data-dir data/processed/<dataset-name> --max-rows 1000
   9. 输出改名报告，包含：
      - 迁移了哪些目录
      - 重命名了哪些文件
