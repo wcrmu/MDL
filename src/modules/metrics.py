@@ -1,15 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
-from dataclasses import dataclass
-from typing import Iterable, Sequence
-
-
-@dataclass(frozen=True)
-class QAUCResult:
-    qauc: float
-    valid_groups: int
-    skipped_groups: int
+from typing import Sequence
 
 
 def binary_auc(labels: Sequence[float], scores: Sequence[float]) -> float | None:
@@ -34,30 +25,3 @@ def binary_auc(labels: Sequence[float], scores: Sequence[float]) -> float | None
         index = tie_end
 
     return (rank_sum - positives * (positives + 1) / 2.0) / (positives * negatives)
-
-
-def qauc(
-    labels: Sequence[float],
-    scores: Sequence[float],
-    query_ids: Iterable[object],
-) -> QAUCResult:
-    groups: dict[object, list[tuple[float, float]]] = defaultdict(list)
-    for label, score, query_id in zip(labels, scores, query_ids):
-        groups[query_id].append((float(label), float(score)))
-
-    aucs: list[float] = []
-    skipped = 0
-    for rows in groups.values():
-        group_labels = [label for label, _ in rows]
-        group_scores = [score for _, score in rows]
-        auc = binary_auc(group_labels, group_scores)
-        if auc is None:
-            skipped += 1
-        else:
-            aucs.append(auc)
-
-    return QAUCResult(
-        qauc=sum(aucs) / len(aucs) if aucs else float("nan"),
-        valid_groups=len(aucs),
-        skipped_groups=skipped,
-    )

@@ -9,16 +9,14 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
 from src.datasets import ManifestDataset, collate_manifest_batch
-from src.modules import binary_auc, multitask_bce_loss, qauc
+from src.modules import binary_auc, multitask_bce_loss
+from src.utils.formatting import format_table
 
 
 @dataclass(frozen=True)
 class TaskMetric:
     task_name: str
     auc: float | None
-    qauc: float
-    valid_groups: int
-    skipped_groups: int
 
 
 @dataclass(frozen=True)
@@ -26,9 +24,6 @@ class ScenarioTaskMetric:
     scenario_name: str
     task_name: str
     auc: float | None
-    qauc: float
-    valid_groups: int
-    skipped_groups: int
 
 
 @dataclass(frozen=True)
@@ -39,25 +34,49 @@ class EvaluationResult:
     scenario_task_metrics: list[ScenarioTaskMetric]
 
     def format_lines(self) -> list[str]:
-        loss_text = f"{self.loss:.6f}" if not math.isnan(self.loss) else "nan"
-        lines = [f"{self.split}_loss={loss_text}"]
-        for metric in self.task_metrics:
-            auc_text = f"{metric.auc:.6f}" if metric.auc is not None else "nan"
-            qauc_text = f"{metric.qauc:.6f}" if not math.isnan(metric.qauc) else "nan"
-            lines.append(
-                f"{self.split}_{metric.task_name}_auc={auc_text} "
-                f"{self.split}_{metric.task_name}_qauc={qauc_text} "
-                f"valid_groups={metric.valid_groups}"
+        loss_text = _format_float(self.loss)
+        lines = [f"Evaluation: {self.split}", f"loss: {loss_text}"]
+        if self.task_metrics:
+            lines.extend(
+                [
+                    "",
+                    "Task metrics",
+                    *format_table(
+                        ["task", "auc"],
+                        [
+                            [metric.task_name, _format_optional_float(metric.auc)]
+                            for metric in self.task_metrics
+                        ],
+                    ),
+                ]
             )
-        for metric in self.scenario_task_metrics:
-            auc_text = f"{metric.auc:.6f}" if metric.auc is not None else "nan"
-            qauc_text = f"{metric.qauc:.6f}" if not math.isnan(metric.qauc) else "nan"
-            lines.append(
-                f"{self.split}_{metric.scenario_name}_{metric.task_name}_auc={auc_text} "
-                f"{self.split}_{metric.scenario_name}_{metric.task_name}_qauc={qauc_text} "
-                f"valid_groups={metric.valid_groups}"
+        if self.scenario_task_metrics:
+            lines.extend(
+                [
+                    "",
+                    "Scenario-task metrics",
+                    *format_table(
+                        ["scenario", "task", "auc"],
+                        [
+                            [
+                                metric.scenario_name,
+                                metric.task_name,
+                                _format_optional_float(metric.auc),
+                            ]
+                            for metric in self.scenario_task_metrics
+                        ],
+                    ),
+                ]
             )
         return lines
+
+
+def _format_float(value: float) -> str:
+    return f"{value:.6f}" if not math.isnan(value) else "nan"
+
+
+def _format_optional_float(value: float | None) -> str:
+    return f"{value:.6f}" if value is not None else "nan"
 
 
 def move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -141,6 +160,7 @@ def evaluate_model(
     max_batches: int | None = 100,
     task_weights: Tensor | None = None,
     scenario_weights: Tensor | None = None,
+    positive_class_weights: Tensor | None = None,
 ) -> EvaluationResult:
     dataset = ManifestDataset(data_dir, split)
     loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_manifest_batch)
@@ -148,10 +168,8 @@ def evaluate_model(
     scenario_names = manifest["scenario_names"]
     labels_by_task = [[] for _ in task_names]
     scores_by_task = [[] for _ in task_names]
-    groups_by_task = [[] for _ in task_names]
     labels_by_scenario_task = [[[] for _ in task_names] for _ in scenario_names]
     scores_by_scenario_task = [[[] for _ in task_names] for _ in scenario_names]
-    groups_by_scenario_task = [[[] for _ in task_names] for _ in scenario_names]
     losses: list[float] = []
 
     model.eval()
@@ -171,6 +189,7 @@ def evaluate_model(
                 batch["label_mask"],
                 task_weights=task_weights,
                 sample_weights=sample_weights,
+                positive_class_weights=positive_class_weights,
             ).item()
         )
         probabilities = torch.sigmoid(logits).cpu()
@@ -181,9 +200,6 @@ def evaluate_model(
             valid = masks[:, task_index] > 0
             labels_by_task[task_index].extend(labels[valid, task_index].tolist())
             scores_by_task[task_index].extend(probabilities[valid, task_index].tolist())
-            groups_by_task[task_index].extend(
-                group for group, keep in zip(batch["group_id"], valid.tolist()) if keep
-            )
             for scenario_index, _scenario_name in enumerate(scenario_names):
                 scenario_valid = valid & (memberships[:, scenario_index] > 0)
                 labels_by_scenario_task[scenario_index][task_index].extend(
@@ -192,9 +208,6 @@ def evaluate_model(
                 scores_by_scenario_task[scenario_index][task_index].extend(
                     probabilities[scenario_valid, task_index].tolist()
                 )
-                groups_by_scenario_task[scenario_index][task_index].extend(
-                    group for group, keep in zip(batch["group_id"], scenario_valid.tolist()) if keep
-                )
 
     task_metrics = []
     for task_index, task_name in enumerate(task_names):
@@ -202,17 +215,7 @@ def evaluate_model(
         scores = scores_by_task[task_index]
         if not labels:
             continue
-        auc = binary_auc(labels, scores)
-        qauc_result = qauc(labels, scores, groups_by_task[task_index])
-        task_metrics.append(
-            TaskMetric(
-                task_name=task_name,
-                auc=auc,
-                qauc=qauc_result.qauc,
-                valid_groups=qauc_result.valid_groups,
-                skipped_groups=qauc_result.skipped_groups,
-            )
-        )
+        task_metrics.append(TaskMetric(task_name=task_name, auc=binary_auc(labels, scores)))
 
     scenario_task_metrics = []
     for scenario_index, scenario_name in enumerate(scenario_names):
@@ -221,16 +224,11 @@ def evaluate_model(
             scores = scores_by_scenario_task[scenario_index][task_index]
             if not labels:
                 continue
-            auc = binary_auc(labels, scores)
-            qauc_result = qauc(labels, scores, groups_by_scenario_task[scenario_index][task_index])
             scenario_task_metrics.append(
                 ScenarioTaskMetric(
                     scenario_name=scenario_name,
                     task_name=task_name,
-                    auc=auc,
-                    qauc=qauc_result.qauc,
-                    valid_groups=qauc_result.valid_groups,
-                    skipped_groups=qauc_result.skipped_groups,
+                    auc=binary_auc(labels, scores),
                 )
             )
 

@@ -192,6 +192,7 @@ class ManifestDataset(IterableDataset[dict[str, Any]]):
         label_columns = data_columns["labels"]
         label_mask_columns = data_columns["label_masks"]
         sample_weight_column = data_columns.get("sample_weight")
+        group_id_column = data_columns.get("group_id")
 
         with self.path.open("r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -212,7 +213,7 @@ class ManifestDataset(IterableDataset[dict[str, Any]]):
                     "labels": [float(row[label_columns[name]]) for name in task_names],
                     "label_mask": [float(row[label_mask_columns[name]]) for name in task_names],
                     "sample_weight": float(row[sample_weight_column]) if sample_weight_column else 1.0,
-                    "group_id": row[data_columns["group_id"]],
+                    "group_id": row[group_id_column] if group_id_column is not None else "",
                 }
 
 

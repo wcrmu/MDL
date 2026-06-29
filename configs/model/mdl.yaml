@@ -5,6 +5,9 @@ feature_backbone: rankmixer
 num_layers: 2
 num_heads: 4
 ffn_hidden_dim: 64
+task_head_type: linear
+task_head_hidden_dim: 64
+task_head_dropout: 0.0
 dropout: 0.0
 ffn_type: dense
 sparse_moe_num_experts: 4

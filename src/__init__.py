@@ -8,7 +8,7 @@ from .models import (
     build_model_config_from_manifest,
     build_model_from_config,
 )
-from .modules import FeatureCompilerConfig, FeatureTokenCompiler, binary_auc, qauc
+from .modules import FeatureCompilerConfig, FeatureTokenCompiler, binary_auc
 
 __all__ = [
     "FeatureCompilerConfig",
@@ -22,5 +22,4 @@ __all__ = [
     "binary_auc",
     "build_model_config_from_manifest",
     "build_model_from_config",
-    "qauc",
 ]

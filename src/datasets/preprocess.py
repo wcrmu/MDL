@@ -120,8 +120,6 @@ def validate_manifest(
         raise ValueError("data_columns must declare scenario_id or scenario_ids")
     if "scenario_id" in data_columns and "scenario_ids" in data_columns:
         raise ValueError("data_columns must not declare both scenario_id and scenario_ids")
-    if "group_id" not in data_columns:
-        raise ValueError("data_columns must declare group_id")
     if "sample_weight" in data_columns and not isinstance(data_columns["sample_weight"], str):
         raise ValueError("data_columns.sample_weight must be a csv column name")
     labels = data_columns.get("labels")
@@ -180,7 +178,9 @@ def validate_manifest(
 def _required_csv_columns(manifest: Mapping[str, Any]) -> set[str]:
     data_columns = manifest["data_columns"]
     task_names = manifest["task_names"]
-    columns = {str(data_columns.get("group_id"))}
+    columns = set()
+    if "group_id" in data_columns:
+        columns.add(str(data_columns["group_id"]))
     if "sample_weight" in data_columns:
         columns.add(str(data_columns["sample_weight"]))
     scenario_column = data_columns.get("scenario_ids", data_columns.get("scenario_id"))

@@ -156,6 +156,135 @@ def test_mdl_forward_shapes() -> None:
     assert output["logits"].shape == (5, 2)
 
 
+def test_mdl_block_uses_paper_style_feature_and_domain_attention() -> None:
+    config = MDLConfig(
+        num_feature_tokens=4,
+        scenario_context_dim=8,
+        task_context_dim=6,
+        num_scenarios=3,
+        num_tasks=2,
+        token_dim=16,
+        num_layers=1,
+        num_heads=4,
+        ffn_hidden_dim=32,
+    )
+    model = MDLModel(config)
+    block = model.blocks[0]
+
+    assert hasattr(block, "feature_norm")
+    assert not hasattr(block, "feature_norm_1")
+    assert not hasattr(block, "feature_norm_2")
+    assert block.scenario_attention.query_projection.__class__.__name__ == "PerTokenFFN"
+    assert block.scenario_attention.key_projection.__class__.__name__ == "PerTokenFFN"
+    assert block.scenario_attention.value_projection.__class__.__name__ == "PerTokenFFN"
+    assert not hasattr(block.scenario_attention, "output_projection")
+    assert block.task_attention.query_projection.__class__.__name__ == "PerTokenFFN"
+
+    output = model(
+        feature_tokens=torch.randn(5, 4, 16),
+        scenario_context=torch.randn(5, 8),
+        task_context=torch.randn(5, 6),
+        scenario_mask=torch.tensor(
+            [
+                [1, 0, 0],
+                [0, 1, 0],
+                [0, 0, 1],
+                [1, 0, 0],
+                [0, 1, 0],
+            ],
+            dtype=torch.float32,
+        ),
+        return_attention=True,
+    )
+    assert output["logits"].shape == (5, 2)
+    assert output["attentions"][0]["scenario_feature"].shape == (5, 4, 4, 4)
+    assert output["attentions"][0]["task_feature"].shape == (5, 4, 2, 4)
+
+
+def test_mdl_mlp_task_head_forward_shapes() -> None:
+    config = MDLConfig(
+        num_feature_tokens=4,
+        scenario_context_dim=8,
+        task_context_dim=6,
+        num_scenarios=3,
+        num_tasks=2,
+        token_dim=16,
+        num_layers=1,
+        num_heads=4,
+        ffn_hidden_dim=32,
+        task_head_type="mlp",
+        task_head_hidden_dim=12,
+        task_head_dropout=0.1,
+    )
+    model = MDLModel(config)
+
+    assert len(model.logit_layers) == 2
+    for head in model.logit_layers:
+        assert isinstance(head, torch.nn.Sequential)
+        assert isinstance(head[0], torch.nn.Linear)
+        assert head[0].in_features == 16
+        assert head[0].out_features == 12
+        assert isinstance(head[1], torch.nn.GELU)
+        assert isinstance(head[2], torch.nn.Dropout)
+        assert head[2].p == 0.1
+        assert isinstance(head[3], torch.nn.Linear)
+        assert head[3].out_features == 1
+
+    output = model(
+        feature_tokens=torch.randn(5, 4, 16),
+        scenario_context=torch.randn(5, 8),
+        task_context=torch.randn(5, 6),
+        scenario_mask=torch.tensor(
+            [
+                [1, 0, 0],
+                [0, 1, 0],
+                [0, 0, 1],
+                [1, 0, 0],
+                [0, 1, 0],
+            ],
+            dtype=torch.float32,
+        ),
+    )
+    assert output["logits"].shape == (5, 2)
+
+
+def test_mdl_config_from_manifest_uses_mlp_task_head() -> None:
+    manifest = {
+        "scenario_names": ["default"],
+        "task_names": ["click", "like"],
+        "tokenization": {
+            "version": 2,
+            "kind": "encoder_registry",
+            "features": [
+                {"name": "user_id", "encoder": "embedding", "vocab_size": 10},
+                {"name": "score", "encoder": "identity", "dim": 1},
+            ],
+            "token_specs": [
+                {"token_id": 0, "projection": "linear", "inputs": ["user_id"]},
+                {"token_id": 1, "projection": "linear", "inputs": ["score"]},
+            ],
+        },
+    }
+    manifest = _with_required_domain_tokens(manifest, task_input="score")
+    config = build_model_config_from_manifest(
+        manifest,
+        model_name="mdl",
+        embedding_dim=8,
+        token_dim=16,
+        num_layers=1,
+        num_heads=4,
+        ffn_hidden_dim=32,
+        task_head_type="mlp",
+        task_head_hidden_dim=12,
+        task_head_dropout=0.1,
+    )
+    assert config.task_head_type == "mlp"
+
+    model = build_model_from_config(config)
+    assert isinstance(model, ModelFromManifest)
+    assert all(isinstance(head, torch.nn.Sequential) for head in model.mdl.logit_layers)
+
+
 def test_mdl_forward_with_ablation_switches() -> None:
     config = MDLConfig(
         num_feature_tokens=4,

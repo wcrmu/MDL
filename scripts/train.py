@@ -31,9 +31,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-name", choices=["mdl", "rankmixer"], default="mdl")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--sparse-lr", type=float, default=None)
+    parser.add_argument("--lr-scheduler", choices=["none", "linear", "cosine"], default="none")
+    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.0)
+    parser.add_argument("--dense-weight-decay", type=float, default=0.0)
     parser.add_argument("--gradient-clip-norm", type=float, default=None)
     parser.add_argument("--task-weights", type=_parse_float_list, default=None)
     parser.add_argument("--scenario-weights", type=_parse_float_list, default=None)
+    parser.add_argument("--positive-class-weights", type=_parse_float_list, default=None)
+    parser.add_argument("--auto-positive-class-weights", action="store_true")
     parser.add_argument("--disable-data-validation", dest="validate_data", action="store_false")
     parser.add_argument("--validation-max-rows", type=int, default=1000)
     parser.add_argument("--embedding-dim", type=int, default=32)
@@ -43,6 +49,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--ffn-hidden-dim", type=int, default=64)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--task-head-type", choices=["linear", "mlp"], default="linear")
     parser.add_argument("--task-head-hidden-dim", type=int, default=64)
     parser.add_argument("--task-head-dropout", type=float, default=0.0)
     parser.add_argument("--ffn-type", choices=["dense", "sparse_moe"], default="dense")
@@ -95,9 +102,15 @@ def main() -> None:
             model_name=args.model_name,
             lr=args.lr,
             sparse_lr=args.sparse_lr,
+            lr_scheduler=args.lr_scheduler,
+            warmup_steps=args.warmup_steps,
+            min_lr_ratio=args.min_lr_ratio,
+            dense_weight_decay=args.dense_weight_decay,
             gradient_clip_norm=args.gradient_clip_norm,
             task_weights=args.task_weights,
             scenario_weights=args.scenario_weights,
+            positive_class_weights=args.positive_class_weights,
+            auto_positive_class_weights=args.auto_positive_class_weights,
             validate_data=args.validate_data,
             validation_max_rows=args.validation_max_rows,
             embedding_dim=args.embedding_dim,
@@ -107,6 +120,7 @@ def main() -> None:
             num_heads=args.num_heads,
             ffn_hidden_dim=args.ffn_hidden_dim,
             dropout=args.dropout,
+            task_head_type=args.task_head_type,
             task_head_hidden_dim=args.task_head_hidden_dim,
             task_head_dropout=args.task_head_dropout,
             ffn_type=args.ffn_type,

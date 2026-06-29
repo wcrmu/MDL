@@ -5,7 +5,7 @@ import math
 import torch
 from torch import Tensor, nn
 
-from .mlp import PerTokenLinear
+from .mlp import PerTokenFFN
 
 
 class RankMixerTokenMixing(nn.Module):
@@ -80,20 +80,40 @@ class DomainAwareAttention(nn.Module):
         num_heads: int,
         num_domain_tokens: int,
         num_feature_tokens: int,
+        hidden_dim: int,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if token_dim % num_heads != 0:
             raise ValueError("token_dim must be divisible by num_heads")
+        if hidden_dim <= 0:
+            raise ValueError("hidden_dim must be positive")
         self.token_dim = token_dim
         self.num_heads = num_heads
         self.num_domain_tokens = num_domain_tokens
         self.num_feature_tokens = num_feature_tokens
         self.head_dim = token_dim // num_heads
-        self.query_projection = PerTokenLinear(num_domain_tokens, token_dim, token_dim)
-        self.key_projection = PerTokenLinear(num_feature_tokens, token_dim, token_dim)
-        self.value_projection = PerTokenLinear(num_feature_tokens, token_dim, token_dim)
-        self.output_projection = PerTokenLinear(num_domain_tokens, token_dim, token_dim)
+        self.query_projection = PerTokenFFN(
+            num_domain_tokens,
+            token_dim,
+            hidden_dim,
+            dropout=dropout,
+            activation="relu",
+        )
+        self.key_projection = PerTokenFFN(
+            num_feature_tokens,
+            token_dim,
+            hidden_dim,
+            dropout=dropout,
+            activation="relu",
+        )
+        self.value_projection = PerTokenFFN(
+            num_feature_tokens,
+            token_dim,
+            hidden_dim,
+            dropout=dropout,
+            activation="relu",
+        )
         self.dropout = nn.Dropout(dropout)
 
     def _split_heads(self, tokens: Tensor) -> Tensor:
@@ -126,8 +146,7 @@ class DomainAwareAttention(nn.Module):
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
         weights = torch.softmax(scores, dim=-1)
         attended = torch.matmul(self.dropout(weights), value)
-        output = self.output_projection(self._merge_heads(attended))
-        return output, weights if need_weights else None
+        return self._merge_heads(attended), weights if need_weights else None
 
 
 class DomainFusedModule(nn.Module):

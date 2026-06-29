@@ -14,6 +14,7 @@ model:
   num_layers: 2
   num_heads: 4
   ffn_hidden_dim: 64
+  task_head_type: linear
   task_head_hidden_dim: 64
   task_head_dropout: 0.0
   dropout: 0.0
@@ -34,9 +35,15 @@ training:
   batch_size: 2048
   lr: 0.001
   sparse_lr: null
+  lr_scheduler: none
+  warmup_steps: 0
+  min_lr_ratio: 0.0
+  dense_weight_decay: 0.0
   gradient_clip_norm: null
   task_weights: null
   scenario_weights: null
+  positive_class_weights: null
+  auto_positive_class_weights: false
   validate_data: true
   validation_max_rows: 1000
   sparse_moe_target_active_ratio: null

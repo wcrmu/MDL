@@ -119,6 +119,20 @@ def test_training_config_rejects_invalid_gradient_clip_norm() -> None:
     with pytest.raises(ValueError, match="gradient_clip_norm must be positive"):
         TrainingConfig(data_dir="unused", gradient_clip_norm=0.0)
 
+
+def test_training_config_rejects_invalid_learning_strategy_options() -> None:
+    with pytest.raises(ValueError, match="warmup_steps requires lr_scheduler"):
+        TrainingConfig(data_dir="unused", lr_scheduler="none", warmup_steps=1)
+    with pytest.raises(ValueError, match="dense_weight_decay must be non-negative"):
+        TrainingConfig(data_dir="unused", dense_weight_decay=-0.1)
+    with pytest.raises(ValueError, match="must not both be set"):
+        TrainingConfig(
+            data_dir="unused",
+            positive_class_weights=[1.0],
+            auto_positive_class_weights=True,
+        )
+
+
 def test_trainer_rankmixer_feature_only_single_step_and_checkpoint(tmp_path: Path) -> None:
     manifest = {
         "splits": ["train"],
@@ -190,3 +204,89 @@ def test_trainer_rankmixer_feature_only_single_step_and_checkpoint(tmp_path: Pat
     assert isinstance(checkpoint["model_config"], RankMixerConfig)
     model = build_model_from_config(checkpoint["model_config"])
     model.load_state_dict(checkpoint["model_state_dict"])
+
+
+def test_trainer_scheduler_weight_decay_positive_weights_and_overview(tmp_path: Path) -> None:
+    manifest = {
+        "splits": ["train"],
+        "scenario_names": ["default"],
+        "task_names": ["click"],
+        "data_columns": {
+            "scenario_id": "scenario_id",
+            "labels": {"click": "click"},
+            "label_masks": {"click": "click_mask"},
+        },
+        "tokenization": {
+            "version": 2,
+            "kind": "encoder_registry",
+            "features": [
+                {
+                    "name": "user_id",
+                    "encoder": "embedding",
+                    "vocab_size": 10,
+                    "source": {"type": "csv_column", "column": "user_id", "dtype": "int64"},
+                },
+                {
+                    "name": "score",
+                    "encoder": "identity",
+                    "dim": 1,
+                    "source": {"type": "csv_column", "column": "score", "dtype": "float32"},
+                },
+            ],
+            "token_specs": [
+                {"token_id": 0, "projection": "linear", "inputs": ["user_id"]},
+                {"token_id": 1, "projection": "linear", "inputs": ["score"]},
+            ],
+        },
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with (tmp_path / "train.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["scenario_id", "click", "click_mask", "user_id", "score"],
+        )
+        writer.writeheader()
+        for index, click in enumerate([1, 0, 0, 0], start=1):
+            writer.writerow(
+                {
+                    "scenario_id": 0,
+                    "click": click,
+                    "click_mask": 1,
+                    "user_id": index,
+                    "score": 0.1 * index,
+                }
+            )
+
+    trainer = Trainer(
+        TrainingConfig(
+            data_dir=str(tmp_path),
+            model_name="rankmixer",
+            batch_size=1,
+            max_steps=3,
+            lr=1e-3,
+            lr_scheduler="linear",
+            warmup_steps=1,
+            min_lr_ratio=0.1,
+            dense_weight_decay=0.01,
+            auto_positive_class_weights=True,
+            embedding_dim=4,
+            token_dim=8,
+            num_layers=1,
+            ffn_hidden_dim=8,
+        )
+    )
+
+    assert trainer.train_overview.sample_count == 4
+    assert trainer.train_overview.scenario_counts == [4]
+    assert trainer.train_overview.task_positive_counts == [1]
+    assert trainer.positive_class_weights is not None
+    assert trainer.positive_class_weights.tolist() == [3.0]
+    assert trainer.dense_optimizer is not None
+    assert trainer.dense_optimizer.param_groups[0]["weight_decay"] == 0.01
+
+    overview_text = "\n".join(trainer.train_overview.format_lines())
+    assert "Dataset overview: train" in overview_text
+    assert "positive_rate" in overview_text
+
+    trainer._set_learning_rates(2)
+    assert trainer.dense_optimizer.param_groups[0]["lr"] == pytest.approx(0.00055)

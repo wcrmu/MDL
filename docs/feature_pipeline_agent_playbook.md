@@ -224,7 +224,7 @@ candidate role: interactions / users / items / features / labels / unknown
 验收：
 - data_profile.md 有字段表。
 - 明确列出候选 labels、group_id、scenario、features。
-- 无法确定 label 或 group_id 时，停止并输出 NEEDS_USER_DECISION。
+- 无法确定 label 时，停止并输出 NEEDS_USER_DECISION；group_id 不清楚时可以省略。
 ```
 
 字段画像表推荐格式：
@@ -288,7 +288,7 @@ feature_pipeline_design.md 必须包含：
 弱 agent 的判断规则：
 
 - 不知道 label，就停止。
-- 不知道 group_id，就停止。
+- 不知道 group_id 时不要阻塞，可以省略。
 - 不知道是否能按时间切分，就使用稳定随机切分，但要写清楚。
 - 没有 scenario，就使用单场景 `default`。
 - ID 特征无法可靠转整数时，建立 vocab。
@@ -524,7 +524,7 @@ Known limitations:
 agent 遇到以下情况必须停止，不要猜：
 
 `NEEDS_USER_DECISION`
-: 无法确定 label、group_id、样本粒度、切分策略、任务定义、敏感字段处理方式。
+: 无法确定 label、样本粒度、切分策略、任务定义、敏感字段处理方式。
 
 `NEEDS_FRAMEWORK_CHANGE`
 : 当前 MDL manifest 协议不能表达该数据，例如需要新的 encoder、新的 reader、新的 label 类型、新的 loss 或非 CSV 输入。
@@ -572,7 +572,7 @@ agent 明确禁止：
 - embedding/sequence ID 范围匹配 `vocab_size`。
 - `0` 被保留给 unknown/padding。
 - val/test 没有 fit 新 vocab。
-- group_id 对 QAUC 有意义。
+- 可选 group_id 如存在，应能帮助追踪业务分组。
 - smoke train 命令通过。
 - reports 中没有泄露敏感原始数据。
 

@@ -39,6 +39,9 @@ class MDLConfig:
     sparse_moe_use_dtsi: bool = True
     sparse_moe_dtsi_infer_weight: float = 0.5
     sparse_moe_inference_threshold: float = 0.0
+    task_head_type: str = "linear"
+    task_head_hidden_dim: int = 64
+    task_head_dropout: float = 0.0
     use_task_tokens: bool = True
     use_scenario_tokens: bool = True
     use_global_scenario_token: bool = True
@@ -76,12 +79,29 @@ class MDLConfig:
             raise ValueError("sparse_moe_num_experts must be positive")
         if self.sparse_moe_inference_threshold < 0:
             raise ValueError("sparse_moe_inference_threshold must be non-negative")
+        if self.task_head_type not in {"linear", "mlp"}:
+            raise ValueError("task_head_type must be 'linear' or 'mlp'")
+        if self.task_head_hidden_dim <= 0:
+            raise ValueError("task_head_hidden_dim must be positive")
+        if self.task_head_dropout < 0:
+            raise ValueError("task_head_dropout must be non-negative")
         if not 0.0 <= self.sparse_moe_dtsi_infer_weight <= 1.0:
             raise ValueError("sparse_moe_dtsi_infer_weight must be in [0, 1]")
         if self.feature_backbone == "rankmixer" and self.token_dim % self.num_feature_tokens != 0:
             raise ValueError(
                 "rankmixer backbone requires token_dim divisible by number of feature tokens"
             )
+
+
+def _build_task_head(config: MDLConfig) -> nn.Module:
+    if config.task_head_type == "linear":
+        return nn.Linear(config.token_dim, 1)
+    return nn.Sequential(
+        nn.Linear(config.token_dim, config.task_head_hidden_dim),
+        nn.GELU(),
+        nn.Dropout(config.task_head_dropout),
+        nn.Linear(config.task_head_hidden_dim, 1),
+    )
 
 
 def _build_per_token_ffn(num_tokens: int, config: MDLConfig) -> nn.Module:
@@ -124,15 +144,15 @@ class MDLBlock(nn.Module):
             dropout=config.dropout,
             backbone=config.feature_backbone,
         )
-        self.feature_norm_1 = nn.LayerNorm(config.token_dim)
+        self.feature_norm = nn.LayerNorm(config.token_dim)
         self.feature_ffn = _build_per_token_ffn(num_feature_tokens, config)
-        self.feature_norm_2 = nn.LayerNorm(config.token_dim)
 
         self.scenario_attention = DomainAwareAttention(
             config.token_dim,
             config.num_heads,
             num_scenario_tokens,
             num_feature_tokens,
+            config.ffn_hidden_dim,
             config.dropout,
         )
         self.scenario_ffn = _build_per_token_ffn(num_scenario_tokens, config)
@@ -142,6 +162,7 @@ class MDLBlock(nn.Module):
             config.num_heads,
             config.num_tasks,
             num_feature_tokens,
+            config.ffn_hidden_dim,
             config.dropout,
         )
         self.domain_fused = DomainFusedModule(include_global=config.use_global_scenario_token)
@@ -159,8 +180,7 @@ class MDLBlock(nn.Module):
             feature_tokens,
             need_attention=need_attention,
         )
-        feature_tokens = self.feature_norm_1(feature_tokens + mixed_features)
-        feature_tokens = self.feature_norm_2(feature_tokens + self.feature_ffn(feature_tokens))
+        feature_tokens = self.feature_ffn(self.feature_norm(feature_tokens + mixed_features))
 
         if not self.use_scenario_tokens:
             scenario_tokens = torch.zeros_like(scenario_tokens)
@@ -233,7 +253,7 @@ class MDLModel(BaseRecommender):
         )
         self.blocks = nn.ModuleList(MDLBlock(config) for _ in range(config.num_layers))
         self.logit_layers = nn.ModuleList(
-            nn.Linear(config.token_dim, 1) for _ in range(config.num_tasks)
+            _build_task_head(config) for _ in range(config.num_tasks)
         )
 
     def sparse_moe_regularization_loss(self, reference: Tensor) -> Tensor:
@@ -362,6 +382,9 @@ class ModelConfig:
     sparse_moe_use_dtsi: bool = True
     sparse_moe_dtsi_infer_weight: float = 0.5
     sparse_moe_inference_threshold: float = 0.0
+    task_head_type: str = "linear"
+    task_head_hidden_dim: int = 64
+    task_head_dropout: float = 0.0
     use_task_tokens: bool = True
     use_scenario_tokens: bool = True
     use_global_scenario_token: bool = True
@@ -460,6 +483,9 @@ def config_from_manifest(
     sparse_moe_use_dtsi: bool = True,
     sparse_moe_dtsi_infer_weight: float = 0.5,
     sparse_moe_inference_threshold: float = 0.0,
+    task_head_type: str = "linear",
+    task_head_hidden_dim: int = 64,
+    task_head_dropout: float = 0.0,
     use_task_tokens: bool = True,
     use_scenario_tokens: bool = True,
     use_global_scenario_token: bool = True,
@@ -490,6 +516,9 @@ def config_from_manifest(
         sparse_moe_use_dtsi=sparse_moe_use_dtsi,
         sparse_moe_dtsi_infer_weight=sparse_moe_dtsi_infer_weight,
         sparse_moe_inference_threshold=sparse_moe_inference_threshold,
+        task_head_type=task_head_type,
+        task_head_hidden_dim=task_head_hidden_dim,
+        task_head_dropout=task_head_dropout,
         use_task_tokens=use_task_tokens,
         use_scenario_tokens=use_scenario_tokens,
         use_global_scenario_token=use_global_scenario_token,
@@ -539,6 +568,9 @@ class ModelFromManifest(BaseRecommender):
             sparse_moe_use_dtsi=config.sparse_moe_use_dtsi,
             sparse_moe_dtsi_infer_weight=config.sparse_moe_dtsi_infer_weight,
             sparse_moe_inference_threshold=config.sparse_moe_inference_threshold,
+            task_head_type=config.task_head_type,
+            task_head_hidden_dim=config.task_head_hidden_dim,
+            task_head_dropout=config.task_head_dropout,
             use_task_tokens=config.use_task_tokens,
             use_scenario_tokens=config.use_scenario_tokens,
             use_global_scenario_token=config.use_global_scenario_token,

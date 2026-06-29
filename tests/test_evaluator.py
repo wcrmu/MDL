@@ -126,8 +126,11 @@ def test_evaluate_model_reports_scenario_task_metrics(tmp_path: Path) -> None:
         ("search", "like"),
     }
     formatted = "\n".join(result.format_lines())
-    assert "val_home_click_auc=" in formatted
-    assert "val_search_like_qauc=" in formatted
+    assert "Evaluation: val" in formatted
+    assert "Task metrics" in formatted
+    assert "Scenario-task metrics" in formatted
+    assert "home" in formatted
+    assert "search" in formatted
 
 
 def test_scenario_membership_accepts_index_and_multihot() -> None:

@@ -140,7 +140,7 @@ scene,query,click_label,click_mask,user_id,item_id,price,history_items
 要求：
 
 - `scenario_id` 必须是从 `0` 开始的整数 ID。
-- `group_id` 用于 QAUC 分组，通常是 query/session/request/user-session。
+- `group_id` 是可选业务追踪字段；训练和评估不再依赖它。
 - 可选 `sample_weight` 列用于样本级训练/验证 loss 加权；如果在 `data_columns.sample_weight` 声明，CSV 中该列必须能转成 float。
 - 每个 task 都需要 label 列。
 - 每个 task 都需要 label mask 列，mask 为 `1` 表示该样本该任务有效，`0` 表示忽略。
@@ -899,8 +899,8 @@ manifest feature：
 训练 loss 为 `nan`
 : 常见原因是 label 不是合法数值、mask 全为 0、连续特征存在空值但未声明 missing value。
 
-QAUC 有大量 skipped groups
-: 很多 group 内只有正样本或只有负样本。检查 group 定义是否合理，或者数据切分是否破坏了同一个 group 的候选集合。
+评估 AUC 为 `nan`
+: 对应 task 或场景内只有正样本或只有负样本。检查 label 分布、切分策略和 `label_mask`。
 
 ## 11. 不应该做什么
 

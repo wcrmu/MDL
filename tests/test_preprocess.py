@@ -100,6 +100,30 @@ def test_validate_processed_dataset_allows_feature_only_without_domain_tokenizat
     validate_processed_dataset(tmp_path, require_domain_tokenization=False)
 
 
+def test_validate_processed_dataset_allows_missing_group_id(tmp_path: Path) -> None:
+    manifest = _valid_manifest()
+    manifest["data_columns"].pop("group_id")
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with (tmp_path / "train.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["scenario_id", "click", "click_mask", "user_id", "score"],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "scenario_id": 0,
+                "click": 1,
+                "click_mask": 1,
+                "user_id": 1,
+                "score": 0.2,
+            }
+        )
+
+    validate_processed_dataset(tmp_path)
+
+
 def test_validate_processed_dataset_rejects_scenario_id_out_of_range(tmp_path: Path) -> None:
     _write_dataset(tmp_path, _valid_manifest(), scenario_id=1)
 

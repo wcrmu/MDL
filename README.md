@@ -52,7 +52,7 @@
 └── notebooks/
 ```
 
-## 数据契约
+## 数据处理流程
 
 数据集相关的原始数据转换逻辑放在 feature pipeline 中。
 
@@ -67,7 +67,7 @@ processed_dataset/
   vocab__<feature_name>.json   # 可选
 ```
 
-`manifest.json` 声明场景列、分组列、标签、标签 mask、特征 encoder 和 token 分组。当前 tokenization 契约如下：
+`manifest.json` 声明场景列、标签、标签 mask、特征 encoder 和 token 分组；可选声明 `group_id` 作为业务追踪字段。当前 tokenization 契约如下：
 
 ```json
 {
@@ -75,7 +75,6 @@ processed_dataset/
   "task_names": ["click"],
   "data_columns": {
     "scenario_id": "scene",
-    "group_id": "query",
     "sample_weight": "sample_weight",
     "labels": {"click": "click_label"},
     "label_masks": {"click": "click_mask"}
@@ -135,9 +134,19 @@ python scripts/train.py \
   --max-steps 10 \
   --eval-max-batches 10 \
   --gradient-clip-norm 5.0 \
+  --lr-scheduler cosine \
+  --warmup-steps 2 \
+  --min-lr-ratio 0.1 \
+  --dense-weight-decay 1e-5 \
+  --task-head-type mlp \
+  --task-head-hidden-dim 64 \
+  --task-head-dropout 0.0 \
+  --auto-positive-class-weights \
   --task-weights 1.0 \
   --scenario-weights 1.0
 ```
+
+`--task-head-type linear` 是 MDL 默认输出头，等价于每个 task token 接一层 `Linear(token_dim, 1)`；`--task-head-type mlp` 会改为每个任务一个两层 MLP head，便于和 RankMixer baseline 的 head 容量做更公平的 ablation。
 
 训练纯 RankMixer baseline：
 

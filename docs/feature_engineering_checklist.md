@@ -15,13 +15,13 @@
 - `task_names` 是什么，每个 task 的 label 来自哪一列。
 - 每个 task 的 `label_mask` 规则是什么。
 - 一行样本代表什么，例如曝光、候选 item、用户行为、session step。
-- `group_id` 使用哪一列，以及为什么它适合 QAUC 分组。
+- 如果业务需要追踪分组，明确可选 `group_id` 使用哪一列；训练和评估不依赖它。
 - `scenario_names` 有哪些；如果没有多场景，也必须使用 `["default"]`。
 
 检查点：
 
 - 不知道 label 时停止，输出 `NEEDS_USER_DECISION`。
-- 不知道 `group_id` 时停止，输出 `NEEDS_USER_DECISION`。
+- 不知道 `group_id` 时不要阻塞；可以省略该字段。
 - 多任务中缺失 label 的样本必须用 `label_mask=0`，不要硬填负样本。
 
 ## 2. 数据泄漏检查
@@ -274,7 +274,7 @@ python scripts/train.py \
 遇到以下情况不要绕开协议，必须停止：
 
 - label 定义不清楚。
-- group_id 定义不清楚。
+- 可选 group_id 定义不清楚时，可以省略该字段。
 - 字段是否泄漏无法判断。
 - scenario/task token 输入无法用 manifest 表达。
 - 需要新的 encoder、reader 或输入 shape。
