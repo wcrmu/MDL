@@ -24,6 +24,8 @@ class RankMixerConfig:
     num_layers: int = 2
     ffn_hidden_dim: int = 64
     dropout: float = 0.0
+    task_head_hidden_dim: int = 64
+    task_head_dropout: float = 0.0
     ffn_type: str = "dense"
     sparse_moe_num_experts: int = 4
     sparse_moe_loss_weight: float = 0.0
@@ -51,6 +53,10 @@ class RankMixerConfig:
             raise ValueError("ffn_hidden_dim must be positive")
         if self.dropout < 0:
             raise ValueError("dropout must be non-negative")
+        if self.task_head_hidden_dim <= 0:
+            raise ValueError("task_head_hidden_dim must be positive")
+        if self.task_head_dropout < 0:
+            raise ValueError("task_head_dropout must be non-negative")
         if self.ffn_type not in {"dense", "sparse_moe"}:
             raise ValueError("ffn_type must be 'dense' or 'sparse_moe'")
         if self.sparse_moe_num_experts <= 0:
@@ -72,6 +78,15 @@ class RankMixerConfig:
             dropout=self.dropout,
             default_projection="linear",
         )
+
+
+def _build_task_head(input_dim: int, config: RankMixerConfig) -> nn.Module:
+    return nn.Sequential(
+        nn.Linear(input_dim, config.task_head_hidden_dim),
+        nn.GELU(),
+        nn.Dropout(config.task_head_dropout),
+        nn.Linear(config.task_head_hidden_dim, 1),
+    )
 
 
 def _build_per_token_ffn(num_tokens: int, config: RankMixerConfig) -> nn.Module:
@@ -117,7 +132,10 @@ class RankMixerFromManifest(BaseRecommender):
         self.config = config
         self.feature_compiler = FeatureTokenCompiler(config.feature_compiler_config())
         self.blocks = nn.ModuleList(RankMixerBlock(config) for _ in range(config.num_layers))
-        self.output_layer = nn.Linear(len(config.token_specs) * config.token_dim, config.num_tasks)
+        output_dim = len(config.token_specs) * config.token_dim
+        self.output_heads = nn.ModuleList(
+            _build_task_head(output_dim, config) for _ in range(config.num_tasks)
+        )
 
     def compile_feature_tokens(self, features: dict[str, Tensor | dict[str, Tensor]]) -> Tensor:
         return self.feature_compiler(features)
@@ -152,7 +170,8 @@ class RankMixerFromManifest(BaseRecommender):
         tokens = self.compile_feature_tokens(features)
         for block in self.blocks:
             tokens = block(tokens)
-        logits = self.output_layer(tokens.flatten(start_dim=1))
+        flattened_tokens = tokens.flatten(start_dim=1)
+        logits = torch.cat([head(flattened_tokens) for head in self.output_heads], dim=1)
         output: dict[str, Tensor | list[dict[str, Tensor | None]]] = {"logits": logits}
         if self.config.ffn_type == "sparse_moe":
             output["moe_regularization_loss"] = self.sparse_moe_regularization_loss(logits)
@@ -169,6 +188,8 @@ def rankmixer_config_from_manifest(
     num_layers: int = 2,
     ffn_hidden_dim: int = 64,
     dropout: float = 0.0,
+    task_head_hidden_dim: int = 64,
+    task_head_dropout: float = 0.0,
     ffn_type: str = "dense",
     sparse_moe_num_experts: int = 4,
     sparse_moe_loss_weight: float = 0.0,
@@ -185,6 +206,8 @@ def rankmixer_config_from_manifest(
         num_layers=num_layers,
         ffn_hidden_dim=ffn_hidden_dim,
         dropout=dropout,
+        task_head_hidden_dim=task_head_hidden_dim,
+        task_head_dropout=task_head_dropout,
         ffn_type=ffn_type,
         sparse_moe_num_experts=sparse_moe_num_experts,
         sparse_moe_loss_weight=sparse_moe_loss_weight,

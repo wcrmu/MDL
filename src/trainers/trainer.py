@@ -41,6 +41,8 @@ class TrainingConfig:
     num_heads: int = 4
     ffn_hidden_dim: int = 64
     dropout: float = 0.0
+    task_head_hidden_dim: int = 64
+    task_head_dropout: float = 0.0
     ffn_type: str = "dense"
     sparse_moe_num_experts: int = 4
     sparse_moe_loss_weight: float = 0.0
@@ -73,6 +75,10 @@ class TrainingConfig:
             raise ValueError("scenario_weights must be non-negative")
         if self.validation_max_rows is not None and self.validation_max_rows < 0:
             raise ValueError("validation_max_rows must be non-negative")
+        if self.task_head_hidden_dim <= 0:
+            raise ValueError("task_head_hidden_dim must be positive")
+        if self.task_head_dropout < 0:
+            raise ValueError("task_head_dropout must be non-negative")
         if self.sparse_moe_loss_weight < 0:
             raise ValueError("sparse_moe_loss_weight must be non-negative")
         if self.sparse_moe_target_active_ratio is not None:
@@ -175,6 +181,8 @@ class Trainer:
             num_heads=config.num_heads,
             ffn_hidden_dim=config.ffn_hidden_dim,
             dropout=config.dropout,
+            task_head_hidden_dim=config.task_head_hidden_dim,
+            task_head_dropout=config.task_head_dropout,
             feature_backbone=config.feature_backbone,
             ffn_type=config.ffn_type,
             sparse_moe_num_experts=config.sparse_moe_num_experts,

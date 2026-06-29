@@ -93,6 +93,15 @@ def test_rankmixer_from_manifest_forward_feature_only() -> None:
     assert isinstance(config, RankMixerConfig)
     model = build_model_from_config(config)
     assert isinstance(model, RankMixerFromManifest)
+    assert len(model.output_heads) == len(manifest["task_names"])
+    for head in model.output_heads:
+        assert isinstance(head, torch.nn.Sequential)
+        assert isinstance(head[0], torch.nn.Linear)
+        assert head[0].out_features == config.task_head_hidden_dim
+        assert isinstance(head[1], torch.nn.GELU)
+        assert isinstance(head[2], torch.nn.Dropout)
+        assert isinstance(head[3], torch.nn.Linear)
+        assert head[3].out_features == 1
 
     output = model(
         {
