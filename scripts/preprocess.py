@@ -17,6 +17,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--model-name", choices=["mdl", "rankmixer"], default="mdl")
     parser.add_argument(
         "--max-rows",
         type=int,
@@ -28,7 +29,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    validate_processed_dataset(args.data_dir, max_rows=args.max_rows)
+    validate_processed_dataset(
+        args.data_dir,
+        max_rows=args.max_rows,
+        require_domain_tokenization=args.model_name == "mdl",
+    )
     print(f"validated_processed_dataset={args.data_dir}")
 
 

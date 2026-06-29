@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from src.datasets import ManifestDataset, collate_manifest_batch, load_manifest
 from src.datasets.preprocess import validate_processed_dataset
-from src.models import ModelFromManifest, config_from_manifest
+from src.models import build_model_config_from_manifest, build_model_from_config
 from src.modules import multitask_bce_loss
 from src.utils.checkpoint import save_checkpoint
 
@@ -26,6 +26,7 @@ class TrainingConfig:
     max_steps: int | None = None
     eval_max_batches: int | None = 100
     device: str = "cpu"
+    model_name: str = "mdl"
     lr: float = 1e-3
     sparse_lr: float | None = None
     gradient_clip_norm: float | None = None
@@ -58,6 +59,8 @@ class TrainingConfig:
     checkpoint_path: str | None = None
 
     def __post_init__(self) -> None:
+        if self.model_name not in {"mdl", "rankmixer"}:
+            raise ValueError("model_name must be 'mdl' or 'rankmixer'")
         if self.lr <= 0:
             raise ValueError("lr must be positive")
         if self.sparse_lr is not None and self.sparse_lr <= 0:
@@ -157,10 +160,15 @@ class Trainer:
         self.config = config
         self.device = torch.device(config.device)
         if config.validate_data:
-            validate_processed_dataset(config.data_dir, max_rows=config.validation_max_rows)
+            validate_processed_dataset(
+                config.data_dir,
+                max_rows=config.validation_max_rows,
+                require_domain_tokenization=config.model_name == "mdl",
+            )
         self.manifest = load_manifest(config.data_dir)
-        model_config = config_from_manifest(
+        model_config = build_model_config_from_manifest(
             self.manifest,
+            model_name=config.model_name,
             embedding_dim=config.embedding_dim,
             token_dim=config.token_dim,
             num_layers=config.num_layers,
@@ -193,7 +201,7 @@ class Trainer:
             len(self.manifest["scenario_names"]),
             self.device,
         )
-        self.model = ModelFromManifest(model_config).to(self.device)
+        self.model = build_model_from_config(model_config).to(self.device)
         dense_parameters, embedding_parameters = _partition_embedding_parameters(self.model)
         self.dense_optimizer = (
             torch.optim.RMSprop(dense_parameters, lr=config.lr) if dense_parameters else None

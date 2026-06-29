@@ -1,8 +1,6 @@
-# MDL Recommendation Project
+# MDL 推荐系统项目
 
-This repository is organized as a standard recommendation-system project. The main implementation lives under `src/`; legacy files were moved out of this tree to a sibling legacy archive directory.
-
-## Project Layout
+## 项目结构
 
 ```text
 .
@@ -54,11 +52,11 @@ This repository is organized as a standard recommendation-system project. The ma
 └── notebooks/
 ```
 
-## Data Contract
+## 数据契约
 
-The core model package does not hard-code any dataset. Dataset-specific raw conversion should live in a feature pipeline that writes the generic processed format. For full feature pipeline implementation guidance, see [docs/feature_pipeline_development.md](docs/feature_pipeline_development.md). For agent execution prompts and step-by-step acceptance gates, see [docs/feature_pipeline_agent_playbook.md](docs/feature_pipeline_agent_playbook.md).
+数据集相关的原始数据转换逻辑放在 feature pipeline 中。
 
-The processed format is:
+processed 数据格式如下：
 
 ```text
 processed_dataset/
@@ -66,10 +64,10 @@ processed_dataset/
   train.csv
   val.csv
   test.csv
-  vocab__<feature_name>.json   # optional
+  vocab__<feature_name>.json   # 可选
 ```
 
-The manifest declares scenario columns, group columns, labels, label masks, feature encoders, and token grouping. The current tokenization contract is:
+`manifest.json` 声明场景列、分组列、标签、标签 mask、特征 encoder 和 token 分组。当前 tokenization 契约如下：
 
 ```json
 {
@@ -109,25 +107,25 @@ The manifest declares scenario columns, group columns, labels, label masks, feat
 }
 ```
 
-Built-in encoders are `embedding`, `identity`, multi-field `sequence_mean_pooling`, multi-field target-aware `din`, and long-sequence target-aware `sim`/`longer`. MDL manifests must declare `scenario_features/scenario_token_specs` and `task_features/task_token_specs`; model construction raises an error if any of these fields is missing. Single-scenario CSVs use `data_columns.scenario_id`; overlapping scenarios can use `data_columns.scenario_ids` with `scenario_ids_delimiter` such as `|`. If `data_columns.sample_weight` is declared, training and evaluation loss use it together with optional task/scenario weights.
+内置 encoder 包括 `embedding`、`identity`、多字段 `sequence_mean_pooling`、多字段目标感知 `din`，以及长序列目标感知 `sim`/`longer`。MDL manifest 必须声明 `scenario_features/scenario_token_specs` 和 `task_features/task_token_specs`；如果缺少任意字段，模型构建会直接报错。纯 RankMixer baseline 只使用 `features/token_specs`，可用于 feature-only manifest。单场景 CSV 使用 `data_columns.scenario_id`；重叠场景可使用 `data_columns.scenario_ids`，并配合 `scenario_ids_delimiter`，例如 `|`。如果声明了 `data_columns.sample_weight`，训练和评估 loss 会同时使用该样本权重以及可选的 task/scenario 权重。
 
-## Commands
+## 常用命令
 
-Install dependencies:
+安装依赖：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Validate a processed manifest dataset:
+校验 processed manifest 数据集：
 
 ```bash
 python scripts/preprocess.py --data-dir processed_dataset
 ```
 
-Use `--max-rows N` to validate only the first `N` rows per split during fast feature pipeline iteration.
+在快速迭代 feature pipeline 时，可以用 `--max-rows N` 只校验每个 split 的前 `N` 行。
 
-Train MDL:
+训练 MDL：
 
 ```bash
 python scripts/train.py \
@@ -141,7 +139,18 @@ python scripts/train.py \
   --scenario-weights 1.0
 ```
 
-Enable RankMixer-style Sparse-MoE per-token FFNs:
+训练纯 RankMixer baseline：
+
+```bash
+python scripts/train.py \
+  --model-name rankmixer \
+  --data-dir processed_dataset \
+  --epochs 1 \
+  --batch-size 256 \
+  --max-steps 10
+```
+
+启用 RankMixer 风格的 Sparse-MoE per-token FFN：
 
 ```bash
 python scripts/train.py \
@@ -153,9 +162,9 @@ python scripts/train.py \
   --sparse-moe-dtsi-infer-weight 0.5
 ```
 
-Sparse-MoE uses ReLU routing, DTSI training by default, L1 regularization on the inference router, adaptive loss-weight control when `--sparse-moe-target-active-ratio` is set, configurable train/infer-router mixing via `--sparse-moe-dtsi-infer-weight`, and sparse expert execution during `eval()`/prediction. Training uses RMSProp for dense parameters and Adagrad for embedding-table parameters; override the embedding optimizer learning rate with `--sparse-lr`. Use `--disable-sparse-moe-dtsi` and the `--disable-*-tokens` / `--disable-*-feature-interaction` flags only for ablation.
+Sparse-MoE 默认使用 ReLU routing 和 DTSI training，对 inference router 做 L1 正则；当设置 `--sparse-moe-target-active-ratio` 时，会启用自适应 loss weight 控制；`--sparse-moe-dtsi-infer-weight` 可配置训练/推理 router 的混合比例；在 `eval()`/prediction 阶段会使用稀疏 expert 执行。
 
-Evaluate:
+评估：
 
 ```bash
 python scripts/evaluate.py \
@@ -164,7 +173,7 @@ python scripts/evaluate.py \
   --checkpoint-path experiments/checkpoints/mdl.pt
 ```
 
-Predict:
+预测：
 
 ```bash
 python scripts/predict.py \
@@ -174,9 +183,9 @@ python scripts/predict.py \
   --output-path experiments/runs/predictions.csv
 ```
 
-## Testing
+## 测试
 
-Run the focused tests:
+运行聚焦测试：
 
 ```bash
 python -m pytest tests

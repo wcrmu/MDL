@@ -107,7 +107,10 @@ def _validate_token_specs(
         raise ValueError(f"tokenization {section} token_id values must be unique")
 
 
-def validate_manifest(manifest: Mapping[str, Any]) -> None:
+def validate_manifest(
+    manifest: Mapping[str, Any],
+    require_domain_tokenization: bool = True,
+) -> None:
     splits = _require_string_list(manifest, "splits")
     _require_string_list(manifest, "scenario_names")
     task_names = _require_string_list(manifest, "task_names")
@@ -135,39 +138,41 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
         raise ValueError("tokenization must use version=2 and kind='encoder_registry'")
     features = _require_non_empty_list(tokenization, "features")
     token_specs = _require_non_empty_list(tokenization, "token_specs")
-    required_domain_keys = [
-        "scenario_features",
-        "scenario_token_specs",
-        "task_features",
-        "task_token_specs",
-    ]
-    missing = [key for key in required_domain_keys if key not in tokenization]
-    if missing:
-        raise ValueError(
-            "tokenization must declare scenario_features, scenario_token_specs, "
-            f"task_features, and task_token_specs; missing: {', '.join(missing)}"
-        )
-    scenario_features = _require_non_empty_list(tokenization, "scenario_features")
-    scenario_token_specs = _require_non_empty_list(tokenization, "scenario_token_specs")
-    task_features = _require_non_empty_list(tokenization, "task_features")
-    task_token_specs = _require_non_empty_list(tokenization, "task_token_specs")
-
     feature_names = _feature_names("features", features)
-    scenario_feature_names = _feature_names("scenario_features", scenario_features)
-    task_feature_names = _feature_names("task_features", task_features)
     _validate_token_specs("token_specs", token_specs, feature_names)
-    _validate_token_specs(
-        "scenario_token_specs",
-        scenario_token_specs,
-        scenario_feature_names,
-        expected_count=len(manifest["scenario_names"]) + 1,
-    )
-    _validate_token_specs(
-        "task_token_specs",
-        task_token_specs,
-        task_feature_names,
-        expected_count=len(task_names),
-    )
+
+    if require_domain_tokenization:
+        required_domain_keys = [
+            "scenario_features",
+            "scenario_token_specs",
+            "task_features",
+            "task_token_specs",
+        ]
+        missing = [key for key in required_domain_keys if key not in tokenization]
+        if missing:
+            raise ValueError(
+                "tokenization must declare scenario_features, scenario_token_specs, "
+                f"task_features, and task_token_specs; missing: {', '.join(missing)}"
+            )
+        scenario_features = _require_non_empty_list(tokenization, "scenario_features")
+        scenario_token_specs = _require_non_empty_list(tokenization, "scenario_token_specs")
+        task_features = _require_non_empty_list(tokenization, "task_features")
+        task_token_specs = _require_non_empty_list(tokenization, "task_token_specs")
+
+        scenario_feature_names = _feature_names("scenario_features", scenario_features)
+        task_feature_names = _feature_names("task_features", task_features)
+        _validate_token_specs(
+            "scenario_token_specs",
+            scenario_token_specs,
+            scenario_feature_names,
+            expected_count=len(manifest["scenario_names"]) + 1,
+        )
+        _validate_token_specs(
+            "task_token_specs",
+            task_token_specs,
+            task_feature_names,
+            expected_count=len(task_names),
+        )
     if not splits:
         raise ValueError("manifest must declare at least one split")
 
@@ -276,7 +281,11 @@ def _validate_csv_rows(
         raise ValueError(f"split {split!r} csv must contain at least one row")
 
 
-def validate_processed_dataset(data_dir: str | Path, max_rows: int | None = None) -> None:
+def validate_processed_dataset(
+    data_dir: str | Path,
+    max_rows: int | None = None,
+    require_domain_tokenization: bool = True,
+) -> None:
     if max_rows is not None and max_rows < 0:
         raise ValueError("max_rows must be non-negative")
     path = Path(data_dir)
@@ -285,7 +294,7 @@ def validate_processed_dataset(data_dir: str | Path, max_rows: int | None = None
         raise FileNotFoundError(f"missing manifest: {manifest_path}")
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    validate_manifest(manifest)
+    validate_manifest(manifest, require_domain_tokenization=require_domain_tokenization)
     for split in manifest.get("splits", []):
         split_path = path / f"{split}.csv"
         if not split_path.exists():

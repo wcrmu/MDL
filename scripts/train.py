@@ -28,6 +28,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--eval-max-batches", type=int, default=100)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--model-name", choices=["mdl", "rankmixer"], default="mdl")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--sparse-lr", type=float, default=None)
     parser.add_argument("--gradient-clip-norm", type=float, default=None)
@@ -89,6 +90,7 @@ def main() -> None:
             max_steps=args.max_steps,
             eval_max_batches=args.eval_max_batches,
             device=args.device,
+            model_name=args.model_name,
             lr=args.lr,
             sparse_lr=args.sparse_lr,
             gradient_clip_norm=args.gradient_clip_norm,

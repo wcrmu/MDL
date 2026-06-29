@@ -3,7 +3,17 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.models import MDLConfig, MDLModel, ModelFromManifest, config_from_manifest
+from src.models import (
+    MDLConfig,
+    MDLModel,
+    ModelFromManifest,
+    RankMixerConfig,
+    RankMixerFromManifest,
+    build_model_config_from_manifest,
+    build_model_from_config,
+    config_from_manifest,
+    rankmixer_config_from_manifest,
+)
 
 
 def _with_required_domain_tokens(
@@ -49,6 +59,61 @@ def test_config_from_manifest_requires_domain_tokenization() -> None:
         match="missing: scenario_features, scenario_token_specs, task_features, task_token_specs",
     ):
         config_from_manifest(manifest)
+
+
+def _rankmixer_feature_only_manifest() -> dict:
+    return {
+        "scenario_names": ["default"],
+        "task_names": ["click", "like"],
+        "tokenization": {
+            "version": 2,
+            "kind": "encoder_registry",
+            "features": [
+                {"name": "user_id", "encoder": "embedding", "vocab_size": 10},
+                {"name": "score", "encoder": "identity", "dim": 1},
+            ],
+            "token_specs": [
+                {"token_id": 0, "projection": "linear", "inputs": ["user_id"]},
+                {"token_id": 1, "projection": "linear", "inputs": ["score"]},
+            ],
+        },
+    }
+
+
+def test_rankmixer_from_manifest_forward_feature_only() -> None:
+    manifest = _rankmixer_feature_only_manifest()
+    config = build_model_config_from_manifest(
+        manifest,
+        model_name="rankmixer",
+        embedding_dim=4,
+        token_dim=8,
+        num_layers=1,
+        ffn_hidden_dim=8,
+    )
+    assert isinstance(config, RankMixerConfig)
+    model = build_model_from_config(config)
+    assert isinstance(model, RankMixerFromManifest)
+
+    output = model(
+        {
+            "user_id": torch.tensor([1, 2, 3]),
+            "score": torch.tensor([0.1, 0.2, 0.3]),
+        },
+        torch.tensor([0, 0, 0]),
+    )
+
+    assert output["logits"].shape == (3, 2)
+
+
+def test_rankmixer_config_rejects_indivisible_token_dim() -> None:
+    with pytest.raises(ValueError, match="token_dim divisible"):
+        rankmixer_config_from_manifest(
+            _rankmixer_feature_only_manifest(),
+            embedding_dim=4,
+            token_dim=7,
+            num_layers=1,
+            ffn_hidden_dim=8,
+        )
 
 
 def test_mdl_forward_shapes() -> None:

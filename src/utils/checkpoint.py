@@ -7,7 +7,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from src.models.mdl import ModelConfig
+from src.models import deserialize_model_config
 
 
 def _serialize_config(config: Any) -> dict[str, Any]:
@@ -38,5 +38,5 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") 
     payload = torch.load(Path(path), map_location=map_location)
     if "model_state_dict" not in payload or "model_config" not in payload:
         raise ValueError("checkpoint must contain model_state_dict and model_config")
-    payload["model_config"] = ModelConfig(**payload["model_config"])
+    payload["model_config"] = deserialize_model_config(payload["model_config"])
     return payload

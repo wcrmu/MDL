@@ -371,6 +371,7 @@ class ModelConfig:
     scenario_feature_specs: list[dict[str, Any]] | None = None
     task_token_specs: list[dict[str, Any]] | None = None
     task_feature_specs: list[dict[str, Any]] | None = None
+    model_name: str = "mdl"
 
     def feature_compiler_config(self) -> FeatureCompilerConfig:
         return FeatureCompilerConfig(

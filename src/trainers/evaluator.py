@@ -5,11 +5,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
 from src.datasets import ManifestDataset, collate_manifest_batch
-from src.models import ModelFromManifest
 from src.modules import binary_auc, multitask_bce_loss, qauc
 
 
@@ -133,7 +132,7 @@ def _loss_sample_weights(
 
 @torch.no_grad()
 def evaluate_model(
-    model: ModelFromManifest,
+    model: nn.Module,
     data_dir: str,
     split: str,
     manifest: dict[str, Any],

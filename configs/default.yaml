@@ -1,6 +1,6 @@
 project:
-  name: mdl-recsys
-  seed: 2026
+  name: mdl
+  seed: 1
 
 dataset:
   data_dir: data/processed

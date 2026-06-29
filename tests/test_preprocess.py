@@ -89,6 +89,17 @@ def test_validate_processed_dataset_requires_domain_tokenization(tmp_path: Path)
         validate_processed_dataset(tmp_path)
 
 
+def test_validate_processed_dataset_allows_feature_only_without_domain_tokenization(
+    tmp_path: Path,
+) -> None:
+    manifest = _valid_manifest()
+    for key in ["scenario_features", "scenario_token_specs", "task_features", "task_token_specs"]:
+        manifest["tokenization"].pop(key)
+    _write_dataset(tmp_path, manifest)
+
+    validate_processed_dataset(tmp_path, require_domain_tokenization=False)
+
+
 def test_validate_processed_dataset_rejects_scenario_id_out_of_range(tmp_path: Path) -> None:
     _write_dataset(tmp_path, _valid_manifest(), scenario_id=1)
 

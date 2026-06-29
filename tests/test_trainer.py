@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 import torch
 
+from src.models import RankMixerConfig, build_model_from_config
 from src.trainers import Trainer, TrainingConfig
+from src.utils import load_checkpoint
 
 
 def test_trainer_sparse_moe_single_step(tmp_path: Path) -> None:
@@ -116,3 +118,75 @@ def test_trainer_sparse_moe_single_step(tmp_path: Path) -> None:
 def test_training_config_rejects_invalid_gradient_clip_norm() -> None:
     with pytest.raises(ValueError, match="gradient_clip_norm must be positive"):
         TrainingConfig(data_dir="unused", gradient_clip_norm=0.0)
+
+def test_trainer_rankmixer_feature_only_single_step_and_checkpoint(tmp_path: Path) -> None:
+    manifest = {
+        "splits": ["train"],
+        "scenario_names": ["default"],
+        "task_names": ["click"],
+        "data_columns": {
+            "scenario_id": "scenario_id",
+            "group_id": "group_id",
+            "labels": {"click": "click"},
+            "label_masks": {"click": "click_mask"},
+        },
+        "tokenization": {
+            "version": 2,
+            "kind": "encoder_registry",
+            "features": [
+                {
+                    "name": "user_id",
+                    "encoder": "embedding",
+                    "vocab_size": 10,
+                    "source": {"type": "csv_column", "column": "user_id", "dtype": "int64"},
+                },
+                {
+                    "name": "score",
+                    "encoder": "identity",
+                    "dim": 1,
+                    "source": {"type": "csv_column", "column": "score", "dtype": "float32"},
+                },
+            ],
+            "token_specs": [
+                {"token_id": 0, "projection": "linear", "inputs": ["user_id"]},
+                {"token_id": 1, "projection": "linear", "inputs": ["score"]},
+            ],
+        },
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with (tmp_path / "train.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["scenario_id", "group_id", "click", "click_mask", "user_id", "score"],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"scenario_id": 0, "group_id": "g1", "click": 1, "click_mask": 1, "user_id": 1, "score": 0.2}
+        )
+        writer.writerow(
+            {"scenario_id": 0, "group_id": "g2", "click": 0, "click_mask": 1, "user_id": 2, "score": 0.4}
+        )
+
+    checkpoint_path = tmp_path / "rankmixer.pt"
+    trainer = Trainer(
+        TrainingConfig(
+            data_dir=str(tmp_path),
+            model_name="rankmixer",
+            batch_size=2,
+            max_steps=1,
+            embedding_dim=4,
+            token_dim=8,
+            num_layers=1,
+            ffn_hidden_dim=8,
+            checkpoint_path=str(checkpoint_path),
+        )
+    )
+    assert isinstance(trainer.model_config, RankMixerConfig)
+    assert trainer.sparse_optimizer is not None
+
+    trainer.train()
+
+    checkpoint = load_checkpoint(checkpoint_path)
+    assert isinstance(checkpoint["model_config"], RankMixerConfig)
+    model = build_model_from_config(checkpoint["model_config"])
+    model.load_state_dict(checkpoint["model_state_dict"])
