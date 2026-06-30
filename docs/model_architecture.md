@@ -465,6 +465,50 @@ hist_item_id 使用 vocab_size=100000 的 embedding
 target_feature=item_id 也通过这张 embedding 表编码
 ```
 
+#### Target side info 缺失时的当前行为
+
+当前实现不会自动补齐 target side info，也不会在 target side info 缺失时自动退化成只用 ID。规则是：DIN 里声明了几个历史字段，就要为这几个历史字段分别声明可用的 target 字段。
+
+具体行为如下：
+
+- 如果某个 `sequence_features[*]` 没有声明 `target_feature`，模型构建阶段会直接报错：`din sequence field '<name>' must declare target_feature`。
+- 如果声明了 `target_feature`，但 forward 时 batch 中没有这个字段，会报错：`din sequence field '<name>' target_feature '<target>' is missing from batch features`。
+- 如果 embedding target 存在但不是 scalar，即 shape 不是 `[B]` 或 `[B, 1]`，会报错：`din target_feature '<target>' must be scalar`。
+- 如果 numeric target 存在但不是 `[B, dim]`，或最后一维与 `dim` 不一致，也会报错。
+- 只有历史序列字段本身缺失时，DIN encoder 会返回该 DIN feature 的零向量；这不适用于 target 缺失。
+
+因此，只有候选 item ID 而没有候选类目、价格等 side info 时，不应该把 `hist_cate_id`、`hist_price` 也放进同一个 DIN `sequence_features` 中。可行配置是只保留有 target 对应项的历史字段：
+
+```json
+{
+  "name": "history_items",
+  "encoder": "din",
+  "vocab_size": 100000,
+  "target_feature": "item_id",
+  "source": {"type": "csv_column", "column": "history_items", "dtype": "int64", "shape": "sequence", "delimiter": "|"}
+}
+```
+
+或者使用显式单字段形式：
+
+```json
+{
+  "name": "history_behavior",
+  "encoder": "din",
+  "sequence_features": [
+    {
+      "name": "hist_item_id",
+      "target_feature": "item_id",
+      "encoder": "embedding",
+      "vocab_size": 100000,
+      "source": {"type": "csv_column", "column": "hist_item_id", "dtype": "int64", "shape": "sequence", "delimiter": "|"}
+    }
+  ]
+}
+```
+
+如果确实希望历史类目、价格参与 DIN，当前数据中就必须提供对应 target 字段，例如 `cate_id`、`price`，并保证这些字段被 reader 读入 batch。target 字段可以来自普通 `features` 中同名 spec 的 `source`，也可以在 sequence field 中通过对象形式的 `target_feature` 或 `target_source` 单独声明。
+
 DIN 的前向计算分为五步。
 
 第一步，编码历史序列每个 step：
