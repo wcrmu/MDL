@@ -103,7 +103,124 @@ projection 支持两种：
 
 普通 feature tokens 默认使用 `linear`，scenario/task tokens 默认使用 `ffn_relu`。
 
-### 2.3 支持的 feature encoder
+### 2.3 Tokenization 阶段的完整执行路径
+
+这里的 tokenization 不是简单地把字段 ID 做 embedding，而是一条从 CSV 字段到模型 token 的编译链路。以 `ModelFromManifest.forward(features, scenario_id)` 为例，进入模型前后会经历四层转换：
+
+```text
+CSV row
+  -> ManifestDataset 逐行解析 source
+  -> collate_manifest_batch 组 batch、padding 序列
+  -> FeatureTokenCompiler 调用 encoder 得到 dense feature vectors
+  -> token_specs 把一个或多个 dense feature vectors 投影成 token
+```
+
+这几层的职责不同：
+
+| 阶段 | 输入 | 输出 | 主要职责 |
+| --- | --- | --- | --- |
+| CSV parsing | CSV 单元格字符串 | Python scalar/list | 按 `source.dtype`、`source.shape` 和 `delimiter` 解析原始值 |
+| collate | 多行 Python scalar/list | Tensor 或 sequence payload | 把 scalar 堆成 tensor，把 sequence padding 成 batch 内等长 |
+| feature encoding | batch features | `[B, feature_output_dim]` | embedding、数值投影、序列池化或目标注意力 |
+| token projection | 若干 encoded features 拼接 | `[B, token_dim]` | 按 `token_specs.inputs` 组合特征并统一维度 |
+
+MDL 有三套独立但机制相同的 tokenization：
+
+```text
+feature_compiler:
+  features + token_specs -> feature_tokens [B, F, D]
+
+scenario_token_compiler:
+  scenario_features + scenario_token_specs -> scenario_tokens [B, S + 1, D]
+
+task_token_compiler:
+  task_features + task_token_specs -> task_tokens [B, T, D]
+```
+
+这意味着同一个原始 CSV 字段可以被普通 feature token、scenario token 和 task token 复用。只要对应的 feature spec 有 `source`，数据 reader 就会把它读进 batch；如果同名字段已经在其他 feature group 中声明过 `source`，后续同名 spec 可以复用这个 batch 字段。
+
+### 2.4 Source 解析与 batch payload
+
+每个需要从 CSV 读取的 feature spec 都通过 `source` 声明物理列：
+
+```json
+{
+  "name": "hist_item_id",
+  "encoder": "embedding",
+  "vocab_size": 100000,
+  "source": {
+    "type": "csv_column",
+    "column": "hist_item_id",
+    "dtype": "int64",
+    "shape": "sequence",
+    "delimiter": "|"
+  }
+}
+```
+
+当前 reader 支持的关键字段：
+
+- `type`：当前必须是 `csv_column`。
+- `column`：CSV 中的物理列名。
+- `dtype`：支持 `int`、`int64`、`long`、`float`、`float32`、`double`、`bool`、`boolean`。
+- `shape`：默认是 `scalar`；序列字段使用 `sequence`，代码里也把 `vector`、`list` 当作逐行 list 解析。
+- `delimiter`：序列分隔符；如果不声明，则按空白字符 split。
+- `missing_value`：空字符串时使用的缺失值；不声明时 int 默认 `0`、float 默认 `0.0`、bool 默认 `False`。
+- `padding_value`：batch padding 时使用的值；不声明时使用对应 dtype 的默认缺失值。
+
+scalar 字段会直接堆成 tensor：
+
+```text
+CSV:
+user_id
+3
+4
+
+batch["features"]["user_id"] = LongTensor([3, 4])  # [B]
+```
+
+sequence 字段会先按行解析成 list，再在 collate 时 padding 成 batch 内最大长度：
+
+```text
+CSV:
+history
+1|2|3
+2|5
+
+逐行解析:
+row0 -> [1, 2, 3]
+row1 -> [2, 5]
+
+collate 后:
+batch["features"]["history"] = {
+  "values":  LongTensor([[1, 2, 3],
+                         [2, 5, 0]]),
+  "lengths": LongTensor([3, 2])
+}
+```
+
+encoder 侧统一通过 `sequence_values_and_mask(payload)` 取序列值和 mask：
+
+```text
+如果 payload 是 Tensor:
+  values = payload
+  mask = values != 0
+
+如果 payload 是 dict 且包含 mask:
+  values = payload["values"]
+  mask = payload["mask"]
+
+如果 payload 是 dict 且包含 lengths:
+  values = payload["values"]
+  mask[b, pos] = pos < lengths[b]
+
+否则:
+  mask = values != 0
+```
+
+因此，通过当前通用 CSV reader 进入模型的序列默认是 `values + lengths`。padding 位置即使值是 `0`，也主要由 `lengths` 生成的 mask 控制；手工构造 batch 时也可以直接传 `mask`。
+
+### 2.5 Feature encoder 总览
 
 当前 encoder registry 支持以下输入编码：
 
@@ -115,31 +232,510 @@ projection 支持两种：
 | `din` | 序列字段 + target feature | `[B, sum(field_dims)]` | 使用 DIN activation unit 做目标感知加权 |
 | `sim` / `longer` | 长序列字段 + target feature | `[B, sum(field_dims)]` | 先用 target 相似度取 top-k，再执行 DIN 加权 |
 
-序列特征既可以是单字段，也可以是多字段。例如用户历史行为可以同时包含 `hist_item_id`、`hist_cate_id`、`hist_price`，先分别编码，再在最后一维拼接。
+普通 scalar encoder 的输出很直接：
 
-### 2.4 Token 编译示例
+```text
+embedding:
+  input  user_id: [B]
+  output user_emb: [B, embedding_dim]
 
-假设 manifest 中有：
+identity:
+  input  price: [B] 或 [B, dim]
+  output price_value: [B, dim]
+```
+
+序列 encoder 的输出不是 `[B, L, D]`，而是已经聚合好的 `[B, output_dim]`。随后它会像普通 dense feature 一样被 `token_specs` 引用，并投影为 token。
+
+### 2.6 单字段序列的编码流程
+
+最简单的序列配置可以把 feature 本身声明为序列：
 
 ```json
 {
-  "features": [
-    {"name": "user_id", "encoder": "embedding", "vocab_size": 100000},
-    {"name": "item_id", "encoder": "embedding", "vocab_size": 500000},
-    {"name": "price", "encoder": "identity", "dim": 1}
-  ],
-  "token_specs": [
-    {"token_id": 0, "projection": "linear", "inputs": ["user_id"]},
-    {"token_id": 1, "projection": "linear", "inputs": ["item_id", "price"]}
+  "name": "history_items",
+  "encoder": "sequence_mean_pooling",
+  "vocab_size": 100000,
+  "source": {
+    "type": "csv_column",
+    "column": "history_items",
+    "dtype": "int64",
+    "shape": "sequence",
+    "delimiter": "|"
+  }
+}
+```
+
+内部会被 `_sequence_field_specs` 展开为一个序列字段：
+
+```text
+sequence field:
+  name = history_items
+  encoder = sequence_encoder or embedding
+  vocab_size = 100000
+```
+
+如果没有显式写 `sequence_encoder`，默认使用 `embedding`。于是计算过程是：
+
+```text
+payload = {
+  values:  [B, Lmax],
+  lengths: [B]
+}
+
+values, mask = sequence_values_and_mask(payload)
+step_embeddings = Embedding(values)       # [B, Lmax, embedding_dim]
+masked_steps = step_embeddings * mask     # padding 位置清零
+output = sum(masked_steps, dim=1) / max(sum(mask), 1)
+```
+
+例子：
+
+```text
+history_items:
+  row0 = 1|2|3
+  row1 = 4
+
+values = [[1, 2, 3],
+          [4, 0, 0]]
+lengths = [3, 1]
+mask = [[1, 1, 1],
+        [1, 0, 0]]
+
+row0_output = (emb(1) + emb(2) + emb(3)) / 3
+row1_output = emb(4) / 1
+```
+
+如果序列是数值序列，可以使用 `sequence_encoder: "identity"` 或在多字段形式中写 `encoder: "identity"`。数值序列会先变成 `[B, L, dim]`，再按需要用 `projection_dim` 投影到新的 step 维度。
+
+### 2.7 多字段序列的编码流程
+
+真实行为序列通常每个 step 有多个字段，例如：
+
+```text
+第 k 个历史行为 = (hist_item_id[k], hist_cate_id[k], hist_price[k])
+```
+
+这类配置使用 `sequence_features`：
+
+```json
+{
+  "name": "history_behavior",
+  "encoder": "sequence_mean_pooling",
+  "fusion": "concat",
+  "sequence_features": [
+    {
+      "name": "hist_item_id",
+      "encoder": "embedding",
+      "vocab_size": 100000,
+      "embedding_dim": 8,
+      "source": {"type": "csv_column", "column": "hist_item_id", "dtype": "int64", "shape": "sequence", "delimiter": "|"}
+    },
+    {
+      "name": "hist_cate_id",
+      "encoder": "embedding",
+      "vocab_size": 5000,
+      "embedding_dim": 4,
+      "source": {"type": "csv_column", "column": "hist_cate_id", "dtype": "int64", "shape": "sequence", "delimiter": "|"}
+    },
+    {
+      "name": "hist_price",
+      "encoder": "identity",
+      "dim": 1,
+      "projection_dim": 2,
+      "source": {"type": "csv_column", "column": "hist_price", "dtype": "float32", "shape": "sequence", "delimiter": "|"}
+    }
   ]
 }
 ```
 
-如果 `embedding_dim=8`、`token_dim=16`，那么：
+每个子字段先独立编码：
 
-- `user_id` 被 embedding 成 `[B, 8]`，再投影为第 0 个 token `[B, 16]`。
-- `item_id` 是 `[B, 8]`，`price` 是 `[B, 1]`，拼接成 `[B, 9]`，再投影为第 1 个 token `[B, 16]`。
-- 最终 `feature_tokens` 形状是 `[B, 2, 16]`。
+```text
+hist_item_id -> item_step_emb:  [B, L, 8]
+hist_cate_id -> cate_step_emb:  [B, L, 4]
+hist_price   -> price_step_vec: [B, L, 2]
+```
+
+然后按最后一维拼接：
+
+```text
+sequence_embeddings = concat([item_step_emb, cate_step_emb, price_step_vec], dim=-1)
+                    = [B, L, 14]
+```
+
+当前 `fusion` 只支持 `concat`。多字段序列还有两个重要约束：
+
+- 所有 `sequence_features` 在同一个样本中应表示同一条行为序列，因此 batch 后的 padded shape 必须一致，例如都是 `[B, L]`。
+- 多个字段的 mask 会逐位取 AND；只要某个字段在该 step 无效，该 step 就整体无效。
+
+对于上面的例子，`history_behavior.output_dim = 8 + 4 + 2 = 14`。它输出的不是每个 step 的表示，而是经过 pooling 或 attention 后的 `[B, 14]` 向量。
+
+### 2.8 sequence_mean_pooling 细节
+
+`sequence_mean_pooling` 的目标是把变长行为序列压缩成一个固定维度向量。单字段和多字段都会先得到：
+
+```text
+sequence_embeddings: [B, L, E]
+mask:                [B, L]
+```
+
+其中 `E` 是所有 step 字段编码维度之和。然后执行 masked mean：
+
+```text
+weighted = sequence_embeddings * mask.unsqueeze(-1)
+denominator = max(mask.sum(dim=1), 1)
+output = weighted.sum(dim=1) / denominator
+```
+
+如果某条样本的序列为空，`denominator` 会被 clamp 到 1，输出为零向量或 padding 后对应的零贡献，避免除零。
+
+一个多字段例子：
+
+```text
+hist_item_id = 1|2|3
+hist_cate_id = 7|7|8
+hist_price   = 0.1|0.2|0.3
+
+step0 = concat(item_emb(1), cate_emb(7), price_proj(0.1))
+step1 = concat(item_emb(2), cate_emb(7), price_proj(0.2))
+step2 = concat(item_emb(3), cate_emb(8), price_proj(0.3))
+
+history_behavior = (step0 + step1 + step2) / 3
+```
+
+这个输出之后可以被 token 引用：
+
+```json
+{"token_id": 1, "projection": "linear", "inputs": ["history_behavior"]}
+```
+
+如果 `history_behavior.output_dim=14`、`token_dim=16`，这个 token 的 projection 就是：
+
+```text
+Linear(14, 16)(history_behavior) -> token_1 [B, 16]
+```
+
+### 2.9 DIN 序列编码细节
+
+`din` 用于目标感知的行为序列建模。它不仅看历史行为本身，还看当前候选 item、类目、价格等 target feature，让不同候选样本对同一段历史产生不同的权重。
+
+DIN 配置示例：
+
+```json
+{
+  "name": "history_behavior",
+  "encoder": "din",
+  "fusion": "concat",
+  "attention_hidden_dims": [80, 40],
+  "activation": "dice",
+  "attention_normalization": "none",
+  "sequence_features": [
+    {
+      "name": "hist_item_id",
+      "target_feature": "item_id",
+      "encoder": "embedding",
+      "vocab_size": 100000,
+      "embedding_dim": 8,
+      "source": {"type": "csv_column", "column": "hist_item_id", "dtype": "int64", "shape": "sequence", "delimiter": "|"}
+    },
+    {
+      "name": "hist_cate_id",
+      "target_feature": "cate_id",
+      "encoder": "embedding",
+      "vocab_size": 5000,
+      "embedding_dim": 4,
+      "source": {"type": "csv_column", "column": "hist_cate_id", "dtype": "int64", "shape": "sequence", "delimiter": "|"}
+    },
+    {
+      "name": "hist_price",
+      "target_feature": "price",
+      "encoder": "identity",
+      "dim": 1,
+      "projection_dim": 2,
+      "source": {"type": "csv_column", "column": "hist_price", "dtype": "float32", "shape": "sequence", "delimiter": "|"}
+    }
+  ]
+}
+```
+
+每个 `sequence_features[*].target_feature` 必须能在当前 batch features 中找到。ID 类历史字段和 target 字段通常应该共用同一 vocab，因为它们会经过同一个 field encoder 的 embedding 表。例如：
+
+```text
+hist_item_id 使用 vocab_size=100000 的 embedding
+target_feature=item_id 也通过这张 embedding 表编码
+```
+
+DIN 的前向计算分为五步。
+
+第一步，编码历史序列每个 step：
+
+```text
+hist_item_id -> [B, L, 8]
+hist_cate_id -> [B, L, 4]
+hist_price   -> [B, L, 2]
+
+sequence_embeddings = concat(...) -> [B, L, 14]
+```
+
+第二步，用相同字段编码逻辑编码 target：
+
+```text
+item_id -> [B, 8]
+cate_id -> [B, 4]
+price   -> [B, 2]
+
+target_embeddings = concat(...) -> [B, 14]
+```
+
+第三步，把 target 扩展到每个历史位置，并构造 activation unit 输入：
+
+```text
+expanded_target = target_embeddings.unsqueeze(1).expand_as(sequence_embeddings)
+
+activation_input = concat([
+  sequence_embeddings,
+  expanded_target,
+  sequence_embeddings - expanded_target,
+  sequence_embeddings * expanded_target,
+], dim=-1)
+
+activation_input: [B, L, 4 * 14]
+```
+
+第四步，activation unit 输出每个历史 step 的权重分数：
+
+```text
+scores = MLP(activation_input).squeeze(-1)  # [B, L]
+```
+
+MLP 的隐藏层来自 `attention_hidden_dims`，激活函数由 `activation` 控制，支持：
+
+- `dice`：默认值，使用 DIN 常见的 Dice activation。
+- `prelu`。
+- `relu`。
+
+第五步，按 mask 加权求和：
+
+```text
+if attention_normalization == "softmax":
+    scores = scores.masked_fill(~mask, -1e9)
+    weights = softmax(scores, dim=1)
+    weights = weights * mask
+    weights = weights / max(weights.sum(dim=1), 1e-8)
+else:
+    weights = scores * mask
+
+output = sum(sequence_embeddings * weights.unsqueeze(-1), dim=1)  # [B, 14]
+```
+
+注意：当前默认 `attention_normalization="none"`，也就是不做 softmax，直接使用 activation unit 的原始分数乘 mask 后加权求和。只有显式配置 `softmax` 时，才会把有效历史位置归一化成概率分布。
+
+DIN 输出仍然是一个普通 dense feature，可以在 `token_specs` 中和其他特征一起组成 token：
+
+```json
+{
+  "token_id": 2,
+  "projection": "linear",
+  "inputs": ["item_id", "history_behavior", "price"]
+}
+```
+
+如果 `item_id` 输出 8 维、`history_behavior` 输出 14 维、`price` 输出 1 维，那么 token projection 的输入维度就是 23：
+
+```text
+concat(item_emb, history_behavior, price) -> [B, 23]
+Linear(23, token_dim) -> [B, token_dim]
+```
+
+### 2.10 SIM / Longer 序列编码细节
+
+`sim` 和 `longer` 继承 DIN 的字段编码和 activation unit，但在 DIN 加权前增加了 top-k 检索步骤，适合更长的历史序列。
+
+配置上与 DIN 类似，多一个 `top_k` 或 `search_top_k`：
+
+```json
+{
+  "name": "history_items",
+  "encoder": "sim",
+  "vocab_size": 100000,
+  "target_feature": "item_id",
+  "attention_hidden_dims": [80, 40],
+  "attention_normalization": "softmax",
+  "top_k": 50,
+  "source": {
+    "type": "csv_column",
+    "column": "history_items",
+    "dtype": "int64",
+    "shape": "sequence",
+    "delimiter": "|"
+  }
+}
+```
+
+内部流程是：
+
+```text
+1. 和 DIN 一样得到：
+   sequence_embeddings: [B, L, E]
+   target_embeddings:   [B, E]
+   mask:                [B, L]
+
+2. 用点积做粗排检索：
+   search_scores = sum(sequence_embeddings * target_embeddings.unsqueeze(1), dim=-1)
+                 = [B, L]
+
+3. padding 位置设成很小的分数：
+   masked_search_scores = search_scores.masked_fill(~mask, -1e9)
+
+4. 取 top_k 个历史位置：
+   k = min(search_top_k, L)
+   top_indices = topk(masked_search_scores, k)
+
+5. gather 出 selected_embeddings 和 selected_mask：
+   selected_embeddings: [B, k, E]
+   selected_mask:       [B, k]
+
+6. 在 top-k 子序列上执行 DIN activation unit 和 weighted sum：
+   output: [B, E]
+```
+
+`longer` 当前实现与 `sim` 相同，是 `SIMSequenceEncoder` 的别名子类。
+
+### 2.11 序列特征进入 token_specs 的方式
+
+无论使用 `sequence_mean_pooling`、`din`、`sim` 还是 `longer`，encoder 的最终输出都是 `[B, output_dim]`。从 `FeatureTokenCompiler` 看，它和普通 embedding/identity 没有区别：
+
+```text
+encoded_features["history_behavior"] = sequence_encoder(batch)  # [B, E]
+```
+
+然后 token_specs 决定如何把它变成 token：
+
+```json
+{
+  "token_specs": [
+    {"token_id": 0, "projection": "linear", "inputs": ["user_id"]},
+    {"token_id": 1, "projection": "linear", "inputs": ["item_id", "history_behavior"]},
+    {"token_id": 2, "projection": "ffn_relu", "inputs": ["history_behavior", "price"]}
+  ]
+}
+```
+
+对应的形状可能是：
+
+```text
+user_id          -> [B, 8]
+item_id          -> [B, 8]
+history_behavior -> [B, 14]
+price            -> [B, 1]
+
+token 0 input = user_id                      -> [B, 8]  -> Linear(8, D)
+token 1 input = concat(item_id, history)     -> [B, 22] -> Linear(22, D)
+token 2 input = concat(history, price)       -> [B, 15] -> FFN(15, hidden, D)
+
+feature_tokens = concat token 0/1/2 on dim=1 -> [B, 3, D]
+```
+
+对于 MDL，scenario tokens 和 task tokens 也完全遵守同样规则。也就是说，序列特征不仅可以进入普通 feature tokens，也可以作为场景 token 或任务 token 的输入。例如：
+
+```json
+{
+  "scenario_token_specs": [
+    {"token_id": 0, "inputs": ["user_profile", "history_behavior"]},
+    {"token_id": 1, "inputs": ["search_context"]},
+    {"token_id": 2, "inputs": ["user_profile", "history_behavior", "search_context"]}
+  ],
+  "task_token_specs": [
+    {"token_id": 0, "inputs": ["item_id", "history_behavior"]},
+    {"token_id": 1, "inputs": ["item_id", "price"]}
+  ]
+}
+```
+
+这里 `scenario_token_specs` 的数量仍然必须是 `num_scenarios + 1`，`task_token_specs` 的数量仍然必须是 `num_tasks`。序列 encoder 只负责把历史压缩成 dense feature；最终它影响哪个 token、影响多少 token，完全由这些 token specs 决定。
+
+### 2.12 序列 tokenization 的完整例子
+
+假设一条样本包含当前候选商品和用户历史：
+
+```csv
+item_id,cate_id,price,hist_item_id,hist_cate_id,hist_price
+3,2,0.2,1|2|3,2|2|1,0.1|0.2|0.3
+```
+
+manifest 中声明：
+
+```json
+{
+  "features": [
+    {"name": "item_id", "encoder": "embedding", "vocab_size": 20, "embedding_dim": 8,
+     "source": {"type": "csv_column", "column": "item_id", "dtype": "int64"}},
+    {"name": "cate_id", "encoder": "embedding", "vocab_size": 8, "embedding_dim": 4,
+     "source": {"type": "csv_column", "column": "cate_id", "dtype": "int64"}},
+    {"name": "price", "encoder": "identity", "dim": 1,
+     "source": {"type": "csv_column", "column": "price", "dtype": "float32"}},
+    {
+      "name": "history_behavior",
+      "encoder": "din",
+      "fusion": "concat",
+      "attention_hidden_dims": [8],
+      "sequence_features": [
+        {"name": "hist_item_id", "target_feature": "item_id", "encoder": "embedding", "vocab_size": 20, "embedding_dim": 8,
+         "source": {"type": "csv_column", "column": "hist_item_id", "dtype": "int64", "shape": "sequence", "delimiter": "|"}},
+        {"name": "hist_cate_id", "target_feature": "cate_id", "encoder": "embedding", "vocab_size": 8, "embedding_dim": 4,
+         "source": {"type": "csv_column", "column": "hist_cate_id", "dtype": "int64", "shape": "sequence", "delimiter": "|"}},
+        {"name": "hist_price", "target_feature": "price", "encoder": "identity", "dim": 1, "projection_dim": 2,
+         "source": {"type": "csv_column", "column": "hist_price", "dtype": "float32", "shape": "sequence", "delimiter": "|"}}
+      ]
+    }
+  ],
+  "token_specs": [
+    {"token_id": 0, "projection": "linear", "inputs": ["item_id"]},
+    {"token_id": 1, "projection": "linear", "inputs": ["item_id", "history_behavior", "price"]}
+  ]
+}
+```
+
+tokenization 阶段的形状流是：
+
+```text
+CSV 解析:
+  item_id = 3
+  cate_id = 2
+  price = 0.2
+  hist_item_id = [1, 2, 3]
+  hist_cate_id = [2, 2, 1]
+  hist_price = [0.1, 0.2, 0.3]
+
+collate:
+  item_id: LongTensor[B]
+  cate_id: LongTensor[B]
+  price: FloatTensor[B]
+  hist_item_id: {values: LongTensor[B, L], lengths: LongTensor[B]}
+  hist_cate_id: {values: LongTensor[B, L], lengths: LongTensor[B]}
+  hist_price: {values: FloatTensor[B, L], lengths: LongTensor[B]}
+
+feature encoding:
+  item_id -> [B, 8]
+  cate_id -> [B, 4]
+  price -> [B, 1]
+  history_behavior:
+    sequence side = concat([B, L, 8], [B, L, 4], [B, L, 2]) -> [B, L, 14]
+    target side   = concat([B, 8],    [B, 4],    [B, 2])    -> [B, 14]
+    DIN weighted sum -> [B, 14]
+
+token projection:
+  token 0 input = item_id -> [B, 8]
+  token 0 = Linear(8, D) -> [B, D]
+
+  token 1 input = concat(item_id, history_behavior, price) -> [B, 23]
+  token 1 = Linear(23, D) -> [B, D]
+
+final:
+  feature_tokens = stack([token0, token1], dim=1) -> [B, 2, D]
+```
+
+这个例子里，DIN 的 target 是当前候选商品、类目和价格；因此同一个用户历史在不同候选 item 下会得到不同的 `history_behavior` 向量，进而影响后续 token 和最终预测。
 
 ## 3. MDL 主模型
 
