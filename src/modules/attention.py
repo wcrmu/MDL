@@ -1,11 +1,29 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import math
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
+
+try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+except ImportError:  # pragma: no cover - compatibility with older PyTorch builds.
+    SDPBackend = None
+    sdpa_kernel = None
 
 from .mlp import PerTokenFFN
+
+
+def _sdpa_context(attention_backend: str):
+    if attention_backend in {"auto", "sdpa"}:
+        return nullcontext()
+    if attention_backend == "flash":
+        if SDPBackend is None or sdpa_kernel is None:
+            raise RuntimeError("runtime.attention_backend='flash' requires torch.nn.attention.sdpa_kernel")
+        return sdpa_kernel([SDPBackend.FLASH_ATTENTION])
+    raise ValueError("attention_backend must be auto, sdpa, or flash")
 
 
 class RankMixerTokenMixing(nn.Module):
@@ -29,50 +47,6 @@ class RankMixerTokenMixing(nn.Module):
         return mixed.view(batch_size, num_tokens, token_dim)
 
 
-class FeatureInteraction(nn.Module):
-    def __init__(
-        self,
-        num_feature_tokens: int,
-        token_dim: int,
-        num_heads: int,
-        dropout: float = 0.0,
-        backbone: str = "rankmixer",
-    ) -> None:
-        super().__init__()
-        self.backbone = backbone
-        if self.backbone == "rankmixer":
-            self.rankmixer = RankMixerTokenMixing(num_feature_tokens, token_dim)
-            self.attention = None
-        elif self.backbone == "attention":
-            self.rankmixer = None
-            self.attention = nn.MultiheadAttention(
-                embed_dim=token_dim,
-                num_heads=num_heads,
-                dropout=dropout,
-                batch_first=True,
-            )
-        else:
-            raise ValueError("feature backbone must be 'rankmixer' or 'attention'")
-
-    def forward(
-        self, tokens: Tensor, need_attention: bool = False
-    ) -> tuple[Tensor, Tensor | None]:
-        if self.backbone == "rankmixer":
-            if self.rankmixer is None:
-                raise RuntimeError("rankmixer module is not initialized")
-            return self.rankmixer(tokens), None
-        if self.attention is None:
-            raise RuntimeError("attention module is not initialized")
-        mixed, weights = self.attention(
-            tokens,
-            tokens,
-            tokens,
-            need_weights=need_attention,
-            average_attn_weights=False,
-        )
-        return mixed, weights if need_attention else None
-
-
 class DomainAwareAttention(nn.Module):
     def __init__(
         self,
@@ -82,6 +56,7 @@ class DomainAwareAttention(nn.Module):
         num_feature_tokens: int,
         hidden_dim: int,
         dropout: float = 0.0,
+        attention_backend: str = "auto",
     ) -> None:
         super().__init__()
         if token_dim % num_heads != 0:
@@ -93,6 +68,7 @@ class DomainAwareAttention(nn.Module):
         self.num_domain_tokens = num_domain_tokens
         self.num_feature_tokens = num_feature_tokens
         self.head_dim = token_dim // num_heads
+        self.attention_backend = attention_backend
         self.query_projection = PerTokenFFN(
             num_domain_tokens,
             token_dim,
@@ -142,6 +118,17 @@ class DomainAwareAttention(nn.Module):
         query = self._split_heads(self.query_projection(domain_tokens))
         key = self._split_heads(self.key_projection(feature_tokens))
         value = self._split_heads(self.value_projection(feature_tokens))
+
+        if not need_weights:
+            dropout_p = self.dropout.p if self.training else 0.0
+            with _sdpa_context(self.attention_backend):
+                attended = F.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    dropout_p=dropout_p,
+                )
+            return self._merge_heads(attended), None
 
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
         weights = torch.softmax(scores, dim=-1)

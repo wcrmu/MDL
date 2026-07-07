@@ -1,0 +1,223 @@
+runtime:
+  device: cuda
+  precision: bf16
+  compile: false
+  activation_checkpoint: true
+  attention_backend: auto
+  distributed: none
+  nproc_per_node: null
+  master_addr: 127.0.0.1
+  master_port: 29500
+
+data:
+  train:
+    format: agg_parquet
+    inputs:
+      - /secure/train/day=*/part-*.parquet
+    reader:
+      engine: pyarrow_dataset
+      columns_pruning: true
+      num_workers: 8
+      prefetch_batches: 4
+      pin_memory: true
+      shard_unit: row_group
+      batch_size_candidates: 2048
+    agg_layout:
+      type: parallel_lists
+      request_id: request_id
+      shared_columns:
+        - user_id
+        - rankmixer_context_dense
+        - hist_item_id
+        - hist_shop_id
+        - hist_action
+        - hist_age
+      candidate_columns:
+        - item_id
+        - shop_id
+        - click
+      labels:
+        click: click
+
+  test:
+    format: flat_parquet
+    inputs:
+      - /secure/test/day=*/part-*.parquet
+    request_id: request_id
+    group_id: request_id
+    reader:
+      engine: pyarrow_dataset
+      columns_pruning: true
+      num_workers: 8
+      prefetch_batches: 4
+      pin_memory: true
+      shard_unit: row_group
+      batch_size_rows: 4096
+
+  schema_policy:
+    require_same_schema: true
+    allow_missing_nullable_columns: false
+    validate_before_train: true
+
+features:
+  - name: user_id
+    kind: categorical
+    source: user_id
+    embedding_scope: feature
+  - name: item_id
+    kind: categorical
+    source: item_id
+    embedding_scope: feature
+  - name: shop_id
+    kind: categorical
+    source: shop_id
+    embedding_scope: feature
+  - name: rankmixer_context_dense
+    kind: dense
+    source: rankmixer_context_dense
+    dimension: 672
+    embedding_scope: feature
+
+sequences:
+  - name: hist
+    layout: parallel_lists
+    embedding_scope: feature
+    max_length: 100
+    truncation: tail
+    encoder: longer
+    # Multi-slice RankMixer summary. For 9 core sequences, allocate this per
+    # sequence (for example 2-4 slices each) so sequence signals are not squeezed
+    # into only 9/32 feature slices.
+    rankmixer_summary_tokens: 31
+    longer_token_merge: 4
+    longer_inner_layers: 1
+    time_delta_field: age
+    target_inputs:
+      - item_id
+    longer_query_tokens: 32
+    longer_self_layers: 1
+    fields:
+      - name: item_id
+        kind: categorical
+        source: hist_item_id
+      - name: shop_id
+        kind: categorical
+        source: hist_shop_id
+      - name: action
+        kind: categorical
+        source: hist_action
+      - name: age
+        kind: dense
+        source: hist_age
+
+scenarios:
+  names:
+    - default
+  source: null
+
+tokenization:
+  feature_tokenizer: rankmixer
+  # Strict RankMixer reshape: user/item/shop (3 * 32) + context dense (672) + hist (31 * 768) = 24576 = 32 * 768.
+  # No implicit padding is allowed; adjust per-feature dims and per-sequence summary tokens to keep this exact.
+  num_feature_tokens: 32
+  sequence_tokens:
+    - name: history
+      inputs:
+        - hist
+  ns_tokens:
+    - name: user
+      inputs:
+        - user_id
+    - name: item
+      inputs:
+        - item_id
+    - name: shop
+      inputs:
+        - shop_id
+  scenario_tokens:
+    - name: default
+      important_inputs:
+        - user_id
+        - item_id
+      prior_inputs:
+        - hist
+    - name: global
+      important_inputs:
+        - user_id
+        - item_id
+      prior_inputs:
+        - hist
+  task_tokens:
+    - name: click
+      important_inputs:
+        - user_id
+        - item_id
+      prior_inputs:
+        - hist
+
+vocab_strategy:
+  defaults:
+    fit_split: train
+    oov_id: 0
+    padding_id: 0
+    unseen_policy: oov
+    artifact_dir: artifacts/vocab
+  features:
+    user_id:
+      encoding: vocab
+      source: user_id
+      min_count: 5
+      max_size: 5000000
+      artifact: user_id.parquet
+    item_id:
+      encoding: vocab
+      source: item_id
+      min_count: 3
+      max_size: 10000000
+      artifact: item_id.parquet
+    hist.item_id:
+      encoding: shared_vocab
+      source: hist_item_id
+      share_with: item_id
+      share_embedding: true
+    shop_id:
+      encoding: hash
+      source: shop_id
+      num_buckets: 1000000
+      salt: mdl_v1_shop
+    hist.shop_id:
+      encoding: hash
+      source: hist_shop_id
+      num_buckets: 1000000
+      salt: mdl_v1_hist_shop
+    hist.action:
+      encoding: hash
+      source: hist_action
+      num_buckets: 1024
+      salt: mdl_v1_hist_action
+
+model:
+  name: mdl_rankmixer
+  embedding_dim: 32
+  token_dim: 768
+  num_layers: 2
+  num_heads: 12
+  hidden_dim: 1536
+  use_task_tokens: true
+  use_scenario_tokens: true
+  use_global_scenario_token: true
+  use_task_feature_interaction: true
+  use_scenario_feature_interaction: true
+  use_request_cache: true
+
+training:
+  batch_size: 2048
+  lr_dense: 0.005
+  dense_optimizer: rmsprop
+  sparse_optimizer: adagrad
+  embedding_sparse_gradients: true
+  sparse_update_mode: ddp_synced_adagrad
+  sparse_parameter_server_adapter: null
+  dense_clip_norm: 90.0
+  sparse_clip_norm: 120.0
+  checkpoint_path: artifacts/checkpoints/mdl_rankmixer.pt

@@ -1,112 +1,27 @@
 # MDL 推荐系统项目
 
+本仓库保留工业级 MDL 推荐系统核心实现，面向安全环境中的 parquet-native 训练和推理。训练数据支持多个同 schema 的 agg parquet 文件，测试/推理数据支持多个同 schema 的 flat parquet 文件；具体字段、agg 解压方式、词表策略、bucket/hash 策略和训练参数都通过 YAML 配置。
+
 ## 项目结构
 
 ```text
 .
 ├── configs/
-│   ├── default.yaml
-│   ├── model/
-│   │   ├── mdl.yaml
-│   │   ├── rankmixer.yaml
-│   │   └── deepfm.yaml
-│   └── dataset/
-│       └── manifest.yaml
-├── data/
+│   └── mdl.yaml                 # 数据、词表、模型和训练模板
+├── PAPER_ALIGNMENT.md           # MDL / OneTrans 论文对齐检查说明
+├── paper/                       # 本地论文源码
+├── mdl.py                       # 唯一对外 CLI
 ├── src/
-│   ├── datasets/
-│   │   ├── build_dataset.py
-│   │   ├── feature_schema.py
-│   │   └── preprocess.py
-│   ├── models/
-│   │   ├── base.py
-│   │   ├── deepfm.py
-│   │   ├── rankmixer.py
-│   │   └── mdl.py
-│   ├── modules/
-│   │   ├── embedding.py
-│   │   ├── tokenizer.py
-│   │   ├── mlp.py
-│   │   ├── attention.py
-│   │   ├── loss.py
-│   │   └── metrics.py
-│   ├── trainers/
-│   │   ├── trainer.py
-│   │   ├── evaluator.py
-│   │   └── callbacks.py
-│   └── utils/
-│       ├── config.py
-│       ├── logger.py
-│       ├── seed.py
-│       └── checkpoint.py
-├── scripts/
-│   ├── preprocess.py
-│   ├── train.py
-│   ├── evaluate.py
-│   └── predict.py
-├── experiments/
-│   ├── runs/
-│   ├── logs/
-│   └── checkpoints/
-├── tests/
-└── notebooks/
+│   ├── config.py                # YAML 配置 dataclass 和校验
+│   ├── data.py                  # parquet discovery、schema 校验和 agg 解压
+│   ├── features.py              # 词表策略和特征元信息
+│   ├── vocab.py                 # vocab fit/load
+│   ├── tensorize.py             # Arrow table 到 torch batch
+│   ├── model.py                 # paper-aligned MDL 模型
+│   ├── train.py                 # 训练和预测流程
+│   ├── benchmark.py             # parquet 读取性能检查
+│   └── modules/                 # 复用的 attention、MLP、loss、metrics 模块
 ```
-
-## 数据处理流程
-
-数据集相关的原始数据转换逻辑放在 feature pipeline 中。
-
-processed 数据格式如下：
-
-```text
-processed_dataset/
-  manifest.json
-  train.csv
-  val.csv
-  test.csv
-  vocab__<feature_name>.json   # 可选
-```
-
-`manifest.json` 声明场景列、标签、标签 mask、特征 encoder 和 token 分组；可选声明 `group_id` 作为业务追踪字段。当前 tokenization 契约如下：
-
-```json
-{
-  "scenario_names": ["default"],
-  "task_names": ["click"],
-  "data_columns": {
-    "scenario_id": "scene",
-    "sample_weight": "sample_weight",
-    "labels": {"click": "click_label"},
-    "label_masks": {"click": "click_mask"}
-  },
-  "tokenization": {
-    "version": 2,
-    "kind": "encoder_registry",
-    "features": [
-      {"name": "user_id", "encoder": "embedding", "vocab_size": 100000, "source": {"type": "csv_column", "column": "user_id", "dtype": "int64"}},
-      {"name": "score", "encoder": "identity", "dim": 1, "source": {"type": "csv_column", "column": "score", "dtype": "float32"}}
-    ],
-    "token_specs": [
-      {"token_id": 0, "projection": "linear", "inputs": ["user_id", "score"]}
-    ],
-    "scenario_features": [
-      {"name": "user_id", "encoder": "embedding", "vocab_size": 100000}
-    ],
-    "scenario_token_specs": [
-      {"token_id": 0, "inputs": ["user_id"]},
-      {"token_id": 1, "inputs": ["user_id"]}
-    ],
-    "task_features": [
-      {"name": "score", "encoder": "identity", "dim": 1}
-    ],
-    "task_token_specs": [
-      {"token_id": 0, "inputs": ["score"]}
-    ]
-  }
-}
-```
-
-内置 encoder 包括 `embedding`、`identity`、多字段 `sequence_mean_pooling`、多字段目标感知 `din`，以及长序列目标感知 `sim`/`longer`。MDL manifest 必须声明 `scenario_features/scenario_token_specs` 和 `task_features/task_token_specs`；如果缺少任意字段，模型构建会直接报错。纯 RankMixer baseline 只使用 `features/token_specs`，可用于 feature-only manifest。单场景 CSV 使用 `data_columns.scenario_id`；重叠场景可使用 `data_columns.scenario_ids`，并配合 `scenario_ids_delimiter`，例如 `|`。如果声明了 `data_columns.sample_weight`，训练和评估 loss 会同时使用该样本权重以及可选的 task/scenario 权重。
 
 ## 常用命令
 
@@ -116,86 +31,131 @@ processed_dataset/
 pip install -r requirements.txt
 ```
 
-校验 processed manifest 数据集：
+校验工业配置：
 
 ```bash
-python scripts/preprocess.py --data-dir processed_dataset
+python mdl.py validate-config --config configs/mdl.yaml
 ```
 
-在快速迭代 feature pipeline 时，可以用 `--max-rows N` 只校验每个 split 的前 `N` 行。
-
-训练 MDL：
+检查 parquet schema、所需列和样例 batch：
 
 ```bash
-python scripts/train.py \
-  --data-dir processed_dataset \
-  --epochs 1 \
-  --batch-size 256 \
-  --max-steps 10 \
-  --eval-max-batches 10 \
-  --gradient-clip-norm 5.0 \
-  --lr-scheduler cosine \
-  --warmup-steps 2 \
-  --min-lr-ratio 0.1 \
-  --dense-weight-decay 1e-5 \
-  --task-head-type mlp \
-  --task-head-hidden-dim 64 \
-  --task-head-dropout 0.0 \
-  --auto-positive-class-weights \
-  --task-weights 1.0 \
-  --scenario-weights 1.0
+python mdl.py profile \
+  --config configs/mdl.yaml \
+  --split train \
+  --max-batches 10
 ```
 
-`--task-head-type linear` 是 MDL 默认输出头，等价于每个 task token 接一层 `Linear(token_dim, 1)`；`--task-head-type mlp` 会改为每个任务一个两层 MLP head，便于和 RankMixer baseline 的 head 容量做更公平的 ablation。
-
-训练纯 RankMixer baseline：
+做读取性能基准：
 
 ```bash
-python scripts/train.py \
-  --model-name rankmixer \
-  --data-dir processed_dataset \
-  --epochs 1 \
-  --batch-size 256 \
+python mdl.py benchmark \
+  --config configs/mdl.yaml \
+  --split train \
+  --max-batches 10
+```
+
+构建词表：
+
+```bash
+python mdl.py fit-vocab --config configs/mdl.yaml
+```
+
+短训练 smoke test：
+
+```bash
+python mdl.py train \
+  --config configs/mdl.yaml \
   --max-steps 10
 ```
 
-启用 RankMixer 风格的 Sparse-MoE per-token FFN：
+模型通过 `model.name` 切换：
 
-```bash
-python scripts/train.py \
-  --data-dir processed_dataset \
-  --ffn-type sparse_moe \
-  --sparse-moe-num-experts 4 \
-  --sparse-moe-loss-weight 1e-4 \
-  --sparse-moe-target-active-ratio 0.25 \
-  --sparse-moe-dtsi-infer-weight 0.5
+- `mdl_rankmixer`：MDL 场景/任务 token + RankMixer-style TokenMixing backbone。
+- `onetrans`：论文版 OneTrans，包含 S/NS tokenizer、mixed causal attention、mixed FFN 和 pyramid stack。
+- `mdl_onetrans`：OneTrans 产生 feature tokens，MDL 场景/任务 token 和 domain-aware attention 负责多场景/多任务输出。
+
+默认 `configs/mdl.yaml` 面向大字段安全环境：`mdl_rankmixer` 使用 `tokenization.feature_tokenizer: rankmixer`，默认 feature tokens 是 `32 * 768`，不包括另外生成的 scenario/task tokens。按 `feature_token_inputs` 的 YAML 顺序拼接所有 `embedding_scope: feature/shared` 的输入，并要求拼接后的维度严格等于 `num_feature_tokens * token_dim` 后直接 reshape；不再隐式 zero-pad。模板中 `user_id/item_id/shop_id` 提供 `3 * 32` 维，`rankmixer_context_dense` 提供 `672` 维，`hist` 的 LONGER multi-slice summary 提供 `31 * 768` 维，总计 `24576 = 32 * 768`。后续适配私有 schema 时，优先改 `features`、`sequences`、`vocab_strategy`、`scenario_tokens` 和 `task_tokens`；只有需要排除某些字段或控制切片顺序时才声明 `tokenization.feature_token_inputs`。`auto_split` 仍保留为显式 fallback，但不是默认 RankMixer 对齐路径。
+
+多字段行为序列用 `sequences` 声明，每个序列 step 内可以包含多个 categorical/dense 字段：
+
+`FeatureConfig.kind: sequence` 只保留为 legacy 单列序列兼容入口，新配置应使用顶层 `sequences`。`encoder: longer` 在 RankMixer 路径中支持 target/global tokens、recent query 压缩、Token Merge、InnerTrans、time-delta side projection、cross-causal attention、后续 self-causal attention，以及 `rankmixer_summary_tokens` 多 slice 序列摘要。
+
+```yaml
+sequences:
+  - name: hist
+    layout: parallel_lists
+    max_length: 100
+    truncation: tail
+    encoder: longer
+    target_inputs: [item_id]
+    longer_query_tokens: 32
+    longer_self_layers: 1
+    fields:
+      - name: item_id
+        kind: categorical
+        source: hist_item_id
+      - name: action
+        kind: categorical
+        source: hist_action
+      - name: age
+        kind: dense
+        source: hist_age
 ```
 
-Sparse-MoE 默认使用 ReLU routing 和 DTSI training，对 inference router 做 L1 正则；当设置 `--sparse-moe-target-active-ratio` 时，会启用自适应 loss weight 控制；`--sparse-moe-dtsi-infer-weight` 可配置训练/推理 router 的混合比例；在 `eval()`/prediction 阶段会使用稀疏 expert 执行。
-
-评估：
+单机多卡 DDP 训练可以由 CLI 自动启动：
 
 ```bash
-python scripts/evaluate.py \
-  --data-dir processed_dataset \
-  --split test \
-  --checkpoint-path experiments/checkpoints/mdl.pt
+python mdl.py train \
+  --config configs/mdl.yaml \
+  --distributed ddp \
+  --nproc-per-node 4 \
+  --max-steps 100
 ```
+
+也可以直接使用生产环境常见的 `torchrun`：
+
+```bash
+torchrun --nproc_per_node=4 mdl.py train \
+  --config configs/mdl.yaml \
+  --distributed ddp \
+  --max-steps 100
+```
+
+DDP 下 `reader.shard_unit: file` 会按文件分片；`row_group` 和 `record_batch` 会按扫描 batch 分片。`training.batch_size` 和 `reader.batch_size_candidates` 按每个进程解释，checkpoint 只由 rank 0 写入。
+
+默认 `training.sparse_update_mode: ddp_synced_adagrad` 使用稀疏 embedding 梯度和 Adagrad，但 DDP 仍会同步梯度；这不是论文中“sparse 异步、dense 同步”的数百 GPU 参数服务器训练。安全环境若要对齐论文训练系统，需要配置：
+
+```yaml
+training:
+  sparse_update_mode: external_parameter_server
+  sparse_parameter_server_adapter: secure_pkg.mdl_ps_train:train
+```
+
+adapter 必须接管完整训练流程，并返回 `{"steps": int, "last_loss": float}` 或 `TrainResult`。
 
 预测：
 
 ```bash
-python scripts/predict.py \
-  --data-dir processed_dataset \
-  --split test \
-  --checkpoint-path experiments/checkpoints/mdl.pt \
-  --output-path experiments/runs/predictions.csv
+python mdl.py predict \
+  --config configs/mdl.yaml \
+  --checkpoint-path artifacts/checkpoints/mdl_rankmixer.pt \
+  --output-path artifacts/runs/predictions.parquet
 ```
 
-## 测试
-
-运行聚焦测试：
+论文对齐检查：
 
 ```bash
-python -m pytest tests
+python mdl.py check-paper-alignment
 ```
+
+基础校验：
+
+```bash
+python mdl.py validate-config --config configs/mdl.yaml
+python mdl.py check-paper-alignment
+```
+
+## 数据与安全
+
+不要提交 raw parquet、词表产物、checkpoint、预测结果或安全环境路径。`configs/mdl.yaml` 中的路径是模板占位；进入安全环境后只需要替换 `data.*.inputs`、`features`、`vocab_strategy`、`tokenization` 和训练参数；训练输出默认写入 ignored 的 `artifacts/`。

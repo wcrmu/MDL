@@ -1,8 +1,0 @@
-format: manifest_csv
-data_dir: data/processed
-required_files:
-  - manifest.json
-  - train.csv
-optional_splits:
-  - val.csv
-  - test.csv
