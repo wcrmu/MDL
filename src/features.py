@@ -61,7 +61,7 @@ def _require_pyarrow() -> tuple[Any, Any, Any, Any]:
         import pyarrow.parquet as pq
     except ImportError as error:
         raise RuntimeError(
-            "pyarrow is required for vocab fitting and loading; install requirements.txt"
+            "pyarrow is required for vocab fitting and loading; install it in the runtime environment"
         ) from error
     return pa, pc, ds, pq
 

@@ -95,7 +95,7 @@ def _require_pyarrow() -> tuple[Any, Any, Any, Any]:
         import pyarrow.parquet as pq
     except ImportError as error:
         raise RuntimeError(
-            "parquet-native data loading requires pyarrow; install requirements.txt"
+            "parquet-native data loading requires pyarrow; install it in the runtime environment"
         ) from error
     return pa, pc, ds, pq
 
@@ -107,7 +107,7 @@ def _require_pyarrow_fs() -> Any:
     except ImportError as error:
         raise RuntimeError(
             "parquet-native data loading requires pyarrow filesystem support; "
-            "install requirements.txt"
+            "install pyarrow in the runtime environment"
         ) from error
     return pafs
 

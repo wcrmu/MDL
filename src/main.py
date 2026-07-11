@@ -6,7 +6,20 @@ from pathlib import Path
 import subprocess
 import sys
 
-from src.benchmark import benchmark_split, benchmark_training
+MAIN_SCRIPT = Path(__file__).resolve()
+
+
+def _bootstrap_import_path() -> None:
+    if __package__ not in {None, ""}:
+        return
+    repo_root = MAIN_SCRIPT.parent.parent
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+
+
+_bootstrap_import_path()
+
 from src.config import load_app_config
 from src.dataloader import (
     discover_parquet_inputs,
@@ -19,11 +32,6 @@ from src.features import fit_vocabs, plan_vocab_fit, vocab_artifacts, vocab_stra
 from src.train import is_main_process, predict_mdl, train_mdl
 
 
-MDL_PAPER = Path("paper/MDL/main.tex")
-ONETRANS_PAPER = Path("paper/OneTrans/main.tex")
-ALIGNMENT_DOC = Path("PAPER_ALIGNMENT.md")
-
-
 def _load_config(args: argparse.Namespace):
     return load_app_config(args.config)
 
@@ -34,66 +42,6 @@ def _cmd_validate_config(args: argparse.Namespace) -> int:
     print(f"model: {config.model.name}")
     print(f"features: {len(config.features)}")
     print(f"vocab_strategy_hash: {vocab_strategy_fingerprint(config)}")
-    return 0
-
-
-def _require_text(path: Path, patterns: list[str]) -> list[str]:
-    if not path.exists():
-        return [f"missing file: {path}"]
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    return [f"{path}: missing pattern {pattern!r}" for pattern in patterns if pattern not in text]
-
-
-def _cmd_check_paper_alignment(args: argparse.Namespace) -> int:
-    errors: list[str] = []
-    errors.extend(
-        _require_text(
-            MDL_PAPER,
-            [
-                "Multi",
-                "Distribution",
-                "Unified Information Tokenization",
-                "Domain-aware Attention",
-                "Domain-fused Module",
-                "TokenMixing",
-                "PertokenFFN",
-            ],
-        )
-    )
-    errors.extend(
-        _require_text(
-            ONETRANS_PAPER,
-            [
-                "OneTrans",
-                "Non-Sequential Tokenization",
-                "Sequential Tokenization",
-                "Mixed (shared/token-specific) Causal Attention",
-                "Pyramid Stack",
-                "Cross Request KV Caching",
-            ],
-        )
-    )
-    errors.extend(
-        _require_text(
-            ALIGNMENT_DOC,
-            [
-                "`rankmixer`",
-                "mdl_rankmixer",
-                "onetrans",
-                "mdl_onetrans",
-                "Hybrid MDL + OneTrans",
-                "Open Deviations",
-            ],
-        )
-    )
-    if errors:
-        for error in errors:
-            print(error, file=sys.stderr)
-        return 1
-    print("paper alignment sources: OK")
-    print(f"MDL paper: {MDL_PAPER}")
-    print(f"OneTrans paper: {ONETRANS_PAPER}")
-    print(f"alignment doc: {ALIGNMENT_DOC}")
     return 0
 
 
@@ -122,31 +70,6 @@ def _cmd_profile(args: argparse.Namespace) -> int:
             "vocab_feature "
             f"name={ref.feature_name} encoding={ref.encoding} artifact={ref.artifact_path} size_hint={ref.size_hint}"
         )
-    return 0
-
-
-def _cmd_benchmark(args: argparse.Namespace) -> int:
-    config = _load_config(args)
-    result = benchmark_split(config, args.split, max_batches=args.max_batches)
-    print(f"split: {result.split}")
-    print(f"files: {result.files}")
-    print(f"record_batches: {result.record_batches}")
-    print(f"input_rows: {result.input_rows}")
-    print(f"flat_rows: {result.flat_rows}")
-    print(f"elapsed_seconds: {result.elapsed_seconds:.6f}")
-    print(f"rows_per_second: {result.rows_per_second:.2f}")
-    return 0
-
-
-def _cmd_benchmark_train(args: argparse.Namespace) -> int:
-    config = _load_config(args)
-    result = benchmark_training(config, max_steps=args.max_steps)
-    print(f"steps: {result.steps}")
-    print(f"rows: {result.rows}")
-    print(f"last_loss: {result.last_loss:.6f}")
-    print(f"elapsed_seconds: {result.elapsed_seconds:.6f}")
-    print(f"steps_per_second: {result.steps_per_second:.2f}")
-    print(f"rows_per_second: {result.rows_per_second:.2f}")
     return 0
 
 
@@ -203,7 +126,7 @@ def _launch_ddp_train(args: argparse.Namespace, config) -> int:
         master_addr,
         "--master-port",
         str(master_port),
-        str(Path(__file__).resolve()),
+        str(MAIN_SCRIPT),
         *sys.argv[1:],
     ]
     env = os.environ.copy()
@@ -248,25 +171,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     validate.add_argument("--config", required=True)
     validate.set_defaults(func=_cmd_validate_config)
 
-    align = subparsers.add_parser("check-paper-alignment")
-    align.set_defaults(func=_cmd_check_paper_alignment)
-
     profile = subparsers.add_parser("profile")
     profile.add_argument("--config", required=True)
     profile.add_argument("--split", choices=["train", "test"], default="train")
     profile.add_argument("--max-batches", type=int, default=10)
     profile.set_defaults(func=_cmd_profile)
-
-    benchmark = subparsers.add_parser("benchmark")
-    benchmark.add_argument("--config", required=True)
-    benchmark.add_argument("--split", choices=["train", "test"], default="train")
-    benchmark.add_argument("--max-batches", type=int, default=10)
-    benchmark.set_defaults(func=_cmd_benchmark)
-
-    benchmark_train = subparsers.add_parser("benchmark-train")
-    benchmark_train.add_argument("--config", required=True)
-    benchmark_train.add_argument("--max-steps", type=int, default=10)
-    benchmark_train.set_defaults(func=_cmd_benchmark_train)
 
     fit_vocab = subparsers.add_parser("fit-vocab")
     fit_vocab.add_argument("--config", required=True)
