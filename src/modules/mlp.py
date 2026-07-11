@@ -20,7 +20,7 @@ class PerTokenFFN(nn.Module):
         hidden_dim: int,
         dropout: float = 0.0,
         output_relu: bool = False,
-        activation: str = "relu",
+        activation: str = "gelu",
     ) -> None:
         super().__init__()
         activation_layer = _activation_layer(activation)

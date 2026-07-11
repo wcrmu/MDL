@@ -6,12 +6,17 @@ from pathlib import Path
 import subprocess
 import sys
 
-from src.benchmark import benchmark_split
+from src.benchmark import benchmark_split, benchmark_training
 from src.config import load_app_config
-from src.data import ParquetScanner, discover_parquet_inputs, required_columns_for_split, validate_matching_schemas
-from src.features import vocab_artifacts, vocab_strategy_fingerprint
+from src.dataloader import (
+    discover_parquet_inputs,
+    iter_flat_tables,
+    required_columns_for_split,
+    scan_flat_table_stats,
+    validate_matching_schemas,
+)
+from src.features import fit_vocabs, plan_vocab_fit, vocab_artifacts, vocab_strategy_fingerprint
 from src.train import is_main_process, predict_mdl, train_mdl
-from src.vocab import fit_vocabs
 
 
 MDL_PAPER = Path("paper/MDL/main.tex")
@@ -28,7 +33,7 @@ def _cmd_validate_config(args: argparse.Namespace) -> int:
     print(f"config: OK ({args.config})")
     print(f"model: {config.model.name}")
     print(f"features: {len(config.features)}")
-    print(f"vocab_strategy_hash: {vocab_strategy_fingerprint(config.vocab_strategy)}")
+    print(f"vocab_strategy_hash: {vocab_strategy_fingerprint(config)}")
     return 0
 
 
@@ -72,6 +77,7 @@ def _cmd_check_paper_alignment(args: argparse.Namespace) -> int:
         _require_text(
             ALIGNMENT_DOC,
             [
+                "`rankmixer`",
                 "mdl_rankmixer",
                 "onetrans",
                 "mdl_onetrans",
@@ -99,17 +105,19 @@ def _cmd_profile(args: argparse.Namespace) -> int:
     paths = discover_parquet_inputs(split.inputs)
     fingerprint = validate_matching_schemas(paths)
     columns = required_columns_for_split(config, split)
-    scanner = ParquetScanner(split, columns)
-    stats = scanner.scan_stats(max_batches=args.max_batches)
+    stats = scan_flat_table_stats(config, args.split, max_batches=args.max_batches)
     print(f"split: {args.split}")
     print(f"format: {split.format}")
+    print(f"adapter: {split.adapter.callable if split.adapter else 'identity'}")
     print(f"files: {len(paths)}")
     print(f"schema_fingerprint: {fingerprint}")
     print(f"required_columns: {len(columns)}")
-    print(f"sample_record_batches: {stats.record_batches}")
-    print(f"sample_rows: {stats.rows}")
-    print(f"vocab_strategy_hash: {vocab_strategy_fingerprint(config.vocab_strategy)}")
-    for ref in vocab_artifacts(config.vocab_strategy):
+    print(f"sample_record_batches: {stats.raw_record_batches}")
+    print(f"sample_raw_rows: {stats.raw_rows}")
+    print(f"sample_rows: {stats.flat_rows}")
+    print(f"sample_flat_tables: {stats.flat_tables}")
+    print(f"vocab_strategy_hash: {vocab_strategy_fingerprint(config)}")
+    for ref in vocab_artifacts(config):
         print(
             "vocab_feature "
             f"name={ref.feature_name} encoding={ref.encoding} artifact={ref.artifact_path} size_hint={ref.size_hint}"
@@ -124,17 +132,29 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
     print(f"files: {result.files}")
     print(f"record_batches: {result.record_batches}")
     print(f"input_rows: {result.input_rows}")
-    print(f"candidate_rows: {result.candidate_rows}")
+    print(f"flat_rows: {result.flat_rows}")
     print(f"elapsed_seconds: {result.elapsed_seconds:.6f}")
     print(f"rows_per_second: {result.rows_per_second:.2f}")
-    if result.candidates_per_second is not None:
-        print(f"candidates_per_second: {result.candidates_per_second:.2f}")
+    return 0
+
+
+def _cmd_benchmark_train(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    result = benchmark_training(config, max_steps=args.max_steps)
+    print(f"steps: {result.steps}")
+    print(f"rows: {result.rows}")
+    print(f"last_loss: {result.last_loss:.6f}")
+    print(f"elapsed_seconds: {result.elapsed_seconds:.6f}")
+    print(f"steps_per_second: {result.steps_per_second:.2f}")
+    print(f"rows_per_second: {result.rows_per_second:.2f}")
     return 0
 
 
 def _cmd_fit_vocab(args: argparse.Namespace) -> int:
     config = _load_config(args)
-    fitted = fit_vocabs(config)
+    plan = plan_vocab_fit(config)
+    tables = iter_flat_tables(config, "train", extra_columns=plan.columns)
+    fitted = fit_vocabs(config, tables, plan)
     if not fitted:
         print("no vocab features configured")
         return 0
@@ -197,7 +217,13 @@ def _cmd_train(args: argparse.Namespace) -> int:
         return _launch_ddp_train(args, config)
     result = train_mdl(config, max_steps=args.max_steps)
     if is_main_process():
-        print(f"train_result steps={result.steps} last_loss={result.last_loss:.6f}")
+        print(
+            "train_result "
+            f"steps={result.steps} rows={result.rows} last_loss={result.last_loss:.6f} "
+            f"elapsed_seconds={result.elapsed_seconds:.6f} "
+            f"steps_per_second={result.steps_per_second:.2f} "
+            f"rows_per_second={result.rows_per_second:.2f}"
+        )
     return 0
 
 
@@ -208,6 +234,7 @@ def _cmd_predict(args: argparse.Namespace) -> int:
         checkpoint_path=args.checkpoint_path,
         output_path=args.output_path,
         max_batches=args.max_batches,
+        allow_random_init=args.allow_random_init,
     )
     print(f"predict_result rows={result.rows} output_path={result.output_path}")
     return 0
@@ -236,6 +263,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--max-batches", type=int, default=10)
     benchmark.set_defaults(func=_cmd_benchmark)
 
+    benchmark_train = subparsers.add_parser("benchmark-train")
+    benchmark_train.add_argument("--config", required=True)
+    benchmark_train.add_argument("--max-steps", type=int, default=10)
+    benchmark_train.set_defaults(func=_cmd_benchmark_train)
+
     fit_vocab = subparsers.add_parser("fit-vocab")
     fit_vocab.add_argument("--config", required=True)
     fit_vocab.set_defaults(func=_cmd_fit_vocab)
@@ -254,6 +286,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     predict.add_argument("--checkpoint-path", default=None)
     predict.add_argument("--output-path", default=None)
     predict.add_argument("--max-batches", type=int, default=None)
+    predict.add_argument("--allow-random-init", action="store_true")
     predict.set_defaults(func=_cmd_predict)
 
     return parser

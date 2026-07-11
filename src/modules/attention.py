@@ -57,6 +57,7 @@ class DomainAwareAttention(nn.Module):
         hidden_dim: int,
         dropout: float = 0.0,
         attention_backend: str = "auto",
+        activation: str = "gelu",
     ) -> None:
         super().__init__()
         if token_dim % num_heads != 0:
@@ -74,21 +75,21 @@ class DomainAwareAttention(nn.Module):
             token_dim,
             hidden_dim,
             dropout=dropout,
-            activation="relu",
+            activation=activation,
         )
         self.key_projection = PerTokenFFN(
             num_feature_tokens,
             token_dim,
             hidden_dim,
             dropout=dropout,
-            activation="relu",
+            activation=activation,
         )
         self.value_projection = PerTokenFFN(
             num_feature_tokens,
             token_dim,
             hidden_dim,
             dropout=dropout,
-            activation="relu",
+            activation=activation,
         )
         self.dropout = nn.Dropout(dropout)
 

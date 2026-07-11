@@ -8,7 +8,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-from .config import AppConfig, DomainTokenConfig, FeatureConfig, SequenceConfig, TokenGroupConfig, VocabFeatureStrategy
+from .config import AppConfig, DomainTokenConfig, FeatureConfig, ResolvedEncoding, SequenceConfig, TokenGroupConfig
 from .modules.attention import DomainAwareAttention, DomainFusedModule, RankMixerTokenMixing, _sdpa_context
 from .modules.mlp import PerTokenFFN
 
@@ -26,7 +26,7 @@ class OneTransOutput:
     encoded_features: dict[str, Tensor]
     s_token_count: int
     ns_token_count: int
-    s_valid_mask: Tensor | None = None
+    s_valid_mask: Tensor
 
 
 @dataclass(frozen=True)
@@ -35,25 +35,102 @@ class OneTransRequestCache:
     s_valid_mask: Tensor
 
 
-def _strategy_for(config: AppConfig, feature_name: str) -> VocabFeatureStrategy | None:
-    return config.vocab_strategy.features.get(feature_name)
+def _encoding_for(config: AppConfig, feature_name: str) -> ResolvedEncoding:
+    try:
+        return config.resolved.categorical_input_by_name[feature_name].encoding
+    except KeyError as error:
+        raise ValueError(
+            f"categorical feature or sequence field {feature_name!r} must declare encoding"
+        ) from error
 
 
-def _embedding_size(strategy: VocabFeatureStrategy | None, vocab_maps: dict[str, dict[str, int]], feature_name: str) -> int:
-    if strategy is None:
-        raise ValueError(f"categorical/sequence feature {feature_name!r} must declare vocab_strategy")
-    if strategy.encoding == "hash":
-        if strategy.num_buckets is None:
-            raise ValueError("hash strategy requires num_buckets")
-        return strategy.num_buckets + 1
-    if strategy.encoding == "identity":
-        if strategy.max_id is None:
-            raise ValueError("identity strategy requires max_id")
-        return strategy.max_id + 1
-    if strategy.encoding in {"vocab", "shared_vocab"}:
+def _embedding_size(encoding: ResolvedEncoding, vocab_maps: dict[str, dict[str, int]], feature_name: str) -> int:
+    if encoding.encoding == "hash":
+        return encoding.num_buckets + 1
+    if encoding.encoding == "identity":
+        return encoding.max_id + 1
+    if encoding.encoding in {"vocab", "shared_vocab"}:
         values = vocab_maps.get(feature_name, {})
         return max(values.values(), default=0) + 1
-    raise ValueError(f"unsupported encoding {strategy.encoding!r}")
+    raise ValueError(f"unsupported encoding {encoding.encoding!r}")
+
+
+def _scenario_mask_from_ids(scenario_id: Tensor, scenario_count: int) -> Tensor:
+    if scenario_count <= 0:
+        raise ValueError("scenario_count must be positive")
+    if scenario_id.ndim == 2:
+        if scenario_id.size(1) != scenario_count:
+            raise ValueError(
+                f"scenario mask width must be {scenario_count}, got {scenario_id.size(1)}"
+            )
+        mask = scenario_id.float()
+        invalid = (mask < 0.0) | (mask > 1.0) | ((mask != 0.0) & (mask != 1.0))
+        if bool(invalid.any().item()):
+            raise ValueError("scenario mask must be binary with shape [batch, num_scenarios]")
+        return mask
+    if scenario_id.ndim != 1:
+        raise ValueError("scenario_id must have shape [batch] or [batch, num_scenarios]")
+    indices = scenario_id.long().view(-1, 1)
+    invalid = (indices < 0) | (indices >= scenario_count)
+    if bool(invalid.any().item()):
+        examples = indices[invalid][:5].detach().cpu().tolist()
+        raise ValueError(f"scenario_id contains ids outside [0, {scenario_count - 1}]: {examples}")
+    mask = torch.zeros(indices.size(0), scenario_count, device=indices.device)
+    mask.scatter_(1, indices, 1.0)
+    return mask
+
+
+def _normal_parameter(shape: tuple[int, ...], std: float) -> nn.Parameter:
+    parameter = nn.Parameter(torch.empty(*shape))
+    nn.init.normal_(parameter, mean=0.0, std=std)
+    return parameter
+
+
+def _init_embedding(embedding: nn.Embedding, std: float) -> nn.Embedding:
+    nn.init.normal_(embedding.weight, mean=0.0, std=std)
+    if embedding.padding_idx is not None:
+        with torch.no_grad():
+            embedding.weight[embedding.padding_idx].zero_()
+    return embedding
+
+
+def _activation_module(name: str) -> nn.Module:
+    if name == "gelu":
+        return nn.GELU()
+    if name == "relu":
+        return nn.ReLU()
+    raise ValueError(f"unsupported activation {name!r}")
+
+
+def _categorical_input_dims(config: AppConfig, embedding_dim: int) -> dict[str, int]:
+    return dict(config.resolved.categorical_embedding_dims)
+
+
+class TaskHead(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float, activation: str) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            _activation_module(activation),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, values: Tensor) -> Tensor:
+        return self.network(values)
+
+
+def _build_task_heads(config: AppConfig, input_dim: int, task_count: int) -> nn.ModuleList:
+    hidden_dim = config.model.task_head_hidden_dim or config.model.hidden_dim
+    return nn.ModuleList(
+        TaskHead(
+            input_dim,
+            hidden_dim,
+            config.model.task_head_dropout,
+            config.model.task_head_activation,
+        )
+        for _ in range(task_count)
+    )
 
 
 @dataclass(frozen=True)
@@ -328,7 +405,6 @@ class FeatureEncoderBank(nn.Module):
     def __init__(self, config: AppConfig, vocab_maps: dict[str, dict[str, int]], embedding_dim: int) -> None:
         super().__init__()
         self.config = config
-        self.embedding_dim = embedding_dim
         self.sequence_token_dim = config.model.token_dim
         self.output_dims: dict[str, int] = {}
         self.embeddings = nn.ModuleDict()
@@ -337,48 +413,61 @@ class FeatureEncoderBank(nn.Module):
         self.sequence_query_projectors = nn.ModuleDict()
         self.sequence_queries = nn.ParameterDict()
         self.sequence_position_embeddings = nn.ModuleDict()
-        self.sequence_time_delta_projectors = nn.ModuleDict()
         self.sequence_longer_encoders = nn.ModuleDict()
-        self.features_by_name = {feature.name: feature for feature in config.features}
         self.sequences_by_name = {sequence.name: sequence for sequence in config.sequences}
+        categorical_dims = _categorical_input_dims(config, embedding_dim)
         sparse_gradients = config.training.embedding_sparse_gradients
 
         for feature in config.features:
             if feature.kind == "dense":
                 self.output_dims[feature.name] = feature.dimension
+            elif feature.kind == "categorical":
+                self.output_dims[feature.name] = categorical_dims[feature.name]
+
+        for sequence in config.sequences:
+            for field in sequence.fields:
+                if field.kind == "categorical":
+                    qualified = field.qualified_name(sequence.name)
+                    self.sequence_field_embedding_keys[qualified] = self._module_key(qualified)
+
+        for feature in config.features:
+            if feature.kind == "dense":
                 continue
-            strategy = _strategy_for(config, feature.name)
-            if strategy is not None and strategy.encoding == "shared_vocab" and strategy.share_embedding:
+            encoding = _encoding_for(config, feature.name)
+            if encoding.encoding == "shared_vocab" and encoding.share_embedding:
                 continue
-            feature_embedding_dim = feature.embedding_dim or embedding_dim
-            size = _embedding_size(strategy, vocab_maps, feature.name)
-            self.embeddings[feature.name] = nn.Embedding(
-                size,
-                feature_embedding_dim,
-                padding_idx=0,
-                sparse=sparse_gradients,
+            feature_embedding_dim = categorical_dims[feature.name]
+            size = _embedding_size(encoding, vocab_maps, feature.name)
+            self.embeddings[feature.name] = _init_embedding(
+                nn.Embedding(
+                    size,
+                    feature_embedding_dim,
+                    padding_idx=0,
+                    sparse=sparse_gradients,
+                ),
+                config.model.init_std,
             )
-            self.output_dims[feature.name] = feature_embedding_dim
 
         for sequence in config.sequences:
             step_input_dim = 0
             for field in sequence.fields:
                 qualified = field.qualified_name(sequence.name)
                 if field.kind == "categorical":
-                    key = self._module_key(qualified)
-                    self.sequence_field_embedding_keys[qualified] = key
-                    strategy = _strategy_for(config, qualified)
-                    field_embedding_dim = field.embedding_dim or embedding_dim
-                    if strategy is not None and strategy.encoding == "shared_vocab" and strategy.share_embedding:
-                        field_embedding_dim = self.output_dims.get(strategy.share_with, field_embedding_dim)
+                    key = self.sequence_field_embedding_keys[qualified]
+                    encoding = _encoding_for(config, qualified)
+                    field_embedding_dim = categorical_dims[qualified]
+                    if encoding.encoding == "shared_vocab" and encoding.share_embedding:
                         step_input_dim += field_embedding_dim
                         continue
-                    size = _embedding_size(strategy, vocab_maps, qualified)
-                    self.embeddings[key] = nn.Embedding(
-                        size,
-                        field_embedding_dim,
-                        padding_idx=0,
-                        sparse=sparse_gradients,
+                    size = _embedding_size(encoding, vocab_maps, qualified)
+                    self.embeddings[key] = _init_embedding(
+                        nn.Embedding(
+                            size,
+                            field_embedding_dim,
+                            padding_idx=0,
+                            sparse=sparse_gradients,
+                        ),
+                        config.model.init_std,
                     )
                     step_input_dim += field_embedding_dim
                 else:
@@ -388,18 +477,15 @@ class FeatureEncoderBank(nn.Module):
                 self.sequence_token_dim,
             )
             if sequence.max_length is not None:
-                self.sequence_position_embeddings[self._module_key(sequence.name)] = nn.Embedding(
-                    sequence.max_length,
-                    self.sequence_token_dim,
+                self.sequence_position_embeddings[self._module_key(sequence.name)] = _init_embedding(
+                    nn.Embedding(
+                        sequence.max_length,
+                        self.sequence_token_dim,
+                    ),
+                    config.model.init_std,
                 )
             sequence_key = self._module_key(sequence.name)
             summary_dim = sequence.rankmixer_summary_tokens * self.sequence_token_dim
-            if sequence.time_delta_field is not None:
-                time_field = next(field for field in sequence.fields if field.name == sequence.time_delta_field)
-                self.sequence_time_delta_projectors[sequence_key] = nn.Linear(
-                    time_field.dimension,
-                    self.sequence_token_dim,
-                )
             if sequence.target_inputs:
                 target_dim = sum(self.output_dims[name] for name in sequence.target_inputs)
                 self.sequence_query_projectors[sequence_key] = nn.Linear(
@@ -407,8 +493,9 @@ class FeatureEncoderBank(nn.Module):
                     summary_dim,
                 )
             else:
-                self.sequence_queries[sequence_key] = nn.Parameter(
-                    torch.zeros(1, sequence.rankmixer_summary_tokens, self.sequence_token_dim)
+                self.sequence_queries[sequence_key] = _normal_parameter(
+                    (1, sequence.rankmixer_summary_tokens, self.sequence_token_dim),
+                    config.model.init_std,
                 )
             if sequence.encoder == "longer":
                 self.sequence_longer_encoders[sequence_key] = LongerSequenceEncoder(
@@ -425,28 +512,32 @@ class FeatureEncoderBank(nn.Module):
             self.output_dims[sequence.name] = summary_dim
 
         for feature in config.features:
-            strategy = _strategy_for(config, feature.name)
-            if strategy is not None and strategy.encoding == "shared_vocab" and strategy.share_embedding:
-                if strategy.share_with not in self.output_dims:
+            if feature.kind != "categorical":
+                continue
+            encoding = _encoding_for(config, feature.name)
+            if encoding.encoding == "shared_vocab" and encoding.share_embedding:
+                if feature.name not in categorical_dims:
                     raise ValueError(f"shared_vocab feature {feature.name!r} references unknown feature")
-                base_key = self._embedding_key(strategy.share_with)
+                base_name = self._shared_base_name(feature.name)
+                base_key = self._embedding_key(base_name)
                 if base_key not in self.embeddings:
-                    raise ValueError(f"shared_vocab base {strategy.share_with!r} has no embedding")
+                    raise ValueError(f"shared_vocab base {base_name!r} has no embedding")
                 self.embeddings[feature.name] = self.embeddings[base_key]
-                self.output_dims[feature.name] = self.output_dims[strategy.share_with]
+                self.output_dims[feature.name] = categorical_dims[feature.name]
 
         for sequence in config.sequences:
             for field in sequence.fields:
                 if field.kind != "categorical":
                     continue
                 qualified = field.qualified_name(sequence.name)
-                strategy = _strategy_for(config, qualified)
-                if strategy is not None and strategy.encoding == "shared_vocab" and strategy.share_embedding:
-                    if strategy.share_with not in self.output_dims and strategy.share_with not in self.sequence_field_embedding_keys:
+                encoding = _encoding_for(config, qualified)
+                if encoding.encoding == "shared_vocab" and encoding.share_embedding:
+                    if qualified not in categorical_dims:
                         raise ValueError(f"shared_vocab sequence field {qualified!r} references unknown feature")
-                    base_key = self._embedding_key(strategy.share_with)
+                    base_name = self._shared_base_name(qualified)
+                    base_key = self._embedding_key(base_name)
                     if base_key not in self.embeddings:
-                        raise ValueError(f"shared_vocab base {strategy.share_with!r} has no embedding")
+                        raise ValueError(f"shared_vocab base {base_name!r} has no embedding")
                     self.embeddings[self.sequence_field_embedding_keys[qualified]] = self.embeddings[base_key]
 
     @staticmethod
@@ -455,6 +546,18 @@ class FeatureEncoderBank(nn.Module):
 
     def _embedding_key(self, name: str) -> str:
         return self.sequence_field_embedding_keys.get(name, name)
+
+    def _shared_base_name(self, name: str) -> str:
+        seen: set[str] = set()
+        current = name
+        while True:
+            if current in seen:
+                raise ValueError(f"shared_vocab cycle detected at {name!r}")
+            seen.add(current)
+            encoding = _encoding_for(self.config, current)
+            if encoding.encoding != "shared_vocab" or not encoding.share_embedding:
+                return current
+            current = encoding.share_with
 
     def _encode_scalar_feature(self, feature: FeatureConfig, value: Tensor) -> Tensor:
         if feature.kind == "dense":
@@ -481,16 +584,6 @@ class FeatureEncoderBank(nn.Module):
         mask = positions >= shifts
         aligned = embedded.gather(1, gather_index) * mask.unsqueeze(-1).to(dtype=embedded.dtype)
         return aligned, mask
-
-    def _legacy_sequence_tokens(
-        self,
-        feature: FeatureConfig,
-        value: dict[str, Tensor],
-    ) -> tuple[Tensor, Tensor]:
-        values = value["values"].long()
-        lengths = value["lengths"].long()
-        embedded = self.embeddings[feature.name](values)
-        return self._right_aligned_sequence(embedded, lengths)
 
     def _multi_field_sequence_tokens(
         self,
@@ -521,23 +614,14 @@ class FeatureEncoderBank(nn.Module):
             positions = torch.arange(tokens.size(1), device=tokens.device).clamp(max=max_positions - 1)
             tokens = tokens + self.sequence_position_embeddings[position_key](positions).unsqueeze(0)
             tokens = tokens * mask.unsqueeze(-1).to(dtype=tokens.dtype)
-        if sequence.time_delta_field is not None and position_key in self.sequence_time_delta_projectors:
-            side = field_values[sequence.time_delta_field].float()
-            if side.dim() == 2:
-                side = side.unsqueeze(-1)
-            side, _side_mask = self._right_aligned_sequence(side, lengths)
-            tokens = tokens + self.sequence_time_delta_projectors[position_key](side)
-            tokens = tokens * mask.unsqueeze(-1).to(dtype=tokens.dtype)
         return tokens, mask
 
     def encode_sequence_tokens(
         self,
-        sequence_or_feature: str | FeatureConfig,
+        sequence_name: str,
         value: dict[str, Any],
     ) -> tuple[Tensor, Tensor]:
-        if isinstance(sequence_or_feature, FeatureConfig):
-            return self._legacy_sequence_tokens(sequence_or_feature, value)
-        sequence = self.sequences_by_name[sequence_or_feature]
+        sequence = self.sequences_by_name[sequence_name]
         return self._multi_field_sequence_tokens(sequence, value)
 
     def _pool_sequence(
@@ -591,6 +675,8 @@ class FeatureEncoderBank(nn.Module):
         features: dict[str, Any],
         request_cache: dict[str, LongerSequenceCache] | None = None,
     ) -> dict[str, Tensor]:
+        if request_cache is None and self.config.model.use_request_cache:
+            request_cache = self.precompute_request_cache(features)
         encoded: dict[str, Tensor] = {}
         for feature in self.config.features:
             value = features[feature.name]
@@ -603,17 +689,6 @@ class FeatureEncoderBank(nn.Module):
                 if not isinstance(value, Tensor):
                     raise ValueError(f"categorical feature {feature.name!r} must be a tensor")
                 encoded[feature.name] = self._encode_scalar_feature(feature, value)
-                continue
-            if feature.kind == "sequence":
-                if not isinstance(value, dict):
-                    raise ValueError(f"sequence feature {feature.name!r} must be a payload dict")
-                tokens, mask = self._legacy_sequence_tokens(feature, value)
-                if tokens.size(1) == 0:
-                    encoded[feature.name] = tokens.new_zeros(tokens.size(0), self.output_dims[feature.name])
-                    continue
-                mask_float = mask.unsqueeze(-1).to(dtype=tokens.dtype)
-                denominator = mask_float.sum(dim=1).clamp_min(1.0)
-                encoded[feature.name] = (tokens * mask_float).sum(dim=1) / denominator
                 continue
             raise ValueError(f"unsupported feature kind {feature.kind!r}")
 
@@ -700,6 +775,30 @@ class RankMixerSliceTokenizer(nn.Module):
         return values.view(values.size(0), self.num_tokens, self.token_dim)
 
 
+def _build_rankmixer_feature_projector(
+    config: AppConfig,
+    encoder_bank: FeatureEncoderBank,
+    feature_groups: list[TokenGroupConfig],
+    feature_token_inputs: list[str],
+    feature_token_count: int,
+) -> nn.Module:
+    if config.tokenization.feature_tokenizer == "auto_split":
+        return AutoSplitTokenProjector(
+            feature_token_inputs,
+            encoder_bank.output_dims,
+            feature_token_count,
+            config.model.token_dim,
+        )
+    if config.tokenization.feature_tokenizer == "rankmixer":
+        return RankMixerSliceTokenizer(
+            feature_token_inputs,
+            encoder_bank.output_dims,
+            feature_token_count,
+            config.model.token_dim,
+        )
+    return TokenProjector(feature_groups, encoder_bank.output_dims, config.model.token_dim)
+
+
 class DomainTokenProjector(nn.Module):
     def __init__(
         self,
@@ -707,14 +806,18 @@ class DomainTokenProjector(nn.Module):
         input_dims: dict[str, int],
         token_dim: int,
         hidden_dim: int,
+        activation: str = "gelu",
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.input_names_by_token = [token.resolved_inputs() for token in tokens]
         self.networks = nn.ModuleList(
             nn.Sequential(
                 nn.Linear(sum(input_dims[name] for name in input_names), hidden_dim),
-                nn.ReLU(),
+                _activation_module(activation),
+                nn.Dropout(dropout),
                 nn.Linear(hidden_dim, token_dim),
+                # MDL tokenization applies ReLU(FFN(...)) to scenario/task tokens.
                 nn.ReLU(),
             )
             for input_names in self.input_names_by_token
@@ -753,7 +856,7 @@ class OneTransTokenizer(nn.Module):
         self.use_sep_tokens = config.model.use_sep_tokens
 
         if not self.ns_groups and self.ns_tokenizer == "groupwise":
-            raise ValueError("groupwise OneTrans tokenizer requires tokenization.ns_tokens or non-sequence features")
+            raise ValueError("groupwise OneTrans tokenizer requires tokenization.ns_tokens or scalar features")
         if not self.sequence_groups:
             raise ValueError("OneTrans requires at least one sequence feature")
 
@@ -762,20 +865,20 @@ class OneTransTokenizer(nn.Module):
             for group in self.sequence_groups
         )
         self.sep_tokens = nn.ParameterList(
-            nn.Parameter(torch.zeros(1, 1, self.token_dim))
+            _normal_parameter((1, 1, self.token_dim), config.model.init_std)
             for _ in range(max(len(self.sequence_groups) - 1, 0))
         )
 
         self.scalar_feature_names = [
             feature.name
             for feature in config.features
-            if feature.kind != "sequence" and feature.embedding_scope in {"feature", "shared"}
+            if feature.embedding_scope in {"feature", "shared"}
         ]
         if self.ns_tokenizer == "auto_split":
             self.num_ns_tokens = config.model.num_ns_tokens or max(len(self.scalar_feature_names), 1)
             input_dim = sum(self.encoder_bank.output_dims[name] for name in self.scalar_feature_names)
             if input_dim <= 0:
-                raise ValueError("auto_split OneTrans tokenizer requires at least one non-sequence feature")
+                raise ValueError("auto_split OneTrans tokenizer requires at least one scalar feature")
             self.auto_ns_projection = nn.Linear(input_dim, self.num_ns_tokens * self.token_dim)
             self.ns_projectors = nn.ModuleList()
         else:
@@ -792,8 +895,6 @@ class OneTransTokenizer(nn.Module):
         return sum(self.encoder_bank.output_dims[name] for name in group.inputs)
 
     def _payload_max_length(self, value: dict[str, Any]) -> int:
-        if "values" in value:
-            return int(value["values"].size(1))
         fields = value.get("fields", {})
         first = next(iter(fields.values()), None)
         if first is None:
@@ -811,13 +912,6 @@ class OneTransTokenizer(nn.Module):
                 sequence_lengths.append(value["lengths"].long())
                 max_length = max(max_length, self._payload_max_length(value))
                 continue
-            feature = self.by_name[name]
-            if feature.kind == "sequence":
-                value = features[name]
-                if not isinstance(value, dict):
-                    raise ValueError(f"sequence feature {name!r} must be a payload dict")
-                sequence_lengths.append(value["lengths"].long())
-                max_length = max(max_length, self._payload_max_length(value))
         if not sequence_lengths:
             raise ValueError(f"sequence token group {group.name!r} must include a sequence input")
         first = sequence_lengths[0]
@@ -845,17 +939,10 @@ class OneTransTokenizer(nn.Module):
                 parts.append(tokens)
                 continue
             feature = self.by_name[name]
-            if feature.kind == "sequence":
-                if not isinstance(value, dict):
-                    raise ValueError(f"sequence feature {name!r} must be a payload dict")
-                tokens, current_mask = self.encoder_bank.encode_sequence_tokens(feature, value)
-                mask = current_mask if mask is None else mask & current_mask
-                parts.append(tokens)
-            else:
-                if not isinstance(value, Tensor):
-                    raise ValueError(f"scalar feature {name!r} must be a tensor")
-                scalar = self.encoder_bank._encode_scalar_feature(feature, value)
-                parts.append(scalar.unsqueeze(1).expand(-1, max_length, -1))
+            if not isinstance(value, Tensor):
+                raise ValueError(f"scalar feature {name!r} must be a tensor")
+            scalar = self.encoder_bank._encode_scalar_feature(feature, value)
+            parts.append(scalar.unsqueeze(1).expand(-1, max_length, -1))
         if mask is None:
             raise ValueError(f"sequence token group {group.name!r} produced no mask")
         return projection(torch.cat(parts, dim=-1)), mask
@@ -898,6 +985,8 @@ class OneTransTokenizer(nn.Module):
         features: dict[str, Any],
         request_cache: OneTransRequestCache | None = None,
     ) -> OneTransOutput:
+        if request_cache is None and self.config.model.use_request_cache:
+            request_cache = self.precompute_request_cache(features)
         encoded = self.encoder_bank(features)
         cache = self._sequence_token_part(features) if request_cache is None else request_cache
         s_tokens = cache.s_tokens
@@ -925,7 +1014,6 @@ class MixedCausalAttention(nn.Module):
         self.token_dim = token_dim
         self.num_heads = num_heads
         self.head_dim = token_dim // num_heads
-        self.ns_token_count = ns_token_count
         self.attention_backend = attention_backend
         self.s_query = nn.Linear(token_dim, token_dim)
         self.s_key = nn.Linear(token_dim, token_dim)
@@ -1071,8 +1159,7 @@ class OneTransBackbone(nn.Module):
             target = round(initial_s_count - (initial_s_count - final) * progress)
         round_to = self.config.model.pyramid_round_to
         if target > round_to:
-            target = max(final, int(round(target / round_to) * round_to)
-            )
+            target = max(final, int(round(target / round_to) * round_to))
         return max(0, min(current_s_count, target))
 
     def precompute_request_cache(self, features: dict[str, Any]) -> OneTransRequestCache:
@@ -1087,8 +1174,6 @@ class OneTransBackbone(nn.Module):
         tokens = tokenized.feature_tokens
         s_count = tokenized.s_token_count
         ns_count = tokenized.ns_token_count
-        if tokenized.s_valid_mask is None:
-            raise RuntimeError("OneTrans tokenizer must return an S-token validity mask")
         valid_mask = torch.cat(
             [
                 tokenized.s_valid_mask,
@@ -1123,72 +1208,174 @@ class OneTransBackbone(nn.Module):
         )
 
 
+class RankMixerBlock(nn.Module):
+    def __init__(self, config: AppConfig, feature_token_count: int) -> None:
+        super().__init__()
+        token_dim = config.model.token_dim
+        self.token_mixing = RankMixerTokenMixing(feature_token_count, token_dim)
+        self.feature_norm = nn.LayerNorm(token_dim)
+        self.feature_ffn = PerTokenFFN(
+            feature_token_count,
+            token_dim,
+            config.model.hidden_dim,
+            activation=config.model.ffn_activation,
+        )
+
+    def forward(self, feature_tokens: Tensor) -> Tensor:
+        mixed = self.token_mixing(feature_tokens) + feature_tokens
+        return self.feature_ffn(self.feature_norm(mixed))
+
+
+class RankMixerModel(nn.Module):
+    def __init__(self, config: AppConfig, vocab_maps: dict[str, dict[str, int]], embedding_dim: int | None = None) -> None:
+        super().__init__()
+        self.config = config
+        self.feature_groups = config.tokenization.resolved_feature_tokens(config.features, config.sequences)
+        self.feature_token_inputs = config.tokenization.resolved_feature_token_inputs(config.features, config.sequences)
+        self.feature_token_count = config.tokenization.resolved_feature_token_count(config.features, config.sequences)
+        if config.model.token_dim % self.feature_token_count != 0:
+            raise ValueError("rankmixer requires token_dim divisible by feature token count")
+        embedding_dim = config.model.embedding_dim if embedding_dim is None else embedding_dim
+        self.encoder_bank = FeatureEncoderBank(config, vocab_maps, embedding_dim)
+        self.feature_projector = _build_rankmixer_feature_projector(
+            config,
+            self.encoder_bank,
+            self.feature_groups,
+            self.feature_token_inputs,
+            self.feature_token_count,
+        )
+        self.blocks = nn.ModuleList(RankMixerBlock(config, self.feature_token_count) for _ in range(config.model.num_layers))
+        output_dim = self.feature_token_count * config.model.token_dim
+        self.logit_layers = _build_task_heads(config, output_dim, len(config.task_names))
+
+    def precompute_request_cache(self, features: dict[str, Any]) -> dict[str, LongerSequenceCache]:
+        return self.encoder_bank.precompute_request_cache(features)
+
+    def forward(
+        self,
+        features: dict[str, Any],
+        scenario_id: Tensor,
+        request_cache: dict[str, LongerSequenceCache] | None = None,
+    ) -> dict[str, Tensor]:
+        del scenario_id
+        encoded = self.encoder_bank(features, request_cache=request_cache)
+        feature_tokens = self.feature_projector(encoded)
+        for block in self.blocks:
+            if self.config.runtime.activation_checkpoint and self.training:
+                feature_tokens = checkpoint(block, feature_tokens, use_reentrant=False)
+            else:
+                feature_tokens = block(feature_tokens)
+        pooled = feature_tokens.flatten(start_dim=1)
+        logits = torch.cat([layer(pooled) for layer in self.logit_layers], dim=1)
+        return {"logits": logits}
+
+
+def _init_domain_interaction_modules(block: nn.Module, config: AppConfig, metadata: ModelMetadata) -> None:
+    token_dim = config.model.token_dim
+    hidden_dim = config.model.hidden_dim
+    block.use_task_tokens = config.model.use_task_tokens
+    block.use_scenario_tokens = config.model.use_scenario_tokens
+    block.use_global_scenario_token = config.model.use_global_scenario_token
+    block.use_task_feature_interaction = config.model.use_task_feature_interaction
+    block.use_scenario_feature_interaction = config.model.use_scenario_feature_interaction
+    block.scenario_attention = DomainAwareAttention(
+        token_dim,
+        config.model.num_heads,
+        metadata.scenario_count + 1,
+        metadata.feature_token_count,
+        hidden_dim,
+        attention_backend=config.runtime.attention_backend,
+        activation=config.model.ffn_activation,
+    )
+    block.scenario_ffn = PerTokenFFN(
+        metadata.scenario_count + 1,
+        token_dim,
+        hidden_dim,
+        activation=config.model.ffn_activation,
+    )
+    block.task_attention = DomainAwareAttention(
+        token_dim,
+        config.model.num_heads,
+        metadata.task_count,
+        metadata.feature_token_count,
+        hidden_dim,
+        attention_backend=config.runtime.attention_backend,
+        activation=config.model.ffn_activation,
+    )
+    block.domain_fused = DomainFusedModule(include_global=config.model.use_global_scenario_token)
+    block.task_ffn = PerTokenFFN(
+        metadata.task_count,
+        token_dim,
+        hidden_dim,
+        activation=config.model.ffn_activation,
+    )
+
+
+def _forward_domain_interaction(
+    block: Any,
+    feature_tokens: Tensor,
+    scenario_tokens: Tensor,
+    task_tokens: Tensor,
+    scenario_mask: Tensor,
+) -> tuple[Tensor, Tensor]:
+    if not block.use_scenario_tokens:
+        scenario_tokens = torch.zeros_like(scenario_tokens)
+    elif not block.use_global_scenario_token:
+        scenario_tokens = scenario_tokens.clone()
+        scenario_tokens[:, -1, :] = 0.0
+    if not block.use_task_tokens:
+        task_tokens = torch.zeros_like(task_tokens)
+
+    if block.use_scenario_feature_interaction:
+        scenario_update, _weights = block.scenario_attention(scenario_tokens, feature_tokens)
+    else:
+        scenario_update = torch.zeros_like(scenario_tokens)
+    scenario_hat = scenario_tokens + scenario_update
+    if not block.use_global_scenario_token:
+        scenario_hat = scenario_hat.clone()
+        scenario_hat[:, -1, :] = 0.0
+    scenario_tokens = scenario_hat + block.scenario_ffn(scenario_hat)
+    if not block.use_global_scenario_token:
+        scenario_tokens = scenario_tokens.clone()
+        scenario_tokens[:, -1, :] = 0.0
+
+    if block.use_task_feature_interaction:
+        task_update, _weights = block.task_attention(task_tokens, feature_tokens)
+    else:
+        task_update = torch.zeros_like(task_tokens)
+    task_hat = task_tokens + task_update
+    if block.use_scenario_tokens or block.use_scenario_feature_interaction:
+        task_hat = block.domain_fused(task_hat, scenario_hat, scenario_mask)
+    task_tokens = task_hat + block.task_ffn(task_hat)
+    return scenario_tokens, task_tokens
+
+
 class MDLRankMixerBlock(nn.Module):
     def __init__(self, config: AppConfig, metadata: ModelMetadata) -> None:
         super().__init__()
         token_dim = config.model.token_dim
         hidden_dim = config.model.hidden_dim
-        self.use_task_tokens = config.model.use_task_tokens
-        self.use_scenario_tokens = config.model.use_scenario_tokens
-        self.use_global_scenario_token = config.model.use_global_scenario_token
-        self.use_task_feature_interaction = config.model.use_task_feature_interaction
-        self.use_scenario_feature_interaction = config.model.use_scenario_feature_interaction
 
         self.token_mixing = RankMixerTokenMixing(metadata.feature_token_count, token_dim)
         self.feature_norm = nn.LayerNorm(token_dim)
-        self.feature_ffn = PerTokenFFN(metadata.feature_token_count, token_dim, hidden_dim, activation="relu")
-        self.scenario_attention = DomainAwareAttention(
-            token_dim,
-            config.model.num_heads,
-            metadata.scenario_count + 1,
+        self.feature_ffn = PerTokenFFN(
             metadata.feature_token_count,
-            hidden_dim,
-            attention_backend=config.runtime.attention_backend,
-        )
-        self.scenario_ffn = PerTokenFFN(metadata.scenario_count + 1, token_dim, hidden_dim, activation="relu")
-        self.task_attention = DomainAwareAttention(
             token_dim,
-            config.model.num_heads,
-            metadata.task_count,
-            metadata.feature_token_count,
             hidden_dim,
-            attention_backend=config.runtime.attention_backend,
+            activation=config.model.ffn_activation,
         )
-        self.domain_fused = DomainFusedModule(include_global=config.model.use_global_scenario_token)
-        self.task_ffn = PerTokenFFN(metadata.task_count, token_dim, hidden_dim, activation="relu")
+        _init_domain_interaction_modules(self, config, metadata)
 
     def forward(self, feature_tokens: Tensor, scenario_tokens: Tensor, task_tokens: Tensor, scenario_mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         feature_tokens = self.feature_ffn(self.feature_norm(self.token_mixing(feature_tokens) + feature_tokens))
 
-        if not self.use_scenario_tokens:
-            scenario_tokens = torch.zeros_like(scenario_tokens)
-        elif not self.use_global_scenario_token:
-            scenario_tokens = scenario_tokens.clone()
-            scenario_tokens[:, -1, :] = 0.0
-        if not self.use_task_tokens:
-            task_tokens = torch.zeros_like(task_tokens)
-
-        if self.use_scenario_feature_interaction:
-            scenario_update, _weights = self.scenario_attention(scenario_tokens, feature_tokens)
-        else:
-            scenario_update = torch.zeros_like(scenario_tokens)
-        scenario_hat = scenario_tokens + scenario_update
-        if not self.use_global_scenario_token:
-            scenario_hat = scenario_hat.clone()
-            scenario_hat[:, -1, :] = 0.0
-        scenario_tokens = scenario_hat + self.scenario_ffn(scenario_hat)
-        if not self.use_global_scenario_token:
-            scenario_tokens = scenario_tokens.clone()
-            scenario_tokens[:, -1, :] = 0.0
-
-        if self.use_task_feature_interaction:
-            task_update, _weights = self.task_attention(task_tokens, feature_tokens)
-        else:
-            task_update = torch.zeros_like(task_tokens)
-        task_hat = task_tokens + task_update
-        if self.use_scenario_tokens or self.use_scenario_feature_interaction:
-            task_hat = self.domain_fused(task_hat, scenario_hat, scenario_mask)
-        task_tokens = task_hat + self.task_ffn(task_hat)
+        scenario_tokens, task_tokens = _forward_domain_interaction(
+            self,
+            feature_tokens,
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
+        )
         return feature_tokens, scenario_tokens, task_tokens
 
 
@@ -1218,44 +1405,29 @@ class MDLRankMixerModel(nn.Module):
             raise ValueError("mdl_rankmixer requires token_dim divisible by feature token count")
         embedding_dim = config.model.embedding_dim if embedding_dim is None else embedding_dim
         self.encoder_bank = FeatureEncoderBank(config, vocab_maps, embedding_dim)
-        if config.tokenization.feature_tokenizer == "auto_split":
-            self.feature_projector = AutoSplitTokenProjector(
-                self.feature_token_inputs,
-                self.encoder_bank.output_dims,
-                self.metadata.feature_token_count,
-                config.model.token_dim,
-            )
-        elif config.tokenization.feature_tokenizer == "rankmixer":
-            self.feature_projector = RankMixerSliceTokenizer(
-                self.feature_token_inputs,
-                self.encoder_bank.output_dims,
-                self.metadata.feature_token_count,
-                config.model.token_dim,
-            )
-        else:
-            self.feature_projector = TokenProjector(self.feature_groups, self.encoder_bank.output_dims, config.model.token_dim)
+        self.feature_projector = _build_rankmixer_feature_projector(
+            config,
+            self.encoder_bank,
+            self.feature_groups,
+            self.feature_token_inputs,
+            self.metadata.feature_token_count,
+        )
         self.scenario_projector = DomainTokenProjector(
             self.scenario_token_specs,
             self.encoder_bank.output_dims,
             config.model.token_dim,
             config.model.hidden_dim,
+            activation=config.model.ffn_activation,
         )
         self.task_projector = DomainTokenProjector(
             self.task_token_specs,
             self.encoder_bank.output_dims,
             config.model.token_dim,
             config.model.hidden_dim,
+            activation=config.model.ffn_activation,
         )
         self.blocks = nn.ModuleList(MDLRankMixerBlock(config, self.metadata) for _ in range(config.model.num_layers))
-        self.logit_layers = nn.ModuleList(nn.Linear(config.model.token_dim, 1) for _ in range(self.metadata.task_count))
-
-    def _scenario_mask(self, scenario_id: Tensor) -> Tensor:
-        if scenario_id.ndim == 2 and scenario_id.size(1) == self.metadata.scenario_count:
-            return scenario_id.float()
-        indices = scenario_id.long().view(-1, 1)
-        mask = torch.zeros(indices.size(0), self.metadata.scenario_count, device=indices.device)
-        mask.scatter_(1, indices.clamp(min=0, max=self.metadata.scenario_count - 1), 1.0)
-        return mask
+        self.logit_layers = _build_task_heads(config, config.model.token_dim, self.metadata.task_count)
 
     def precompute_request_cache(self, features: dict[str, Any]) -> dict[str, LongerSequenceCache]:
         return self.encoder_bank.precompute_request_cache(features)
@@ -1270,7 +1442,7 @@ class MDLRankMixerModel(nn.Module):
         feature_tokens = self.feature_projector(encoded)
         scenario_tokens = self.scenario_projector(encoded)
         task_tokens = self.task_projector(encoded)
-        scenario_mask = self._scenario_mask(scenario_id)
+        scenario_mask = _scenario_mask_from_ids(scenario_id, self.metadata.scenario_count)
         for block in self.blocks:
             if self.config.runtime.activation_checkpoint and self.training:
                 feature_tokens, scenario_tokens, task_tokens = checkpoint(
@@ -1298,10 +1470,9 @@ class MDLRankMixerModel(nn.Module):
 class OneTransModel(nn.Module):
     def __init__(self, config: AppConfig, vocab_maps: dict[str, dict[str, int]], embedding_dim: int | None = None) -> None:
         super().__init__()
-        self.config = config
         self.backbone = OneTransBackbone(config, vocab_maps, embedding_dim)
         output_dim = self.backbone.ns_token_count * config.model.token_dim
-        self.logit_layers = nn.ModuleList(nn.Linear(output_dim, 1) for _ in range(len(config.task_names)))
+        self.logit_layers = _build_task_heads(config, output_dim, len(config.task_names))
 
     def precompute_request_cache(self, features: dict[str, Any]) -> OneTransRequestCache:
         return self.backbone.precompute_request_cache(features)
@@ -1322,32 +1493,7 @@ class OneTransModel(nn.Module):
 class MDLDomainBlock(nn.Module):
     def __init__(self, config: AppConfig, metadata: ModelMetadata) -> None:
         super().__init__()
-        token_dim = config.model.token_dim
-        hidden_dim = config.model.hidden_dim
-        self.use_task_tokens = config.model.use_task_tokens
-        self.use_scenario_tokens = config.model.use_scenario_tokens
-        self.use_global_scenario_token = config.model.use_global_scenario_token
-        self.use_task_feature_interaction = config.model.use_task_feature_interaction
-        self.use_scenario_feature_interaction = config.model.use_scenario_feature_interaction
-        self.scenario_attention = DomainAwareAttention(
-            token_dim,
-            config.model.num_heads,
-            metadata.scenario_count + 1,
-            metadata.feature_token_count,
-            hidden_dim,
-            attention_backend=config.runtime.attention_backend,
-        )
-        self.scenario_ffn = PerTokenFFN(metadata.scenario_count + 1, token_dim, hidden_dim, activation="relu")
-        self.task_attention = DomainAwareAttention(
-            token_dim,
-            config.model.num_heads,
-            metadata.task_count,
-            metadata.feature_token_count,
-            hidden_dim,
-            attention_backend=config.runtime.attention_backend,
-        )
-        self.domain_fused = DomainFusedModule(include_global=config.model.use_global_scenario_token)
-        self.task_ffn = PerTokenFFN(metadata.task_count, token_dim, hidden_dim, activation="relu")
+        _init_domain_interaction_modules(self, config, metadata)
 
     def forward(
         self,
@@ -1356,35 +1502,7 @@ class MDLDomainBlock(nn.Module):
         task_tokens: Tensor,
         scenario_mask: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        if not self.use_scenario_tokens:
-            scenario_tokens = torch.zeros_like(scenario_tokens)
-        elif not self.use_global_scenario_token:
-            scenario_tokens = scenario_tokens.clone()
-            scenario_tokens[:, -1, :] = 0.0
-        if not self.use_task_tokens:
-            task_tokens = torch.zeros_like(task_tokens)
-
-        if self.use_scenario_feature_interaction:
-            scenario_update, _weights = self.scenario_attention(scenario_tokens, feature_tokens)
-        else:
-            scenario_update = torch.zeros_like(scenario_tokens)
-        scenario_hat = scenario_tokens + scenario_update
-        if not self.use_global_scenario_token:
-            scenario_hat = scenario_hat.clone()
-            scenario_hat[:, -1, :] = 0.0
-        scenario_tokens = scenario_hat + self.scenario_ffn(scenario_hat)
-        if not self.use_global_scenario_token:
-            scenario_tokens = scenario_tokens.clone()
-            scenario_tokens[:, -1, :] = 0.0
-
-        if self.use_task_feature_interaction:
-            task_update, _weights = self.task_attention(task_tokens, feature_tokens)
-        else:
-            task_update = torch.zeros_like(task_tokens)
-        task_hat = task_tokens + task_update
-        if self.use_scenario_tokens or self.use_scenario_feature_interaction:
-            task_hat = self.domain_fused(task_hat, scenario_hat, scenario_mask)
-        return scenario_tokens, task_hat + self.task_ffn(task_hat)
+        return _forward_domain_interaction(self, feature_tokens, scenario_tokens, task_tokens, scenario_mask)
 
 
 class MDLOneTransModel(nn.Module):
@@ -1413,23 +1531,17 @@ class MDLOneTransModel(nn.Module):
             output_dims,
             config.model.token_dim,
             config.model.hidden_dim,
+            activation=config.model.ffn_activation,
         )
         self.task_projector = DomainTokenProjector(
             task_token_specs,
             output_dims,
             config.model.token_dim,
             config.model.hidden_dim,
+            activation=config.model.ffn_activation,
         )
         self.blocks = nn.ModuleList(MDLDomainBlock(config, self.metadata) for _ in range(config.model.num_layers))
-        self.logit_layers = nn.ModuleList(nn.Linear(config.model.token_dim, 1) for _ in range(self.metadata.task_count))
-
-    def _scenario_mask(self, scenario_id: Tensor) -> Tensor:
-        if scenario_id.ndim == 2 and scenario_id.size(1) == self.metadata.scenario_count:
-            return scenario_id.float()
-        indices = scenario_id.long().view(-1, 1)
-        mask = torch.zeros(indices.size(0), self.metadata.scenario_count, device=indices.device)
-        mask.scatter_(1, indices.clamp(min=0, max=self.metadata.scenario_count - 1), 1.0)
-        return mask
+        self.logit_layers = _build_task_heads(config, config.model.token_dim, self.metadata.task_count)
 
     def precompute_request_cache(self, features: dict[str, Any]) -> OneTransRequestCache:
         return self.backbone.precompute_request_cache(features)
@@ -1444,7 +1556,7 @@ class MDLOneTransModel(nn.Module):
         feature_tokens = output.feature_tokens
         scenario_tokens = self.scenario_projector(output.encoded_features)
         task_tokens = self.task_projector(output.encoded_features)
-        scenario_mask = self._scenario_mask(scenario_id)
+        scenario_mask = _scenario_mask_from_ids(scenario_id, self.metadata.scenario_count)
         for block in self.blocks:
             if self.config.runtime.activation_checkpoint and self.training:
                 scenario_tokens, task_tokens = checkpoint(
@@ -1470,6 +1582,8 @@ class MDLOneTransModel(nn.Module):
 
 
 def build_model(config: AppConfig, vocab_maps: dict[str, dict[str, int]]) -> nn.Module:
+    if config.model.name == "rankmixer":
+        return RankMixerModel(config, vocab_maps)
     if config.model.name == "mdl_rankmixer":
         return MDLRankMixerModel(config, vocab_maps)
     if config.model.name == "onetrans":

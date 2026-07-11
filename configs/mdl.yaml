@@ -11,9 +11,22 @@ runtime:
 
 data:
   train:
-    format: agg_parquet
+    # flat_parquet means the physical Parquet already has one row per sample.
+    # For environment-specific raw layouts, use format: adapter_parquet and
+    # provide adapter.callable, e.g. examples.parquet_identity_adapter:adapt.
+    format: flat_parquet
+    # adapter_parquet example:
+    # adapter:
+    #   callable: secure_pkg.mdl_adapters:flatten_requests
+    #   input_columns: [request_id, user_id, candidates]
+    #   options:
+    #     candidate_field: candidates
     inputs:
       - /secure/train/day=*/part-*.parquet
+    request_id: request_id
+    group_id: request_id
+    labels:
+      click: click
     reader:
       engine: pyarrow_dataset
       columns_pruning: true
@@ -21,25 +34,10 @@ data:
       prefetch_batches: 4
       pin_memory: true
       shard_unit: row_group
-      batch_size_candidates: 2048
-    agg_layout:
-      type: parallel_lists
-      request_id: request_id
-      shared_columns:
-        - user_id
-        - rankmixer_context_dense
-        - hist_item_id
-        - hist_shop_id
-        - hist_action
-        - hist_age
-      candidate_columns:
-        - item_id
-        - shop_id
-        - click
-      labels:
-        click: click
 
   test:
+    # Keep test/predict on the same format semantics as train so all commands
+    # interpret a dataset through the same preprocessing boundary.
     format: flat_parquet
     inputs:
       - /secure/test/day=*/part-*.parquet
@@ -80,7 +78,6 @@ features:
 
 sequences:
   - name: hist
-    layout: parallel_lists
     embedding_scope: feature
     max_length: 100
     truncation: tail
@@ -91,7 +88,6 @@ sequences:
     rankmixer_summary_tokens: 31
     longer_token_merge: 4
     longer_inner_layers: 1
-    time_delta_field: age
     target_inputs:
       - item_id
     longer_query_tokens: 32
@@ -203,6 +199,11 @@ model:
   num_layers: 2
   num_heads: 12
   hidden_dim: 1536
+  init_std: 0.02
+  ffn_activation: gelu
+  task_head_hidden_dim: 1536
+  task_head_dropout: 0.0
+  task_head_activation: gelu
   use_task_tokens: true
   use_scenario_tokens: true
   use_global_scenario_token: true
@@ -213,7 +214,13 @@ model:
 training:
   batch_size: 2048
   lr_dense: 0.005
+  lr_schedule: cosine
+  lr_warmup_steps: 1000
+  lr_decay_steps: 100000
+  lr_min_ratio: 0.1
   dense_optimizer: rmsprop
+  rmsprop_alpha: 0.99
+  rmsprop_momentum: 0.0
   sparse_optimizer: adagrad
   embedding_sparse_gradients: true
   sparse_update_mode: ddp_synced_adagrad

@@ -2,7 +2,12 @@
 
 ## Project Structure & Module Organization
 
-Core Python code lives in `src/`. Parquet-native code is in `src/config.py`, `src/data.py`, `src/features.py`, `src/vocab.py`, `src/tensorize.py`, `src/model.py`, `src/train.py`, and `src/benchmark.py`. Reusable neural network blocks live in `src/modules/`.
+Core Python code lives in `src/`. Parquet-native loading and model-batch
+construction live in `src/dataloader.py`; categorical encoding helpers,
+vocab fitting/loading, strategy fingerprints, and hash buckets live in
+`src/features.py`; related code is in `src/config.py`, `src/model.py`,
+`src/train.py`, and `src/benchmark.py`. Reusable neural network blocks live in
+`src/modules/`.
 
 The root CLI is `mdl.py`. The core YAML template is `configs/mdl.yaml`; paper-alignment notes live in `PAPER_ALIGNMENT.md`, and local paper sources are under `paper/`.
 

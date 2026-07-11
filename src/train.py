@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from importlib import import_module
+import math
 import os
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Iterator
 
 import torch
@@ -13,18 +17,37 @@ from torch import Tensor, nn
 from torch.distributed.algorithms.join import Join
 from torch.nn.parallel import DistributedDataParallel
 
-from .config import AppConfig
-from .data import AggParquetScanner, ParquetScanner, _require_pyarrow, required_columns_for_split
-from .features import vocab_strategy_fingerprint
+from .config import AppConfig, ParquetSplitConfig, ReaderConfig
+from .dataloader import (
+    FeatureBatch,
+    _require_pyarrow,
+    iter_flat_tables,
+    move_feature_batch,
+    pin_feature_batch,
+    table_to_feature_batch,
+)
+from .features import load_vocab_maps, vocab_strategy_fingerprint
 from .model import build_model
-from .tensorize import FeatureBatch, move_feature_batch, table_to_feature_batch
-from .vocab import load_vocab_maps
 
 
 @dataclass(frozen=True)
 class TrainResult:
     steps: int
     last_loss: float
+    rows: int = 0
+    elapsed_seconds: float = 0.0
+
+    @property
+    def steps_per_second(self) -> float:
+        if self.elapsed_seconds <= 0:
+            return 0.0
+        return self.steps / self.elapsed_seconds
+
+    @property
+    def rows_per_second(self) -> float:
+        if self.elapsed_seconds <= 0:
+            return 0.0
+        return self.rows / self.elapsed_seconds
 
 
 @dataclass(frozen=True)
@@ -34,6 +57,11 @@ class PredictResult:
 
 
 ExternalTrainAdapter = Callable[..., TrainResult | dict[str, Any]]
+
+
+class _NoOpGradScaler:
+    def is_enabled(self) -> bool:
+        return False
 
 
 @dataclass(frozen=True)
@@ -124,6 +152,8 @@ def _coerce_train_result(result: TrainResult | dict[str, Any]) -> TrainResult:
         return TrainResult(
             steps=int(result.get("steps", 0)),
             last_loss=float(result.get("last_loss", 0.0)),
+            rows=int(result.get("rows", 0)),
+            elapsed_seconds=float(result.get("elapsed_seconds", 0.0)),
         )
     raise TypeError("external training adapter must return TrainResult or a dict")
 
@@ -134,31 +164,60 @@ def iter_candidate_tables(
     shard_rank: int = 0,
     shard_world_size: int = 1,
 ) -> Iterator[object]:
-    split = config.data.train if split_name == "train" else config.data.test
-    if split is None:
-        raise ValueError(f"split {split_name!r} is not configured")
-    columns = required_columns_for_split(config, split)
-    if split.format == "agg_parquet":
-        scanner = AggParquetScanner(
-            split,
-            columns,
-            shard_rank=shard_rank,
-            shard_world_size=shard_world_size,
-        )
-        yield from scanner.iter_candidate_tables()
-    else:
-        scanner = ParquetScanner(
-            split,
-            columns,
-            shard_rank=shard_rank,
-            shard_world_size=shard_world_size,
-        )
-        yield from scanner.iter_tables()
+    yield from iter_flat_tables(
+        config,
+        split_name,
+        shard_rank=shard_rank,
+        shard_world_size=shard_world_size,
+    )
 
 
 def _slice_table(table: object, batch_size: int) -> Iterator[object]:
     for offset in range(0, table.num_rows, batch_size):
         yield table.slice(offset, batch_size)
+
+
+def _iter_batch_tables(
+    config: AppConfig,
+    split_name: str,
+    shard_rank: int,
+    shard_world_size: int,
+) -> Iterator[object]:
+    batch_size = config.training.batch_size
+    for table in iter_candidate_tables(
+        config,
+        split_name,
+        shard_rank=shard_rank,
+        shard_world_size=shard_world_size,
+    ):
+        yield from _slice_table(table, batch_size)
+
+
+def _prepare_feature_batch(
+    config: AppConfig,
+    split: ParquetSplitConfig,
+    table: object,
+    vocab_maps: dict[str, dict[str, int]],
+    require_labels: bool,
+    pin_memory: bool,
+    include_group_id: bool,
+) -> FeatureBatch:
+    batch = table_to_feature_batch(
+        config,
+        table,
+        vocab_maps,
+        require_labels=require_labels,
+        include_group_id=include_group_id,
+        split=split,
+    )
+    return pin_feature_batch(batch) if pin_memory else batch
+
+
+def _split_reader(config: AppConfig, split_name: str) -> ReaderConfig:
+    split = config.data.train if split_name == "train" else config.data.test
+    if split is None:
+        raise ValueError(f"split {split_name!r} is not configured")
+    return split.reader
 
 
 def iter_feature_batches(
@@ -168,18 +227,79 @@ def iter_feature_batches(
     require_labels: bool,
     shard_rank: int = 0,
     shard_world_size: int = 1,
+    pin_memory: bool = False,
+    include_group_id: bool = True,
 ) -> Iterator[FeatureBatch]:
-    batch_size = config.training.batch_size
-    if split_name == "train" and config.data.train.reader.batch_size_candidates is not None:
-        batch_size = config.data.train.reader.batch_size_candidates
-    for table in iter_candidate_tables(
+    split = config.data.train if split_name == "train" else config.data.test
+    if split is None:
+        raise ValueError(f"split {split_name!r} is not configured")
+    reader = _split_reader(config, split_name)
+    pin_memory = reader.pin_memory and pin_memory
+    table_iter = _iter_batch_tables(
         config,
         split_name,
         shard_rank=shard_rank,
         shard_world_size=shard_world_size,
-    ):
-        for batch_table in _slice_table(table, batch_size):
-            yield table_to_feature_batch(config, batch_table, vocab_maps, require_labels=require_labels)
+    )
+
+    if reader.num_workers <= 0 and reader.prefetch_batches <= 0:
+        for table in table_iter:
+            yield _prepare_feature_batch(
+                config,
+                split,
+                table,
+                vocab_maps,
+                require_labels,
+                pin_memory,
+                include_group_id,
+            )
+        return
+
+    worker_count = max(1, reader.num_workers)
+    max_pending = max(1, reader.prefetch_batches, worker_count)
+    pending: deque[Future[FeatureBatch]] = deque()
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="mdl-reader") as executor:
+        exhausted = False
+        while not exhausted and len(pending) < max_pending:
+            try:
+                table = next(table_iter)
+            except StopIteration:
+                exhausted = True
+                break
+            pending.append(
+                executor.submit(
+                    _prepare_feature_batch,
+                    config,
+                    split,
+                    table,
+                    vocab_maps,
+                    require_labels,
+                    pin_memory,
+                    include_group_id,
+                )
+            )
+
+        while pending:
+            future = pending.popleft()
+            if not exhausted:
+                try:
+                    table = next(table_iter)
+                except StopIteration:
+                    exhausted = True
+                else:
+                    pending.append(
+                        executor.submit(
+                            _prepare_feature_batch,
+                            config,
+                            split,
+                            table,
+                            vocab_maps,
+                            require_labels,
+                            pin_memory,
+                            include_group_id,
+                        )
+                    )
+            yield future.result()
 
 
 def _partition_embedding_parameters(model: nn.Module) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
@@ -207,6 +327,95 @@ def _maybe_compile_model(config: AppConfig, model: nn.Module) -> nn.Module:
     if not hasattr(torch, "compile"):
         raise RuntimeError("runtime.compile requires torch.compile support")
     return torch.compile(model)
+
+
+def _autocast_dtype(config: AppConfig, device: torch.device) -> torch.dtype | None:
+    if config.runtime.precision == "fp32":
+        return None
+    if config.runtime.precision == "bf16":
+        if device.type in {"cuda", "cpu"}:
+            return torch.bfloat16
+        return None
+    if config.runtime.precision == "fp16":
+        if device.type == "cuda":
+            return torch.float16
+        return None
+    raise ValueError(f"unsupported runtime.precision {config.runtime.precision!r}")
+
+
+def _autocast_context(config: AppConfig, device: torch.device):
+    dtype = _autocast_dtype(config, device)
+    if dtype is None:
+        return nullcontext()
+    return torch.amp.autocast(device_type=device.type, dtype=dtype)
+
+
+def _make_grad_scaler(config: AppConfig, device: torch.device):
+    if config.runtime.precision != "fp16" or device.type != "cuda":
+        return _NoOpGradScaler()
+    return torch.amp.GradScaler(
+        device="cuda",
+        enabled=True,
+    )
+
+
+def _sync_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _non_blocking_transfer(config: AppConfig, split_name: str, device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
+    return _split_reader(config, split_name).pin_memory
+
+
+def _resolve_lr_decay_steps(config: AppConfig, max_steps: int | None) -> int | None:
+    if config.training.lr_schedule == "constant":
+        return None
+    if config.training.lr_decay_steps is not None:
+        return config.training.lr_decay_steps
+    if max_steps is not None:
+        return max_steps
+    raise ValueError(
+        "training.lr_decay_steps is required for cosine when train --max-steps is not set"
+    )
+
+
+def _lr_schedule_multiplier(config: AppConfig, step: int, decay_steps: int | None) -> float:
+    warmup_steps = config.training.lr_warmup_steps
+    if warmup_steps > 0 and step <= warmup_steps:
+        return float(step) / float(warmup_steps)
+    if config.training.lr_schedule == "constant":
+        return 1.0
+    if config.training.lr_schedule != "cosine":
+        raise ValueError(f"unsupported lr_schedule {config.training.lr_schedule!r}")
+    if decay_steps is None:
+        raise RuntimeError("cosine lr_schedule requires resolved decay_steps")
+    if decay_steps <= warmup_steps:
+        return min(1.0, float(step) / float(max(warmup_steps, 1)))
+
+    progress = float(step - warmup_steps) / float(decay_steps - warmup_steps)
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    min_ratio = config.training.lr_min_ratio
+    return min_ratio + (1.0 - min_ratio) * cosine
+
+
+def _set_optimizer_lrs(
+    optimizers: list[torch.optim.Optimizer],
+    base_lrs: list[list[float]],
+    multiplier: float,
+) -> None:
+    for optimizer, optimizer_base_lrs in zip(optimizers, base_lrs):
+        for group, base_lr in zip(optimizer.param_groups, optimizer_base_lrs):
+            group["lr"] = base_lr * multiplier
+
+
+def _mark_sparse_invariant_checks_explicitly_disabled() -> None:
+    checker = getattr(torch.sparse, "check_sparse_tensor_invariants", None)
+    if checker is not None and not checker.is_enabled():
+        checker.disable()
 
 
 @torch.no_grad()
@@ -242,7 +451,7 @@ def _clip_grad_norm(parameters: list[nn.Parameter], max_norm: float) -> Tensor:
     return total_norm
 
 
-def _loss_from_batch(output: dict[str, Tensor], batch: FeatureBatch) -> Tensor:
+def _loss_terms_from_batch(output: dict[str, Tensor], batch: FeatureBatch) -> tuple[Tensor, Tensor, Tensor]:
     if batch.labels is None or batch.label_mask is None:
         raise ValueError("training batch must contain labels and label_mask")
     logits = output["logits"]
@@ -256,10 +465,64 @@ def _loss_from_batch(output: dict[str, Tensor], batch: FeatureBatch) -> Tensor:
         reduction="none",
     )
     weights = batch.label_mask.to(device=logits.device, dtype=loss.dtype)
-    return (loss * weights).sum() / weights.sum().clamp_min(1.0)
+    numerator = (loss * weights).sum()
+    denominator = weights.sum()
+    return numerator / denominator.clamp_min(1.0), numerator, denominator
 
 
-def train_mdl(config: AppConfig, max_steps: int | None = None) -> TrainResult:
+def _loss_from_batch(output: dict[str, Tensor], batch: FeatureBatch) -> Tensor:
+    return _loss_terms_from_batch(output, batch)[0]
+
+
+def _aggregate_train_result(
+    context: DistributedContext,
+    local_result: TrainResult,
+    last_loss_numerator: float,
+    last_loss_denominator: float,
+) -> TrainResult:
+    if not context.enabled or not torch_dist.is_initialized():
+        return local_result
+
+    sum_values = torch.tensor(
+        [
+            float(local_result.rows),
+            float(last_loss_numerator),
+            float(last_loss_denominator),
+            local_result.last_loss if local_result.steps > 0 else 0.0,
+            1.0 if local_result.steps > 0 else 0.0,
+        ],
+        dtype=torch.float64,
+        device=context.device,
+    )
+    max_values = torch.tensor(
+        [float(local_result.steps), float(local_result.elapsed_seconds)],
+        dtype=torch.float64,
+        device=context.device,
+    )
+    torch_dist.all_reduce(sum_values, op=torch_dist.ReduceOp.SUM)
+    torch_dist.all_reduce(max_values, op=torch_dist.ReduceOp.MAX)
+
+    global_denominator = float(sum_values[2].item())
+    if global_denominator > 0.0:
+        last_loss = float((sum_values[1] / sum_values[2]).item())
+    elif float(sum_values[4].item()) > 0.0:
+        last_loss = float((sum_values[3] / sum_values[4]).item())
+    else:
+        last_loss = 0.0
+    return TrainResult(
+        steps=int(max_values[0].item()),
+        rows=int(sum_values[0].item()),
+        last_loss=last_loss,
+        elapsed_seconds=float(max_values[1].item()),
+    )
+
+
+def train_mdl(
+    config: AppConfig,
+    max_steps: int | None = None,
+    save_checkpoint: bool = True,
+    log_steps: bool = True,
+) -> TrainResult:
     if config.training.sparse_update_mode == "external_parameter_server":
         adapter = _load_external_train_adapter(config.training.sparse_parameter_server_adapter)
         return _coerce_train_result(adapter(config=config, max_steps=max_steps))
@@ -286,18 +549,31 @@ def train_mdl(config: AppConfig, max_steps: int | None = None) -> TrainResult:
                 torch.optim.RMSprop(
                     dense_params,
                     lr=config.training.lr_dense,
-                    alpha=0.99999,
-                    momentum=0.0,
+                    alpha=config.training.rmsprop_alpha,
+                    momentum=config.training.rmsprop_momentum,
                 )
             )
         if sparse_params:
+            _mark_sparse_invariant_checks_explicitly_disabled()
             sparse_lr = config.training.lr_sparse or config.training.lr_dense
             optimizers.append(torch.optim.Adagrad(sparse_params, lr=sparse_lr))
+        optimizer_base_lrs = [
+            [float(group["lr"]) for group in optimizer.param_groups]
+            for optimizer in optimizers
+        ]
+        lr_decay_steps = _resolve_lr_decay_steps(config, max_steps)
+        scaler = _make_grad_scaler(config, device)
+        non_blocking = _non_blocking_transfer(config, "train", device)
 
         steps = 0
+        rows = 0
         last_loss = 0.0
+        last_loss_numerator = 0.0
+        last_loss_denominator = 0.0
         model.train()
         join_context = Join([model]) if context.enabled else nullcontext()
+        _sync_device(device)
+        start = perf_counter()
         with join_context:
             for batch in iter_feature_batches(
                 config,
@@ -306,38 +582,67 @@ def train_mdl(config: AppConfig, max_steps: int | None = None) -> TrainResult:
                 require_labels=True,
                 shard_rank=context.rank,
                 shard_world_size=context.world_size,
+                pin_memory=non_blocking,
+                include_group_id=False,
             ):
-                batch = move_feature_batch(batch, device)
+                batch = move_feature_batch(batch, device, non_blocking=non_blocking)
+                lr_multiplier = _lr_schedule_multiplier(config, steps + 1, lr_decay_steps)
+                _set_optimizer_lrs(optimizers, optimizer_base_lrs, lr_multiplier)
                 for optimizer in optimizers:
                     optimizer.zero_grad(set_to_none=True)
-                output = model(batch.features, batch.scenario_id)
-                loss = _loss_from_batch(output, batch)
-                loss.backward()
+                with _autocast_context(config, device):
+                    output = model(batch.features, batch.scenario_id)
+                    loss, loss_numerator, loss_denominator = _loss_terms_from_batch(output, batch)
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    for optimizer in optimizers:
+                        scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
                 if config.training.dense_clip_norm is not None and dense_params:
                     _clip_grad_norm(dense_params, config.training.dense_clip_norm)
                 if config.training.sparse_clip_norm is not None and sparse_params:
                     _clip_grad_norm(sparse_params, config.training.sparse_clip_norm)
-                for optimizer in optimizers:
-                    optimizer.step()
+                if scaler.is_enabled():
+                    for optimizer in optimizers:
+                        scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    for optimizer in optimizers:
+                        optimizer.step()
                 steps += 1
+                rows += int(batch.scenario_id.size(0))
                 last_loss = float(loss.detach().cpu().item())
-                if context.rank == 0:
+                last_loss_numerator = float(loss_numerator.detach().cpu().item())
+                last_loss_denominator = float(loss_denominator.detach().cpu().item())
+                if log_steps and context.rank == 0:
                     print(f"Train step | step={steps} | loss={last_loss:.6f}")
                 if max_steps is not None and steps >= max_steps:
                     break
+        _sync_device(device)
+        elapsed = perf_counter() - start
 
-        if config.training.checkpoint_path and context.rank == 0:
+        local_result = TrainResult(steps=steps, rows=rows, last_loss=last_loss, elapsed_seconds=elapsed)
+        result = _aggregate_train_result(
+            context,
+            local_result,
+            last_loss_numerator,
+            last_loss_denominator,
+        )
+
+        if save_checkpoint and config.training.checkpoint_path and context.rank == 0:
             checkpoint_path = Path(config.training.checkpoint_path)
             checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
                 {
                     "model_state_dict": base_model.state_dict(),
                     "model_name": config.model.name,
-                    "vocab_strategy_hash": vocab_strategy_fingerprint(config.vocab_strategy),
+                    "task_names": config.task_names,
+                    "vocab_strategy_hash": vocab_strategy_fingerprint(config),
                 },
                 checkpoint_path,
             )
-        return TrainResult(steps=steps, last_loss=last_loss)
+        return result
     finally:
         _cleanup_distributed(context)
 
@@ -348,14 +653,26 @@ def predict_mdl(
     checkpoint_path: str | None = None,
     output_path: str | None = None,
     max_batches: int | None = None,
+    allow_random_init: bool = False,
 ) -> PredictResult:
     pa, _pc, _ds, pq = _require_pyarrow()
     device = _select_device(config)
     vocab_maps = load_vocab_maps(config)
     base_model = build_model(config, vocab_maps).to(device)
-    if checkpoint_path:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        expected_hash = vocab_strategy_fingerprint(config.vocab_strategy)
+    resolved_checkpoint_path = checkpoint_path or config.training.checkpoint_path
+    if resolved_checkpoint_path is None and not allow_random_init:
+        raise ValueError(
+            "prediction requires a checkpoint; pass --checkpoint-path, set "
+            "training.checkpoint_path, or pass --allow-random-init explicitly"
+        )
+    if resolved_checkpoint_path is not None:
+        checkpoint = torch.load(resolved_checkpoint_path, map_location=device)
+        if checkpoint.get("model_name") not in {None, config.model.name}:
+            raise ValueError("checkpoint model_name does not match current config")
+        checkpoint_task_names = checkpoint.get("task_names")
+        if checkpoint_task_names is not None and list(checkpoint_task_names) != config.task_names:
+            raise ValueError("checkpoint task_names do not match current config")
+        expected_hash = vocab_strategy_fingerprint(config)
         if checkpoint.get("vocab_strategy_hash") != expected_hash:
             raise ValueError("checkpoint vocab_strategy_hash does not match current config")
         base_model.load_state_dict(checkpoint["model_state_dict"])
@@ -364,18 +681,22 @@ def predict_mdl(
     model.eval()
 
     rows: list[dict[str, object]] = []
+    non_blocking = _non_blocking_transfer(config, "test", device)
     for batch_index, batch in enumerate(
-        iter_feature_batches(config, "test", vocab_maps, require_labels=False)
+        iter_feature_batches(
+            config,
+            "test",
+            vocab_maps,
+            require_labels=False,
+            pin_memory=non_blocking,
+        )
     ):
         if max_batches is not None and batch_index >= max_batches:
             break
-        batch = move_feature_batch(batch, device)
-        if config.model.use_request_cache and hasattr(base_model, "precompute_request_cache"):
-            request_cache = base_model.precompute_request_cache(batch.features)
-            logits = base_model(batch.features, batch.scenario_id, request_cache=request_cache)["logits"]
-        else:
+        batch = move_feature_batch(batch, device, non_blocking=non_blocking)
+        with _autocast_context(config, device):
             logits = model(batch.features, batch.scenario_id)["logits"]
-        probabilities = torch.sigmoid(logits).cpu().tolist()
+        probabilities = torch.sigmoid(logits.float()).cpu().tolist()
         for group_id, scores in zip(batch.group_id, probabilities):
             row = {"group_id": group_id}
             row.update({task: float(score) for task, score in zip(config.task_names, scores)})
