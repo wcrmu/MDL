@@ -24,7 +24,7 @@ LRScheduleType = Literal["constant", "cosine"]
 ActivationType = Literal["gelu", "relu"]
 
 
-# Raw YAML schema. These dataclasses mirror configs/mdl.yaml field names.
+# Raw YAML schema. These dataclasses mirror configs/default.yaml field names.
 @dataclass(frozen=True)
 class CategoricalEncodingConfig:
     """Inline categorical encoding config under a logical feature declaration."""

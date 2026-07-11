@@ -9,17 +9,17 @@ vocab fitting/loading, strategy fingerprints, and hash buckets live in
 `src/train.py`, and `src/benchmark.py`. Reusable neural network blocks live in
 `src/modules/`.
 
-The root CLI is `mdl.py`. The core YAML template is `configs/mdl.yaml`; paper-alignment notes live in `PAPER_ALIGNMENT.md`, and local paper sources are under `paper/`.
+The root CLI is `mdl.py`. The core YAML template is `configs/default.yaml`; paper-alignment notes live in `PAPER_ALIGNMENT.md`, and local paper sources are under `paper/`.
 
 ## Build, Test, and Development Commands
 
 - `pip install -r requirements.txt`: install runtime and test dependencies.
-- `python mdl.py validate-config --config configs/mdl.yaml`: validate the YAML config.
-- `python mdl.py profile --config configs/mdl.yaml --split train --max-batches 10`: inspect parquet schema, columns, and scan stats.
-- `python mdl.py benchmark --config configs/mdl.yaml --split train --max-batches 10`: measure parquet scan and candidate decoding speed.
-- `python mdl.py fit-vocab --config configs/mdl.yaml`: build configured vocab artifacts.
-- `python mdl.py train --config configs/mdl.yaml --max-steps 10`: run a training smoke test.
-- `python mdl.py train --config configs/mdl.yaml --distributed ddp --nproc-per-node 4`: launch single-node multi-GPU DDP training.
+- `python mdl.py validate-config --config configs/default.yaml`: validate the YAML config.
+- `python mdl.py profile --config configs/default.yaml --split train --max-batches 10`: inspect parquet schema, columns, and scan stats.
+- `python mdl.py benchmark --config configs/default.yaml --split train --max-batches 10`: measure parquet scan and candidate decoding speed.
+- `python mdl.py fit-vocab --config configs/default.yaml`: build configured vocab artifacts.
+- `python mdl.py train --config configs/default.yaml --max-steps 10`: run a training smoke test.
+- `python mdl.py train --config configs/default.yaml --distributed ddp --nproc-per-node 4`: launch single-node multi-GPU DDP training.
 - `python mdl.py check-paper-alignment`: verify expected MDL and OneTrans paper-alignment markers.
 
 ## Coding Style & Naming Conventions
@@ -28,7 +28,7 @@ Use Python 3.11+ style, 4-space indentation, type hints for public functions, an
 
 ## Testing Guidelines
 
-No in-repository test suite is kept in the slim runtime tree. Validate changes with `python mdl.py validate-config --config configs/mdl.yaml`, `python mdl.py check-paper-alignment`, and a small secure-environment smoke run when parquet fixtures are available.
+No in-repository test suite is kept in the slim runtime tree. Validate changes with `python mdl.py validate-config --config configs/default.yaml`, `python mdl.py check-paper-alignment`, and a small secure-environment smoke run when parquet fixtures are available.
 
 ## Commit & Pull Request Guidelines
 
