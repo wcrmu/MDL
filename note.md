@@ -1,373 +1,424 @@
-这里要修正一个表述：
+## 结论
 
-> **不是“推荐系统用了 sparse 更新，就完全不能用 DDP”**，而是不能把整个含 `sparse=True Embedding` 的模型直接交给 **NCCL-DDP，期待 NCCL 原生对稀疏梯度做 AllReduce**。
+**通常应该共用。**
 
-PyTorch 的 DDP Reducer 内部确实存在处理 sparse gradient 的分支，但 `ProcessGroupNCCL` 的原生 sparse AllReduce 仍不是常规支持路径；PyTorch 官方仓库对应的 NCCL sparse-allreduce issue 目前仍处于开放状态。Gloo 曾实现 sparse AllReduce，但性能和跨机通信能力通常不适合大型 GPU 推荐训练。([GitHub][1])
+更准确地说：
 
-工业上的主流答案是：
-
-## Embedding 不走 DDP，Dense 部分继续走 DDP
-
-把模型拆成两部分：
-
-```text
-Sparse 部分：Embedding tables
-    → 模型并行 / 参数服务器 / 分片更新
-
-Dense 部分：MLP、Attention、CrossNet、Tower
-    → DDP + NCCL AllReduce
-```
-
-也就是一种 **Hybrid Parallelism**：
-
-```text
-embedding model parallel
-        +
-dense data parallel
-```
-
-PyTorch 官方的混合 DDP + RPC 教程也是这个结构：大 embedding 放到参数服务器，FC 层复制到各 trainer 上并使用 DDP。([PyTorch 文档][2])
-
----
-
-# 1. GPU 推荐系统最主流：Embedding Sharding
-
-Embedding 表不是每张 GPU 各复制一份，而是切开存放。
-
-例如有一个表：
-
-```text
-Embedding[10000, 64]
-```
-
-两张 GPU 做 row-wise sharding：
-
-```text
-GPU 0：row 0    ~ 4999
-GPU 1：row 5000 ~ 9999
-```
-
-假设本轮输入是：
-
-```text
-GPU 0 batch IDs: [3, 7000]
-GPU 1 batch IDs: [8, 7000]
-```
-
-执行过程是：
-
-```text
-1. 按 ID 的 owner 路由
-
-   ID 3    → GPU 0
-   ID 8    → GPU 0
-   ID 7000 → GPU 1
-
-2. 使用 All-to-All 把 ID 发给对应 owner
-
-3. 每张 GPU 只查询自己持有的 embedding 行
-
-4. 再把 embedding vector 发回原始请求 GPU
-
-5. Dense 网络在每张 GPU 上正常计算
-
-6. 反向传播时，embedding gradient 再路由给 owner
-
-7. owner 对同一个 ID 的梯度求和，然后只更新本地行
-```
-
-这里没有进行：
-
-```text
-sparse gradient AllReduce
-```
-
-而是在进行：
-
-```text
-ID / embedding / gradient 的 All-to-All 路由
-```
-
-NCCL 完全可以传输这些普通的 dense tensor：
-
-```text
-indices: int64 tensor
-values:  float tensor
-```
-
-所以并不要求 NCCL 理解 `torch.sparse_coo_tensor`。
-
-同时 Dense MLP 仍然执行正常的：
-
-```text
-NCCL AllReduce(dense_gradients)
-```
-
-这就是大型 GPU 推荐系统最典型的结构。
-
-TorchRec 的 `DistributedModelParallel` 正是为这种情况设计的，支持：
-
-* table-wise
-* row-wise
-* column-wise
-* table-row-wise
-* data-parallel
-
-并通过 planner 自动选择 embedding placement。([PyTorch 文档][3])
-
----
-
-# 2. 不同规模通常怎么选
-
-| 场景               | Embedding 处理                         | Dense 网络 |
-| ---------------- | ------------------------------------ | -------- |
-| 表很小，例如几十万到几百万参数  | `sparse=False`，直接 Dense DDP          | DDP      |
-| 多个中等 embedding 表 | Table-wise sharding                  | DDP      |
-| 单张超大 user/item 表 | Row-wise sharding                    | DDP      |
-| 表非常大且放不进 GPU     | CPU Parameter Server / CPU embedding | GPU DDP  |
-| ID 动态增长、在线增量训练   | Parameter Server / KV store          | DDP      |
-| 只是实验原型           | 手工同步 sparse indices/values           | DDP      |
-
-PyTorch 官方 TorchRec 教程将 table-wise 描述为多个中小表常见的分片方式，而 row-wise 用于单设备无法容纳的大表。([PyTorch 文档][3])
-
----
-
-# 3. 最简单的处理：直接关闭 sparse gradient
-
-假设表并不大：
-
-```python
-self.embedding = nn.Embedding(
-    num_embeddings=100_000,
-    embedding_dim=32,
-    sparse=False,
-)
-```
-
-这样 embedding 的梯度变成普通 dense tensor，可以直接：
-
-```python
-model = DistributedDataParallel(model)
-```
-
-问题是通信量由：
-
-```text
-本轮实际访问的行数 × embedding_dim
-```
-
-变成：
-
-```text
-整个 embedding 表大小
-```
+> 只要 target item 中的 ID 和行为序列中的 ID，表示的是**同一种实体、使用同一套 ID 空间**，就应该默认共用同一个 embedding 表。
 
 例如：
 
 ```text
-表：1 亿行 × 64 维 × FP32
-大小：约 25.6 GB
-
-本轮只访问 10 万行
-实际有效梯度：约 25.6 MB
+target_item_id = 103
+history_item_ids = [25, 103, 87]
 ```
 
-如果 densify，DDP 需要处理接近整个 25.6 GB 的梯度，而不是有效的 25.6 MB，所以大型推荐表不能这样处理。
+这里的 `103` 无论出现在目标位置还是历史位置，都是同一件商品，因此应满足：
 
-因此它只适用于：
+[
+e_{\text{target}}(103)=e_{\text{history}}(103)=E_{\text{item}}[103]
+]
 
-* 小词表；
-* embedding 参数量远小于 dense 网络；
-* 单机实验；
-* 通信不是瓶颈的情况。
-
----
-
-# 4. 参数服务器方案
-
-传统工业推荐系统常采用：
-
-```text
-GPU Trainer:
-    Dense model
-    DDP + NCCL
-
-CPU Parameter Server:
-    Embedding table
-    Sparse pull / sparse push
-```
-
-一次训练大致是：
-
-```text
-Trainer 把 IDs 发给 PS
-PS 返回对应 embedding rows
-Trainer 完成 forward/backward
-Trainer 把 (ID, gradient) 发回 PS
-PS 更新这些行
-```
-
-它的优点：
-
-* 表可以远大于单张甚至所有 GPU 显存；
-* 只传输本轮访问的行；
-* 支持动态 ID 和超大 KV 表；
-* optimizer state 也可以放在 CPU 或分布式内存。
-
-代价是：
-
-* RPC 延迟；
-* 网络带宽压力；
-* 可能出现异步更新和参数陈旧；
-* PS 容易成为热点，特别是高频 ID。
-
-PyTorch 官方给出的 DDP + RPC 示例，就是 embedding 放参数服务器、FC 层使用 DDP 的混合模式。([PyTorch 文档][2])
-
-从发展历史看，早期大规模推荐训练更常使用参数服务器；随着 GPU 显存、NVLink、All-to-All 集合通信和 fused embedding kernel 成熟，GPU embedding sharding 逐渐成为 GPU 集群上的主要方案。TorchRec 就是这一类 GPU 分片体系的代表。
-
----
-
-# 5. 小规模可以手工同步 sparse gradient
-
-还有一种折中方案：每张 GPU 仍然复制完整 embedding 表，但不使用 sparse AllReduce。
-
-每个 rank 得到：
-
-```text
-indices = [3, 8, 8]
-values  = [g3, g8_a, g8_b]
-```
-
-然后：
-
-```text
-1. AllGather 每个 rank 的 nnz
-2. AllGather / AllToAll indices
-3. AllGather / AllToAll values
-4. concat
-5. 按 ID coalesce
-6. 每张 GPU 应用完全相同的更新
-```
-
-通信的是普通 tensor：
+实现上就是：
 
 ```python
-indices: Tensor[int64]
-values: Tensor[float]
+item_embedding = nn.Embedding(num_items, dim, sparse=True)
+
+target_emb = item_embedding(target_item_id)
+history_emb = item_embedding(history_item_ids)
 ```
 
-不是 `SparseTensor`，所以 NCCL 可以处理。
-
-但它通常只适合：
-
-* 表能在每张 GPU 上完整复制；
-* world size 较小；
-* 每轮访问 ID 数量较少；
-* 快速验证算法。
-
-主要问题是，假设有 (P) 个 rank，每个 rank 访问 (K) 行，所有 rank 都需要获得约 (P K) 个梯度项，扩展性通常不如 owner-based sharding。
-
-此外使用 Adam、Adagrad 等带状态的优化器时，必须保证：
-
-```text
-所有 rank 对重复 ID 做相同的聚合
-所有 rank 对每个 ID 只执行一次 optimizer update
-所有 rank 的 optimizer state 保持完全一致
-```
-
-否则 embedding 副本会逐渐分叉。
+SASRec 明确共享输入和预测层的 item embedding；BERT4Rec 同样使用共享的输入、输出 item embedding 矩阵。NVIDIA 的 SIM 实现也明确指出，target item、短期行为序列和长期行为序列中的 item 特征共享 embedding 表。([arXiv][1])
 
 ---
 
-# 6. Optimizer 也要拆开
+## 为什么默认要共享？
 
-典型写法不是一个 optimizer 管整个模型，而是：
+### 1. 同一个商品应具有同一个基础表示
 
-```python
-dense_optimizer = torch.optim.AdamW(
-    dense_parameters,
-    lr=1e-3,
-)
-
-embedding_optimizer = SparseOrFusedOptimizer(
-    embedding_parameters,
-    lr=1e-2,
-)
-```
-
-普通 `nn.Embedding(..., sparse=True)` 产生的是 sparse gradient；PyTorch 官方文档指出，原生支持这类 sparse gradient 的 optimizer 范围有限，主要包括 SGD、SparseAdam 和 Adagrad。([PyTorch 文档][4])
-
-工业框架通常不会直接依赖普通的 `SparseAdam`，而是使用：
-
-* fused embedding optimizer；
-* row-wise Adagrad；
-* optimizer-in-backward；
-* 每个 shard 本地维护 optimizer state。
-
-例如 row-wise sharding 下：
+假设历史序列为：
 
 ```text
-GPU 0 只保存和更新 row 0~4999 的 optimizer state
-GPU 1 只保存和更新 row 5000~9999 的 optimizer state
+历史：[手机壳、充电器、耳机]
+目标：耳机
 ```
 
-因此 optimizer state 也不需要 AllReduce。
+DIN 需要计算目标耳机和历史行为之间的相关性：
+
+[
+a_i=f(e_{\text{target}},e_{\text{history},i})
+]
+
+如果目标耳机来自表 (E_t)，历史耳机来自另一张表 (E_h)：
+
+[
+E_t[\text{耳机}] \ne E_h[\text{耳机}]
+]
+
+那么模型必须额外学习如何将两个 embedding 空间对齐。
+
+共用表时，同一个商品天然位于同一个空间：
+
+```text
+target 耳机 ─┐
+             ├── E_item[耳机]
+history 耳机 ┘
+```
+
+这尤其适合 DIN、DIEN、BST 等 target-aware 模型，因为这些模型要用 target item 对行为序列进行匹配或注意力计算。DIN 的核心就是计算候选商品和历史商品的相关性；DIEN 的兴趣演化同样以目标商品为条件。([GitHub][2])
+
+### 2. 两类样本共同训练同一件商品
+
+假设商品 103 在训练数据中：
+
+```text
+作为历史行为出现：10,000 次
+作为 target 出现：500 次
+```
+
+共享 embedding 后，商品 103 的向量可以同时收到两类梯度：
+
+[
+\nabla E[103]
+=============
+
+\nabla_{\text{history}} E[103]
++
+\nabla_{\text{target}} E[103]
+]
+
+这通常能提高低频 target item 的训练充分度。
+
+从你上一问的 sparse update 角度看，同一次迭代中可以把 target 和 sequence 访问的 ID 合并：
+
+```text
+target IDs:  [3, 8]
+history IDs: [1, 3, 5, 8]
+
+实际更新行：
+[1, 3, 5, 8]
+```
+
+其中 ID 3 和 ID 8 的不同来源梯度在更新前进行聚合。分片训练时，同一个 item ID 也只需要对应一个 shard owner。
+
+### 3. 节省 embedding 参数和优化器状态
+
+如果有：
+
+```text
+1 亿件商品
+embedding_dim = 64
+FP32
+```
+
+一张表约为：
+
+[
+10^8 \times 64 \times 4 \approx 25.6\text{ GB}
+]
+
+target 和 history 分开建表就会变成约 51.2 GB。若使用 Adam，还要额外维护一阶、二阶状态，内存差异更大。
 
 ---
 
-# 7. 推荐的项目结构
+# 不只是 item_id：同名属性也通常成对共享
 
-如果你现在在写 PyTorch 推荐框架，比较合理的结构是：
-
-```python
-class RecModel(nn.Module):
-    def __init__(self):
-        self.sparse_arch = ShardedEmbeddingCollection(...)
-        self.dense_arch = DenseTower(...)
-
-    def forward(self, sparse_features, dense_features):
-        sparse_emb = self.sparse_arch(sparse_features)
-        return self.dense_arch(sparse_emb, dense_features)
-```
-
-分布式封装：
+例如目标商品有：
 
 ```text
-sparse_arch
-    → TorchRec DistributedModelParallel
-      或自定义 embedding sharding
-
-dense_arch
-    → DDP / NCCL
+target_item_id
+target_category_id
+target_brand_id
+target_shop_id
 ```
 
-而不是：
+序列中每个历史商品有：
+
+```text
+hist_item_id
+hist_category_id
+hist_brand_id
+hist_shop_id
+```
+
+通常建立：
 
 ```python
-DDP(entire_model_with_sparse_embedding)
+item_table     # target_item_id  <-> hist_item_id
+category_table # target_category <-> hist_category
+brand_table    # target_brand    <-> hist_brand
+shop_table     # target_shop     <-> hist_shop
 ```
+
+即：
+
+| Target 特征            | Sequence 特征        | 是否共享 |
+| -------------------- | ------------------ | ---: |
+| `target_item_id`     | `hist_item_id`     |    是 |
+| `target_category_id` | `hist_category_id` |    是 |
+| `target_brand_id`    | `hist_brand_id`    |    是 |
+| `target_shop_id`     | `hist_shop_id`     |    是 |
+| `target_item_id`     | `hist_category_id` |    否 |
+
+最后一行不能共享。虽然二者底层可能都是整数，例如都出现数字 `23`，但：
+
+```text
+item_id = 23
+category_id = 23
+```
+
+表示不同类型的实体，必须属于不同 vocabulary 和 embedding 表。
+
+阿里 EasyRec 的序列组件也要求 target item 和 history sequence 的对应子特征按相同次序配对，这反映的正是 item、category、brand 等同类型属性之间的对应关系。([GitHub][3])
 
 ---
 
-# 最核心的判断
+# 共享基础表，不等于后续处理必须完全相同
 
-可以压缩成三句话：
-
-1. **小 embedding 表**：关闭 `sparse=True`，整个模型直接 DDP。
-2. **GPU 上的大 embedding 表**：embedding 做 table-wise/row-wise model parallel，dense 部分做 DDP。
-3. **远超 GPU 容量或动态 ID 表**：embedding 放 parameter server，dense 部分做 DDP。
-
-因此，推荐系统中一般不是解决“如何让 NCCL AllReduce sparse gradient”，而是改变并行结构：
+实践中最稳妥的设计通常是：
 
 ```text
-不要同步整个稀疏梯度；
-把每一行 embedding 指定唯一 owner，
-将访问和梯度路由到 owner 更新。
+共享基础 ID embedding
+        ↓
+target 和 history 使用不同的角色变换
 ```
 
-这才是问题结构决定的解法。
+例如：
 
-[1]: https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/reducer.cpp?utm_source=chatgpt.com "pytorch/torch/csrc/distributed/c10d/reducer.cpp at main"
-[2]: https://docs.pytorch.org/tutorials/advanced/rpc_ddp_tutorial.html "Combining Distributed DataParallel with Distributed RPC Framework — PyTorch Tutorials 2.13.0+cu130 documentation"
-[3]: https://docs.pytorch.org/tutorials/advanced/sharding.html "Exploring TorchRec sharding — PyTorch Tutorials 2.13.0+cu130 documentation"
-[4]: https://docs.pytorch.org/docs/stable/generated/torch.nn.modules.sparse.Embedding.html?utm_source=chatgpt.com "Embedding — PyTorch 2.12 documentation"
+[
+e_t=W_t E[i]
+]
+
+[
+e_h=W_h E[i]
+]
+
+代码可以是：
+
+```python
+base_target = item_embedding(target_item_id)
+base_history = item_embedding(history_item_ids)
+
+target_emb = target_projection(base_target)
+history_emb = history_projection(base_history)
+```
+
+或者加入角色 embedding：
+
+```python
+target_emb = item_embedding(target_id) + target_role_embedding
+history_emb = item_embedding(history_ids) + history_role_embedding
+```
+
+这样同时保留：
+
+1. 同一个商品具有统一的基础语义；
+2. target 是“待判断对象”，history 是“用户已发生行为”，二者角色不同。
+
+一个简单类比是 NLP：
+
+```text
+同一个词使用同一个 token embedding
++
+通过 position/type embedding 表示它出现在什么位置、承担什么角色
+```
+
+但在推荐系统中，通常不必一上来就加复杂角色变换。最小基线应先使用共享表，观察是否确有角色冲突，再决定是否解耦。
+
+---
+
+# 哪些情况下不应该直接共享？
+
+## 1. ID 空间实际上不同
+
+例如：
+
+```text
+target_item_id：广告创意 ID
+history_item_id：商品 SPU ID
+```
+
+即使字段都叫 item ID，也不是同一种实体，不能共享。
+
+又例如跨域系统：
+
+```text
+domain A 的 item_id=100：一双鞋
+domain B 的 item_id=100：一首歌
+```
+
+如果未先构造全局唯一 ID，就不能共用 embedding 表。
+
+正确判断不是看字段名字，而是看：
+
+[
+\text{ID}=i
+]
+
+在两个字段中是否始终指向同一个实体。
+
+---
+
+## 2. Target 和 history 使用不同粒度
+
+例如：
+
+```text
+target：SKU ID
+history：SPU ID
+```
+
+一件衣服可能：
+
+```text
+SPU 100：某款 T 恤
+SKU 10001：白色 M
+SKU 10002：黑色 L
+```
+
+SKU 和 SPU 不是一一相同的 ID 空间，不能直接共表。
+
+可以采用：
+
+```text
+target SKU embedding
+target 对应的 SPU embedding
+history SPU embedding
+```
+
+其中 target 的 SPU 与 history SPU 可以共享，但 SKU 表独立。
+
+---
+
+## 3. 特意使用双空间或双塔结构
+
+某些模型会有意区分：
+
+```text
+query/target embedding space
+behavior/candidate embedding space
+```
+
+例如：
+
+[
+q_i=E_q[i],\qquad k_i=E_k[i]
+]
+
+这种设计相当于 Transformer 中不同的 Query/Key 投影。它能增加表达能力，但也会：
+
+* 增加参数量；
+* 降低低频 ID 的数据复用；
+* 使两个空间的对齐完全依赖训练；
+* 增加分布式 embedding 的存储和通信复杂度。
+
+因此它通常是有实验动机的结构选择，而不是默认选择。近期一些长序列模型也专门研究了将 attention embedding 与 representation embedding 解耦，说明“不共享”是可以成立的，但需要明确解决某种共享造成的优化冲突。([arXiv][4])
+
+---
+
+## 4. 目标 ID 与历史 ID 的训练任务严重冲突
+
+例如一个 embedding 同时承担：
+
+```text
+历史序列编码
+召回候选打分
+排序特征表示
+辅助分类任务
+```
+
+不同损失可能对同一向量提出冲突要求。
+
+此时不一定要立刻复制完整 embedding 表，可以从简单到复杂依次测试：
+
+```text
+方案 1：完全共享
+方案 2：共享表 + 不同 projection
+方案 3：共享主 embedding + 各任务 residual embedding
+方案 4：完全独立 embedding 表
+```
+
+通常方案 2 或方案 3 已经能提供角色差异，而不必承担两份超大表的成本。
+
+---
+
+# 一个容易混淆的点：共享不会自动造成标签泄漏
+
+假设 next-item 训练样本是：
+
+```text
+history = [A, B, C]
+target = D
+```
+
+历史和目标都查同一张 embedding 表：
+
+```text
+E[A], E[B], E[C], E[D]
+```
+
+这本身不是泄漏。共享的是模型参数，而不是把 `D` 填进历史输入。
+
+真正的泄漏是：
+
+```text
+history = [A, B, C, D]
+target = D
+```
+
+或者在构造 target 前的序列特征时，使用了目标行为发生之后才能知道的信息。
+
+BERT4Rec 之所以采用掩码任务，正是为了避免被预测 item 直接出现在可见上下文中，而不是因为共享 embedding 表存在问题。([arXiv][5])
+
+---
+
+# 推荐的默认配置
+
+对于典型的 DIN、DIEN、BST、SASRec、Transformer 序列模型，我会采用：
+
+```python
+class ItemEmbeddingModule(nn.Module):
+    def __init__(self, num_items: int, dim: int):
+        super().__init__()
+        self.item_embedding = nn.Embedding(
+            num_items,
+            dim,
+            padding_idx=0,
+            sparse=True,
+        )
+
+    def forward(self, target_item_id, history_item_ids):
+        target_emb = self.item_embedding(target_item_id)
+        history_emb = self.item_embedding(history_item_ids)
+        return target_emb, history_emb
+```
+
+如果需要角色差异，再加入轻量变换：
+
+```python
+self.target_proj = nn.Linear(dim, dim, bias=False)
+self.history_proj = nn.Linear(dim, dim, bias=False)
+```
+
+即：
+
+```text
+同一实体、同一 ID 空间
+    → 共享 embedding 表
+
+相同实体但承担不同角色
+    → 共享基础表 + 不同 projection/role embedding
+
+不同实体或不同 ID 空间
+    → 不同 embedding 表
+```
+
+一句话概括：
+
+> **Embedding 表应按照“实体语义和 ID namespace”划分，而不是按照“它来自 target 字段还是 sequence 字段”划分。**
+
+[1]: https://arxiv.org/pdf/1808.09781?utm_source=chatgpt.com "Self-Attentive Sequential Recommendation"
+[2]: https://github.com/shenweichen/DeepCTR/blob/master/docs/source/Features.md?utm_source=chatgpt.com "DeepCTR/docs/source/Features.md at master"
+[3]: https://github.com/alibaba/EasyRec/blob/master/docs/source/component/sequence.md?utm_source=chatgpt.com "EasyRec/docs/source/component/sequence.md at master"
+[4]: https://arxiv.org/html/2410.02604v3?utm_source=chatgpt.com "Long-Sequence Recommendation Models Need ..."
+[5]: https://arxiv.org/abs/1904.06690?utm_source=chatgpt.com "BERT4Rec: Sequential Recommendation with Bidirectional Encoder Representations from Transformer"
