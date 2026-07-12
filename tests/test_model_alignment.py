@@ -1,20 +1,31 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
+from src.dataloader import FeatureBatch
+from src.config import SequenceConfig, SequenceFieldConfig, TokenGroupConfig, load_app_config
 from src.model import (
+    MDLRankMixerBlock,
     MDLOneTransModel,
     ModelMetadata,
+    OneTransBackbone,
     OneTransBackboneState,
     OneTransBlock,
+    OneTransRequestCache,
+    OneTransTokenizer,
     RankMixerBlock,
     RankMixerModel,
+    RankMixerSliceTokenizer,
 )
 from src.modules.mlp import SparseMoEPerTokenFFN
+from src.train import _loss_terms_from_batch, _step_sparse_moe_controllers
 
 
 def _rankmixer_config() -> SimpleNamespace:
@@ -22,7 +33,14 @@ def _rankmixer_config() -> SimpleNamespace:
         model=SimpleNamespace(
             token_dim=4,
             hidden_dim=8,
+            num_heads=2,
             ffn_activation="gelu",
+            mdl_feature_interaction="paper",
+            use_task_tokens=True,
+            use_scenario_tokens=True,
+            use_global_scenario_token=True,
+            use_task_feature_interaction=True,
+            use_scenario_feature_interaction=True,
             rankmixer_ffn_type="dense",
             sparse_moe_num_experts=4,
             sparse_moe_use_dtsi=True,
@@ -30,6 +48,7 @@ def _rankmixer_config() -> SimpleNamespace:
             sparse_moe_target_active_ratio=0.25,
             sparse_moe_regularization_initial=1.0e-8,
             sparse_moe_regularization_multiplier=1.2,
+            sparse_moe_dtsi_training_output=None,
         ),
         runtime=SimpleNamespace(
             attention_backend="auto",
@@ -95,6 +114,303 @@ class RankMixerAlignmentTest(unittest.TestCase):
         expected = tokens.mean(dim=1).sum(dim=1, keepdim=True)
         torch.testing.assert_close(output["logits"], expected)
 
+    def test_paper_tokenizer_slices_input_width_before_projection(self) -> None:
+        tokenizer = RankMixerSliceTokenizer(
+            input_names=["all_features"],
+            input_dims={"all_features": 6},
+            num_tokens=2,
+            token_dim=4,
+        )
+        with torch.no_grad():
+            for layer in tokenizer.projection.layers:
+                layer.weight.zero_()
+                layer.bias.zero_()
+                layer.weight[:3, :3] = torch.eye(3)
+        values = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]])
+
+        tokens = tokenizer({"all_features": values})
+
+        expected = torch.tensor(
+            [[[1.0, 2.0, 3.0, 0.0], [4.0, 5.0, 6.0, 0.0]]]
+        )
+        torch.testing.assert_close(tokens, expected)
+
+
+class MDLFeatureInteractionAlignmentTest(unittest.TestCase):
+    def _block(self, mode: str) -> MDLRankMixerBlock:
+        config = _rankmixer_config()
+        config.model.mdl_feature_interaction = mode
+        block = MDLRankMixerBlock(
+            config,
+            ModelMetadata(feature_token_count=2, scenario_count=1, task_count=1),
+            propagate_scenario_state=False,
+        )
+        with torch.no_grad():
+            for parameter in block.feature_ffn.parameters():
+                parameter.zero_()
+        return block
+
+    def test_paper_mode_matches_mdl_equation_six_without_second_add_norm(self) -> None:
+        block = self._block("paper")
+        feature_tokens = torch.randn(2, 2, 4)
+        scenario_tokens = torch.randn(2, 2, 4)
+        task_tokens = torch.randn(2, 1, 4)
+        scenario_mask = torch.ones(2, 1)
+
+        actual, _scenario, _task = block(
+            feature_tokens,
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
+        )
+
+        torch.testing.assert_close(actual, torch.zeros_like(actual))
+        self.assertIsNone(block.feature_ffn_norm)
+
+    def test_rankmixer_full_mode_remains_an_explicit_compatibility_path(self) -> None:
+        block = self._block("rankmixer_full")
+        feature_tokens = torch.randn(2, 2, 4)
+        mixed = block.feature_norm(block.token_mixing(feature_tokens) + feature_tokens)
+        scenario_tokens = torch.randn(2, 2, 4)
+        task_tokens = torch.randn(2, 1, 4)
+
+        actual, _scenario, _task = block(
+            feature_tokens,
+            scenario_tokens,
+            task_tokens,
+            torch.ones(2, 1),
+        )
+
+        assert block.feature_ffn_norm is not None
+        torch.testing.assert_close(actual, block.feature_ffn_norm(mixed))
+
+    def test_two_scenario_two_task_domain_fusion_selects_per_instance_tokens(self) -> None:
+        config = _rankmixer_config()
+        block = MDLRankMixerBlock(
+            config,
+            ModelMetadata(feature_token_count=2, scenario_count=2, task_count=2),
+            propagate_scenario_state=False,
+        )
+        with torch.no_grad():
+            for module in (block.scenario_attention, block.task_attention, block.task_ffn):
+                for parameter in module.parameters():
+                    parameter.zero_()
+        scenario_tokens = torch.tensor(
+            [
+                [[2.0, 0.0, 0.0, 0.0], [0.0, 4.0, 0.0, 0.0], [2.0, 2.0, 2.0, 2.0]],
+                [[2.0, 0.0, 0.0, 0.0], [0.0, 4.0, 0.0, 0.0], [2.0, 2.0, 2.0, 2.0]],
+            ]
+        )
+        task_tokens = torch.zeros(2, 2, 4)
+        scenario_mask = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+        _features, _scenarios, actual_tasks = block(
+            torch.randn(2, 2, 4),
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
+        )
+
+        expected_scenario_average = torch.tensor(
+            [[2.0, 1.0, 1.0, 1.0], [1.0, 3.0, 1.0, 1.0]]
+        )
+        expected = expected_scenario_average.unsqueeze(1).expand(-1, 2, -1)
+        torch.testing.assert_close(actual_tasks, expected)
+
+
+class MDLLossAlignmentTest(unittest.TestCase):
+    def test_sum_reduction_preserves_masked_sample_and_task_weight(self) -> None:
+        logits = torch.zeros(2, 2)
+        batch = FeatureBatch(
+            features={},
+            labels=torch.tensor([[0.0, 1.0], [1.0, 0.0]]),
+            label_mask=torch.tensor([[True, True], [True, False]]),
+            scenario_id=torch.zeros(2, dtype=torch.long),
+            group_id=[],
+        )
+
+        paper_sum, _numerator, _denominator = _loss_terms_from_batch(
+            {"logits": logits},
+            batch,
+            loss_reduction="sum",
+        )
+        balanced_mean, _numerator, _denominator = _loss_terms_from_batch(
+            {"logits": logits},
+            batch,
+            loss_reduction="mean_per_task",
+        )
+
+        unit = torch.nn.functional.binary_cross_entropy_with_logits(
+            torch.tensor(0.0),
+            torch.tensor(0.0),
+        )
+        torch.testing.assert_close(paper_sum, 3.0 * unit)
+        torch.testing.assert_close(balanced_mean, 2.0 * unit)
+
+
+class OneTransTokenizerAlignmentTest(unittest.TestCase):
+    class Encoder(nn.Module):
+        def __init__(
+            self,
+            output_dims: dict[str, int],
+            sequence_dims: dict[str, int],
+        ) -> None:
+            super().__init__()
+            self.output_dims = output_dims
+            self.sequence_event_input_dims = sequence_dims
+
+        def encode_sequence_event_inputs(
+            self,
+            sequence_name: str,
+            value: dict[str, Tensor | dict[str, Tensor]],
+        ) -> tuple[Tensor, Tensor]:
+            del sequence_name
+            return value["event_inputs"], value["mask"]  # type: ignore[return-value]
+
+        def _align_sequence_inputs(
+            self,
+            sequence: SequenceConfig,
+            inputs: Tensor,
+            lengths: Tensor,
+        ) -> tuple[Tensor, Tensor]:
+            del sequence, lengths
+            return inputs, torch.ones(inputs.shape[:2], dtype=torch.bool)
+
+    def _base_config(self):
+        root = Path(__file__).resolve().parents[1]
+        return load_app_config(root / "configs" / "onetrans.yaml")
+
+    def test_auto_split_and_sequence_tokenizers_each_use_one_mlp(self) -> None:
+        config = self._base_config()
+        scalar_names = [
+            feature.name
+            for feature in config.features
+            if feature.embedding_scope in {"feature", "shared"}
+        ]
+        raw_sequence_dim = sum(
+            config.resolved.categorical_embedding_dims.get(
+                field.qualified_name(config.sequences[0].name),
+                field.dimension,
+            )
+            for field in config.sequences[0].fields
+        )
+        encoder = self.Encoder(
+            {name: config.resolved.encoded_input_dims[name] for name in scalar_names},
+            {config.sequences[0].name: raw_sequence_dim},
+        )
+
+        tokenizer = OneTransTokenizer(config, encoder)
+
+        self.assertIsInstance(tokenizer.auto_ns_projection, nn.Sequential)
+        assert tokenizer.auto_ns_projection is not None
+        self.assertEqual(
+            sum(isinstance(layer, nn.Linear) for layer in tokenizer.auto_ns_projection),
+            2,
+        )
+        self.assertTrue(
+            any(isinstance(layer, nn.GELU) for layer in tokenizer.auto_ns_projection)
+        )
+        sequence_projection = tokenizer.sequence_projectors[0]
+        self.assertIsInstance(sequence_projection, nn.Sequential)
+        first_linear = next(
+            layer for layer in sequence_projection if isinstance(layer, nn.Linear)
+        )
+        self.assertEqual(first_linear.in_features, raw_sequence_dim)
+
+    def _fusion_tokenizer(self, fusion: str) -> OneTransTokenizer:
+        base = self._base_config()
+        sequences = [
+            SequenceConfig(
+                name=name,
+                fields=[
+                    SequenceFieldConfig(
+                        name="timestamp",
+                        kind="dense",
+                        source=f"{name}_timestamp",
+                    )
+                ],
+                max_length=2,
+                timestamp_field="timestamp",
+            )
+            for name in ("a", "b")
+        ]
+        config = replace(
+            base,
+            sequences=sequences,
+            tokenization=replace(
+                base.tokenization,
+                sequence_tokens=[
+                    TokenGroupConfig(name="a", inputs=["a"]),
+                    TokenGroupConfig(name="b", inputs=["b"]),
+                ],
+            ),
+            model=replace(
+                base.model,
+                token_dim=4,
+                num_heads=2,
+                hidden_dim=8,
+                sequence_fusion=fusion,
+                num_ns_tokens=1,
+            ),
+        )
+        scalar_names = [
+            feature.name
+            for feature in config.features
+            if feature.embedding_scope in {"feature", "shared"}
+        ]
+        encoder = self.Encoder(
+            {name: 1 for name in scalar_names},
+            {"a": 4, "b": 4},
+        )
+        tokenizer = OneTransTokenizer(config, encoder)
+        tokenizer.sequence_projectors = nn.ModuleList([nn.Identity(), nn.Identity()])
+        if tokenizer.sequence_type_embeddings is not None:
+            with torch.no_grad():
+                tokenizer.sequence_type_embeddings.weight.zero_()
+        return tokenizer
+
+    def _fusion_features(self) -> dict[str, dict[str, Tensor | dict[str, Tensor]]]:
+        return {
+            "a": {
+                "event_inputs": torch.tensor(
+                    [[[1.0, 0.0, 0.0, 0.0], [3.0, 0.0, 0.0, 0.0]]]
+                ),
+                "mask": torch.ones(1, 2, dtype=torch.bool),
+                "fields": {"timestamp": torch.tensor([[1.0, 3.0]])},
+                "lengths": torch.tensor([2]),
+            },
+            "b": {
+                "event_inputs": torch.tensor(
+                    [[[2.0, 0.0, 0.0, 0.0], [4.0, 0.0, 0.0, 0.0]]]
+                ),
+                "mask": torch.ones(1, 2, dtype=torch.bool),
+                "fields": {"timestamp": torch.tensor([[2.0, 4.0]])},
+                "lengths": torch.tensor([2]),
+            },
+        }
+
+    def test_timestamp_aware_fusion_interleaves_events(self) -> None:
+        tokenizer = self._fusion_tokenizer("timestamp_aware")
+
+        cache = tokenizer.precompute_request_cache(self._fusion_features())
+
+        torch.testing.assert_close(
+            cache.s_tokens[0, :, 0],
+            torch.tensor([1.0, 2.0, 3.0, 4.0]),
+        )
+
+    def test_intent_ordered_fusion_inserts_learned_separator(self) -> None:
+        tokenizer = self._fusion_tokenizer("intent_ordered")
+        with torch.no_grad():
+            tokenizer.sep_tokens[0].fill_(9.0)
+
+        cache = tokenizer.precompute_request_cache(self._fusion_features())
+
+        torch.testing.assert_close(
+            cache.s_tokens[0, :, 0],
+            torch.tensor([1.0, 3.0, 9.0, 2.0, 4.0]),
+        )
+
 
 class OneTransCacheAlignmentTest(unittest.TestCase):
     def test_layer_kv_cache_is_equivalent_and_reuses_s_projections(self) -> None:
@@ -141,6 +457,97 @@ class OneTransCacheAlignmentTest(unittest.TestCase):
         self.assertEqual(calls_after_precompute, {"key": 1, "value": 1})
         self.assertEqual(calls, calls_after_precompute)
 
+    def _backbone(self, use_pyramid: bool) -> OneTransBackbone:
+        class Tokenizer(nn.Module):
+            def precompute_request_cache(
+                self,
+                features: dict[str, Tensor],
+            ) -> OneTransRequestCache:
+                tokens = features["s_tokens"]
+                return OneTransRequestCache(
+                    s_tokens=tokens,
+                    s_valid_mask=torch.ones(tokens.shape[:2], dtype=torch.bool),
+                )
+
+        config = SimpleNamespace(
+            model=SimpleNamespace(
+                token_dim=8,
+                num_heads=2,
+                hidden_dim=16,
+                num_layers=3,
+                use_pyramid=use_pyramid,
+                final_s_tokens=2,
+                pyramid_round_to=32,
+            ),
+            runtime=SimpleNamespace(
+                attention_backend="auto",
+                activation_checkpoint=False,
+            ),
+        )
+        backbone = OneTransBackbone.__new__(OneTransBackbone)
+        nn.Module.__init__(backbone)
+        backbone.config = config
+        backbone.tokenizer = Tokenizer()
+        backbone.ns_token_count = 2
+        backbone.blocks = nn.ModuleList(
+            OneTransBlock(config, ns_token_count=2) for _ in range(3)
+        )
+        return backbone.eval()
+
+    def test_cross_request_append_cache_matches_full_recompute(self) -> None:
+        torch.manual_seed(29)
+        backbone = self._backbone(use_pyramid=False)
+        old_tokens = torch.randn(1, 5, 8)
+        new_tokens = torch.cat([old_tokens, torch.randn(1, 2, 8)], dim=1)
+
+        with torch.no_grad():
+            old_cache = backbone.precompute_request_cache({"s_tokens": old_tokens})
+            incremental = backbone.update_request_cache(
+                {"s_tokens": new_tokens},
+                old_cache,
+            )
+            full = backbone.precompute_request_cache({"s_tokens": new_tokens})
+
+        for incremental_layer, full_layer in zip(incremental.layers, full.layers):
+            self.assertEqual(incremental_layer.s_reused_kv_tokens, old_tokens.size(1))
+            torch.testing.assert_close(incremental_layer.s_key, full_layer.s_key)
+            torch.testing.assert_close(incremental_layer.s_value, full_layer.s_value)
+            torch.testing.assert_close(incremental_layer.s_output, full_layer.s_output)
+
+    def test_pyramid_append_cache_rebuilds_only_changed_deeper_windows(self) -> None:
+        torch.manual_seed(31)
+        backbone = self._backbone(use_pyramid=True)
+        old_tokens = torch.randn(1, 5, 8)
+        new_tokens = torch.cat([old_tokens, torch.randn(1, 2, 8)], dim=1)
+
+        with torch.no_grad():
+            old_cache = backbone.precompute_request_cache({"s_tokens": old_tokens})
+            incremental = backbone.update_request_cache(
+                {"s_tokens": new_tokens},
+                old_cache,
+            )
+            full = backbone.precompute_request_cache({"s_tokens": new_tokens})
+
+        self.assertEqual(incremental.layers[0].s_reused_kv_tokens, old_tokens.size(1))
+        self.assertGreater(incremental.layers[1].s_reused_kv_tokens, 0)
+        self.assertEqual(incremental.layers[2].s_reused_kv_tokens, 0)
+        for incremental_layer, full_layer in zip(incremental.layers, full.layers):
+            torch.testing.assert_close(incremental_layer.s_key, full_layer.s_key)
+            torch.testing.assert_close(incremental_layer.s_output, full_layer.s_output)
+
+    def test_cross_request_cache_rejects_non_append_mutation(self) -> None:
+        backbone = self._backbone(use_pyramid=False)
+        old_tokens = torch.randn(1, 4, 8)
+        old_cache = backbone.precompute_request_cache({"s_tokens": old_tokens})
+        changed = old_tokens.clone()
+        changed[:, 1, :] += 1.0
+
+        with self.assertRaisesRegex(ValueError, "exact prefix"):
+            backbone.update_request_cache(
+                {"s_tokens": torch.cat([changed, torch.randn(1, 1, 8)], dim=1)},
+                old_cache,
+            )
+
 
 class SparseMoEAlignmentTest(unittest.TestCase):
     def test_relu_l1_and_adaptive_coefficient_follow_current_step(self) -> None:
@@ -152,6 +559,7 @@ class SparseMoEAlignmentTest(unittest.TestCase):
             target_active_ratio=0.25,
             regularization_initial=1.0e-4,
             regularization_multiplier=2.0,
+            dtsi_training_output="dense_router",
         ).train()
         with torch.no_grad():
             module.sparse_routers[0].weight.zero_()
@@ -160,6 +568,7 @@ class SparseMoEAlignmentTest(unittest.TestCase):
         tokens = torch.randn(2, 1, 3, requires_grad=True)
         output = module(tokens)
         regularization = module.regularization_loss(output)
+        module.step_regularization_controller()
 
         # Four unit gates per token: lambda_0 * sum_j G_j.
         torch.testing.assert_close(
@@ -171,6 +580,48 @@ class SparseMoEAlignmentTest(unittest.TestCase):
             module.regularization_coefficient.new_tensor(2.0e-4),
         )
         (output.sum() + regularization).backward()
+        self.assertIsNotNone(module.dense_routers[0].weight.grad)
+        self.assertIsNotNone(module.sparse_routers[0].weight.grad)
+
+    def test_dtsi_requires_an_explicit_training_output_policy(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not specified by RankMixer"):
+            SparseMoEPerTokenFFN(
+                num_tokens=1,
+                token_dim=3,
+                hidden_dim=5,
+                use_dtsi=True,
+            )
+
+    def test_checkpoint_recompute_steps_adaptive_controller_once(self) -> None:
+        config = _rankmixer_config()
+        config.model.rankmixer_ffn_type = "sparse_moe"
+        config.model.sparse_moe_dtsi_training_output = "dense_router"
+        config.model.sparse_moe_regularization_initial = 1.0e-4
+        config.model.sparse_moe_regularization_multiplier = 2.0
+        block = RankMixerBlock(config, feature_token_count=2).train()
+        module = block.feature_ffn
+        assert isinstance(module, SparseMoEPerTokenFFN)
+        with torch.no_grad():
+            for router in module.sparse_routers:
+                router.weight.zero_()
+                router.bias.fill_(1.0)
+
+        tokens = torch.randn(3, 2, 4, requires_grad=True)
+        output = checkpoint(block, tokens, use_reentrant=False)
+        loss = output.square().mean() + module.regularization_loss(output)
+        loss.backward()
+        _step_sparse_moe_controllers(block)
+        coefficient_after_step = module.regularization_coefficient.clone()
+        _step_sparse_moe_controllers(block)
+
+        torch.testing.assert_close(
+            coefficient_after_step,
+            coefficient_after_step.new_tensor(2.0e-4),
+        )
+        torch.testing.assert_close(
+            module.regularization_coefficient,
+            coefficient_after_step,
+        )
         self.assertIsNotNone(module.dense_routers[0].weight.grad)
         self.assertIsNotNone(module.sparse_routers[0].weight.grad)
 

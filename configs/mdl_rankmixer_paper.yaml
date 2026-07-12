@@ -1,0 +1,67 @@
+# MDL method profile. The paper reports three production scenarios, 20+ tasks,
+# batch size 2048, and an approximately 0.5B model, but does not disclose a
+# complete L/D/H configuration. The representative three-task surface below
+# exercises the published multi-scenario/multi-task information flow; the small
+# L/D/H values remain explicit implementation placeholders, not paper values.
+extends: default.yaml
+
+data:
+  train:
+    labels:
+      click: click
+      like: like
+      favorite: favorite
+
+scenarios:
+  names:
+    - single_column
+    - double_column
+    - inner_search
+  source: scenario_id
+
+tokenization:
+  feature_tokenizer: groupwise
+  scenario_tokens:
+    - name: single_column
+      important_inputs: [scenario_user_id, scenario_item_id]
+      prior_inputs: [hist]
+    - name: double_column
+      important_inputs: [scenario_user_id, scenario_item_id]
+      prior_inputs: [hist]
+    - name: inner_search
+      important_inputs: [scenario_user_id, scenario_item_id]
+      prior_inputs: [hist]
+    - name: global
+      important_inputs: [scenario_user_id, scenario_item_id]
+      prior_inputs: [hist]
+  task_tokens:
+    - name: click
+      important_inputs: [task_user_id, task_item_id]
+      prior_inputs: [hist]
+    - name: like
+      important_inputs: [task_user_id, task_item_id]
+      prior_inputs: [hist]
+    - name: favorite
+      important_inputs: [task_user_id, task_item_id]
+      prior_inputs: [hist]
+
+model:
+  name: mdl_rankmixer
+  token_dim: 32       # implementation choice; paper value is undisclosed
+  num_layers: 2       # implementation choice; paper value is undisclosed
+  num_heads: 4        # implementation choice; paper value is undisclosed
+  hidden_dim: 64      # implementation choice; paper value is undisclosed
+  mdl_feature_interaction: paper
+
+training:
+  batch_size: 2048
+  dense_optimizer: rmsprop
+  sparse_optimizer: adagrad
+  loss_reduction: sum
+  # MDL does not publish LR or an LR schedule.
+  lr_dense: 0.005
+  lr_schedule: constant
+  lr_warmup_steps: 0
+  lr_decay_steps: null
+  lr_min_ratio: 0.0
+

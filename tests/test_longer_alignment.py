@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import unittest
 from typing import Any
 
 import torch
 from torch import Tensor, nn
 
-from src.model import LongerSequenceEncoder, LongerTokenMerger
+from src.config import SequenceConfig, SequenceFieldConfig
+from src.dataloader import _sequence_bounds
+from src.model import FeatureEncoderBank, LongerSequenceEncoder, LongerTokenMerger
 
 
 def _zero_parameters(module: nn.Module) -> None:
@@ -126,7 +129,11 @@ class LongerTokenMergerAlignmentTest(unittest.TestCase):
 
 
 class LongerSequenceEncoderAlignmentTest(unittest.TestCase):
-    def _encoder(self) -> LongerSequenceEncoder:
+    def _encoder(
+        self,
+        user_global_tokens: int = 0,
+        activation_checkpoint: bool = False,
+    ) -> LongerSequenceEncoder:
         return LongerSequenceEncoder(
             token_dim=4,
             num_heads=2,
@@ -136,6 +143,8 @@ class LongerSequenceEncoderAlignmentTest(unittest.TestCase):
             summary_tokens=2,
             token_merge=1,
             inner_layers=0,
+            user_global_tokens=user_global_tokens,
+            activation_checkpoint=activation_checkpoint,
         )
 
     def test_returns_full_global_and_recent_compressed_sequence(self) -> None:
@@ -202,6 +211,170 @@ class LongerSequenceEncoderAlignmentTest(unittest.TestCase):
             )
 
         torch.testing.assert_close(cached, uncached, rtol=1.0e-5, atol=1.0e-6)
+
+    def test_user_globals_are_cacheable_but_candidates_are_isolated(self) -> None:
+        torch.manual_seed(37)
+        encoder = self._encoder(user_global_tokens=1).eval()
+        tokens = torch.randn(1, 5, 4)
+        mask = torch.ones(1, 5, dtype=torch.bool)
+        user_global = torch.tensor([[[2.0, -1.0, 0.5, 3.0]]])
+        candidate_a = torch.randn(1, 1, 4)
+        candidate_b = torch.randn(1, 1, 4)
+
+        with torch.no_grad():
+            cache = encoder.precompute_cache(tokens, mask, user_global)
+            uncached = encoder(
+                tokens,
+                mask,
+                candidate_a,
+                user_global_tokens=user_global,
+            ).view(1, 4, 4)
+            cached_a = encoder(tokens, mask, candidate_a, cache=cache).view(1, 4, 4)
+            cached_b = encoder(tokens, mask, candidate_b, cache=cache).view(1, 4, 4)
+
+        torch.testing.assert_close(cached_a, uncached, rtol=1.0e-5, atol=1.0e-6)
+        # Output order is [cacheable user globals; candidate globals; recent queries].
+        torch.testing.assert_close(cached_a[:, 0, :], cached_b[:, 0, :])
+        torch.testing.assert_close(cached_a[:, 2:, :], cached_b[:, 2:, :])
+        self.assertFalse(torch.allclose(cached_a[:, 1, :], cached_b[:, 1, :]))
+
+    def test_user_global_changes_sequence_side_cache_state(self) -> None:
+        torch.manual_seed(41)
+        encoder = self._encoder(user_global_tokens=1).eval()
+        tokens = torch.randn(1, 5, 4)
+        mask = torch.ones(1, 5, dtype=torch.bool)
+        user_a = torch.tensor([[[1.0, 0.0, -1.0, 2.0]]])
+        user_b = torch.tensor([[[-2.0, 1.0, 0.0, 3.0]]])
+
+        with torch.no_grad():
+            cache_a = encoder.precompute_cache(tokens, mask, user_a)
+            cache_b = encoder.precompute_cache(tokens, mask, user_b)
+
+        self.assertFalse(
+            torch.allclose(cache_a.cross_recent_output, cache_b.cross_recent_output)
+        )
+
+    def test_activation_checkpoint_covers_merge_cross_and_self_blocks(self) -> None:
+        torch.manual_seed(43)
+        encoder = LongerSequenceEncoder(
+            token_dim=4,
+            num_heads=2,
+            hidden_dim=8,
+            query_token_count=2,
+            self_layers=1,
+            summary_tokens=2,
+            token_merge=1,
+            inner_layers=1,
+            user_global_tokens=1,
+            activation_checkpoint=True,
+        ).train()
+        tokens = torch.randn(2, 5, 4, requires_grad=True)
+        mask = torch.ones(2, 5, dtype=torch.bool)
+        user_global = torch.randn(2, 1, 4, requires_grad=True)
+        candidate_global = torch.randn(2, 1, 4, requires_grad=True)
+
+        output = encoder(
+            tokens,
+            mask,
+            candidate_global,
+            user_global_tokens=user_global,
+        )
+        output.square().mean().backward()
+
+        self.assertIsNotNone(tokens.grad)
+        self.assertIsNotNone(user_global.grad)
+        self.assertIsNotNone(candidate_global.grad)
+
+
+class LongerInputGenerationAlignmentTest(unittest.TestCase):
+    def _sequence(self, order: str) -> SequenceConfig:
+        return SequenceConfig(
+            name="hist",
+            fields=[
+                SequenceFieldConfig(
+                    name="item",
+                    kind="dense",
+                    source="hist_item",
+                    dimension=2,
+                ),
+                SequenceFieldConfig(
+                    name="time_delta",
+                    kind="dense",
+                    source="hist_time_delta",
+                ),
+            ],
+            max_length=2,
+            encoder="longer",
+            target_inputs=["candidate"],
+            time_delta_field="time_delta",
+            sequence_order=order,
+        )
+
+    def _encoder_bank(self, sequence: SequenceConfig) -> FeatureEncoderBank:
+        bank = FeatureEncoderBank.__new__(FeatureEncoderBank)
+        nn.Module.__init__(bank)
+        bank.sequences_by_name = {sequence.name: sequence}
+        bank.sequence_field_embedding_keys = {}
+        bank.embeddings = nn.ModuleDict()
+        bank.sequence_step_projectors = nn.ModuleDict(
+            {"hist": nn.Linear(3, 2, bias=False)}
+        )
+        bank.sequence_position_embeddings = nn.ModuleDict(
+            {"hist": nn.Embedding(2, 2)}
+        )
+        with torch.no_grad():
+            bank.sequence_step_projectors["hist"].weight.copy_(
+                torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+            )
+            bank.sequence_position_embeddings["hist"].weight.copy_(
+                torch.tensor([[10.0, 20.0], [30.0, 40.0]])
+            )
+        return bank
+
+    def _payload(self, newest_first: bool = False) -> dict[str, Any]:
+        item = torch.tensor([[[1.0, 2.0], [4.0, 5.0]]])
+        time_delta = torch.tensor([[[3.0], [6.0]]])
+        if newest_first:
+            item = item.flip(1)
+            time_delta = time_delta.flip(1)
+        return {
+            "fields": {"item": item, "time_delta": time_delta},
+            "lengths": torch.tensor([2]),
+        }
+
+    def test_position_is_added_before_time_delta_concat_and_projection(self) -> None:
+        sequence = self._sequence("oldest_to_newest")
+        bank = self._encoder_bank(sequence)
+
+        tokens, mask = bank._multi_field_sequence_tokens(sequence, self._payload())
+
+        expected = torch.tensor([[[11.0, 3.0], [34.0, 6.0]]])
+        torch.testing.assert_close(tokens, expected)
+        torch.testing.assert_close(mask, torch.ones(1, 2, dtype=torch.bool))
+
+    def test_both_physical_sequence_orders_canonicalize_identically(self) -> None:
+        oldest = self._sequence("oldest_to_newest")
+        newest = self._sequence("newest_to_oldest")
+        bank = self._encoder_bank(oldest)
+
+        oldest_tokens, oldest_mask = bank._multi_field_sequence_tokens(
+            oldest,
+            self._payload(),
+        )
+        newest_tokens, newest_mask = bank._multi_field_sequence_tokens(
+            newest,
+            self._payload(newest_first=True),
+        )
+
+        torch.testing.assert_close(newest_tokens, oldest_tokens)
+        torch.testing.assert_close(newest_mask, oldest_mask)
+
+    def test_truncation_window_is_explicit_for_both_physical_orders(self) -> None:
+        oldest = replace(self._sequence("oldest_to_newest"), truncation="tail")
+        newest = replace(self._sequence("newest_to_oldest"), truncation="head")
+
+        self.assertEqual(_sequence_bounds(5, oldest), (3, 5))
+        self.assertEqual(_sequence_bounds(5, newest), (0, 2))
 
 
 if __name__ == "__main__":

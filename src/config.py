@@ -24,6 +24,10 @@ LRScheduleType = Literal["constant", "cosine"]
 ActivationType = Literal["gelu", "relu"]
 SequenceFusionType = Literal["timestamp_aware", "intent_ordered"]
 RankMixerFFNType = Literal["dense", "sparse_moe"]
+SequenceOrderType = Literal["oldest_to_newest", "newest_to_oldest"]
+MDLFeatureInteractionType = Literal["paper", "rankmixer_full"]
+DTSITrainingOutputType = Literal["dense_router", "mean"]
+LossReductionType = Literal["sum", "mean_per_task"]
 
 
 # Raw YAML schema. These dataclasses mirror configs/default.yaml field names.
@@ -501,9 +505,12 @@ class SequenceConfig:
     fields: list[SequenceFieldConfig]
     # Feature/shared sequences can become model feature tokens. Other scopes are reserved.
     embedding_scope: EmbeddingScope = "feature"
-    # Optional maximum number of recent/oldest steps kept during tensorization.
+    # Optional maximum and physical head/tail window kept during tensorization.
     max_length: int | None = None
     truncation: Literal["head", "tail"] = "tail"
+    # Physical order of valid events in every configured list column. Model code
+    # canonicalizes both choices to oldest_to_newest before causal attention.
+    sequence_order: SequenceOrderType = "oldest_to_newest"
     # attention_pool and mean_pool are simple baselines; longer is the paper-aligned path.
     encoder: SequenceEncoderType = "attention_pool"
     # Scalar features used as target context for LONGER query construction.
@@ -515,6 +522,13 @@ class SequenceConfig:
     longer_self_layers: int = 1
     longer_token_merge: int = 1
     longer_inner_layers: int = 0
+    # Cacheable user/CLS globals are kept separate from candidate globals so
+    # candidate information cannot leak into reusable sequence-side states.
+    longer_user_global_inputs: list[str] = field(default_factory=list)
+    longer_user_global_tokens: int = 0
+    longer_cls_tokens: int = 0
+    # None assigns all remaining rankmixer_summary_tokens to target_inputs.
+    longer_candidate_global_tokens: int | None = None
     # Explicit temporal semantics used by OneTrans and LONGER.
     timestamp_field: str | None = None
     time_delta_field: str | None = None
@@ -538,6 +552,7 @@ class SequenceConfig:
             embedding_scope=payload.get("embedding_scope", "feature"),
             max_length=payload.get("max_length"),
             truncation=payload.get("truncation", "tail"),
+            sequence_order=payload.get("sequence_order", "oldest_to_newest"),
             encoder=payload.get("encoder", "attention_pool"),
             target_inputs=list(payload.get("target_inputs", [])),
             rankmixer_summary_tokens=payload.get("rankmixer_summary_tokens", 1),
@@ -545,9 +560,18 @@ class SequenceConfig:
             longer_self_layers=payload.get("longer_self_layers", 1),
             longer_token_merge=payload.get("longer_token_merge", 1),
             longer_inner_layers=payload.get("longer_inner_layers", 0),
+            longer_user_global_inputs=list(payload.get("longer_user_global_inputs", [])),
+            longer_user_global_tokens=payload.get("longer_user_global_tokens", 0),
+            longer_cls_tokens=payload.get("longer_cls_tokens", 0),
+            longer_candidate_global_tokens=payload.get("longer_candidate_global_tokens"),
             timestamp_field=payload.get("timestamp_field"),
             time_delta_field=payload.get("time_delta_field"),
         )
+
+    def resolved_longer_candidate_global_tokens(self) -> int:
+        if self.longer_candidate_global_tokens is not None:
+            return self.longer_candidate_global_tokens
+        return self.rankmixer_summary_tokens - self.longer_user_global_tokens - self.longer_cls_tokens
 
     def validate(self, scalar_feature_names: set[str]) -> None:
         if not self.name:
@@ -562,6 +586,10 @@ class SequenceConfig:
             raise ValueError(f"sequence {self.name!r} max_length must be positive")
         if self.truncation not in {"head", "tail"}:
             raise ValueError(f"sequence {self.name!r} truncation must be head or tail")
+        if self.sequence_order not in {"oldest_to_newest", "newest_to_oldest"}:
+            raise ValueError(
+                f"sequence {self.name!r} sequence_order must be oldest_to_newest or newest_to_oldest"
+            )
         if self.encoder not in {"attention_pool", "mean_pool", "longer"}:
             raise ValueError(f"sequence {self.name!r} encoder must be attention_pool, mean_pool, or longer")
         if self.rankmixer_summary_tokens <= 0:
@@ -578,6 +606,36 @@ class SequenceConfig:
             raise ValueError(f"sequence {self.name!r} longer_token_merge must be positive")
         if self.longer_inner_layers < 0:
             raise ValueError(f"sequence {self.name!r} longer_inner_layers must be non-negative")
+        if self.longer_user_global_tokens < 0:
+            raise ValueError(f"sequence {self.name!r} longer_user_global_tokens must be non-negative")
+        if self.longer_cls_tokens < 0:
+            raise ValueError(f"sequence {self.name!r} longer_cls_tokens must be non-negative")
+        candidate_global_tokens = self.resolved_longer_candidate_global_tokens()
+        if candidate_global_tokens < 0:
+            raise ValueError(
+                f"sequence {self.name!r} longer_candidate_global_tokens must be non-negative"
+            )
+        if self.encoder == "longer":
+            total_global_tokens = (
+                self.longer_user_global_tokens
+                + self.longer_cls_tokens
+                + candidate_global_tokens
+            )
+            if total_global_tokens != self.rankmixer_summary_tokens:
+                raise ValueError(
+                    f"sequence {self.name!r} LONGER global token counts must sum to "
+                    f"rankmixer_summary_tokens={self.rankmixer_summary_tokens}, got {total_global_tokens}"
+                )
+            if bool(self.longer_user_global_inputs) != (self.longer_user_global_tokens > 0):
+                raise ValueError(
+                    f"sequence {self.name!r} longer_user_global_inputs and "
+                    "longer_user_global_tokens must either both be configured or both be empty"
+                )
+            if bool(self.target_inputs) != (candidate_global_tokens > 0):
+                raise ValueError(
+                    f"sequence {self.name!r} target_inputs and resolved candidate global token count "
+                    "must either both be configured or both be empty"
+                )
         if not self.fields:
             raise ValueError(f"sequence {self.name!r} must declare at least one field")
         field_names: set[str] = set()
@@ -587,6 +645,15 @@ class SequenceConfig:
                 raise ValueError(f"duplicate field {field_config.name!r} in sequence {self.name!r}")
             field_names.add(field_config.name)
         fields_by_name = {item.name: item for item in self.fields}
+        if (
+            self.encoder == "longer"
+            and self.time_delta_field is not None
+            and len(self.fields) == 1
+        ):
+            raise ValueError(
+                f"sequence {self.name!r} LONGER input requires at least one item/side field "
+                "in addition to time_delta_field"
+            )
         for option_name, field_name in (
             ("timestamp_field", self.timestamp_field),
             ("time_delta_field", self.time_delta_field),
@@ -607,6 +674,14 @@ class SequenceConfig:
             raise ValueError(
                 f"sequence {self.name!r} target_inputs references unknown scalar features: "
                 + ", ".join(missing_targets)
+            )
+        missing_user_globals = [
+            name for name in self.longer_user_global_inputs if name not in scalar_feature_names
+        ]
+        if missing_user_globals:
+            raise ValueError(
+                f"sequence {self.name!r} longer_user_global_inputs references unknown scalar features: "
+                + ", ".join(missing_user_globals)
             )
 
 
@@ -1063,6 +1138,9 @@ class ModelConfig:
     use_global_scenario_token: bool = True
     use_task_feature_interaction: bool = True
     use_scenario_feature_interaction: bool = True
+    # MDL Eq. (6) has no second residual/LayerNorm. rankmixer_full is retained
+    # only as an explicit ablation/compatibility path.
+    mdl_feature_interaction: MDLFeatureInteractionType = "paper"
     # Local request-cache support for sequence encoders.
     use_request_cache: bool = False
     # OneTrans pyramid controls for reducing S tokens over layers.
@@ -1083,6 +1161,9 @@ class ModelConfig:
     sparse_moe_regularization_initial: float = 1.0e-8
     sparse_moe_regularization_multiplier: float = 1.2
     sparse_moe_loss_weight: float = 1.0
+    # RankMixer does not publish the DTSI training-output fusion equation. A
+    # sparse DTSI run must therefore acknowledge an implementation choice.
+    sparse_moe_dtsi_training_output: DTSITrainingOutputType | None = None
     # mdl_onetrans is an experimental composition, not a published model.
     experimental_model_acknowledged: bool = False
 
@@ -1119,6 +1200,8 @@ class ModelConfig:
             raise ValueError("model.task_head_dropout must be in [0, 1)")
         if self.task_head_activation not in {"gelu", "relu"}:
             raise ValueError("model.task_head_activation must be gelu or relu")
+        if self.mdl_feature_interaction not in {"paper", "rankmixer_full"}:
+            raise ValueError("model.mdl_feature_interaction must be paper or rankmixer_full")
         if self.pyramid_round_to <= 0:
             raise ValueError("model.pyramid_round_to must be positive")
         if self.ns_tokenizer not in {"auto_split", "groupwise"}:
@@ -1143,6 +1226,24 @@ class ModelConfig:
             raise ValueError("model.sparse_moe_regularization_multiplier must be greater than 1")
         if self.sparse_moe_loss_weight < 0.0:
             raise ValueError("model.sparse_moe_loss_weight must be non-negative")
+        if self.sparse_moe_dtsi_training_output not in {
+            None,
+            "dense_router",
+            "mean",
+        }:
+            raise ValueError(
+                "model.sparse_moe_dtsi_training_output must be dense_router, mean, or null"
+            )
+        if (
+            self.rankmixer_ffn_type == "sparse_moe"
+            and self.sparse_moe_use_dtsi
+            and self.sparse_moe_dtsi_training_output is None
+        ):
+            raise ValueError(
+                "RankMixer does not publish the DTSI training-output fusion equation; set "
+                "model.sparse_moe_dtsi_training_output explicitly to acknowledge the "
+                "implementation choice"
+            )
         if self.name == "mdl_onetrans" and not self.experimental_model_acknowledged:
             raise ValueError(
                 "model.name=mdl_onetrans is experimental and is not defined by the MDL or OneTrans paper; "
@@ -1181,6 +1282,9 @@ class TrainingConfig:
     # Optional gradient clipping for dense and sparse parameter groups.
     dense_clip_norm: float | None = None
     sparse_clip_norm: float | None = None
+    # MDL Eq. (1) uses a literal sum. mean_per_task is an explicit engineering
+    # alternative for datasets that need task-balanced normalization.
+    loss_reduction: LossReductionType = "sum"
     # Default checkpoint path used by train/predict when CLI does not override it.
     checkpoint_path: str | None = None
 
@@ -1236,6 +1340,8 @@ class TrainingConfig:
             raise ValueError("training.dense_clip_norm must be positive")
         if self.sparse_clip_norm is not None and self.sparse_clip_norm <= 0:
             raise ValueError("training.sparse_clip_norm must be positive")
+        if self.loss_reduction not in {"sum", "mean_per_task"}:
+            raise ValueError("training.loss_reduction must be sum or mean_per_task")
 
 
 @dataclass(frozen=True)
@@ -1854,7 +1960,13 @@ def resolve_encoded_input_dims(config: AppConfig, categorical_dims: dict[str, in
         else:
             dims[feature.name] = categorical_dims[feature.name]
     for sequence in config.sequences:
-        dims[sequence.name] = config.model.token_dim * sequence.rankmixer_summary_tokens
+        if sequence.encoder == "longer":
+            merged_dim = config.model.token_dim * sequence.longer_token_merge
+            dims[sequence.name] = (
+                sequence.rankmixer_summary_tokens + sequence.longer_query_tokens
+            ) * merged_dim
+        else:
+            dims[sequence.name] = config.model.token_dim * sequence.rankmixer_summary_tokens
     return dims
 
 
@@ -2115,17 +2227,22 @@ def validate_app_config(config: AppConfig) -> None:
                 "model.name=longer requires exactly one sequence configured with encoder=longer; "
                 "put all event side information in that sequence's fields"
             )
+        expected_layers = config.sequences[0].longer_self_layers + 1
+        if config.model.num_layers != expected_layers:
+            raise ValueError(
+                "model.name=longer requires model.num_layers to count the cross layer plus "
+                "sequences[0].longer_self_layers: "
+                f"{config.model.num_layers} != {expected_layers}"
+            )
     if config.model.name in {"rankmixer", "mdl_rankmixer"} and config.tokenization.feature_tokenizer == "rankmixer":
         input_dim = sum(resolved.encoded_input_dims[name] for name in resolved.tokenization.feature_token_inputs)
-        target_dim = feature_token_count * config.model.token_dim
-        if input_dim != target_dim:
+        if input_dim % feature_token_count != 0:
             raise ValueError(
-                "rankmixer tokenization requires exact encoded input dimension: "
+                "rankmixer tokenization requires equal-width input slices: "
                 f"sum(feature_token_inputs)={input_dim}, "
-                f"num_feature_tokens * model.token_dim={feature_token_count} * "
-                f"{config.model.token_dim} = {target_dim}. "
-                "Implicit zero padding is disabled; adjust secure-environment "
-                "feature dimensions, token packing, or tokenization dimensions."
+                f"num_feature_tokens={feature_token_count}. "
+                "The input width must be divisible by the token count; each slice is then "
+                "projected independently to model.token_dim."
             )
     if config.model.name in {"rankmixer", "mdl_rankmixer"} and config.model.token_dim % feature_token_count != 0:
         raise ValueError(

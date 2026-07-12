@@ -93,6 +93,7 @@ class SparseMoEPerTokenFFN(nn.Module):
         target_active_ratio: float = 0.25,
         regularization_initial: float = 1.0e-8,
         regularization_multiplier: float = 1.2,
+        dtsi_training_output: str | None = None,
     ) -> None:
         super().__init__()
         if num_tokens <= 0 or token_dim <= 0 or hidden_dim <= 0 or num_experts <= 0:
@@ -105,11 +106,21 @@ class SparseMoEPerTokenFFN(nn.Module):
             raise ValueError("regularization_initial must be positive")
         if regularization_multiplier <= 1.0:
             raise ValueError("regularization_multiplier must be greater than 1")
+        if dtsi_training_output not in {None, "dense_router", "mean"}:
+            raise ValueError(
+                "dtsi_training_output must be dense_router, mean, or None"
+            )
+        if use_dtsi and dtsi_training_output is None:
+            raise ValueError(
+                "DTSI training output is not specified by RankMixer; choose "
+                "dense_router or mean explicitly"
+            )
         activation_layer = _activation_layer(activation)
         self.num_tokens = num_tokens
         self.token_dim = token_dim
         self.num_experts = num_experts
         self.use_dtsi = use_dtsi
+        self.dtsi_training_output = dtsi_training_output
         self.inference_threshold = inference_threshold
         self.target_active_ratio = target_active_ratio
         self.regularization_multiplier = regularization_multiplier
@@ -138,6 +149,7 @@ class SparseMoEPerTokenFFN(nn.Module):
         )
         self._last_regularization_loss: Tensor | None = None
         self._last_active_ratio: Tensor | None = None
+        self._coefficient_update_pending = False
 
     def _expert_outputs(self, token_index: int, values: Tensor) -> Tensor:
         return torch.stack(
@@ -179,7 +191,12 @@ class SparseMoEPerTokenFFN(nn.Module):
                 if self.use_dtsi:
                     dense_gates = torch.softmax(self.dense_routers[token_index](values), dim=-1)
                     dense_output = (expert_outputs * dense_gates.unsqueeze(-1)).sum(dim=1)
-                    outputs.append(0.5 * (dense_output + sparse_output))
+                    if self.dtsi_training_output == "dense_router":
+                        outputs.append(dense_output)
+                    elif self.dtsi_training_output == "mean":
+                        outputs.append(0.5 * (dense_output + sparse_output))
+                    else:
+                        raise RuntimeError("DTSI training output policy is not configured")
                 else:
                     outputs.append(sparse_output)
             else:
@@ -189,17 +206,26 @@ class SparseMoEPerTokenFFN(nn.Module):
         self._last_regularization_loss = (
             self.regularization_coefficient.detach().clone() * gate_l1
         )
-        if self.training:
-            # ReMoE's zeroth-order adaptive L1 controller.
-            direction = torch.sign(
-                active_ratio - active_ratio.new_tensor(self.target_active_ratio)
-            )
-            with torch.no_grad():
-                self.regularization_coefficient.mul_(
-                    self.regularization_multiplier ** float(direction.item())
-                )
         self._last_active_ratio = active_ratio
+        self._coefficient_update_pending = self.training
         return torch.stack(outputs, dim=1)
+
+    def step_regularization_controller(
+        self,
+        active_ratio: Tensor | None = None,
+    ) -> None:
+        if not self._coefficient_update_pending or self._last_active_ratio is None:
+            return
+        controller_ratio = self._last_active_ratio if active_ratio is None else active_ratio
+        direction = torch.sign(
+            controller_ratio
+            - controller_ratio.new_tensor(self.target_active_ratio)
+        )
+        with torch.no_grad():
+            self.regularization_coefficient.mul_(
+                self.regularization_multiplier ** float(direction.item())
+            )
+        self._coefficient_update_pending = False
 
     def regularization_loss(self, reference: Tensor | None = None) -> Tensor:
         if self._last_regularization_loss is not None:

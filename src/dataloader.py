@@ -1597,7 +1597,7 @@ def _coerce_sequence_items(row: Any) -> list[Any]:
 
 
 def _sequence_bounds(length: int, sequence: SequenceConfig) -> tuple[int, int]:
-    """Return the configured head/tail truncation window for one sequence."""
+    """Return the configured physical head/tail window before order canonicalization."""
     if sequence.max_length is None or length <= sequence.max_length:
         return 0, length
     if sequence.truncation == "tail":

@@ -1,0 +1,77 @@
+# OneTrans-S method profile. It requires a true event timestamp column; the
+# secure data adapter must provide hist_timestamp with monotonically meaningful
+# timestamps. FFN hidden width and embedding widths are not disclosed.
+extends: default.yaml
+
+sequences:
+  - name: hist
+    embedding_scope: feature
+    max_length: 1190
+    truncation: tail
+    sequence_order: oldest_to_newest
+    encoder: longer
+    rankmixer_summary_tokens: 3
+    longer_token_merge: 4
+    longer_inner_layers: 1
+    timestamp_field: timestamp
+    time_delta_field: time_delta
+    target_inputs: [item_id]
+    longer_user_global_inputs: [user_id]
+    longer_user_global_tokens: 1
+    longer_cls_tokens: 1
+    longer_candidate_global_tokens: 1
+    longer_query_tokens: 8
+    longer_self_layers: 1
+    fields:
+      - name: item_id
+        kind: categorical
+        source: hist_item_id
+      - name: shop_id
+        kind: categorical
+        source: hist_shop_id
+      - name: action
+        kind: categorical
+        source: hist_action
+      - name: age
+        kind: dense
+        source: hist_age
+      - name: timestamp
+        kind: dense
+        source: hist_timestamp
+      - name: time_delta
+        kind: dense
+        source: hist_time_delta
+
+model:
+  name: onetrans
+  token_dim: 256
+  num_layers: 6
+  num_heads: 4
+  hidden_dim: 1024  # implementation choice; OneTrans-S FFN width is undisclosed
+  ffn_activation: gelu
+  ns_tokenizer: auto_split
+  num_ns_tokens: 12
+  sequence_fusion: timestamp_aware
+  use_sep_tokens: false
+  use_pyramid: true
+  pyramid_round_to: 32
+  final_s_tokens: 12
+
+training:
+  batch_size: 2048
+  lr_dense: 0.005
+  dense_optimizer: rmsprop
+  rmsprop_alpha: 0.99999
+  rmsprop_momentum: 0.0
+  sparse_optimizer: adagrad
+  # The paper reports beta1=0.1, beta2=1.0 for its internal Adagrad. PyTorch
+  # exposes no beta2 field; mapping beta1 to initial_accumulator_value remains unresolved.
+  adagrad_initial_accumulator_value: 0.1
+  adagrad_eps: 1.0e-10
+  dense_clip_norm: 90.0
+  sparse_clip_norm: 120.0
+  # OneTrans does not publish an LR schedule.
+  lr_schedule: constant
+  lr_warmup_steps: 0
+  lr_decay_steps: null
+  lr_min_ratio: 0.0

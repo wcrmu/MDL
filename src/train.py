@@ -28,6 +28,7 @@ from .dataloader import (
 )
 from .features import load_vocab_maps, vocab_strategy_fingerprint
 from .model import build_model
+from .modules.mlp import SparseMoEPerTokenFFN
 
 
 @dataclass(frozen=True)
@@ -458,10 +459,23 @@ def _clip_grad_norm(parameters: list[nn.Parameter], max_norm: float) -> Tensor:
     return total_norm
 
 
+@torch.no_grad()
+def _step_sparse_moe_controllers(module: nn.Module) -> None:
+    for item in module.modules():
+        if not isinstance(item, SparseMoEPerTokenFFN):
+            continue
+        active_ratio = item.active_ratio(item.regularization_coefficient).clone()
+        if torch_dist.is_available() and torch_dist.is_initialized():
+            torch_dist.all_reduce(active_ratio, op=torch_dist.ReduceOp.SUM)
+            active_ratio.div_(float(torch_dist.get_world_size()))
+        item.step_regularization_controller(active_ratio)
+
+
 def _loss_terms_from_batch(
     output: dict[str, Tensor],
     batch: FeatureBatch,
     moe_loss_weight: float = 0.0,
+    loss_reduction: str = "sum",
 ) -> tuple[Tensor, Tensor, Tensor]:
     if batch.labels is None or batch.label_mask is None:
         raise ValueError("training batch must contain labels and label_mask")
@@ -479,22 +493,31 @@ def _loss_terms_from_batch(
     task_numerators = (element_loss * weights).sum(dim=0)
     task_counts = weights.sum(dim=0)
 
-    if torch_dist.is_available() and torch_dist.is_initialized():
-        global_counts = task_counts.detach().clone()
-        torch_dist.all_reduce(global_counts, op=torch_dist.ReduceOp.SUM)
-        world_size = float(torch_dist.get_world_size())
-        task_scale = torch.where(
-            global_counts > 0,
-            world_size / global_counts.clamp_min(1.0),
-            torch.zeros_like(global_counts),
-        )
+    distributed = torch_dist.is_available() and torch_dist.is_initialized()
+    if loss_reduction == "sum":
+        # DDP averages gradients across ranks. Multiplying each local sum by the
+        # world size makes the averaged gradient equal the global paper sum.
+        world_size = float(torch_dist.get_world_size()) if distributed else 1.0
+        prediction_loss = task_numerators.sum() * world_size
+    elif loss_reduction == "mean_per_task":
+        if distributed:
+            global_counts = task_counts.detach().clone()
+            torch_dist.all_reduce(global_counts, op=torch_dist.ReduceOp.SUM)
+            world_size = float(torch_dist.get_world_size())
+            task_scale = torch.where(
+                global_counts > 0,
+                world_size / global_counts.clamp_min(1.0),
+                torch.zeros_like(global_counts),
+            )
+        else:
+            task_scale = torch.where(
+                task_counts > 0,
+                task_counts.clamp_min(1.0).reciprocal(),
+                torch.zeros_like(task_counts),
+            )
+        prediction_loss = (task_numerators * task_scale).sum()
     else:
-        task_scale = torch.where(
-            task_counts > 0,
-            task_counts.clamp_min(1.0).reciprocal(),
-            torch.zeros_like(task_counts),
-        )
-    prediction_loss = (task_numerators * task_scale).sum()
+        raise ValueError("loss_reduction must be sum or mean_per_task")
     moe_loss = output.get("moe_regularization_loss")
     total_loss = prediction_loss
     if moe_loss is not None and moe_loss_weight > 0.0:
@@ -638,6 +661,7 @@ def train_mdl(
                         output,
                         batch,
                         moe_loss_weight=config.model.sparse_moe_loss_weight,
+                        loss_reduction=config.training.loss_reduction,
                     )
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
@@ -645,6 +669,7 @@ def train_mdl(
                         scaler.unscale_(optimizer)
                 else:
                     loss.backward()
+                _step_sparse_moe_controllers(base_model)
                 if config.training.dense_clip_norm is not None and dense_params:
                     _clip_grad_norm(dense_params, config.training.dense_clip_norm)
                 if config.training.sparse_clip_norm is not None and sparse_params:

@@ -1,0 +1,39 @@
+# RankMixer dense method profile (arXiv:2507.15551v3, 100M setting).
+# Data paths, feature inventory, embedding widths, task heads, initialization,
+# and batch size are implementation choices because the paper does not publish
+# a portable input schema for them.
+extends: default.yaml
+
+tokenization:
+  feature_tokenizer: rankmixer
+  feature_tokens: []
+  num_feature_tokens: 16
+  feature_token_inputs:
+    - user_id
+    - item_id
+    - shop_id
+    - rankmixer_context_dense
+    - hist
+
+model:
+  name: rankmixer
+  token_dim: 768
+  num_layers: 2
+  # RankMixer TokenMixing uses H=T=16 internally; this field configures the
+  # auxiliary LONGER sequence module inherited from the input template.
+  num_heads: 12
+  # k=2 is an implementation choice; the paper defines k but does not publish
+  # its value for the 100M configuration.
+  hidden_dim: 1536
+  ffn_activation: gelu
+  rankmixer_ffn_type: dense
+
+training:
+  lr_dense: 0.01
+  dense_optimizer: rmsprop
+  sparse_optimizer: adagrad
+  # RankMixer does not specify an LR schedule.
+  lr_schedule: constant
+  lr_warmup_steps: 0
+  lr_decay_steps: null
+  lr_min_ratio: 0.0

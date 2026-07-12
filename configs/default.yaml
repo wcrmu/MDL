@@ -98,13 +98,19 @@ sequences:
     embedding_scope: feature
     max_length: 100
     truncation: tail
+    sequence_order: oldest_to_newest
     encoder: longer
-    rankmixer_summary_tokens: 2
+    rankmixer_summary_tokens: 3
     longer_token_merge: 4
     longer_inner_layers: 1
     time_delta_field: time_delta
     target_inputs:
       - item_id
+    longer_user_global_inputs:
+      - user_id
+    longer_user_global_tokens: 1
+    longer_cls_tokens: 1
+    longer_candidate_global_tokens: 1
     longer_query_tokens: 8
     longer_self_layers: 1
     fields:
@@ -264,7 +270,9 @@ model:
   use_global_scenario_token: true
   use_task_feature_interaction: true
   use_scenario_feature_interaction: true
+  mdl_feature_interaction: paper
   use_request_cache: false
+  sparse_moe_dtsi_training_output: null
 
 training:
   batch_size: 2048
@@ -284,4 +292,5 @@ training:
   sparse_parameter_server_adapter: null
   dense_clip_norm: 90.0
   sparse_clip_norm: 120.0
+  loss_reduction: sum
   checkpoint_path: artifacts/checkpoints/mdl_rankmixer.pt

@@ -31,6 +31,9 @@ class OneTransOutput:
 
 @dataclass(frozen=True)
 class OneTransLayerCache:
+    s_input: Tensor
+    s_input_start: int
+    s_reused_kv_tokens: int
     s_key: Tensor
     s_value: Tensor
     s_output: Tensor
@@ -163,8 +166,9 @@ def _build_task_heads(config: AppConfig, input_dim: int, task_count: int) -> nn.
 
 @dataclass(frozen=True)
 class LongerSelfLayerCache:
-    recent_key: Tensor
-    recent_value: Tensor
+    cacheable_key: Tensor
+    cacheable_value: Tensor
+    user_output: Tensor
     recent_output: Tensor
 
 
@@ -172,9 +176,11 @@ class LongerSelfLayerCache:
 class LongerSequenceCache:
     merged_tokens: Tensor
     merged_mask: Tensor
-    cross_sequence_key: Tensor
-    cross_sequence_value: Tensor
+    cross_cacheable_key: Tensor
+    cross_cacheable_value: Tensor
+    cross_user_output: Tensor
     cross_recent_output: Tensor
+    user_mask: Tensor
     recent_mask: Tensor
     self_layers: tuple[LongerSelfLayerCache, ...]
 
@@ -336,7 +342,9 @@ class LongerSequenceEncoder(nn.Module):
         summary_tokens: int,
         token_merge: int,
         inner_layers: int,
+        user_global_tokens: int = 0,
         attention_backend: str = "auto",
+        activation_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         if query_token_count <= 0:
@@ -345,8 +353,13 @@ class LongerSequenceEncoder(nn.Module):
             raise ValueError("self_layers must be non-negative")
         if summary_tokens <= 0:
             raise ValueError("summary_tokens must be positive")
+        if not 0 <= user_global_tokens <= summary_tokens:
+            raise ValueError("user_global_tokens must be in [0, summary_tokens]")
         self.query_token_count = query_token_count
         self.summary_tokens = summary_tokens
+        self.user_global_tokens = user_global_tokens
+        self.candidate_global_tokens = summary_tokens - user_global_tokens
+        self.activation_checkpoint = activation_checkpoint
         self.input_dim = token_dim
         self.token_merger = LongerTokenMerger(
             token_dim,
@@ -407,41 +420,154 @@ class LongerSequenceEncoder(nn.Module):
         ).view(1, count, 1)
         return recent_mask.unsqueeze(1) & causal & recent_mask.unsqueeze(-1)
 
-    def precompute_cache(self, tokens: Tensor, mask: Tensor) -> LongerSequenceCache:
-        merged_tokens, merged_mask = self.token_merger(tokens, mask)
+    def _cacheable_allowed_mask(
+        self,
+        user_mask: Tensor,
+        sequence_mask: Tensor,
+        sequence_allowed: Tensor,
+    ) -> Tensor:
+        key_mask = torch.cat([user_mask, sequence_mask], dim=1)
+        user_allowed = key_mask.unsqueeze(1).expand(-1, user_mask.size(1), -1)
+        sequence_queries = torch.cat(
+            [
+                user_mask.unsqueeze(1).expand(-1, sequence_allowed.size(1), -1),
+                sequence_allowed,
+            ],
+            dim=2,
+        )
+        return torch.cat([user_allowed, sequence_queries], dim=1)
+
+    def precompute_cache(
+        self,
+        tokens: Tensor,
+        mask: Tensor,
+        user_global_tokens: Tensor | None = None,
+    ) -> LongerSequenceCache:
+        if user_global_tokens is None:
+            user_global_tokens = tokens.new_zeros(tokens.size(0), 0, self.token_dim)
+        expected_user_shape = (tokens.size(0), self.user_global_tokens, self.token_dim)
+        if tuple(user_global_tokens.shape) != expected_user_shape:
+            raise ValueError(
+                f"user_global_tokens must have shape {expected_user_shape}, "
+                f"got {tuple(user_global_tokens.shape)}"
+            )
+        user_mask = torch.ones(
+            tokens.size(0),
+            self.user_global_tokens,
+            dtype=torch.bool,
+            device=tokens.device,
+        )
+        if self.activation_checkpoint and self.training:
+            merged_tokens, merged_mask = checkpoint(
+                self.token_merger,
+                tokens,
+                mask,
+                use_reentrant=False,
+            )
+        else:
+            merged_tokens, merged_mask = self.token_merger(tokens, mask)
         recent_tokens, recent_mask = self._recent_tokens(merged_tokens, merged_mask)
-        cross_key, cross_value = self.cross_block.project_kv(merged_tokens)
-        cross_recent_output = self.cross_block.forward_projected_kv(
-            recent_tokens,
-            cross_key,
-            cross_value,
+        cross_inputs = torch.cat([user_global_tokens, merged_tokens], dim=1)
+        cross_queries = torch.cat([user_global_tokens, recent_tokens], dim=1)
+        cross_allowed = self._cacheable_allowed_mask(
+            user_mask,
+            merged_mask,
             self._recent_allowed_mask(merged_mask, recent_mask),
         )
+        if self.activation_checkpoint and self.training:
+            def cross_forward(
+                current_inputs: Tensor,
+                current_queries: Tensor,
+                current_allowed: Tensor,
+            ) -> tuple[Tensor, Tensor, Tensor]:
+                current_key, current_value = self.cross_block.project_kv(current_inputs)
+                current_output = self.cross_block.forward_projected_kv(
+                    current_queries,
+                    current_key,
+                    current_value,
+                    current_allowed,
+                )
+                return current_key, current_value, current_output
+
+            cross_key, cross_value, cross_output = checkpoint(
+                cross_forward,
+                cross_inputs,
+                cross_queries,
+                cross_allowed,
+                use_reentrant=False,
+            )
+        else:
+            cross_key, cross_value = self.cross_block.project_kv(cross_inputs)
+            cross_output = self.cross_block.forward_projected_kv(
+                cross_queries,
+                cross_key,
+                cross_value,
+                cross_allowed,
+            )
+        cross_user_output = cross_output[:, : self.user_global_tokens, :]
+        cross_recent_output = cross_output[:, self.user_global_tokens :, :]
         cross_recent_output = cross_recent_output * recent_mask.unsqueeze(-1).to(cross_recent_output.dtype)
 
+        current_user = cross_user_output
         current_recent = cross_recent_output
         layer_caches: list[LongerSelfLayerCache] = []
-        recent_allowed = self._recent_self_allowed_mask(recent_mask)
         for block in self.self_blocks:
-            recent_key, recent_value = block.project_kv(current_recent)
-            recent_output = block.forward_projected_kv(
-                current_recent, recent_key, recent_value, recent_allowed
+            cacheable_inputs = torch.cat([current_user, current_recent], dim=1)
+            cacheable_allowed = self._cacheable_allowed_mask(
+                user_mask,
+                recent_mask,
+                self._recent_self_allowed_mask(recent_mask),
             )
+            if self.activation_checkpoint and self.training:
+                def self_forward(
+                    current_inputs: Tensor,
+                    current_allowed: Tensor,
+                    current_block: LongerSequenceAttentionBlock = block,
+                ) -> tuple[Tensor, Tensor, Tensor]:
+                    current_key, current_value = current_block.project_kv(current_inputs)
+                    current_output = current_block.forward_projected_kv(
+                        current_inputs,
+                        current_key,
+                        current_value,
+                        current_allowed,
+                    )
+                    return current_key, current_value, current_output
+
+                cacheable_key, cacheable_value, cacheable_output = checkpoint(
+                    self_forward,
+                    cacheable_inputs,
+                    cacheable_allowed,
+                    use_reentrant=False,
+                )
+            else:
+                cacheable_key, cacheable_value = block.project_kv(cacheable_inputs)
+                cacheable_output = block.forward_projected_kv(
+                    cacheable_inputs,
+                    cacheable_key,
+                    cacheable_value,
+                    cacheable_allowed,
+                )
+            user_output = cacheable_output[:, : self.user_global_tokens, :]
+            recent_output = cacheable_output[:, self.user_global_tokens :, :]
             recent_output = recent_output * recent_mask.unsqueeze(-1).to(recent_output.dtype)
             layer_caches.append(
                 LongerSelfLayerCache(
-                    recent_key=recent_key,
-                    recent_value=recent_value,
+                    cacheable_key=cacheable_key,
+                    cacheable_value=cacheable_value,
+                    user_output=user_output,
                     recent_output=recent_output,
                 )
             )
+            current_user = user_output
             current_recent = recent_output
         return LongerSequenceCache(
             merged_tokens=merged_tokens,
             merged_mask=merged_mask,
-            cross_sequence_key=cross_key,
-            cross_sequence_value=cross_value,
+            cross_cacheable_key=cross_key,
+            cross_cacheable_value=cross_value,
+            cross_user_output=cross_user_output,
             cross_recent_output=cross_recent_output,
+            user_mask=user_mask,
             recent_mask=recent_mask,
             self_layers=tuple(layer_caches),
         )
@@ -453,8 +579,9 @@ class LongerSequenceEncoder(nn.Module):
             raise ValueError("LONGER cache batch must be 1 or match candidate batch")
         layers = tuple(
             LongerSelfLayerCache(
-                recent_key=item.recent_key.expand(batch_size, -1, -1, -1),
-                recent_value=item.recent_value.expand(batch_size, -1, -1, -1),
+                cacheable_key=item.cacheable_key.expand(batch_size, -1, -1, -1),
+                cacheable_value=item.cacheable_value.expand(batch_size, -1, -1, -1),
+                user_output=item.user_output.expand(batch_size, -1, -1),
                 recent_output=item.recent_output.expand(batch_size, -1, -1),
             )
             for item in cache.self_layers
@@ -462,96 +589,124 @@ class LongerSequenceEncoder(nn.Module):
         return LongerSequenceCache(
             merged_tokens=cache.merged_tokens.expand(batch_size, -1, -1),
             merged_mask=cache.merged_mask.expand(batch_size, -1),
-            cross_sequence_key=cache.cross_sequence_key.expand(batch_size, -1, -1, -1),
-            cross_sequence_value=cache.cross_sequence_value.expand(batch_size, -1, -1, -1),
+            cross_cacheable_key=cache.cross_cacheable_key.expand(batch_size, -1, -1, -1),
+            cross_cacheable_value=cache.cross_cacheable_value.expand(batch_size, -1, -1, -1),
+            cross_user_output=cache.cross_user_output.expand(batch_size, -1, -1),
             cross_recent_output=cache.cross_recent_output.expand(batch_size, -1, -1),
+            user_mask=cache.user_mask.expand(batch_size, -1),
             recent_mask=cache.recent_mask.expand(batch_size, -1),
             self_layers=layers,
         )
-
-
-    def _cross_allowed_mask(self, key_valid_mask: Tensor, sampled_mask: Tensor, full_length: int) -> Tensor:
-        sample_count = sampled_mask.size(1)
-        query_count = self.summary_tokens + sample_count
-        allowed = key_valid_mask.unsqueeze(1).expand(-1, query_count, -1).clone()
-        if sample_count == 0:
-            return allowed
-
-        device = key_valid_mask.device
-        key_positions = torch.arange(full_length, device=device).view(1, 1, full_length)
-        sampled_positions = torch.arange(full_length - sample_count, full_length, device=device).view(1, sample_count, 1)
-        sequence_queries = allowed[:, self.summary_tokens :, :]
-        sequence_queries[:, :, : self.summary_tokens] = False
-        sequence_queries[:, :, self.summary_tokens :] &= key_positions <= sampled_positions
-        sequence_queries &= sampled_mask.unsqueeze(-1)
-        allowed[:, self.summary_tokens :, :] = sequence_queries
-        return allowed
-
-    def _self_allowed_mask(self, valid_mask: Tensor) -> Tensor:
-        token_count = valid_mask.size(1)
-        allowed = valid_mask.unsqueeze(1).expand(-1, token_count, -1).clone()
-        sequence_count = token_count - self.summary_tokens
-        if sequence_count <= 0:
-            return allowed
-
-        device = valid_mask.device
-        key_positions = torch.arange(sequence_count, device=device).view(1, 1, sequence_count)
-        query_positions = torch.arange(sequence_count, device=device).view(1, sequence_count, 1)
-        sequence_queries = allowed[:, self.summary_tokens :, :]
-        sequence_queries[:, :, : self.summary_tokens] = False
-        sequence_queries[:, :, self.summary_tokens :] &= key_positions <= query_positions
-        sequence_queries &= valid_mask[:, self.summary_tokens :].unsqueeze(-1)
-        allowed[:, self.summary_tokens :, :] = sequence_queries
-        return allowed
-
     def forward(
         self,
         tokens: Tensor,
         mask: Tensor,
-        global_tokens: Tensor,
+        candidate_global_tokens: Tensor,
         cache: LongerSequenceCache | None = None,
+        user_global_tokens: Tensor | None = None,
     ) -> Tensor:
-        if global_tokens.size(1) != self.summary_tokens or global_tokens.size(2) != self.token_dim:
+        if (
+            candidate_global_tokens.size(1) != self.candidate_global_tokens
+            or candidate_global_tokens.size(2) != self.token_dim
+        ):
             raise ValueError(
-                f"global_tokens must have shape [batch, {self.summary_tokens}, {self.token_dim}]"
+                "candidate_global_tokens must have shape "
+                f"[batch, {self.candidate_global_tokens}, {self.token_dim}]"
             )
-        sequence_cache = self.precompute_cache(tokens, mask) if cache is None else cache
-        sequence_cache = self._expand_cache(sequence_cache, global_tokens.size(0))
-        if sequence_cache.merged_tokens.size(0) != global_tokens.size(0):
-            raise ValueError("LONGER cache and global tokens must have the same batch size")
+        sequence_cache = (
+            self.precompute_cache(tokens, mask, user_global_tokens)
+            if cache is None
+            else cache
+        )
+        sequence_cache = self._expand_cache(
+            sequence_cache,
+            candidate_global_tokens.size(0),
+        )
+        if sequence_cache.merged_tokens.size(0) != candidate_global_tokens.size(0):
+            raise ValueError(
+                "LONGER cache and candidate global tokens must have the same batch size"
+            )
         if len(sequence_cache.self_layers) != len(self.self_blocks):
             raise ValueError("LONGER cache depth does not match encoder depth")
 
-        global_valid = torch.ones(
-            global_tokens.size(0),
-            self.summary_tokens,
+        candidate_valid = torch.ones(
+            candidate_global_tokens.size(0),
+            self.candidate_global_tokens,
             dtype=torch.bool,
-            device=global_tokens.device,
+            device=candidate_global_tokens.device,
         )
-        global_key, global_value = self.cross_block.project_kv(global_tokens)
-        cross_key = torch.cat([global_key, sequence_cache.cross_sequence_key], dim=2)
-        cross_value = torch.cat([global_value, sequence_cache.cross_sequence_value], dim=2)
-        cross_key_mask = torch.cat([global_valid, sequence_cache.merged_mask], dim=1)
-        global_hidden = self.cross_block.forward_projected_kv(
-            global_tokens,
-            cross_key,
-            cross_value,
-            cross_key_mask.unsqueeze(1).expand(-1, self.summary_tokens, -1),
+        candidate_key, candidate_value = self.cross_block.project_kv(
+            candidate_global_tokens
         )
-        hidden = torch.cat([global_hidden, sequence_cache.cross_recent_output], dim=1)
+        cross_key = torch.cat([candidate_key, sequence_cache.cross_cacheable_key], dim=2)
+        cross_value = torch.cat([candidate_value, sequence_cache.cross_cacheable_value], dim=2)
+        cross_key_mask = torch.cat(
+            [candidate_valid, sequence_cache.user_mask, sequence_cache.merged_mask],
+            dim=1,
+        )
+        candidate_allowed = cross_key_mask.unsqueeze(1).expand(
+            -1,
+            self.candidate_global_tokens,
+            -1,
+        )
+        if self.activation_checkpoint and self.training:
+            candidate_hidden = checkpoint(
+                self.cross_block.forward_projected_kv,
+                candidate_global_tokens,
+                cross_key,
+                cross_value,
+                candidate_allowed,
+                use_reentrant=False,
+            )
+        else:
+            candidate_hidden = self.cross_block.forward_projected_kv(
+                candidate_global_tokens,
+                cross_key,
+                cross_value,
+                candidate_allowed,
+            )
+        hidden = torch.cat(
+            [
+                sequence_cache.cross_user_output,
+                candidate_hidden,
+                sequence_cache.cross_recent_output,
+            ],
+            dim=1,
+        )
 
         for block, layer_cache in zip(self.self_blocks, sequence_cache.self_layers):
-            global_key, global_value = block.project_kv(global_hidden)
-            key = torch.cat([global_key, layer_cache.recent_key], dim=2)
-            value = torch.cat([global_value, layer_cache.recent_value], dim=2)
-            key_mask = torch.cat([global_valid, sequence_cache.recent_mask], dim=1)
-            global_hidden = block.forward_projected_kv(
-                global_hidden,
-                key,
-                value,
-                key_mask.unsqueeze(1).expand(-1, self.summary_tokens, -1),
+            candidate_key, candidate_value = block.project_kv(candidate_hidden)
+            key = torch.cat([candidate_key, layer_cache.cacheable_key], dim=2)
+            value = torch.cat([candidate_value, layer_cache.cacheable_value], dim=2)
+            key_mask = torch.cat(
+                [candidate_valid, sequence_cache.user_mask, sequence_cache.recent_mask],
+                dim=1,
             )
-            hidden = torch.cat([global_hidden, layer_cache.recent_output], dim=1)
+            candidate_allowed = key_mask.unsqueeze(1).expand(
+                -1,
+                self.candidate_global_tokens,
+                -1,
+            )
+            if self.activation_checkpoint and self.training:
+                candidate_hidden = checkpoint(
+                    block.forward_projected_kv,
+                    candidate_hidden,
+                    key,
+                    value,
+                    candidate_allowed,
+                    use_reentrant=False,
+                )
+            else:
+                candidate_hidden = block.forward_projected_kv(
+                    candidate_hidden,
+                    key,
+                    value,
+                    candidate_allowed,
+                )
+            hidden = torch.cat(
+                [layer_cache.user_output, candidate_hidden, layer_cache.recent_output],
+                dim=1,
+            )
         return hidden.flatten(start_dim=1)
 
 
@@ -584,9 +739,13 @@ class FeatureEncoderBank(nn.Module):
         self.output_dims: dict[str, int] = {}
         self.embeddings = nn.ModuleDict()
         self.sequence_field_embedding_keys: dict[str, str] = {}
+        self.sequence_field_input_dims: dict[str, dict[str, int]] = {}
+        self.sequence_event_input_dims: dict[str, int] = {}
         self.sequence_step_projectors = nn.ModuleDict()
         self.sequence_query_projectors = nn.ModuleDict()
+        self.sequence_user_global_projectors = nn.ModuleDict()
         self.sequence_queries = nn.ParameterDict()
+        self.sequence_cls_tokens = nn.ParameterDict()
         self.sequence_position_embeddings = nn.ModuleDict()
         self.sequence_longer_encoders = nn.ModuleDict()
         self.sequences_by_name = {sequence.name: sequence for sequence in config.sequences}
@@ -637,12 +796,14 @@ class FeatureEncoderBank(nn.Module):
 
         for sequence in config.sequences:
             step_input_dim = 0
+            field_input_dims: dict[str, int] = {}
             for field in sequence.fields:
                 qualified = field.qualified_name(sequence.name)
                 if field.kind == "categorical":
                     key = self.sequence_field_embedding_keys[qualified]
                     encoding = _encoding_for(config, qualified)
                     field_embedding_dim = categorical_dims[qualified]
+                    field_input_dims[field.name] = field_embedding_dim
                     if encoding.encoding == "shared_vocab" and encoding.share_embedding:
                         step_input_dim += field_embedding_dim
                         continue
@@ -658,25 +819,44 @@ class FeatureEncoderBank(nn.Module):
                     )
                     step_input_dim += field_embedding_dim
                 else:
+                    field_input_dims[field.name] = field.dimension
                     step_input_dim += field.dimension
-            self.sequence_step_projectors[self._module_key(sequence.name)] = nn.Linear(
-                step_input_dim,
-                self.sequence_token_dim,
-            )
-            if sequence.max_length is not None:
-                self.sequence_position_embeddings[self._module_key(sequence.name)] = _init_embedding(
-                    nn.Embedding(
-                        sequence.max_length,
-                        self.sequence_token_dim,
-                    ),
-                    config.model.init_std,
-                )
+            sequence_key = self._module_key(sequence.name)
+            self.sequence_field_input_dims[sequence.name] = field_input_dims
+            self.sequence_event_input_dims[sequence.name] = step_input_dim
             if not self.build_sequence_summaries:
                 self.output_dims[sequence.name] = self.sequence_token_dim
                 continue
-            sequence_key = self._module_key(sequence.name)
+            if sequence.encoder == "longer":
+                self.sequence_step_projectors[sequence_key] = _projection_mlp(
+                    step_input_dim,
+                    self.sequence_token_dim,
+                    config.model.hidden_dim,
+                    config.model.ffn_activation,
+                )
+            else:
+                self.sequence_step_projectors[sequence_key] = nn.Linear(
+                    step_input_dim,
+                    self.sequence_token_dim,
+                )
+            if sequence.max_length is not None:
+                position_dim = self.sequence_token_dim
+                if sequence.encoder == "longer":
+                    if sequence.time_delta_field is None:
+                        raise ValueError("LONGER requires time_delta_field")
+                    position_dim = step_input_dim - field_input_dims[sequence.time_delta_field]
+                self.sequence_position_embeddings[self._module_key(sequence.name)] = _init_embedding(
+                    nn.Embedding(
+                        sequence.max_length,
+                        position_dim,
+                    ),
+                    config.model.init_std,
+                )
             query_token_dim = self.sequence_token_dim
             if sequence.encoder == "longer":
+                user_global_tokens = (
+                    sequence.longer_user_global_tokens + sequence.longer_cls_tokens
+                )
                 longer_encoder = LongerSequenceEncoder(
                     self.sequence_token_dim,
                     config.model.num_heads,
@@ -686,22 +866,51 @@ class FeatureEncoderBank(nn.Module):
                     sequence.rankmixer_summary_tokens,
                     sequence.longer_token_merge,
                     sequence.longer_inner_layers,
+                    user_global_tokens=user_global_tokens,
                     attention_backend=config.runtime.attention_backend,
+                    activation_checkpoint=config.runtime.activation_checkpoint,
                 )
                 self.sequence_longer_encoders[sequence_key] = longer_encoder
                 query_token_dim = longer_encoder.token_dim
                 output_dim = longer_encoder.output_dim
             else:
                 output_dim = sequence.rankmixer_summary_tokens * self.sequence_token_dim
-            query_dim = sequence.rankmixer_summary_tokens * query_token_dim
-            if sequence.target_inputs:
-                target_dim = sum(self.output_dims[name] for name in sequence.target_inputs)
-                self.sequence_query_projectors[sequence_key] = nn.Linear(target_dim, query_dim)
+            if sequence.encoder == "longer":
+                candidate_tokens = sequence.resolved_longer_candidate_global_tokens()
+                if candidate_tokens > 0:
+                    target_dim = sum(self.output_dims[name] for name in sequence.target_inputs)
+                    self.sequence_query_projectors[sequence_key] = _projection_mlp(
+                        target_dim,
+                        candidate_tokens * query_token_dim,
+                        config.model.hidden_dim,
+                        config.model.ffn_activation,
+                    )
+                if sequence.longer_user_global_tokens > 0:
+                    user_dim = sum(
+                        self.output_dims[name]
+                        for name in sequence.longer_user_global_inputs
+                    )
+                    self.sequence_user_global_projectors[sequence_key] = _projection_mlp(
+                        user_dim,
+                        sequence.longer_user_global_tokens * query_token_dim,
+                        config.model.hidden_dim,
+                        config.model.ffn_activation,
+                    )
+                if sequence.longer_cls_tokens > 0:
+                    self.sequence_cls_tokens[sequence_key] = _normal_parameter(
+                        (1, sequence.longer_cls_tokens, query_token_dim),
+                        config.model.init_std,
+                    )
             else:
-                self.sequence_queries[sequence_key] = _normal_parameter(
-                    (1, sequence.rankmixer_summary_tokens, query_token_dim),
-                    config.model.init_std,
-                )
+                query_dim = sequence.rankmixer_summary_tokens * query_token_dim
+                if sequence.target_inputs:
+                    target_dim = sum(self.output_dims[name] for name in sequence.target_inputs)
+                    self.sequence_query_projectors[sequence_key] = nn.Linear(target_dim, query_dim)
+                else:
+                    self.sequence_queries[sequence_key] = _normal_parameter(
+                        (1, sequence.rankmixer_summary_tokens, query_token_dim),
+                        config.model.init_std,
+                    )
             self.output_dims[sequence.name] = output_dim
 
         for feature in config.features:
@@ -791,39 +1000,121 @@ class FeatureEncoderBank(nn.Module):
         aligned = embedded.gather(1, gather_index) * mask.unsqueeze(-1).to(dtype=embedded.dtype)
         return aligned, mask
 
+    def _embedded_sequence_parts(
+        self,
+        sequence: SequenceConfig,
+        value: dict[str, Any],
+    ) -> tuple[dict[str, Tensor], Tensor]:
+        field_values = value["fields"]
+        lengths = value["lengths"].long()
+        parts: dict[str, Tensor] = {}
+        for field in sequence.fields:
+            tensor = field_values[field.name]
+            if field.kind == "categorical":
+                qualified = field.qualified_name(sequence.name)
+                parts[field.name] = self.embeddings[
+                    self.sequence_field_embedding_keys[qualified]
+                ](tensor.long())
+            else:
+                dense = tensor.float()
+                if dense.dim() == 2:
+                    dense = dense.unsqueeze(-1)
+                if dense.size(-1) != field.dimension:
+                    raise ValueError(
+                        f"sequence {sequence.name!r} field {field.name!r} expected "
+                        f"dimension {field.dimension}, got {dense.size(-1)}"
+                    )
+                parts[field.name] = dense
+        if not parts:
+            raise ValueError(f"sequence {sequence.name!r} has no fields")
+        return parts, lengths
+
+    def _align_sequence_inputs(
+        self,
+        sequence: SequenceConfig,
+        inputs: Tensor,
+        lengths: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        aligned, mask = self._right_aligned_sequence(inputs, lengths, sequence.max_length)
+        if sequence.sequence_order == "oldest_to_newest" or aligned.size(1) == 0:
+            return aligned, mask
+        positions = torch.arange(aligned.size(1), device=aligned.device).view(1, -1)
+        valid_lengths = lengths.clamp(min=0, max=aligned.size(1)).view(-1, 1)
+        valid_starts = aligned.size(1) - valid_lengths
+        source_positions = (aligned.size(1) - 1 - (positions - valid_starts)).clamp(
+            min=0,
+            max=aligned.size(1) - 1,
+        )
+        gather_index = source_positions.unsqueeze(-1).expand(-1, -1, aligned.size(-1))
+        reversed_inputs = aligned.gather(1, gather_index)
+        return reversed_inputs * mask.unsqueeze(-1).to(reversed_inputs.dtype), mask
+
+    def _position_inputs(
+        self,
+        sequence: SequenceConfig,
+        lengths: Tensor,
+        token_count: int,
+    ) -> Tensor:
+        position_key = self._module_key(sequence.name)
+        position_embedding = self.sequence_position_embeddings[position_key]
+        max_positions = position_embedding.num_embeddings
+        valid_lengths = lengths.clamp(min=0, max=token_count).view(-1, 1)
+        physical_positions = torch.arange(token_count, device=lengths.device).view(1, -1)
+        relative_positions = (physical_positions - (token_count - valid_lengths)).clamp(
+            min=0,
+            max=max_positions - 1,
+        )
+        return position_embedding(relative_positions)
+
+    def encode_sequence_event_inputs(
+        self,
+        sequence_name: str,
+        value: dict[str, Any],
+    ) -> tuple[Tensor, Tensor]:
+        sequence = self.sequences_by_name[sequence_name]
+        parts, lengths = self._embedded_sequence_parts(sequence, value)
+        event_inputs = torch.cat([parts[field.name] for field in sequence.fields], dim=-1)
+        return self._align_sequence_inputs(sequence, event_inputs, lengths)
+
     def _multi_field_sequence_tokens(
         self,
         sequence: SequenceConfig,
         value: dict[str, Any],
     ) -> tuple[Tensor, Tensor]:
-        field_values = value["fields"]
-        lengths = value["lengths"].long()
-        parts: list[Tensor] = []
-        for field in sequence.fields:
-            tensor = field_values[field.name]
-            if field.kind == "categorical":
-                qualified = field.qualified_name(sequence.name)
-                parts.append(self.embeddings[self.sequence_field_embedding_keys[qualified]](tensor.long()))
-            else:
-                dense = tensor.float()
-                if dense.dim() == 2:
-                    dense = dense.unsqueeze(-1)
-                parts.append(dense)
-        if not parts:
-            raise ValueError(f"sequence {sequence.name!r} has no fields")
-        step_inputs = torch.cat(parts, dim=-1)
-        tokens = self.sequence_step_projectors[self._module_key(sequence.name)](step_inputs)
-        tokens, mask = self._right_aligned_sequence(tokens, lengths, sequence.max_length)
+        parts, lengths = self._embedded_sequence_parts(sequence, value)
         position_key = self._module_key(sequence.name)
-        if position_key in self.sequence_position_embeddings and tokens.size(1) > 0:
-            max_positions = self.sequence_position_embeddings[position_key].num_embeddings
-            valid_lengths = lengths.clamp(min=0, max=tokens.size(1)).view(-1, 1)
-            physical_positions = torch.arange(tokens.size(1), device=tokens.device).view(1, -1)
-            relative_positions = (physical_positions - (tokens.size(1) - valid_lengths)).clamp(
-                min=0, max=max_positions - 1
+        if sequence.encoder == "longer":
+            if sequence.time_delta_field is None:
+                raise ValueError(f"sequence {sequence.name!r} requires time_delta_field")
+            base_inputs = torch.cat(
+                [
+                    parts[field.name]
+                    for field in sequence.fields
+                    if field.name != sequence.time_delta_field
+                ],
+                dim=-1,
             )
-            tokens = tokens + self.sequence_position_embeddings[position_key](relative_positions)
-            tokens = tokens * mask.unsqueeze(-1).to(dtype=tokens.dtype)
+            time_delta = parts[sequence.time_delta_field]
+            combined = torch.cat([base_inputs, time_delta], dim=-1)
+            combined, mask = self._align_sequence_inputs(sequence, combined, lengths)
+            base_dim = base_inputs.size(-1)
+            aligned_base = combined[:, :, :base_dim]
+            aligned_time_delta = combined[:, :, base_dim:]
+            if position_key in self.sequence_position_embeddings and combined.size(1) > 0:
+                aligned_base = aligned_base + self._position_inputs(
+                    sequence,
+                    lengths,
+                    combined.size(1),
+                )
+            projector_inputs = torch.cat([aligned_base, aligned_time_delta], dim=-1)
+            tokens = self.sequence_step_projectors[position_key](projector_inputs)
+        else:
+            step_inputs = torch.cat([parts[field.name] for field in sequence.fields], dim=-1)
+            step_inputs, mask = self._align_sequence_inputs(sequence, step_inputs, lengths)
+            tokens = self.sequence_step_projectors[position_key](step_inputs)
+            if position_key in self.sequence_position_embeddings and tokens.size(1) > 0:
+                tokens = tokens + self._position_inputs(sequence, lengths, tokens.size(1))
+        tokens = tokens * mask.unsqueeze(-1).to(dtype=tokens.dtype)
         return tokens, mask
 
     def encode_sequence_tokens(
@@ -843,7 +1134,7 @@ class FeatureEncoderBank(nn.Module):
         sequence_cache: LongerSequenceCache | None = None,
     ) -> Tensor:
         output_dim = self.output_dims[sequence.name]
-        if tokens.size(1) == 0:
+        if tokens.size(1) == 0 and sequence.encoder != "longer":
             return tokens.new_zeros(tokens.size(0), output_dim)
         mask_float = mask.unsqueeze(-1).to(dtype=tokens.dtype)
         if sequence.encoder == "mean_pool":
@@ -856,6 +1147,35 @@ class FeatureEncoderBank(nn.Module):
             if sequence.encoder == "longer"
             else self.sequence_token_dim
         )
+        if sequence.encoder == "longer":
+            candidate_count = sequence.resolved_longer_candidate_global_tokens()
+            if candidate_count > 0:
+                query_input = torch.cat(
+                    [encoded[name] for name in sequence.target_inputs],
+                    dim=1,
+                )
+                candidate_globals = self.sequence_query_projectors[sequence_key](
+                    query_input
+                ).view(tokens.size(0), candidate_count, query_token_dim)
+            else:
+                candidate_globals = tokens.new_zeros(
+                    tokens.size(0),
+                    0,
+                    query_token_dim,
+                )
+            user_globals = self._longer_user_global_tokens(
+                sequence,
+                encoded,
+                tokens.size(0),
+                tokens,
+            )
+            return self.sequence_longer_encoders[sequence_key](
+                tokens,
+                mask,
+                candidate_globals,
+                cache=sequence_cache,
+                user_global_tokens=user_globals,
+            )
         if sequence.target_inputs:
             query_input = torch.cat([encoded[name] for name in sequence.target_inputs], dim=1)
             query = self.sequence_query_projectors[sequence_key](query_input).view(
@@ -865,13 +1185,39 @@ class FeatureEncoderBank(nn.Module):
             )
         else:
             query = self.sequence_queries[sequence_key].expand(tokens.size(0), -1, -1)
-        if sequence.encoder == "longer":
-            return self.sequence_longer_encoders[sequence_key](tokens, mask, query, cache=sequence_cache)
         scores = (tokens * query[:, :1, :]).sum(dim=-1) / math.sqrt(tokens.size(-1))
         scores = scores.masked_fill(~mask, -1.0e9)
         weights = torch.softmax(scores, dim=1) * mask.to(dtype=tokens.dtype)
         weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1.0e-9)
         return (tokens * weights.unsqueeze(-1)).sum(dim=1)
+
+    def _longer_user_global_tokens(
+        self,
+        sequence: SequenceConfig,
+        encoded: dict[str, Tensor],
+        batch_size: int,
+        reference: Tensor,
+    ) -> Tensor:
+        sequence_key = self._module_key(sequence.name)
+        query_token_dim = self.sequence_longer_encoders[sequence_key].token_dim
+        parts: list[Tensor] = []
+        if sequence.longer_user_global_tokens > 0:
+            user_input = torch.cat(
+                [encoded[name] for name in sequence.longer_user_global_inputs],
+                dim=1,
+            )
+            parts.append(
+                self.sequence_user_global_projectors[sequence_key](user_input).view(
+                    batch_size,
+                    sequence.longer_user_global_tokens,
+                    query_token_dim,
+                )
+            )
+        if sequence.longer_cls_tokens > 0:
+            parts.append(self.sequence_cls_tokens[sequence_key].expand(batch_size, -1, -1))
+        if not parts:
+            return reference.new_zeros(batch_size, 0, query_token_dim)
+        return torch.cat(parts, dim=1)
 
     def encode_scalar_features(
         self,
@@ -902,7 +1248,19 @@ class FeatureEncoderBank(nn.Module):
             if not isinstance(value, dict):
                 raise ValueError(f"sequence {sequence.name!r} must be a payload dict")
             tokens, mask = self._multi_field_sequence_tokens(sequence, value)
-            caches[sequence.name] = self.sequence_longer_encoders[self._module_key(sequence.name)].precompute_cache(tokens, mask)
+            encoded_user = self.encode_scalar_features(
+                features,
+                set(sequence.longer_user_global_inputs),
+            )
+            user_globals = self._longer_user_global_tokens(
+                sequence,
+                encoded_user,
+                tokens.size(0),
+                tokens,
+            )
+            caches[sequence.name] = self.sequence_longer_encoders[
+                self._module_key(sequence.name)
+            ].precompute_cache(tokens, mask, user_globals)
         return caches
 
     def forward(
@@ -937,8 +1295,8 @@ class FeatureEncoderBank(nn.Module):
                 raise ValueError(f"sequence {sequence.name!r} must be a payload dict")
             sequence_cache = None if request_cache is None else request_cache.get(sequence.name)
             if sequence.encoder == "longer" and sequence_cache is not None:
-                # The cache owns sequence embedding, merge, K/V, and sequence-side
-                # attention work. Only candidate-derived global tokens are recomputed.
+                # The cache owns sequence embedding, user/CLS globals, merge, K/V,
+                # and sequence-side attention. Candidate globals are recomputed.
                 batch_size = (
                     int(encoded[sequence.target_inputs[0]].size(0))
                     if sequence.target_inputs
@@ -1019,18 +1377,17 @@ class RankMixerSliceTokenizer(nn.Module):
         self.num_tokens = num_tokens
         self.token_dim = token_dim
         self.input_dim = sum(input_dims[name] for name in input_names)
-        self.target_dim = num_tokens * token_dim
-        self.projection = PerTokenLinear(num_tokens, token_dim, token_dim)
-        if self.input_dim != self.target_dim:
+        if self.input_dim % num_tokens != 0:
             raise ValueError(
-                "rankmixer tokenization requires exact input dimension "
-                "num_feature_tokens * token_dim; implicit zero padding is disabled: "
-                f"{self.input_dim} != {self.target_dim}"
+                "rankmixer tokenization requires an input width divisible by num_feature_tokens: "
+                f"{self.input_dim} % {num_tokens} != 0"
             )
+        self.input_slice_dim = self.input_dim // num_tokens
+        self.projection = PerTokenLinear(num_tokens, self.input_slice_dim, token_dim)
 
     def forward(self, encoded: dict[str, Tensor]) -> Tensor:
         values = torch.cat([encoded[name] for name in self.input_names], dim=1)
-        sliced = values.view(values.size(0), self.num_tokens, self.token_dim)
+        sliced = values.view(values.size(0), self.num_tokens, self.input_slice_dim)
         return self.projection(sliced)
 
 
@@ -1157,7 +1514,12 @@ class OneTransTokenizer(nn.Module):
             input_dim = sum(self.encoder_bank.output_dims[name] for name in self.scalar_feature_names)
             if input_dim <= 0:
                 raise ValueError("auto_split OneTrans tokenizer requires at least one scalar feature")
-            self.auto_ns_projection = nn.Linear(input_dim, self.num_ns_tokens * self.token_dim)
+            self.auto_ns_projection = _projection_mlp(
+                input_dim,
+                self.num_ns_tokens * self.token_dim,
+                config.model.hidden_dim,
+                config.model.ffn_activation,
+            )
             self.ns_projectors = nn.ModuleList()
         else:
             self.num_ns_tokens = len(self.ns_groups)
@@ -1179,7 +1541,7 @@ class OneTransTokenizer(nn.Module):
 
     def _group_input_dim(self, group: TokenGroupConfig) -> int:
         return sum(
-            self.token_dim
+            self.encoder_bank.sequence_event_input_dims[name]
             if name in self.sequence_by_name
             else self.encoder_bank.output_dims[name]
             for name in group.inputs
@@ -1233,8 +1595,10 @@ class OneTransTokenizer(nn.Module):
                 raw = raw.unsqueeze(-1)
             if raw.size(-1) != 1:
                 raise ValueError(f"sequence {name!r} timestamp field must be scalar")
-            aligned, timestamp_mask = self.encoder_bank._right_aligned_sequence(
-                raw, value["lengths"].long(), sequence.max_length
+            aligned, timestamp_mask = self.encoder_bank._align_sequence_inputs(
+                sequence,
+                raw,
+                value["lengths"].long(),
             )
             current = aligned.squeeze(-1)
             if timestamp_mask.shape != expected_mask.shape:
@@ -1262,7 +1626,10 @@ class OneTransTokenizer(nn.Module):
             if name in self.sequence_by_name:
                 if not isinstance(value, dict):
                     raise ValueError(f"sequence {name!r} must be a payload dict")
-                tokens, current_mask = self.encoder_bank.encode_sequence_tokens(name, value)
+                tokens, current_mask = self.encoder_bank.encode_sequence_event_inputs(
+                    name,
+                    value,
+                )
                 mask = current_mask if mask is None else mask & current_mask
                 parts.append(tokens)
                 continue
@@ -1301,6 +1668,15 @@ class OneTransTokenizer(nn.Module):
         token_order = order.unsqueeze(-1).expand(-1, -1, tokens.size(-1))
         return tokens.gather(1, token_order), mask.gather(1, order)
 
+    def _trim_all_invalid_prefix(self, tokens: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+        if mask.size(1) == 0:
+            return tokens, mask
+        valid_columns = mask.any(dim=0)
+        if not bool(valid_columns.any().item()):
+            return tokens[:, :0, :], mask[:, :0]
+        first_valid = int(torch.nonzero(valid_columns, as_tuple=False)[0].item())
+        return tokens[:, first_valid:, :], mask[:, first_valid:]
+
     def _sequence_token_part(self, features: dict[str, Any]) -> OneTransRequestCache:
         sequence_tokens: list[Tensor] = []
         sequence_masks: list[Tensor] = []
@@ -1338,6 +1714,7 @@ class OneTransTokenizer(nn.Module):
             mask = mask.gather(1, order)
         else:
             tokens, mask = self._compact_valid_tokens(tokens, mask)
+        tokens, mask = self._trim_all_invalid_prefix(tokens, mask)
         return OneTransRequestCache(s_tokens=tokens, s_valid_mask=mask)
 
     def precompute_request_cache(self, features: dict[str, Any]) -> OneTransRequestCache:
@@ -1522,6 +1899,7 @@ class OneTransBlock(nn.Module):
         s_tokens: Tensor,
         query_s_count: int,
         valid_mask: Tensor,
+        input_start: int = 0,
     ) -> OneTransLayerCache:
         normalized = self.norm_attention(s_tokens)
         s_key, s_value = self.attention.project_s_kv(normalized)
@@ -1541,6 +1919,90 @@ class OneTransBlock(nn.Module):
             hidden = residual + attended
             output = hidden + self.ffn.s_ffn(self.norm_ffn(hidden))
         return OneTransLayerCache(
+            s_input=s_tokens,
+            s_input_start=input_start,
+            s_reused_kv_tokens=0,
+            s_key=s_key,
+            s_value=s_value,
+            s_output=output,
+            s_key_valid_mask=valid_mask,
+            s_output_valid_mask=output_mask,
+        )
+
+    def extend_precomputed_s(
+        self,
+        s_tokens: Tensor,
+        query_s_count: int,
+        valid_mask: Tensor,
+        input_start: int,
+        previous: OneTransLayerCache,
+    ) -> OneTransLayerCache:
+        if s_tokens.size(0) != previous.s_input.size(0):
+            raise ValueError("incremental OneTrans cache update requires the same request batch size")
+        old_start = previous.s_input_start
+        old_end = old_start + previous.s_input.size(1)
+        new_end = input_start + s_tokens.size(1)
+        if input_start < old_start or new_end < old_end:
+            raise ValueError(
+                "incremental OneTrans layer input must retain a suffix of the previous input "
+                "and append new tokens"
+            )
+        overlap_count = max(0, old_end - input_start)
+        if overlap_count > s_tokens.size(1):
+            raise ValueError("incremental OneTrans overlap exceeds the new layer input")
+        old_offset = input_start - old_start
+        overlap_matches = True
+        if overlap_count > 0:
+            old_overlap = previous.s_input[:, old_offset : old_offset + overlap_count, :]
+            old_mask = previous.s_key_valid_mask[
+                :, old_offset : old_offset + overlap_count
+            ]
+            if not torch.equal(old_overlap, s_tokens[:, :overlap_count, :]):
+                overlap_matches = False
+            if not torch.equal(old_mask, valid_mask[:, :overlap_count]):
+                overlap_matches = False
+        if not overlap_matches:
+            # A moving pyramid window can change deeper-layer states even though
+            # the raw sequence is append-only. Rebuild that layer to preserve
+            # exact full-recompute semantics rather than reusing stale K/V.
+            overlap_count = 0
+            old_offset = previous.s_input.size(1)
+
+        normalized = self.norm_attention(s_tokens)
+        reused_key = previous.s_key[:, :, old_offset : old_offset + overlap_count, :]
+        reused_value = previous.s_value[:, :, old_offset : old_offset + overlap_count, :]
+        appended = normalized[:, overlap_count:, :]
+        if appended.size(1) > 0:
+            appended_key, appended_value = self.attention.project_s_kv(appended)
+        else:
+            appended_key = reused_key[:, :, :0, :]
+            appended_value = reused_value[:, :, :0, :]
+        s_key = torch.cat([reused_key, appended_key], dim=2)
+        s_value = torch.cat([reused_value, appended_value], dim=2)
+        if s_key.size(2) != s_tokens.size(1):
+            raise RuntimeError("incremental OneTrans K/V length is inconsistent")
+
+        output_mask = valid_mask[:, s_tokens.size(1) - query_s_count :]
+        if query_s_count == 0:
+            output = s_tokens[:, :0, :]
+        else:
+            query_tokens = normalized[:, -query_s_count:, :]
+            query = self.attention.project_s_query(query_tokens)
+            key_positions = torch.arange(s_tokens.size(1), device=s_tokens.device).view(1, -1)
+            query_positions = torch.arange(
+                s_tokens.size(1) - query_s_count,
+                s_tokens.size(1),
+                device=s_tokens.device,
+            ).view(-1, 1)
+            allowed = (key_positions <= query_positions).unsqueeze(0) & valid_mask.unsqueeze(1)
+            attended = self.attention.attend_projected(query, s_key, s_value, allowed)
+            residual = s_tokens[:, -query_s_count:, :]
+            hidden = residual + attended
+            output = hidden + self.ffn.s_ffn(self.norm_ffn(hidden))
+        return OneTransLayerCache(
+            s_input=s_tokens,
+            s_input_start=input_start,
+            s_reused_kv_tokens=overlap_count,
             s_key=s_key,
             s_value=s_value,
             s_output=output,
@@ -1640,13 +2102,76 @@ class OneTransBackbone(nn.Module):
         current_tokens = token_cache.s_tokens
         current_mask = token_cache.s_valid_mask
         initial_s_count = current_tokens.size(1)
+        current_start = 0
         layer_caches: list[OneTransLayerCache] = []
         for layer_index, block in enumerate(self.blocks):
             query_s_count = self._layer_s_count(
                 initial_s_count, current_tokens.size(1), layer_index
             )
-            layer_cache = block.precompute_s(current_tokens, query_s_count, current_mask)
+            layer_cache = block.precompute_s(
+                current_tokens,
+                query_s_count,
+                current_mask,
+                input_start=current_start,
+            )
             layer_caches.append(layer_cache)
+            current_start += current_tokens.size(1) - query_s_count
+            current_tokens = layer_cache.s_output
+            current_mask = layer_cache.s_output_valid_mask
+        return OneTransRequestCache(
+            s_tokens=token_cache.s_tokens,
+            s_valid_mask=token_cache.s_valid_mask,
+            layers=tuple(layer_caches),
+        )
+
+    def update_request_cache(
+        self,
+        features: dict[str, Any],
+        previous: OneTransRequestCache,
+    ) -> OneTransRequestCache:
+        if len(previous.layers) != len(self.blocks):
+            raise ValueError("previous OneTrans cache depth does not match backbone")
+        token_cache = self.tokenizer.precompute_request_cache(features)
+        if token_cache.s_tokens.size(0) != previous.s_tokens.size(0):
+            raise ValueError(
+                "cross-request OneTrans cache update requires the same request batch size"
+            )
+        old_count = previous.s_tokens.size(1)
+        if token_cache.s_tokens.size(1) < old_count:
+            raise ValueError("append-only OneTrans cache cannot remove prior S tokens")
+        if not torch.equal(token_cache.s_tokens[:, :old_count, :], previous.s_tokens):
+            raise ValueError(
+                "OneTrans cross-request cache requires the previous S tokens to be an exact prefix"
+            )
+        if not torch.equal(token_cache.s_valid_mask[:, :old_count], previous.s_valid_mask):
+            raise ValueError(
+                "OneTrans cross-request cache requires the previous S mask to be an exact prefix"
+            )
+        if token_cache.s_tokens.size(1) == old_count:
+            return previous
+
+        current_tokens = token_cache.s_tokens
+        current_mask = token_cache.s_valid_mask
+        initial_s_count = current_tokens.size(1)
+        current_start = 0
+        layer_caches: list[OneTransLayerCache] = []
+        for layer_index, (block, previous_layer) in enumerate(
+            zip(self.blocks, previous.layers)
+        ):
+            query_s_count = self._layer_s_count(
+                initial_s_count,
+                current_tokens.size(1),
+                layer_index,
+            )
+            layer_cache = block.extend_precomputed_s(
+                current_tokens,
+                query_s_count,
+                current_mask,
+                current_start,
+                previous_layer,
+            )
+            layer_caches.append(layer_cache)
+            current_start += current_tokens.size(1) - query_s_count
             current_tokens = layer_cache.s_output
             current_mask = layer_cache.s_output_valid_mask
         return OneTransRequestCache(
@@ -1774,7 +2299,10 @@ class LongerModel(nn.Module):
         self.config = config
         self.sequence_name = config.sequences[0].name
         embedding_dim = config.model.embedding_dim if embedding_dim is None else embedding_dim
-        target_inputs = set(config.sequences[0].target_inputs)
+        target_inputs = {
+            *config.sequences[0].target_inputs,
+            *config.sequences[0].longer_user_global_inputs,
+        }
         self.encoder_bank = FeatureEncoderBank(
             config,
             vocab_maps,
@@ -1821,6 +2349,7 @@ def _build_rankmixer_ffn(config: AppConfig, num_tokens: int) -> nn.Module:
         target_active_ratio=config.model.sparse_moe_target_active_ratio,
         regularization_initial=config.model.sparse_moe_regularization_initial,
         regularization_multiplier=config.model.sparse_moe_regularization_multiplier,
+        dtsi_training_output=config.model.sparse_moe_dtsi_training_output,
     )
 
 
@@ -2001,12 +2530,21 @@ class MDLRankMixerBlock(nn.Module):
         self.token_mixing = RankMixerTokenMixing(metadata.feature_token_count, token_dim)
         self.feature_norm = nn.LayerNorm(token_dim)
         self.feature_ffn = _build_rankmixer_ffn(config, metadata.feature_token_count)
-        self.feature_ffn_norm = nn.LayerNorm(token_dim)
+        self.feature_ffn_norm = (
+            nn.LayerNorm(token_dim)
+            if config.model.mdl_feature_interaction == "rankmixer_full"
+            else None
+        )
         _init_domain_interaction_modules(self, config, metadata, propagate_scenario_state)
 
     def forward(self, feature_tokens: Tensor, scenario_tokens: Tensor, task_tokens: Tensor, scenario_mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         mixed = self.feature_norm(self.token_mixing(feature_tokens) + feature_tokens)
-        feature_tokens = self.feature_ffn_norm(self.feature_ffn(mixed) + mixed)
+        feature_update = self.feature_ffn(mixed)
+        feature_tokens = (
+            feature_update
+            if self.feature_ffn_norm is None
+            else self.feature_ffn_norm(feature_update + mixed)
+        )
 
         scenario_tokens, task_tokens = _forward_domain_interaction(
             self,
@@ -2125,6 +2663,13 @@ class OneTransModel(nn.Module):
     def precompute_request_cache(self, features: dict[str, Any]) -> OneTransRequestCache:
         return self.backbone.precompute_request_cache(features)
 
+    def update_request_cache(
+        self,
+        features: dict[str, Any],
+        previous: OneTransRequestCache,
+    ) -> OneTransRequestCache:
+        return self.backbone.update_request_cache(features, previous)
+
     def forward(
         self,
         features: dict[str, Any],
@@ -2207,6 +2752,13 @@ class MDLOneTransModel(nn.Module):
 
     def precompute_request_cache(self, features: dict[str, Any]) -> OneTransRequestCache:
         return self.backbone.precompute_request_cache(features)
+
+    def update_request_cache(
+        self,
+        features: dict[str, Any],
+        previous: OneTransRequestCache,
+    ) -> OneTransRequestCache:
+        return self.backbone.update_request_cache(features, previous)
 
     def forward(
         self,
