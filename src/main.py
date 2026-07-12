@@ -29,7 +29,7 @@ from src.dataloader import (
     validate_matching_schemas,
 )
 from src.features import fit_vocabs, plan_vocab_fit, vocab_artifacts, vocab_strategy_fingerprint
-from src.train import is_main_process, predict_mdl, train_mdl
+from src.train import evaluate_mdl, is_main_process, predict_mdl, train_mdl
 
 
 def _load_config(args: argparse.Namespace):
@@ -163,6 +163,30 @@ def _cmd_predict(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_evaluate(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    result = evaluate_mdl(
+        config,
+        split_name=args.split,
+        checkpoint_path=args.checkpoint_path,
+        max_batches=args.max_batches,
+        allow_random_init=args.allow_random_init,
+        group_metric_name=args.group_metric_name,
+    )
+    print(
+        f"evaluate_result rows={result.rows} "
+        f"group_metric={result.group_metric_name}"
+    )
+    for task_name, metrics in result.metrics.items():
+        formatted = " ".join(
+            f"{name}={'NA' if value is None else f'{value:.8f}'}"
+            for name, value in metrics.items()
+        )
+        print(f"evaluate_task task={task_name} {formatted}")
+    return 0
+
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Parquet-native MDL CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -198,8 +222,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     predict.add_argument("--allow-random-init", action="store_true")
     predict.set_defaults(func=_cmd_predict)
 
-    return parser
+    evaluate = subparsers.add_parser("evaluate")
+    evaluate.add_argument("--config", required=True)
+    evaluate.add_argument("--split", choices=["train", "test"], default="test")
+    evaluate.add_argument("--checkpoint-path", default=None)
+    evaluate.add_argument("--max-batches", type=int, default=None)
+    evaluate.add_argument("--allow-random-init", action="store_true")
+    evaluate.add_argument(
+        "--group-metric-name", choices=["qauc", "uauc"], default="qauc"
+    )
+    evaluate.set_defaults(func=_cmd_evaluate)
 
+    return parser
 
 def main() -> None:
     args = build_arg_parser().parse_args()

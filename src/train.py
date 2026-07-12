@@ -56,6 +56,13 @@ class PredictResult:
     output_path: Path | None
 
 
+@dataclass(frozen=True)
+class EvaluateResult:
+    rows: int
+    group_metric_name: str
+    metrics: dict[str, dict[str, float | None]]
+
+
 ExternalTrainAdapter = Callable[..., TrainResult | dict[str, Any]]
 
 
@@ -451,7 +458,11 @@ def _clip_grad_norm(parameters: list[nn.Parameter], max_norm: float) -> Tensor:
     return total_norm
 
 
-def _loss_terms_from_batch(output: dict[str, Tensor], batch: FeatureBatch) -> tuple[Tensor, Tensor, Tensor]:
+def _loss_terms_from_batch(
+    output: dict[str, Tensor],
+    batch: FeatureBatch,
+    moe_loss_weight: float = 0.0,
+) -> tuple[Tensor, Tensor, Tensor]:
     if batch.labels is None or batch.label_mask is None:
         raise ValueError("training batch must contain labels and label_mask")
     logits = output["logits"]
@@ -459,15 +470,37 @@ def _loss_terms_from_batch(output: dict[str, Tensor], batch: FeatureBatch) -> tu
         raise ValueError(
             f"logits shape {tuple(logits.shape)} does not match labels {tuple(batch.labels.shape)}"
         )
-    loss = torch.nn.functional.binary_cross_entropy_with_logits(
+    element_loss = torch.nn.functional.binary_cross_entropy_with_logits(
         logits,
         batch.labels,
         reduction="none",
     )
-    weights = batch.label_mask.to(device=logits.device, dtype=loss.dtype)
-    numerator = (loss * weights).sum()
-    denominator = weights.sum()
-    return numerator / denominator.clamp_min(1.0), numerator, denominator
+    weights = batch.label_mask.to(device=logits.device, dtype=element_loss.dtype)
+    task_numerators = (element_loss * weights).sum(dim=0)
+    task_counts = weights.sum(dim=0)
+
+    if torch_dist.is_available() and torch_dist.is_initialized():
+        global_counts = task_counts.detach().clone()
+        torch_dist.all_reduce(global_counts, op=torch_dist.ReduceOp.SUM)
+        world_size = float(torch_dist.get_world_size())
+        task_scale = torch.where(
+            global_counts > 0,
+            world_size / global_counts.clamp_min(1.0),
+            torch.zeros_like(global_counts),
+        )
+    else:
+        task_scale = torch.where(
+            task_counts > 0,
+            task_counts.clamp_min(1.0).reciprocal(),
+            torch.zeros_like(task_counts),
+        )
+    prediction_loss = (task_numerators * task_scale).sum()
+    moe_loss = output.get("moe_regularization_loss")
+    total_loss = prediction_loss
+    if moe_loss is not None and moe_loss_weight > 0.0:
+        total_loss = total_loss + moe_loss_weight * moe_loss
+    # Aggregation averages this already task-balanced scalar across ranks.
+    return total_loss, total_loss.detach(), total_loss.new_ones(())
 
 
 def _loss_from_batch(output: dict[str, Tensor], batch: FeatureBatch) -> Tensor:
@@ -556,7 +589,16 @@ def train_mdl(
         if sparse_params:
             _mark_sparse_invariant_checks_explicitly_disabled()
             sparse_lr = config.training.lr_sparse or config.training.lr_dense
-            optimizers.append(torch.optim.Adagrad(sparse_params, lr=sparse_lr))
+            optimizers.append(
+                torch.optim.Adagrad(
+                    sparse_params,
+                    lr=sparse_lr,
+                    lr_decay=config.training.adagrad_lr_decay,
+                    weight_decay=config.training.adagrad_weight_decay,
+                    initial_accumulator_value=config.training.adagrad_initial_accumulator_value,
+                    eps=config.training.adagrad_eps,
+                )
+            )
         optimizer_base_lrs = [
             [float(group["lr"]) for group in optimizer.param_groups]
             for optimizer in optimizers
@@ -592,7 +634,11 @@ def train_mdl(
                     optimizer.zero_grad(set_to_none=True)
                 with _autocast_context(config, device):
                     output = model(batch.features, batch.scenario_id)
-                    loss, loss_numerator, loss_denominator = _loss_terms_from_batch(output, batch)
+                    loss, loss_numerator, loss_denominator = _loss_terms_from_batch(
+                        output,
+                        batch,
+                        moe_loss_weight=config.model.sparse_moe_loss_weight,
+                    )
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                     for optimizer in optimizers:
@@ -645,6 +691,208 @@ def train_mdl(
         return result
     finally:
         _cleanup_distributed(context)
+
+
+def _binary_auc(scores: Tensor, labels: Tensor) -> float | None:
+    """Exact rank-based binary AUC with average ranks for tied scores."""
+
+    scores = scores.detach().float().flatten().cpu()
+    labels = labels.detach().float().flatten().cpu()
+    if scores.numel() != labels.numel():
+        raise ValueError("AUC scores and labels must have the same length")
+    if scores.numel() == 0:
+        return None
+    if not bool(torch.isfinite(scores).all()):
+        raise ValueError("AUC scores must be finite")
+    if not bool(((labels == 0.0) | (labels == 1.0)).all()):
+        raise ValueError("AUC labels must be binary")
+    positive_count = int((labels == 1.0).sum().item())
+    negative_count = int(labels.numel() - positive_count)
+    if positive_count == 0 or negative_count == 0:
+        return None
+
+    order = torch.argsort(scores, stable=True)
+    sorted_scores = scores[order]
+    sorted_labels = labels[order]
+    _unique, inverse, counts = torch.unique_consecutive(
+        sorted_scores,
+        return_inverse=True,
+        return_counts=True,
+    )
+    ranks = torch.arange(1, scores.numel() + 1, dtype=torch.float64)
+    rank_sums = torch.zeros(counts.numel(), dtype=torch.float64)
+    rank_sums.scatter_add_(0, inverse, ranks)
+    average_ranks = rank_sums / counts.to(torch.float64)
+    positive_rank_sum = average_ranks[inverse][sorted_labels == 1.0].sum()
+    auc = (
+        positive_rank_sum
+        - positive_count * (positive_count + 1) / 2.0
+    ) / (positive_count * negative_count)
+    return float(auc.item())
+
+
+def _group_auc(scores: Tensor, labels: Tensor, group_ids: list[str]) -> float | None:
+    """Unweighted mean AUC over groups containing both label classes."""
+
+    if scores.numel() != len(group_ids) or labels.numel() != len(group_ids):
+        raise ValueError("group AUC inputs must have matching lengths")
+    indices_by_group: dict[str, list[int]] = {}
+    for index, group_id in enumerate(group_ids):
+        indices_by_group.setdefault(group_id, []).append(index)
+    values: list[float] = []
+    for indices in indices_by_group.values():
+        index_tensor = torch.tensor(indices, dtype=torch.long)
+        value = _binary_auc(scores[index_tensor], labels[index_tensor])
+        if value is not None:
+            values.append(value)
+    return None if not values else float(sum(values) / len(values))
+
+
+def _load_inference_model(
+    config: AppConfig,
+    device: torch.device,
+    checkpoint_path: str | None,
+    allow_random_init: bool,
+) -> tuple[nn.Module, dict[str, dict[str, int]]]:
+    vocab_maps = load_vocab_maps(config)
+    base_model = build_model(config, vocab_maps).to(device)
+    resolved_checkpoint_path = checkpoint_path or config.training.checkpoint_path
+    if resolved_checkpoint_path is None and not allow_random_init:
+        raise ValueError(
+            "evaluation requires a checkpoint; pass --checkpoint-path, set "
+            "training.checkpoint_path, or pass --allow-random-init explicitly"
+        )
+    if resolved_checkpoint_path is not None:
+        checkpoint = torch.load(resolved_checkpoint_path, map_location=device)
+        if checkpoint.get("model_name") not in {None, config.model.name}:
+            raise ValueError("checkpoint model_name does not match current config")
+        checkpoint_task_names = checkpoint.get("task_names")
+        if checkpoint_task_names is not None and list(checkpoint_task_names) != config.task_names:
+            raise ValueError("checkpoint task_names do not match current config")
+        expected_hash = vocab_strategy_fingerprint(config)
+        if checkpoint.get("vocab_strategy_hash") != expected_hash:
+            raise ValueError("checkpoint vocab_strategy_hash does not match current config")
+        base_model.load_state_dict(checkpoint["model_state_dict"])
+    model = _maybe_compile_model(config, base_model)
+    base_model.eval()
+    model.eval()
+    return model, vocab_maps
+
+
+@torch.no_grad()
+def evaluate_mdl(
+    config: AppConfig,
+    split_name: str = "test",
+    checkpoint_path: str | None = None,
+    max_batches: int | None = None,
+    allow_random_init: bool = False,
+    group_metric_name: str = "qauc",
+) -> EvaluateResult:
+    if split_name not in {"train", "test"}:
+        raise ValueError("evaluation split must be train or test")
+    if group_metric_name not in {"qauc", "uauc"}:
+        raise ValueError("group_metric_name must be qauc or uauc")
+    split = config.data.train if split_name == "train" else config.data.test
+    if split is None:
+        raise ValueError(f"split {split_name!r} is not configured")
+    if list(split.labels) != config.task_names:
+        raise ValueError(
+            f"data.{split_name}.labels must declare the training tasks in the same order: "
+            + ", ".join(config.task_names)
+        )
+    if split.group_id is None:
+        raise ValueError(
+            f"data.{split_name}.group_id is required for {group_metric_name.upper()}"
+        )
+
+    device = _select_device(config)
+    model, vocab_maps = _load_inference_model(
+        config,
+        device,
+        checkpoint_path,
+        allow_random_init,
+    )
+    scores_by_task: list[list[Tensor]] = [[] for _ in config.task_names]
+    labels_by_task: list[list[Tensor]] = [[] for _ in config.task_names]
+    groups_by_task: list[list[str]] = [[] for _ in config.task_names]
+    scenarios_by_task: list[list[Tensor]] = [[] for _ in config.task_names]
+    rows = 0
+    non_blocking = _non_blocking_transfer(config, split_name, device)
+    for batch_index, batch in enumerate(
+        iter_feature_batches(
+            config,
+            split_name,
+            vocab_maps,
+            require_labels=True,
+            pin_memory=non_blocking,
+            include_group_id=True,
+        )
+    ):
+        if max_batches is not None and batch_index >= max_batches:
+            break
+        batch = move_feature_batch(batch, device, non_blocking=non_blocking)
+        with _autocast_context(config, device):
+            logits = model(batch.features, batch.scenario_id)["logits"]
+        if batch.labels is None or batch.label_mask is None:
+            raise RuntimeError("evaluation batch did not contain labels")
+        probabilities = torch.sigmoid(logits.float()).cpu()
+        labels = batch.labels.float().cpu()
+        label_mask = batch.label_mask.bool().cpu()
+        raw_scenarios = batch.scenario_id.cpu()
+        if raw_scenarios.ndim == 1:
+            scenario_membership = torch.nn.functional.one_hot(
+                raw_scenarios.long(),
+                num_classes=len(config.scenarios.names),
+            ).bool()
+        else:
+            scenario_membership = raw_scenarios.bool()
+        rows += int(labels.size(0))
+        for task_index in range(len(config.task_names)):
+            valid = label_mask[:, task_index]
+            scores_by_task[task_index].append(probabilities[valid, task_index])
+            labels_by_task[task_index].append(labels[valid, task_index])
+            scenarios_by_task[task_index].append(scenario_membership[valid])
+            groups_by_task[task_index].extend(
+                group_id
+                for group_id, keep in zip(batch.group_id, valid.tolist())
+                if keep
+            )
+
+    metrics: dict[str, dict[str, float | None]] = {}
+    for task_index, task_name in enumerate(config.task_names):
+        task_scores = torch.cat(scores_by_task[task_index]) if scores_by_task[task_index] else torch.empty(0)
+        task_labels = torch.cat(labels_by_task[task_index]) if labels_by_task[task_index] else torch.empty(0)
+        task_scenarios = (
+            torch.cat(scenarios_by_task[task_index])
+            if scenarios_by_task[task_index]
+            else torch.empty(0, len(config.scenarios.names), dtype=torch.bool)
+        )
+        task_groups = groups_by_task[task_index]
+        values: dict[str, float | None] = {
+            "auc": _binary_auc(task_scores, task_labels),
+            group_metric_name: _group_auc(task_scores, task_labels, task_groups),
+        }
+        for scenario in range(len(config.scenarios.names)):
+            selected = task_scenarios[:, scenario]
+            scenario_groups = [
+                group_id
+                for group_id, keep in zip(task_groups, selected.tolist())
+                if keep
+            ]
+            values[f"scenario_{scenario}_auc"] = _binary_auc(
+                task_scores[selected], task_labels[selected]
+            )
+            values[f"scenario_{scenario}_{group_metric_name}"] = _group_auc(
+                task_scores[selected],
+                task_labels[selected],
+                scenario_groups,
+            )
+        metrics[task_name] = values
+    return EvaluateResult(
+        rows=rows,
+        group_metric_name=group_metric_name,
+        metrics=metrics,
+    )
 
 
 @torch.no_grad()

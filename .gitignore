@@ -8,7 +8,5 @@ __pycache__/
 .ruff_cache/
 /paper/
 .PAPER_ALIGNMENT.md
-/README.md
 /PAPER_ALIGNMENT.md
-/requirements.txt
 /src/benchmark.py

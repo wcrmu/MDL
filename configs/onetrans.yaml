@@ -1,0 +1,8 @@
+# Architecture smoke profile. The shared fixture has no cross-sequence
+# timestamps, so it explicitly selects the paper's intent-ordered variant.
+extends: default.yaml
+
+model:
+  name: onetrans
+  sequence_fusion: intent_ordered
+  ns_tokenizer: auto_split

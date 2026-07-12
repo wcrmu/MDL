@@ -1,0 +1,9 @@
+# Experimental layerwise composition. No MDL or OneTrans paper defines this
+# combined model; the explicit acknowledgement prevents accidental mislabeling.
+extends: default.yaml
+
+model:
+  name: mdl_onetrans
+  experimental_model_acknowledged: true
+  sequence_fusion: intent_ordered
+  ns_tokenizer: auto_split

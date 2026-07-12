@@ -17,11 +17,13 @@ import yaml
 # Public string choices used by YAML and type hints.
 EncodingType = Literal["vocab", "hash", "identity", "shared_vocab"]
 EmbeddingScope = Literal["feature", "scenario", "task", "shared"]
-ModelName = Literal["rankmixer", "mdl_rankmixer", "onetrans", "mdl_onetrans"]
+ModelName = Literal["rankmixer", "mdl_rankmixer", "onetrans", "mdl_onetrans", "longer"]
 SequenceFieldKind = Literal["categorical", "dense"]
 SequenceEncoderType = Literal["attention_pool", "mean_pool", "longer"]
 LRScheduleType = Literal["constant", "cosine"]
 ActivationType = Literal["gelu", "relu"]
+SequenceFusionType = Literal["timestamp_aware", "intent_ordered"]
+RankMixerFFNType = Literal["dense", "sparse_moe"]
 
 
 # Raw YAML schema. These dataclasses mirror configs/default.yaml field names.
@@ -513,14 +515,17 @@ class SequenceConfig:
     longer_self_layers: int = 1
     longer_token_merge: int = 1
     longer_inner_layers: int = 0
+    # Explicit temporal semantics used by OneTrans and LONGER.
+    timestamp_field: str | None = None
+    time_delta_field: str | None = None
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "SequenceConfig":
         # Sequences now use field-level list columns only. Reject old layout keys early.
-        removed = sorted(set(payload) & {"layout", "source", "time_delta_field"})
+        removed = sorted(set(payload) & {"layout", "source"})
         if removed:
             raise ValueError(
-                "sequence layout/source/time_delta_field handling was removed; expose sequence fields "
+                "sequence layout/source handling was removed; expose sequence fields "
                 "as list columns and configure them with fields[].source instead: "
                 + ", ".join(removed)
             )
@@ -540,6 +545,8 @@ class SequenceConfig:
             longer_self_layers=payload.get("longer_self_layers", 1),
             longer_token_merge=payload.get("longer_token_merge", 1),
             longer_inner_layers=payload.get("longer_inner_layers", 0),
+            timestamp_field=payload.get("timestamp_field"),
+            time_delta_field=payload.get("time_delta_field"),
         )
 
     def validate(self, scalar_feature_names: set[str]) -> None:
@@ -579,6 +586,22 @@ class SequenceConfig:
             if field_config.name in field_names:
                 raise ValueError(f"duplicate field {field_config.name!r} in sequence {self.name!r}")
             field_names.add(field_config.name)
+        fields_by_name = {item.name: item for item in self.fields}
+        for option_name, field_name in (
+            ("timestamp_field", self.timestamp_field),
+            ("time_delta_field", self.time_delta_field),
+        ):
+            if field_name is None:
+                continue
+            temporal_field = fields_by_name.get(field_name)
+            if temporal_field is None:
+                raise ValueError(
+                    f"sequence {self.name!r} {option_name} references unknown field {field_name!r}"
+                )
+            if temporal_field.kind != "dense" or temporal_field.dimension != 1:
+                raise ValueError(
+                    f"sequence {self.name!r} {option_name} must reference a scalar dense field"
+                )
         missing_targets = [name for name in self.target_inputs if name not in scalar_feature_names]
         if missing_targets:
             raise ValueError(
@@ -1051,6 +1074,17 @@ class ModelConfig:
     # Separator and final S-token controls for OneTrans sequence handling.
     use_sep_tokens: bool = True
     final_s_tokens: int | None = None
+    sequence_fusion: SequenceFusionType = "intent_ordered"
+    rankmixer_ffn_type: RankMixerFFNType = "dense"
+    sparse_moe_num_experts: int = 4
+    sparse_moe_use_dtsi: bool = True
+    sparse_moe_inference_threshold: float = 0.0
+    sparse_moe_target_active_ratio: float = 0.25
+    sparse_moe_regularization_initial: float = 1.0e-8
+    sparse_moe_regularization_multiplier: float = 1.2
+    sparse_moe_loss_weight: float = 1.0
+    # mdl_onetrans is an experimental composition, not a published model.
+    experimental_model_acknowledged: bool = False
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "ModelConfig":
@@ -1059,8 +1093,10 @@ class ModelConfig:
         return cls(**payload)
 
     def validate(self) -> None:
-        if self.name not in {"rankmixer", "mdl_rankmixer", "onetrans", "mdl_onetrans"}:
-            raise ValueError("model.name must be rankmixer, mdl_rankmixer, onetrans, or mdl_onetrans")
+        if self.name not in {"rankmixer", "mdl_rankmixer", "onetrans", "mdl_onetrans", "longer"}:
+            raise ValueError(
+                "model.name must be rankmixer, mdl_rankmixer, onetrans, mdl_onetrans, or longer"
+            )
         if self.token_dim <= 0:
             raise ValueError("model.token_dim must be positive")
         if self.embedding_dim <= 0:
@@ -1091,6 +1127,27 @@ class ModelConfig:
             raise ValueError("model.num_ns_tokens must be positive")
         if self.final_s_tokens is not None and self.final_s_tokens < 0:
             raise ValueError("model.final_s_tokens must be non-negative")
+        if self.sequence_fusion not in {"timestamp_aware", "intent_ordered"}:
+            raise ValueError("model.sequence_fusion must be timestamp_aware or intent_ordered")
+        if self.rankmixer_ffn_type not in {"dense", "sparse_moe"}:
+            raise ValueError("model.rankmixer_ffn_type must be dense or sparse_moe")
+        if self.sparse_moe_num_experts <= 0:
+            raise ValueError("model.sparse_moe_num_experts must be positive")
+        if self.sparse_moe_inference_threshold < 0.0:
+            raise ValueError("model.sparse_moe_inference_threshold must be non-negative")
+        if not 0.0 < self.sparse_moe_target_active_ratio <= 1.0:
+            raise ValueError("model.sparse_moe_target_active_ratio must be in (0, 1]")
+        if self.sparse_moe_regularization_initial <= 0.0:
+            raise ValueError("model.sparse_moe_regularization_initial must be positive")
+        if self.sparse_moe_regularization_multiplier <= 1.0:
+            raise ValueError("model.sparse_moe_regularization_multiplier must be greater than 1")
+        if self.sparse_moe_loss_weight < 0.0:
+            raise ValueError("model.sparse_moe_loss_weight must be non-negative")
+        if self.name == "mdl_onetrans" and not self.experimental_model_acknowledged:
+            raise ValueError(
+                "model.name=mdl_onetrans is experimental and is not defined by the MDL or OneTrans paper; "
+                "set model.experimental_model_acknowledged=true to opt in"
+            )
 
 
 @dataclass(frozen=True)
@@ -1109,9 +1166,13 @@ class TrainingConfig:
     lr_min_ratio: float = 0.0
     # Optimizer names are constrained for paper alignment and implementation scope.
     dense_optimizer: Literal["rmsprop"] = "rmsprop"
-    rmsprop_alpha: float = 0.99
+    rmsprop_alpha: float = 0.99999
     rmsprop_momentum: float = 0.0
     sparse_optimizer: Literal["adagrad"] = "adagrad"
+    adagrad_lr_decay: float = 0.0
+    adagrad_weight_decay: float = 0.0
+    adagrad_initial_accumulator_value: float = 0.1
+    adagrad_eps: float = 1.0e-10
     # Sparse embeddings reduce gradient memory, but still follow local/DDP limits.
     embedding_sparse_gradients: bool = True
     # external_parameter_server is a handoff hook for secure production systems.
@@ -1155,6 +1216,14 @@ class TrainingConfig:
             raise ValueError("training.rmsprop_momentum must be non-negative")
         if self.sparse_optimizer != "adagrad":
             raise ValueError("training.sparse_optimizer must be adagrad for paper alignment")
+        if self.adagrad_lr_decay < 0.0:
+            raise ValueError("training.adagrad_lr_decay must be non-negative")
+        if self.adagrad_weight_decay < 0.0:
+            raise ValueError("training.adagrad_weight_decay must be non-negative")
+        if self.adagrad_initial_accumulator_value < 0.0:
+            raise ValueError("training.adagrad_initial_accumulator_value must be non-negative")
+        if self.adagrad_eps <= 0.0:
+            raise ValueError("training.adagrad_eps must be positive")
         if self.sparse_update_mode not in {"ddp_synced_adagrad", "external_parameter_server"}:
             raise ValueError(
                 "training.sparse_update_mode must be ddp_synced_adagrad or external_parameter_server"
@@ -1923,6 +1992,35 @@ def validate_tokenization_config(
             _validate_domain_token(token, input_names, section)
 
 
+def _validate_mdl_extra_embeddings(config: AppConfig, resolved: ResolvedConfig) -> None:
+    if config.model.name not in {"mdl_rankmixer", "mdl_onetrans"}:
+        return
+    feature_by_name = {feature.name: feature for feature in config.features}
+    for section, tokens, expected_scope in (
+        ("scenario_tokens", resolved.tokenization.scenario_token_specs, "scenario"),
+        ("task_tokens", resolved.tokenization.task_token_specs, "task"),
+    ):
+        for token in tokens:
+            for input_name in token.important_input_refs:
+                feature = feature_by_name.get(input_name)
+                if feature is None or feature.kind != "categorical":
+                    raise ValueError(
+                        f"tokenization.{section}.{token.name}.important_inputs must reference "
+                        "dedicated categorical extra-embedding features"
+                    )
+                if feature.embedding_scope != expected_scope:
+                    raise ValueError(
+                        f"important input {input_name!r} for {section}.{token.name} must use "
+                        f"embedding_scope={expected_scope!r}, not {feature.embedding_scope!r}"
+                    )
+                encoding = resolved.categorical_input_by_name[input_name].encoding
+                if encoding.encoding == "shared_vocab" and encoding.share_embedding:
+                    raise ValueError(
+                        f"important input {input_name!r} must set share_embedding=false so its "
+                        "embedding table is independent from the feature-token embedding"
+                    )
+
+
 def validate_vocab_strategy_references(config: AppConfig) -> None:
     # Every categorical scalar or sequence field needs exactly one encoding source:
     # inline under the logical input, or legacy vocab_strategy.features[name].
@@ -1968,10 +2066,55 @@ def validate_app_config(config: AppConfig) -> None:
     validate_vocab_strategy_references(config)
 
     resolved = resolve_app_config(config)
+    _validate_mdl_extra_embeddings(config, resolved)
+    if config.model.name in {"mdl_rankmixer", "mdl_onetrans"}:
+        unsupported_ablations = [
+            name
+            for name, enabled in (
+                ("use_task_tokens", config.model.use_task_tokens),
+                ("use_scenario_tokens", config.model.use_scenario_tokens),
+                ("use_task_feature_interaction", config.model.use_task_feature_interaction),
+                ("use_scenario_feature_interaction", config.model.use_scenario_feature_interaction),
+            )
+            if not enabled
+        ]
+        if unsupported_ablations:
+            raise ValueError(
+                "the MDL paper ablations require task/scenario towers or RankMixer replacement "
+                "interactions; zeroing token/update paths is not equivalent. Unsupported switches: "
+                + ", ".join(f"model.{name}=false" for name in unsupported_ablations)
+            )
+    sequence_by_name = {sequence.name: sequence for sequence in config.sequences}
+    if config.model.name in {"onetrans", "mdl_onetrans"} and config.model.sequence_fusion == "timestamp_aware":
+        for group in resolved.tokenization.sequence_token_groups:
+            for input_name in group.input_refs:
+                sequence = sequence_by_name.get(input_name)
+                if sequence is not None and sequence.timestamp_field is None:
+                    raise ValueError(
+                        f"timestamp-aware OneTrans requires sequences.{sequence.name}.timestamp_field; "
+                        "use model.sequence_fusion=intent_ordered when timestamps are unavailable"
+                    )
+    for sequence in config.sequences:
+        if sequence.encoder == "longer" and sequence.max_length is None:
+            raise ValueError(
+                f"paper-aligned LONGER sequence {sequence.name!r} requires max_length so recent-k "
+                "compression and downstream dimensions are independent of batch composition"
+            )
+        if sequence.encoder == "longer" and sequence.time_delta_field is None:
+            raise ValueError(
+                f"paper-aligned LONGER sequence {sequence.name!r} requires time_delta_field; "
+                "declare a scalar dense sequence field containing absolute time difference"
+            )
     # Model-specific checks use resolved values because defaults affect token counts.
     feature_token_count = resolved.tokenization.feature_token_count
     if feature_token_count <= 0:
         raise ValueError("tokenization must produce at least one feature token")
+    if config.model.name == "longer":
+        if len(config.sequences) != 1 or config.sequences[0].encoder != "longer":
+            raise ValueError(
+                "model.name=longer requires exactly one sequence configured with encoder=longer; "
+                "put all event side information in that sequence's fields"
+            )
     if config.model.name in {"rankmixer", "mdl_rankmixer"} and config.tokenization.feature_tokenizer == "rankmixer":
         input_dim = sum(resolved.encoded_input_dims[name] for name in resolved.tokenization.feature_token_inputs)
         target_dim = feature_token_count * config.model.token_dim
@@ -2004,12 +2147,50 @@ def validate_app_config(config: AppConfig) -> None:
             )
 
 
+def _merge_config_mappings(
+    base: dict[str, Any],
+    override: dict[str, Any],
+) -> dict[str, Any]:
+    merged: dict[str, Any] = dict(base)
+    for key, value in override.items():
+        base_value = merged.get(key)
+        if isinstance(base_value, dict) and isinstance(value, dict):
+            merged[key] = _merge_config_mappings(base_value, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_config_mapping(
+    config_path: Path,
+    parents: tuple[Path, ...] = (),
+) -> dict[str, Any]:
+    resolved_path = config_path.expanduser().resolve()
+    if resolved_path in parents:
+        cycle = " -> ".join(str(path) for path in (*parents, resolved_path))
+        raise ValueError(f"config extends cycle detected: {cycle}")
+    with resolved_path.open("r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"config {resolved_path} must contain a YAML object")
+    payload = dict(payload)
+    parent_ref = payload.pop("extends", None)
+    if parent_ref is None:
+        return payload
+    if not isinstance(parent_ref, str) or not parent_ref:
+        raise ValueError(f"config {resolved_path} extends must be a non-empty path string")
+    parent_path = Path(parent_ref)
+    if not parent_path.is_absolute():
+        parent_path = resolved_path.parent / parent_path
+    base = _load_config_mapping(parent_path, (*parents, resolved_path))
+    return _merge_config_mappings(base, payload)
+
+
 def load_app_config(path: str | Path) -> AppConfig:
     """Load YAML, build AppConfig, and validate it before use."""
 
     config_path = Path(path)
-    with config_path.open("r", encoding="utf-8") as handle:
-        payload = yaml.safe_load(handle)
+    payload = _load_config_mapping(config_path)
     config = AppConfig.from_mapping(payload)
     config.validate()
     return config

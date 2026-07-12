@@ -66,6 +66,23 @@ features:
     kind: categorical
     source: item_id
     embedding_scope: feature
+  # Dedicated MDL embeddings over the same raw IDs.
+  - name: scenario_user_id
+    kind: categorical
+    source: user_id
+    embedding_scope: scenario
+  - name: scenario_item_id
+    kind: categorical
+    source: item_id
+    embedding_scope: scenario
+  - name: task_user_id
+    kind: categorical
+    source: user_id
+    embedding_scope: task
+  - name: task_item_id
+    kind: categorical
+    source: item_id
+    embedding_scope: task
   - name: shop_id
     kind: categorical
     source: shop_id
@@ -73,7 +90,7 @@ features:
   - name: rankmixer_context_dense
     kind: dense
     source: rankmixer_context_dense
-    dimension: 672
+    dimension: 16
     embedding_scope: feature
 
 sequences:
@@ -82,15 +99,13 @@ sequences:
     max_length: 100
     truncation: tail
     encoder: longer
-    # Multi-slice RankMixer summary. For 9 core sequences, allocate this per
-    # sequence (for example 2-4 slices each) so sequence signals are not squeezed
-    # into only 9/32 feature slices.
-    rankmixer_summary_tokens: 31
+    rankmixer_summary_tokens: 2
     longer_token_merge: 4
     longer_inner_layers: 1
+    time_delta_field: time_delta
     target_inputs:
       - item_id
-    longer_query_tokens: 32
+    longer_query_tokens: 8
     longer_self_layers: 1
     fields:
       - name: item_id
@@ -105,6 +120,9 @@ sequences:
       - name: age
         kind: dense
         source: hist_age
+      - name: time_delta
+        kind: dense
+        source: hist_time_delta
 
 scenarios:
   names:
@@ -112,10 +130,22 @@ scenarios:
   source: null
 
 tokenization:
-  feature_tokenizer: rankmixer
-  # Strict RankMixer reshape: user/item/shop (3 * 32) + context dense (672) + hist (31 * 768) = 24576 = 32 * 768.
-  # No implicit padding is allowed; adjust per-feature dims and per-sequence summary tokens to keep this exact.
-  num_feature_tokens: 32
+  # Semantic groups are projected independently before RankMixer.
+  feature_tokenizer: groupwise
+  feature_tokens:
+    - name: user_profile
+      inputs:
+        - user_id
+    - name: item_profile
+      inputs:
+        - item_id
+        - shop_id
+    - name: context
+      inputs:
+        - rankmixer_context_dense
+    - name: long_history
+      inputs:
+        - hist
   sequence_tokens:
     - name: history
       inputs:
@@ -133,21 +163,21 @@ tokenization:
   scenario_tokens:
     - name: default
       important_inputs:
-        - user_id
-        - item_id
+        - scenario_user_id
+        - scenario_item_id
       prior_inputs:
         - hist
     - name: global
       important_inputs:
-        - user_id
-        - item_id
+        - scenario_user_id
+        - scenario_item_id
       prior_inputs:
         - hist
   task_tokens:
     - name: click
       important_inputs:
-        - user_id
-        - item_id
+        - task_user_id
+        - task_item_id
       prior_inputs:
         - hist
 
@@ -171,6 +201,26 @@ vocab_strategy:
       min_count: 3
       max_size: 10000000
       artifact: item_id.parquet
+    scenario_user_id:
+      encoding: shared_vocab
+      source: user_id
+      share_with: user_id
+      share_embedding: false
+    scenario_item_id:
+      encoding: shared_vocab
+      source: item_id
+      share_with: item_id
+      share_embedding: false
+    task_user_id:
+      encoding: shared_vocab
+      source: user_id
+      share_with: user_id
+      share_embedding: false
+    task_item_id:
+      encoding: shared_vocab
+      source: item_id
+      share_with: item_id
+      share_embedding: false
     hist.item_id:
       encoding: shared_vocab
       source: hist_item_id
@@ -195,21 +245,26 @@ vocab_strategy:
 model:
   name: mdl_rankmixer
   embedding_dim: 32
-  token_dim: 768
+  token_dim: 32
   num_layers: 2
-  num_heads: 12
-  hidden_dim: 1536
+  num_heads: 4
+  hidden_dim: 64
   init_std: 0.02
   ffn_activation: gelu
-  task_head_hidden_dim: 1536
+  task_head_hidden_dim: 64
   task_head_dropout: 0.0
   task_head_activation: gelu
+  rankmixer_ffn_type: dense
+  sparse_moe_regularization_initial: 1.0e-8
+  sparse_moe_regularization_multiplier: 1.2
+  sparse_moe_loss_weight: 1.0
+  sequence_fusion: intent_ordered
   use_task_tokens: true
   use_scenario_tokens: true
   use_global_scenario_token: true
   use_task_feature_interaction: true
   use_scenario_feature_interaction: true
-  use_request_cache: true
+  use_request_cache: false
 
 training:
   batch_size: 2048
@@ -219,9 +274,11 @@ training:
   lr_decay_steps: 100000
   lr_min_ratio: 0.1
   dense_optimizer: rmsprop
-  rmsprop_alpha: 0.99
+  rmsprop_alpha: 0.99999
   rmsprop_momentum: 0.0
   sparse_optimizer: adagrad
+  adagrad_initial_accumulator_value: 0.1
+  adagrad_eps: 1.0e-10
   embedding_sparse_gradients: true
   sparse_update_mode: ddp_synced_adagrad
   sparse_parameter_server_adapter: null
