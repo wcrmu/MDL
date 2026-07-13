@@ -1274,8 +1274,10 @@ class TrainingConfig:
     adagrad_weight_decay: float = 0.0
     adagrad_initial_accumulator_value: float = 0.1
     adagrad_eps: float = 1.0e-10
-    # Sparse embeddings reduce gradient memory, but still follow local/DDP limits.
+    # Sparse embeddings keep a complete table replica on every rank. Under DDP,
+    # only touched rows are exchanged before the local Adagrad step.
     embedding_sparse_gradients: bool = True
+    # ddp_synced_adagrad is synchronous replicated training without sharding;
     # external_parameter_server is a handoff hook for secure production systems.
     sparse_update_mode: Literal["ddp_synced_adagrad", "external_parameter_server"] = "ddp_synced_adagrad"
     sparse_parameter_server_adapter: str | None = None

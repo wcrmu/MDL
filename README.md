@@ -197,9 +197,25 @@ torchrun --nproc_per_node=4 src/main.py train \
   --max-steps 100
 ```
 
-DDP 下 `reader.shard_unit: file` 会按文件分片；`row_group` 和 `record_batch` 会按扫描 batch 分片。`training.batch_size` 按每个进程解释，checkpoint 只由 rank 0 写入。
+DDP 下 `reader.shard_unit: file` 会按文件分片；`row_group` 和 `record_batch`
+会按扫描 batch 分片。`training.batch_size` 按每个进程解释，checkpoint 只由 rank 0
+写入。各 rank 的 batch 数不同时，已耗尽的 rank 会复用最后一个 batch 做零损失
+forward/backward，继续参与同步和 optimizer step，直到最长 shard 完成；若某个 rank
+从第一步起就是空 shard，训练会要求减少 world size 或改用更细的 shard unit。
 
-默认 `training.sparse_update_mode: ddp_synced_adagrad` 使用稀疏 embedding 梯度和 Adagrad，但 DDP 仍会同步梯度；这不是论文中“sparse 异步、dense 同步”的数百 GPU 参数服务器训练。安全环境若要对齐论文训练系统，需要配置：
+默认 `training.sparse_update_mode: ddp_synced_adagrad` 是同步的完整复制方案，不做
+embedding sharding。每个 rank 保存完整表和完整 Adagrad accumulator；COO embedding
+梯度不交给 NCCL sparse all-reduce，而是按 embedding 宽度打包，只 all-gather 各 rank
+本步命中的 row IDs/values，合并重复行并按固定 world size 平均。所有 rank 随后执行相同的
+Adagrad step，因此权重和 optimizer state 保持一致。`embedding_sparse_gradients: false`
+可作为全量 dense DDP fallback。
+
+例如 `500,000 × 128` 的 FP32 表，权重约为 `244 MiB`，Adagrad accumulator 另需约
+`244 MiB`，即每个 rank 约 `488 MiB`，不含动态稀疏梯度和通信 buffer。训练启动日志会
+列出逐表与汇总复制内存，step 日志会报告 touched rows、global rows 和逻辑 all-gather
+payload；该模式不会因表大小自动切换到 sharding。
+
+这仍不是论文中“sparse 异步、dense 同步”的数百 GPU 参数服务器训练。安全环境若需要异步参数服务，应配置：
 
 ```yaml
 training:

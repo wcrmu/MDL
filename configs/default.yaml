@@ -287,7 +287,9 @@ training:
   sparse_optimizer: adagrad
   adagrad_initial_accumulator_value: 0.1
   adagrad_eps: 1.0e-10
+  # Keep full embedding replicas on every rank and exchange only touched rows.
   embedding_sparse_gradients: true
+  # Synchronous replicated Adagrad; this mode never shards embedding tables.
   sparse_update_mode: ddp_synced_adagrad
   sparse_parameter_server_adapter: null
   dense_clip_norm: 90.0
