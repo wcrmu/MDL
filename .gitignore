@@ -9,7 +9,6 @@ __pycache__/
 /paper/
 .PAPER_ALIGNMENT.md
 /PAPER_ALIGNMENT.md
-AGENTS.md
 README.md
 note.md
 pyproject.toml
