@@ -34,7 +34,10 @@ from .config import (
     AppConfig,
     FeatureConfig,
     ParquetSplitConfig,
+    ResolvedCategoricalInput,
+    ResolvedIdentityEncoding,
     SequenceConfig,
+    resolve_categorical_base_input,
 )
 from .features import encode_categorical_sequence_field, encode_categorical_values
 
@@ -450,6 +453,36 @@ def _put_queue_item(
     return False
 
 
+class _ByteBudget:
+    """A stoppable byte semaphore that admits one oversized item for progress."""
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = max(1, capacity)
+        self.used = 0
+        self.condition = threading.Condition()
+
+    def acquire(self, amount: int, stop_event: threading.Event) -> bool:
+        amount = max(1, amount)
+        with self.condition:
+            while not stop_event.is_set():
+                if self.used + amount <= self.capacity or self.used == 0:
+                    self.used += amount
+                    return True
+                self.condition.wait(timeout=0.05)
+        return False
+
+    def release(self, amount: int) -> None:
+        with self.condition:
+            self.used -= max(1, amount)
+            if self.used < 0:
+                raise RuntimeError("prefetch byte budget was released more than reserved")
+            self.condition.notify_all()
+
+    def wake_all(self) -> None:
+        with self.condition:
+            self.condition.notify_all()
+
+
 def _sequence_source_columns(config: AppConfig) -> set[str]:
     """Collect Parquet source columns referenced by configured sequence fields."""
     columns: set[str] = set()
@@ -720,8 +753,22 @@ class _PrefetchSlot:
 
     index: int
     queue: queue.Queue[Any]
+    byte_budget: _ByteBudget
     thread: threading.Thread | None = None
     error: BaseException | None = None
+
+
+@dataclass(frozen=True)
+class _QueuedRecordBatch:
+    value: Any
+    nbytes: int
+
+
+def _drain_prefetch_slot(slot: _PrefetchSlot) -> None:
+    while not slot.queue.empty():
+        item = slot.queue.get_nowait()
+        if isinstance(item, _QueuedRecordBatch):
+            slot.byte_budget.release(item.nbytes)
 
 
 class _ClosableIterator:
@@ -821,7 +868,7 @@ class ParquetScanner:
         return self.columns or None
 
     def _reader_batch_size(self, default: int) -> int:
-        return self.split.reader.batch_size_rows or default
+        return self.split.reader.scanner_batch_rows or default
 
     def _get_metadata_cache(self) -> dict[ParquetInputRef, _FileMetadataCache]:
         if self._metadata_cache is None:
@@ -957,7 +1004,12 @@ class ParquetScanner:
                     break
                 if stop_event.is_set():
                     return
-                if not _put_queue_item(slot.queue, batch, stop_event):
+                batch_bytes = max(1, int(getattr(batch, "nbytes", 0)))
+                if not slot.byte_budget.acquire(batch_bytes, stop_event):
+                    return
+                queued = _QueuedRecordBatch(batch, batch_bytes)
+                if not _put_queue_item(slot.queue, queued, stop_event):
+                    slot.byte_budget.release(batch_bytes)
                     return
         except BaseException as error:
             slot.error = error
@@ -992,8 +1044,15 @@ class ParquetScanner:
             return
 
         capacities = self._prefetch_queue_capacities(active_workers)
+        byte_capacity = max(
+            1, self.split.reader.max_prefetch_bytes // active_workers
+        )
         slots = [
-            _PrefetchSlot(index=index, queue=queue.Queue(maxsize=capacity))
+            _PrefetchSlot(
+                index=index,
+                queue=queue.Queue(maxsize=capacity),
+                byte_budget=_ByteBudget(byte_capacity),
+            )
             for index, capacity in enumerate(capacities)
         ]
         slot_for_item: dict[int, _PrefetchSlot] = {}
@@ -1077,28 +1136,33 @@ class ParquetScanner:
                         if slot.error is not None:
                             raise slot.error
                         break
-                    yield item
+                    if not isinstance(item, _QueuedRecordBatch):
+                        raise RuntimeError("invalid parquet prefetch queue item")
+                    try:
+                        yield item.value
+                    finally:
+                        slot.byte_budget.release(item.nbytes)
 
                 if slot.thread is not None:
                     slot.thread.join()
                 slot.thread = None
                 slot.error = None
-                while not slot.queue.empty():
-                    slot.queue.get_nowait()
+                _drain_prefetch_slot(slot)
                 free_slots.put(slot.index)
                 with assignment_condition:
                     assign_available_slots()
                     assignment_condition.notify_all()
         finally:
             stop_event.set()
+            for slot in slots:
+                slot.byte_budget.wake_all()
             with assignment_condition:
                 assignment_condition.notify_all()
             assignment_thread.join()
             for slot in slots:
                 if slot.thread is not None:
                     slot.thread.join()
-                while not slot.queue.empty():
-                    slot.queue.get_nowait()
+                _drain_prefetch_slot(slot)
                 slot.thread = None
                 slot.error = None
             slot_for_item.clear()
@@ -1125,11 +1189,14 @@ class ParquetScanner:
         scanner_kwargs: dict[str, Any] = {
             "columns": self._scan_columns(),
             "use_threads": True,
-            "batch_readahead": max(1, self.split.reader.prefetch_batches),
-            "fragment_readahead": max(1, self.split.reader.prefetch_batches),
+            # Dataset's internal queues expose no byte accounting. Keep them at
+            # one batch/fragment; the repository-owned queues enforce both the
+            # configured count and byte limits.
+            "batch_readahead": 1,
+            "fragment_readahead": 1,
         }
-        if self.split.reader.batch_size_rows is not None:
-            scanner_kwargs["batch_size"] = self.split.reader.batch_size_rows
+        if self.split.reader.scanner_batch_rows is not None:
+            scanner_kwargs["batch_size"] = self.split.reader.scanner_batch_rows
         scanner = dataset.scanner(**scanner_kwargs)
         for batch in scanner.to_batches():
             if stop_event.is_set():
@@ -1527,7 +1594,86 @@ def _numeric_column_tensor(table: Any, column: str, dtype: torch.dtype) -> Tenso
         )
 
 
+def _numpy_backed_tensor(array: Any, dtype: torch.dtype) -> Tensor:
+    values = array.to_numpy(zero_copy_only=False)
+    if hasattr(values, "flags") and not values.flags.writeable:
+        values = values.copy()
+    return torch.as_tensor(values, dtype=dtype)
+
+
+def _identity_array_tensor(
+    array: Any,
+    categorical_input: ResolvedCategoricalInput,
+) -> Tensor:
+    """Convert a numeric identity column without Python element processing."""
+
+    encoding = categorical_input.encoding
+    if not isinstance(encoding, ResolvedIdentityEncoding):
+        raise TypeError("_identity_array_tensor requires identity encoding")
+    pa, pc, _ds, _pq = _require_pyarrow()
+    if not pa.types.is_integer(array.type):
+        raise TypeError(
+            f"identity input {categorical_input.name!r} must be an Arrow integer column, "
+            f"got {array.type}"
+        )
+    if array.null_count:
+        array = pc.fill_null(array, encoding.padding_id)
+
+    min_max = pc.min_max(array).as_py()
+    minimum = min_max.get("min") if min_max is not None else None
+    maximum = min_max.get("max") if min_max is not None else None
+    invalid_bounds = (
+        (minimum is not None and int(minimum) < 0)
+        or (maximum is not None and int(maximum) >= encoding.num_buckets)
+    )
+    if invalid_bounds and encoding.out_of_range == "error":
+        raise ValueError(
+            f"identity input {categorical_input.name!r} contains IDs outside "
+            f"[0, {encoding.num_buckets}): min={minimum}, max={maximum}"
+        )
+    if invalid_bounds:
+        valid = pc.and_(
+            pc.greater_equal(array, 0),
+            pc.less(array, encoding.num_buckets),
+        )
+        array = pc.if_else(valid, array, encoding.padding_id)
+    array = pc.cast(array, target_type=pa.int64(), safe=True)
+    return _numpy_backed_tensor(array, torch.long)
+
+
+def _identity_column_tensor(
+    table: Any,
+    categorical_input: ResolvedCategoricalInput,
+) -> Tensor:
+    return _identity_array_tensor(
+        _column_array(table, categorical_input.source),
+        categorical_input,
+    )
+
+
 # --- Categorical encoding ---
+
+
+def _effective_categorical_input(
+    config: AppConfig,
+    categorical_input: ResolvedCategoricalInput,
+) -> ResolvedCategoricalInput:
+    """Apply a shared namespace's base encoding to the current source column."""
+
+    base_input = resolve_categorical_base_input(
+        config.resolved.categorical_input_by_name,
+        categorical_input.name,
+    )
+    if base_input.name == categorical_input.name:
+        return categorical_input
+    return ResolvedCategoricalInput(
+        name=categorical_input.name,
+        source=categorical_input.source,
+        location=categorical_input.location,
+        sequence_name=categorical_input.sequence_name,
+        field_name=categorical_input.field_name,
+        encoding=base_input.encoding,
+    )
 
 
 def _tensorize_categorical(
@@ -1537,7 +1683,12 @@ def _tensorize_categorical(
     vocab_maps: dict[str, dict[str, int]],
 ) -> Tensor:
     """Build a rank-one integer tensor for a configured categorical feature."""
-    categorical_input = config.resolved.categorical_input_by_name[feature.name]
+    categorical_input = _effective_categorical_input(
+        config,
+        config.resolved.categorical_input_by_name[feature.name],
+    )
+    if isinstance(categorical_input.encoding, ResolvedIdentityEncoding):
+        return _identity_column_tensor(table, categorical_input)
     unseen_policy = config.vocab_strategy.defaults.unseen_policy
     encoded = encode_categorical_values(
         _column_values(table, categorical_input.source),
@@ -1605,6 +1756,171 @@ def _sequence_bounds(length: int, sequence: SequenceConfig) -> tuple[int, int]:
     return 0, sequence.max_length
 
 
+def _direct_sequence_supported(config: AppConfig, sequence: SequenceConfig) -> bool:
+    return all(
+        field.kind != "categorical"
+        or isinstance(
+            _effective_categorical_input(
+                config,
+                config.resolved.categorical_input_by_name[
+                    field.qualified_name(sequence.name)
+                ],
+            ).encoding,
+            ResolvedIdentityEncoding,
+        )
+        for field in sequence.fields
+    )
+
+
+def _normalized_list_array(table: Any, column: str) -> Any:
+    pa, pc, _ds, _pq = _require_pyarrow()
+    array = _column_array(table, column)
+    if not (pa.types.is_list(array.type) or pa.types.is_large_list(array.type)):
+        raise TypeError(
+            f"direct sequence input {column!r} must be an Arrow list column, got {array.type}"
+        )
+    if array.null_count:
+        array = pc.fill_null(array, pa.scalar([], type=array.type))
+    return array
+
+
+def _list_offsets_tensor(array: Any) -> Tensor:
+    return _numpy_backed_tensor(array.offsets, torch.long)
+
+
+def _direct_dense_values(array: Any, dimension: int, field_name: str) -> Tensor:
+    pa, pc, _ds, _pq = _require_pyarrow()
+    if dimension == 1:
+        if not (pa.types.is_integer(array.type) or pa.types.is_floating(array.type)):
+            raise TypeError(
+                f"dense sequence field {field_name!r} must contain numeric values, got {array.type}"
+            )
+        if array.null_count:
+            array = pc.fill_null(array, 0.0)
+        return _numpy_backed_tensor(
+            pc.cast(array, target_type=pa.float32(), safe=False),
+            torch.float32,
+        )
+
+    if not (
+        pa.types.is_list(array.type)
+        or pa.types.is_large_list(array.type)
+        or pa.types.is_fixed_size_list(array.type)
+    ):
+        raise TypeError(
+            f"dense sequence field {field_name!r} with dimension={dimension} must contain "
+            f"list values, got {array.type}"
+        )
+    if array.null_count:
+        raise ValueError(
+            f"dense sequence field {field_name!r} contains null event vectors"
+        )
+    lengths = _numpy_backed_tensor(pc.list_value_length(array), torch.long)
+    if lengths.numel() and bool((lengths != dimension).any().item()):
+        observed = torch.unique(lengths)[:5].tolist()
+        raise ValueError(
+            f"dense sequence field {field_name!r} expected dimension={dimension}, "
+            f"observed lengths={observed}"
+        )
+    flattened = pc.list_flatten(array)
+    if flattened.null_count:
+        flattened = pc.fill_null(flattened, 0.0)
+    values = _numpy_backed_tensor(
+        pc.cast(flattened, target_type=pa.float32(), safe=False),
+        torch.float32,
+    )
+    return values.view(-1, dimension)
+
+
+def _gather_padded_sequence(
+    values: Tensor,
+    starts: Tensor,
+    lengths: Tensor,
+    max_length: int,
+    padding_value: int | float,
+) -> Tensor:
+    output_shape = (int(lengths.numel()), max_length, *values.shape[1:])
+    if max_length == 0:
+        return values.new_full(output_shape, padding_value)
+    positions = torch.arange(max_length, dtype=torch.long).unsqueeze(0)
+    valid = positions < lengths.unsqueeze(1)
+    indices = starts.unsqueeze(1) + positions
+    safe_indices = indices.clamp(min=0, max=max(int(values.size(0)) - 1, 0))
+    gathered = values.index_select(0, safe_indices.reshape(-1)).view(output_shape)
+    mask = valid
+    for _ in values.shape[1:]:
+        mask = mask.unsqueeze(-1)
+    return torch.where(mask, gathered, gathered.new_full((), padding_value))
+
+
+def _tensorize_direct_sequence(
+    config: AppConfig,
+    sequence: SequenceConfig,
+    table: Any,
+) -> dict[str, Any]:
+    """Vectorize an identity-ID sequence from Arrow offsets and flat values."""
+
+    arrays = {
+        field.name: _normalized_list_array(table, field.source)
+        for field in sequence.fields
+    }
+    reference_offsets: Tensor | None = None
+    reference_base = 0
+    reference_stop = 0
+    for field in sequence.fields:
+        offsets = _list_offsets_tensor(arrays[field.name])
+        base = int(offsets[0].item()) if offsets.numel() else 0
+        normalized = offsets - base
+        if reference_offsets is None:
+            reference_offsets = normalized
+            reference_base = base
+            reference_stop = int(offsets[-1].item()) if offsets.numel() else base
+        elif not torch.equal(normalized, reference_offsets):
+            raise ValueError(
+                f"sequence {sequence.name!r} field {field.name!r} has offsets that do not "
+                "match the other aligned fields"
+            )
+    if reference_offsets is None:
+        return {"fields": {}, "lengths": torch.empty(0, dtype=torch.long)}
+
+    raw_lengths = reference_offsets[1:] - reference_offsets[:-1]
+    lengths = raw_lengths
+    if sequence.max_length is not None:
+        lengths = torch.clamp(raw_lengths, max=sequence.max_length)
+    if sequence.truncation == "tail":
+        starts = reference_offsets[1:] - lengths
+    else:
+        starts = reference_offsets[:-1]
+    max_length = int(lengths.max().item()) if lengths.numel() else 0
+
+    tensor_fields: dict[str, Tensor] = {}
+    total_values = reference_stop - reference_base
+    for field in sequence.fields:
+        array = arrays[field.name]
+        offsets = _list_offsets_tensor(array)
+        base = int(offsets[0].item()) if offsets.numel() else 0
+        flat = array.values.slice(base, total_values)
+        if field.kind == "categorical":
+            qualified = field.qualified_name(sequence.name)
+            categorical_input = _effective_categorical_input(
+                config,
+                config.resolved.categorical_input_by_name[qualified],
+            )
+            values = _identity_array_tensor(flat, categorical_input)
+            padding_value: int | float = categorical_input.encoding.padding_id
+        else:
+            values = _direct_dense_values(flat, field.dimension, field.name)
+            padding_value = 0.0
+        tensor_fields[field.name] = _gather_padded_sequence(
+            values,
+            starts,
+            lengths,
+            max_length,
+            padding_value,
+        )
+    return {"fields": tensor_fields, "lengths": lengths}
+
+
 def _dense_vector(value: Any, dimension: int) -> list[float]:
     """Normalize one dense element inside a sequence field."""
     if value is None:
@@ -1663,6 +1979,8 @@ def _tensorize_multi_field_sequence(
     vocab_maps: dict[str, dict[str, int]],
 ) -> dict[str, Any]:
     """Encode and right-pad one configured sequence to the batch maximum length."""
+    if _direct_sequence_supported(config, sequence):
+        return _tensorize_direct_sequence(config, sequence, table)
     rows_by_field, row_lengths = _sequence_rows(table, sequence)
 
     lengths = torch.tensor(row_lengths, dtype=torch.long)
@@ -1673,7 +1991,10 @@ def _tensorize_multi_field_sequence(
         rows = rows_by_field[field.name]
         if field.kind == "categorical":
             qualified = field.qualified_name(sequence.name)
-            categorical_input = config.resolved.categorical_input_by_name[qualified]
+            categorical_input = _effective_categorical_input(
+                config,
+                config.resolved.categorical_input_by_name[qualified],
+            )
             encoded_rows = encode_categorical_sequence_field(
                 rows,
                 categorical_input,

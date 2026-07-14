@@ -47,6 +47,65 @@ class RankMixerTokenMixing(nn.Module):
         return mixed.view(batch_size, num_tokens, token_dim)
 
 
+class RankMixerDomainInteraction(nn.Module):
+    """Route feature information into domain tokens with RankMixer mixing.
+
+    MDL only states that its interaction ablation replaces domain-aware
+    attention with the RankMixer interaction; it does not publish a separate
+    cross-interaction equation. This module makes that replacement explicit:
+    concatenate ``[feature; domain]`` tokens, apply RankMixer's parameter-free
+    token mixing plus residual/LayerNorm, and keep the domain-token outputs.
+    When the configured width is not divisible by the combined token count,
+    the smallest valid RankMixer width is supplied with zero-padding and
+    cropped back to ``token_dim`` afterwards.
+    """
+
+    def __init__(
+        self,
+        token_dim: int,
+        num_domain_tokens: int,
+        num_feature_tokens: int,
+    ) -> None:
+        super().__init__()
+        if token_dim <= 0 or num_domain_tokens <= 0 or num_feature_tokens <= 0:
+            raise ValueError("token and domain/feature counts must be positive")
+        self.token_dim = token_dim
+        self.num_domain_tokens = num_domain_tokens
+        self.num_feature_tokens = num_feature_tokens
+        self.num_tokens = num_feature_tokens + num_domain_tokens
+        self.mixing_dim = math.ceil(token_dim / self.num_tokens) * self.num_tokens
+        self.token_mixing = RankMixerTokenMixing(self.num_tokens, self.mixing_dim)
+        self.norm = nn.LayerNorm(self.mixing_dim)
+
+    def forward(self, domain_tokens: Tensor, feature_tokens: Tensor) -> Tensor:
+        if domain_tokens.ndim != 3 or domain_tokens.shape[1:] != (
+            self.num_domain_tokens,
+            self.token_dim,
+        ):
+            raise ValueError(
+                "expected domain tokens with shape "
+                f"[batch, {self.num_domain_tokens}, {self.token_dim}], "
+                f"got {tuple(domain_tokens.shape)}"
+            )
+        if feature_tokens.ndim != 3 or feature_tokens.shape[1:] != (
+            self.num_feature_tokens,
+            self.token_dim,
+        ):
+            raise ValueError(
+                "expected feature tokens with shape "
+                f"[batch, {self.num_feature_tokens}, {self.token_dim}], "
+                f"got {tuple(feature_tokens.shape)}"
+            )
+        if domain_tokens.size(0) != feature_tokens.size(0):
+            raise ValueError("domain and feature token batches must match")
+
+        tokens = torch.cat([feature_tokens, domain_tokens], dim=1)
+        if self.mixing_dim != self.token_dim:
+            tokens = F.pad(tokens, (0, self.mixing_dim - self.token_dim))
+        mixed = self.norm(self.token_mixing(tokens) + tokens)
+        return mixed[:, self.num_feature_tokens :, : self.token_dim]
+
+
 class DomainAwareAttention(nn.Module):
     def __init__(
         self,
@@ -137,27 +196,74 @@ class DomainAwareAttention(nn.Module):
         return self._merge_heads(attended), weights if need_weights else None
 
 
+def masked_scenario_pool(
+    scenario_states: Tensor,
+    scenario_mask: Tensor,
+    *,
+    include_global: bool = True,
+    has_global_state: bool = True,
+) -> Tensor:
+    """Select and mean-pool per-example scenario states.
+
+    This operation is shared by the MDL DomainFused path and the explicit
+    scenario-tower ablation. Keeping it separate prevents the ablation from
+    registering or executing a DomainFusedModule when scenario tokens do not
+    exist.
+    """
+
+    if scenario_states.ndim != 3:
+        raise ValueError("scenario_tokens must have shape [batch, tokens, dim]")
+    if scenario_mask.ndim != 2:
+        raise ValueError("scenario_mask must have shape [batch, num_scenarios]")
+    if scenario_mask.size(0) != scenario_states.size(0):
+        raise ValueError("scenario_mask batch size must match scenario_tokens")
+    expected_states = scenario_mask.size(1) + int(has_global_state)
+    if scenario_states.size(1) != expected_states:
+        suffix = " plus one global token" if has_global_state else ""
+        raise ValueError(
+            "scenario token count must match scenario_mask width" + suffix
+        )
+
+    mask = scenario_mask.to(
+        dtype=scenario_states.dtype,
+        device=scenario_states.device,
+    )
+    if has_global_state and include_global:
+        global_mask = torch.ones(
+            mask.size(0),
+            1,
+            dtype=mask.dtype,
+            device=mask.device,
+        )
+        full_mask = torch.cat([mask, global_mask], dim=1)
+        selected_states = scenario_states
+    elif has_global_state:
+        full_mask = mask
+        selected_states = scenario_states[:, :-1, :]
+    else:
+        full_mask = mask
+        selected_states = scenario_states
+    denominator = full_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+    return (selected_states * full_mask.unsqueeze(-1)).sum(dim=1) / denominator
+
+
 class DomainFusedModule(nn.Module):
-    def __init__(self, include_global: bool = True) -> None:
+    def __init__(
+        self,
+        include_global: bool = True,
+        has_global_token: bool = True,
+    ) -> None:
         super().__init__()
         self.include_global = include_global
+        self.has_global_token = has_global_token
+
+    def pool(self, scenario_tokens: Tensor, scenario_mask: Tensor) -> Tensor:
+        return masked_scenario_pool(
+            scenario_tokens,
+            scenario_mask,
+            include_global=self.include_global,
+            has_global_state=self.has_global_token,
+        )
 
     def forward(self, task_tokens: Tensor, scenario_tokens: Tensor, scenario_mask: Tensor) -> Tensor:
-        if scenario_mask.ndim != 2:
-            raise ValueError("scenario_mask must have shape [batch, num_scenarios]")
-        if scenario_mask.size(0) != scenario_tokens.size(0):
-            raise ValueError("scenario_mask batch size must match scenario_tokens")
-        if scenario_mask.size(1) != scenario_tokens.size(1) - 1:
-            raise ValueError("scenario_mask must exclude the global scenario token")
-
-        mask = scenario_mask.to(dtype=scenario_tokens.dtype, device=scenario_tokens.device)
-        if self.include_global:
-            global_mask = torch.ones(mask.size(0), 1, dtype=mask.dtype, device=mask.device)
-            full_mask = torch.cat([mask, global_mask], dim=1)
-            fused_scenario_tokens = scenario_tokens
-        else:
-            full_mask = mask
-            fused_scenario_tokens = scenario_tokens[:, :-1, :]
-        denominator = full_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        scenario_average = (fused_scenario_tokens * full_mask.unsqueeze(-1)).sum(dim=1) / denominator
-        return task_tokens + scenario_average.unsqueeze(1)
+        return task_tokens + self.pool(scenario_tokens, scenario_mask).unsqueeze(1)

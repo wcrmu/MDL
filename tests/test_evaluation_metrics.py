@@ -4,7 +4,12 @@ import unittest
 
 import torch
 
-from src.train import _binary_auc, _group_auc
+from src.train import (
+    _DiskBackedGroupAUC,
+    _StreamingHistogramAUC,
+    _binary_auc,
+    _group_auc,
+)
 
 
 class EvaluationMetricTest(unittest.TestCase):
@@ -41,6 +46,36 @@ class EvaluationMetricTest(unittest.TestCase):
         groups = ["a", "a", "b", "b", "c", "c"]
 
         self.assertEqual(_group_auc(scores, labels, groups), 0.5)
+
+    def test_streaming_histogram_matches_separated_exact_scores(self) -> None:
+        scores = torch.tensor([0.1, 0.9, 0.8, 0.2])
+        labels = torch.tensor([0.0, 1.0, 0.0, 1.0])
+        accumulator = _StreamingHistogramAUC(1024)
+        accumulator.update(scores[:2], labels[:2])
+        accumulator.update(scores[2:], labels[2:])
+        self.assertEqual(accumulator.compute(), _binary_auc(scores, labels))
+
+    def test_disk_group_histogram_aggregates_across_batches(self) -> None:
+        accumulator = _DiskBackedGroupAUC(1024)
+        try:
+            accumulator.add(
+                0,
+                ["a", "b"],
+                torch.tensor([0.1, 0.8]),
+                torch.tensor([0.0, 0.0]),
+                torch.tensor([[True], [True]]),
+            )
+            accumulator.add(
+                0,
+                ["a", "b", "c"],
+                torch.tensor([0.9, 0.2, 0.7]),
+                torch.tensor([1.0, 1.0, 1.0]),
+                torch.tensor([[True], [True], [True]]),
+            )
+            self.assertEqual(accumulator.compute(0, -1), 0.5)
+            self.assertEqual(accumulator.compute(0, 0), 0.5)
+        finally:
+            accumulator.close()
 
 
 if __name__ == "__main__":

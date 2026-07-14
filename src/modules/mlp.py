@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 
 class PerTokenLinear(nn.Module):
@@ -12,9 +15,17 @@ class PerTokenLinear(nn.Module):
         self.num_tokens = num_tokens
         self.input_dim = input_dim
         self.output_dim = output_dim
-        self.layers = nn.ModuleList(
-            nn.Linear(input_dim, output_dim) for _ in range(num_tokens)
+        self.weight = nn.Parameter(
+            torch.empty(num_tokens, output_dim, input_dim)
         )
+        self.bias = nn.Parameter(torch.empty(num_tokens, output_dim))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for token_index in range(self.num_tokens):
+            nn.init.kaiming_uniform_(self.weight[token_index], a=math.sqrt(5))
+            bound = 1.0 / math.sqrt(self.input_dim)
+            nn.init.uniform_(self.bias[token_index], -bound, bound)
 
     def forward(self, tokens: Tensor) -> Tensor:
         expected = (self.num_tokens, self.input_dim)
@@ -23,10 +34,12 @@ class PerTokenLinear(nn.Module):
                 f"expected tokens with shape [batch, {self.num_tokens}, {self.input_dim}], "
                 f"got {tuple(tokens.shape)}"
             )
-        return torch.stack(
-            [layer(tokens[:, index, :]) for index, layer in enumerate(self.layers)],
-            dim=1,
-        )
+        # [T,B,I] @ [T,I,O] -> [T,B,O], one batched GEMM instead of T launches.
+        output = torch.bmm(
+            tokens.transpose(0, 1),
+            self.weight.transpose(1, 2),
+        ).transpose(0, 1)
+        return output + self.bias.unsqueeze(0)
 
 
 def _activation_layer(name: str) -> type[nn.Module]:
@@ -68,6 +81,79 @@ class PerTokenFFN(nn.Module):
             for token_index, network in enumerate(self.networks)
         ]
         return torch.cat(outputs, dim=1)
+
+
+class StackedPerTokenFFN(nn.Module):
+    """Independent token FFNs executed as two strided batched GEMMs."""
+
+    def __init__(
+        self,
+        num_tokens: int,
+        token_dim: int,
+        hidden_dim: int,
+        dropout: float = 0.0,
+        output_relu: bool = False,
+        activation: str = "gelu",
+    ) -> None:
+        super().__init__()
+        if num_tokens <= 0 or token_dim <= 0 or hidden_dim <= 0:
+            raise ValueError("token and hidden dimensions must be positive")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
+        if activation not in {"gelu", "relu"}:
+            raise ValueError("activation must be 'relu' or 'gelu'")
+        self.num_tokens = num_tokens
+        self.token_dim = token_dim
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
+        self.output_relu = output_relu
+        self.activation = activation
+        self.input_weight = nn.Parameter(
+            torch.empty(num_tokens, hidden_dim, token_dim)
+        )
+        self.input_bias = nn.Parameter(torch.empty(num_tokens, hidden_dim))
+        self.output_weight = nn.Parameter(
+            torch.empty(num_tokens, token_dim, hidden_dim)
+        )
+        self.output_bias = nn.Parameter(torch.empty(num_tokens, token_dim))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for token_index in range(self.num_tokens):
+            nn.init.kaiming_uniform_(
+                self.input_weight[token_index], a=math.sqrt(5)
+            )
+            input_bound = 1.0 / math.sqrt(self.token_dim)
+            nn.init.uniform_(
+                self.input_bias[token_index], -input_bound, input_bound
+            )
+            nn.init.kaiming_uniform_(
+                self.output_weight[token_index], a=math.sqrt(5)
+            )
+            output_bound = 1.0 / math.sqrt(self.hidden_dim)
+            nn.init.uniform_(
+                self.output_bias[token_index], -output_bound, output_bound
+            )
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        expected = (self.num_tokens, self.token_dim)
+        if tokens.ndim != 3 or tuple(tokens.shape[1:]) != expected:
+            raise ValueError(
+                f"expected tokens with shape [batch, {self.num_tokens}, "
+                f"{self.token_dim}], got {tuple(tokens.shape)}"
+            )
+        token_major = tokens.transpose(0, 1)
+        hidden = torch.bmm(
+            token_major, self.input_weight.transpose(1, 2)
+        ) + self.input_bias.unsqueeze(1)
+        hidden = F.gelu(hidden) if self.activation == "gelu" else F.relu(hidden)
+        hidden = F.dropout(hidden, p=self.dropout, training=self.training)
+        output = torch.bmm(
+            hidden, self.output_weight.transpose(1, 2)
+        ) + self.output_bias.unsqueeze(1)
+        if self.output_relu:
+            output = F.relu(output)
+        return output.transpose(0, 1)
 
 
 class SparseMoEPerTokenFFN(nn.Module):

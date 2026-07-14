@@ -2,7 +2,8 @@ runtime:
   device: cuda
   precision: bf16
   compile: false
-  activation_checkpoint: true
+  allow_tf32: true
+  activation_checkpoint: none
   attention_backend: auto
   distributed: none
   nproc_per_node: null
@@ -32,8 +33,17 @@ data:
       columns_pruning: true
       num_workers: 8
       prefetch_batches: 4
+      max_prefetch_bytes: 1073741824
+      scanner_batch_rows: 8192
       pin_memory: true
       shard_unit: row_group
+      length_buckets:
+        - {max_length: 128, batch_size: 2048}
+        - {max_length: 256, batch_size: 1024}
+        - {max_length: 512, batch_size: 512}
+        - {max_length: 1024, batch_size: 256}
+        - {max_length: 2048, batch_size: 128}
+        - {max_length: null, batch_size: 64}
 
   test:
     # Keep test/predict on the same format semantics as train so all commands
@@ -48,9 +58,17 @@ data:
       columns_pruning: true
       num_workers: 8
       prefetch_batches: 4
+      max_prefetch_bytes: 536870912
       pin_memory: true
       shard_unit: row_group
-      batch_size_rows: 4096
+      scanner_batch_rows: 4096
+      length_buckets:
+        - {max_length: 128, batch_size: 2048}
+        - {max_length: 256, batch_size: 1024}
+        - {max_length: 512, batch_size: 512}
+        - {max_length: 1024, batch_size: 256}
+        - {max_length: 2048, batch_size: 128}
+        - {max_length: null, batch_size: 64}
 
   schema_policy:
     require_same_schema: true
@@ -261,13 +279,22 @@ model:
   task_head_dropout: 0.0
   task_head_activation: gelu
   rankmixer_ffn_type: dense
+  # OneTrans only. null infers the maximum unified [S; NS] length when all
+  # behavior sequences declare max_length.
+  max_position_embeddings: null
   sparse_moe_regularization_initial: 1.0e-8
   sparse_moe_regularization_multiplier: 1.2
   sparse_moe_loss_weight: 1.0
   sequence_fusion: intent_ordered
+  # false removes task tokens and feeds the final shared/scenario representation
+  # directly into the per-task MLP towers.
   use_task_tokens: true
+  # false removes all scenario tokens and uses per-scenario MLP towers at output.
   use_scenario_tokens: true
+  # false removes the global token and its parameters, rather than zeroing it.
   use_global_scenario_token: true
+  # false selects RankMixer [feature; domain] interaction as the paper ablation
+  # replacement; it does not disable interaction.
   use_task_feature_interaction: true
   use_scenario_feature_interaction: true
   mdl_feature_interaction: paper
@@ -276,20 +303,42 @@ model:
 
 training:
   batch_size: 2048
+  # replicated is the small-scale correctness baseline; industrial-ID
+  # performance overlays switch this to sharded.
+  embedding_distribution: replicated
+  dense_distribution: ddp
+  embedding_sharding:
+    strategy: auto
+    local_dedup: true
+    table_wise_max_rows: 65536
+  # Safe audit mode. Only switch to false/false or true/false after the
+  # corresponding validation flag is backed by a representative run.
+  ddp:
+    static_graph: false
+    find_unused_parameters: true
+    gradient_as_bucket_view: true
+    bucket_cap_mb: 25.0
+    audit_steps: 10
+    validated_no_unused_parameters: false
+    validated_static_graph: false
   lr_dense: 0.005
   lr_schedule: cosine
   lr_warmup_steps: 1000
   lr_decay_steps: 100000
   lr_min_ratio: 0.1
   dense_optimizer: rmsprop
+  fused_dense_optimizer: true
   rmsprop_alpha: 0.99999
   rmsprop_momentum: 0.0
   sparse_optimizer: adagrad
   adagrad_initial_accumulator_value: 0.1
   adagrad_eps: 1.0e-10
-  # Keep full embedding replicas on every rank and exchange only touched rows.
+  # Sparse gradients are required by both the replicated correctness baseline
+  # and the built-in owner-sharded Adagrad path.
   embedding_sparse_gradients: true
-  # Synchronous replicated Adagrad; this mode never shards embedding tables.
+  # Legacy optimizer-routing selector. embedding_distribution determines
+  # replicated versus built-in owner sharding; the external adapter is outside
+  # the single-node performance scope.
   sparse_update_mode: ddp_synced_adagrad
   sparse_parameter_server_adapter: null
   dense_clip_norm: 90.0

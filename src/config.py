@@ -19,7 +19,7 @@ EncodingType = Literal["vocab", "hash", "identity", "shared_vocab"]
 EmbeddingScope = Literal["feature", "scenario", "task", "shared"]
 ModelName = Literal["rankmixer", "mdl_rankmixer", "onetrans", "mdl_onetrans", "longer"]
 SequenceFieldKind = Literal["categorical", "dense"]
-SequenceEncoderType = Literal["attention_pool", "mean_pool", "longer"]
+SequenceEncoderType = Literal["raw", "attention_pool", "mean_pool", "longer"]
 LRScheduleType = Literal["constant", "cosine"]
 ActivationType = Literal["gelu", "relu"]
 SequenceFusionType = Literal["timestamp_aware", "intent_ordered"]
@@ -28,6 +28,30 @@ SequenceOrderType = Literal["oldest_to_newest", "newest_to_oldest"]
 MDLFeatureInteractionType = Literal["paper", "rankmixer_full"]
 DTSITrainingOutputType = Literal["dense_router", "mean"]
 LossReductionType = Literal["sum", "mean_per_task"]
+IdentityOutOfRangeType = Literal["error", "padding"]
+
+
+def _validate_identity_bounds(
+    *,
+    num_buckets: int | None,
+    max_id: int | None,
+    padding_id: int,
+    out_of_range: str,
+    path: str,
+) -> None:
+    if num_buckets is not None and max_id is not None:
+        raise ValueError(f"{path} must set num_buckets or legacy max_id, not both")
+    if num_buckets is None and max_id is None:
+        raise ValueError(f"{path}.num_buckets is required for identity encoding")
+    resolved_buckets = num_buckets if num_buckets is not None else int(max_id) + 1
+    if resolved_buckets <= 0:
+        raise ValueError(f"{path}.num_buckets must be positive")
+    if padding_id != 0:
+        raise ValueError(f"{path}.padding_id must be 0")
+    if not 0 <= padding_id < resolved_buckets:
+        raise ValueError(f"{path}.padding_id must be inside [0, num_buckets)")
+    if out_of_range not in {"error", "padding"}:
+        raise ValueError(f"{path}.out_of_range must be error or padding")
 
 
 # Raw YAML schema. These dataclasses mirror configs/default.yaml field names.
@@ -42,7 +66,11 @@ class CategoricalEncodingConfig:
     artifact: str | None = None
     num_buckets: int | None = None
     salt: str | None = None
+    # ``max_id`` is accepted only as a compatibility alias for
+    # ``num_buckets=max_id+1``. New identity configurations use num_buckets.
     max_id: int | None = None
+    padding_id: int = 0
+    out_of_range: IdentityOutOfRangeType = "error"
     share_with: str | None = None
     share_embedding: bool = False
 
@@ -61,6 +89,8 @@ class CategoricalEncodingConfig:
             "num_buckets",
             "salt",
             "max_id",
+            "padding_id",
+            "out_of_range",
             "share_with",
             "share_embedding",
         }
@@ -93,8 +123,17 @@ class CategoricalEncodingConfig:
             if self.num_buckets is None or self.num_buckets <= 0:
                 raise ValueError(f"{path}.num_buckets must be positive for hash encoding")
         if self.encoding == "identity":
-            if self.max_id is None or self.max_id <= 0:
-                raise ValueError(f"{path}.max_id must be positive for identity encoding")
+            _validate_identity_bounds(
+                num_buckets=self.num_buckets,
+                max_id=self.max_id,
+                padding_id=self.padding_id,
+                out_of_range=self.out_of_range,
+                path=path,
+            )
+            if self.share_embedding and not self.share_with:
+                raise ValueError(
+                    f"{path}.share_with is required when identity share_embedding=true"
+                )
         if self.encoding == "shared_vocab" and not self.share_with:
             raise ValueError(f"{path}.share_with is required for shared_vocab encoding")
 
@@ -165,6 +204,26 @@ class ParquetAdapterConfig:
 
 
 @dataclass(frozen=True)
+class LengthBucketConfig:
+    """One upper-bounded sequence-length bucket and its per-rank batch size."""
+
+    max_length: int | None
+    batch_size: int
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any]) -> "LengthBucketConfig":
+        if not isinstance(payload, dict):
+            raise ValueError("reader.length_buckets entries must be objects")
+        return cls(**payload)
+
+    def validate(self) -> None:
+        if self.max_length is not None and self.max_length <= 0:
+            raise ValueError("reader.length_buckets.max_length must be positive or null")
+        if self.batch_size <= 0:
+            raise ValueError("reader.length_buckets.batch_size must be positive")
+
+
+@dataclass(frozen=True)
 class ReaderConfig:
     """Parquet reader options for one data split.
 
@@ -181,21 +240,37 @@ class ReaderConfig:
     num_workers: int = 0
     # Dataset scanner readahead. Larger values can help throughput but use more memory.
     prefetch_batches: int = 2
+    # Hard queue budget per rank. Count and bytes are both enforced.
+    max_prefetch_bytes: int = 512 * 1024 * 1024
     # DataLoader pinning is only useful when batches are later moved to CUDA.
     pin_memory: bool = False
     # DDP can shard by files, row groups, or record batches depending on data layout.
     shard_unit: Literal["file", "row_group", "record_batch"] = "row_group"
-    # Optional scanner batch size in rows. Training batch size lives in TrainingConfig.
-    batch_size_rows: int | None = None
+    # Optional Arrow scanner batch size. Training batch size is independent.
+    scanner_batch_rows: int | None = None
+    # Optional vectorized length buckets. Null max_length is the final catch-all.
+    length_buckets: tuple[LengthBucketConfig, ...] = ()
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> "ReaderConfig":
         if payload is None:
             return cls()
+        values = dict(payload)
         # Keep removed YAML keys explicit so old configs fail with a useful message.
-        if "batch_size_candidates" in payload:
+        if "batch_size_candidates" in values:
             raise ValueError("reader.batch_size_candidates was removed; use training.batch_size")
-        return cls(**payload)
+        if "batch_size_rows" in values:
+            if "scanner_batch_rows" in values:
+                raise ValueError(
+                    "reader must set scanner_batch_rows, not both scanner_batch_rows "
+                    "and legacy batch_size_rows"
+                )
+            values["scanner_batch_rows"] = values.pop("batch_size_rows")
+        values["length_buckets"] = tuple(
+            LengthBucketConfig.from_mapping(item)
+            for item in values.get("length_buckets", ())
+        )
+        return cls(**values)
 
     def validate(self) -> None:
         if self.engine != "pyarrow_dataset":
@@ -204,10 +279,32 @@ class ReaderConfig:
             raise ValueError("reader.num_workers must be non-negative")
         if self.prefetch_batches < 0:
             raise ValueError("reader.prefetch_batches must be non-negative")
+        if self.max_prefetch_bytes <= 0:
+            raise ValueError("reader.max_prefetch_bytes must be positive")
         if self.shard_unit not in {"file", "row_group", "record_batch"}:
             raise ValueError("reader.shard_unit must be file, row_group, or record_batch")
-        if self.batch_size_rows is not None and self.batch_size_rows <= 0:
-            raise ValueError("reader.batch_size_rows must be positive")
+        if self.scanner_batch_rows is not None and self.scanner_batch_rows <= 0:
+            raise ValueError("reader.scanner_batch_rows must be positive")
+        previous = 0
+        saw_catch_all = False
+        for index, bucket in enumerate(self.length_buckets):
+            bucket.validate()
+            if saw_catch_all:
+                raise ValueError(
+                    "reader.length_buckets catch-all entry must be last"
+                )
+            if bucket.max_length is None:
+                saw_catch_all = True
+            elif bucket.max_length <= previous:
+                raise ValueError(
+                    "reader.length_buckets max_length values must be strictly increasing"
+                )
+            else:
+                previous = bucket.max_length
+            if index == len(self.length_buckets) - 1 and not saw_catch_all:
+                raise ValueError(
+                    "reader.length_buckets requires a final max_length: null catch-all"
+                )
 
 
 @dataclass(frozen=True)
@@ -511,7 +608,8 @@ class SequenceConfig:
     # Physical order of valid events in every configured list column. Model code
     # canonicalizes both choices to oldest_to_newest before causal attention.
     sequence_order: SequenceOrderType = "oldest_to_newest"
-    # attention_pool and mean_pool are simple baselines; longer is the paper-aligned path.
+    # raw leaves event-level modeling to OneTrans. attention_pool and mean_pool
+    # are summary baselines; longer is the paper-aligned standalone encoder path.
     encoder: SequenceEncoderType = "attention_pool"
     # Scalar features used as target context for LONGER query construction.
     target_inputs: list[str] = field(default_factory=list)
@@ -590,8 +688,11 @@ class SequenceConfig:
             raise ValueError(
                 f"sequence {self.name!r} sequence_order must be oldest_to_newest or newest_to_oldest"
             )
-        if self.encoder not in {"attention_pool", "mean_pool", "longer"}:
-            raise ValueError(f"sequence {self.name!r} encoder must be attention_pool, mean_pool, or longer")
+        if self.encoder not in {"raw", "attention_pool", "mean_pool", "longer"}:
+            raise ValueError(
+                f"sequence {self.name!r} encoder must be raw, attention_pool, "
+                "mean_pool, or longer"
+            )
         if self.rankmixer_summary_tokens <= 0:
             raise ValueError(f"sequence {self.name!r} rankmixer_summary_tokens must be positive")
         if self.encoder != "longer" and self.rankmixer_summary_tokens != 1:
@@ -1011,6 +1112,8 @@ class VocabFeatureStrategy:
     salt: str | None = None
     # Maximum accepted id. Only used when encoding == "identity".
     max_id: int | None = None
+    padding_id: int = 0
+    out_of_range: IdentityOutOfRangeType = "error"
     # shared_vocab reuses another feature's fitted vocab, optionally its embedding.
     share_with: str | None = None
     share_embedding: bool = False
@@ -1035,8 +1138,18 @@ class VocabFeatureStrategy:
             if self.num_buckets is None or self.num_buckets <= 0:
                 raise ValueError(f"hash feature {feature_name!r} requires positive num_buckets")
         if self.encoding == "identity":
-            if self.max_id is None or self.max_id <= 0:
-                raise ValueError(f"identity feature {feature_name!r} requires positive max_id")
+            _validate_identity_bounds(
+                num_buckets=self.num_buckets,
+                max_id=self.max_id,
+                padding_id=self.padding_id,
+                out_of_range=self.out_of_range,
+                path=f"vocab_strategy.features.{feature_name}",
+            )
+            if self.share_embedding and not self.share_with:
+                raise ValueError(
+                    f"identity feature {feature_name!r} requires share_with when "
+                    "share_embedding=true"
+                )
         if self.encoding == "shared_vocab" and not self.share_with:
             raise ValueError(f"shared_vocab feature {feature_name!r} requires share_with")
 
@@ -1082,8 +1195,11 @@ class RuntimeConfig:
     precision: Literal["fp32", "bf16", "fp16"] = "fp32"
     # torch.compile toggle. Keep false for easier debugging and wider compatibility.
     compile: bool = False
-    # Activation checkpointing trades compute for memory during training.
-    activation_checkpoint: bool = False
+    # TensorFloat-32 accelerates FP32 matrix multiplications on supported GPUs.
+    allow_tf32: bool = True
+    # none avoids recompute; selective checkpoints large blocks; full also
+    # checkpoints model-specific preprocessing/merge stages where supported.
+    activation_checkpoint: Literal["none", "selective", "full"] = "none"
     # Attention backend selection is resolved by model modules at runtime.
     attention_backend: Literal["auto", "sdpa", "flash"] = "auto"
     # DDP launch options. none means single process.
@@ -1096,13 +1212,30 @@ class RuntimeConfig:
     def from_mapping(cls, payload: dict[str, Any] | None) -> "RuntimeConfig":
         if payload is None:
             return cls()
-        return cls(**payload)
+        values = dict(payload)
+        legacy_checkpoint = values.get("activation_checkpoint")
+        if isinstance(legacy_checkpoint, bool):
+            values["activation_checkpoint"] = (
+                "full" if legacy_checkpoint else "none"
+            )
+        return cls(**values)
 
     def validate(self) -> None:
         if self.precision not in {"fp32", "bf16", "fp16"}:
             raise ValueError("runtime.precision must be fp32, bf16, or fp16")
         if self.attention_backend not in {"auto", "sdpa", "flash"}:
             raise ValueError("runtime.attention_backend must be auto, sdpa, or flash")
+        if self.activation_checkpoint not in {"none", "selective", "full"}:
+            raise ValueError(
+                "runtime.activation_checkpoint must be none, selective, or full"
+            )
+        if self.attention_backend == "flash":
+            if not self.device.startswith("cuda"):
+                raise ValueError("runtime.attention_backend=flash requires a CUDA device")
+            if self.precision not in {"bf16", "fp16"}:
+                raise ValueError(
+                    "runtime.attention_backend=flash requires BF16 or FP16 precision"
+                )
         if self.distributed not in {"none", "ddp"}:
             raise ValueError("runtime.distributed must be none or ddp")
         if self.nproc_per_node is not None and self.nproc_per_node <= 0:
@@ -1132,10 +1265,15 @@ class ModelConfig:
     task_head_hidden_dim: int | None = None
     task_head_dropout: float = 0.0
     task_head_activation: ActivationType = "gelu"
-    # MDL ablation switches. They should not change config shape or token counts.
+    # MDL token ablations. False removes the corresponding token projectors and
+    # block modules, then uses the repository's explicit task/scenario towers.
     use_task_tokens: bool = True
     use_scenario_tokens: bool = True
+    # False removes the global token itself (including projector/FFN parameters).
     use_global_scenario_token: bool = True
+    # MDL interaction ablations. False replaces DomainAwareAttention with
+    # RankMixer mixing over concatenated [feature; domain] tokens; it never
+    # means a zero update.
     use_task_feature_interaction: bool = True
     use_scenario_feature_interaction: bool = True
     # MDL Eq. (6) has no second residual/LayerNorm. rankmixer_full is retained
@@ -1149,6 +1287,10 @@ class ModelConfig:
     # OneTrans NS tokenizer mode and optional token count override.
     ns_tokenizer: Literal["auto_split", "groupwise"] = "auto_split"
     num_ns_tokens: int | None = None
+    # Capacity of the learned absolute embedding added to the unified [S; NS]
+    # sequence. None infers the exact configured maximum when every behavior
+    # sequence declares max_length.
+    max_position_embeddings: int | None = None
     # Separator and final S-token controls for OneTrans sequence handling.
     use_sep_tokens: bool = True
     final_s_tokens: int | None = None
@@ -1208,6 +1350,8 @@ class ModelConfig:
             raise ValueError("model.ns_tokenizer must be auto_split or groupwise")
         if self.num_ns_tokens is not None and self.num_ns_tokens <= 0:
             raise ValueError("model.num_ns_tokens must be positive")
+        if self.max_position_embeddings is not None and self.max_position_embeddings <= 0:
+            raise ValueError("model.max_position_embeddings must be positive")
         if self.final_s_tokens is not None and self.final_s_tokens < 0:
             raise ValueError("model.final_s_tokens must be non-negative")
         if self.sequence_fusion not in {"timestamp_aware", "intent_ordered"}:
@@ -1252,6 +1396,76 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class EmbeddingShardingConfig:
+    """Model-independent ownership policy for industrial ID embeddings."""
+
+    strategy: Literal["auto", "row_wise", "table_wise"] = "auto"
+    local_dedup: bool = True
+    table_wise_max_rows: int = 65536
+
+    @classmethod
+    def from_mapping(
+        cls, payload: dict[str, Any] | None
+    ) -> "EmbeddingShardingConfig":
+        if payload is None:
+            return cls()
+        return cls(**payload)
+
+    def validate(self) -> None:
+        if self.strategy not in {"auto", "row_wise", "table_wise"}:
+            raise ValueError(
+                "training.embedding_sharding.strategy must be auto, row_wise, or table_wise"
+            )
+        if self.table_wise_max_rows <= 0:
+            raise ValueError(
+                "training.embedding_sharding.table_wise_max_rows must be positive"
+            )
+
+
+@dataclass(frozen=True)
+class DDPConfig:
+    """Dense DDP reducer settings with explicit validation evidence gates."""
+
+    static_graph: bool = False
+    find_unused_parameters: bool = True
+    gradient_as_bucket_view: bool = True
+    bucket_cap_mb: float = 25.0
+    audit_steps: int = 10
+    validated_no_unused_parameters: bool = False
+    validated_static_graph: bool = False
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any] | None) -> "DDPConfig":
+        if payload is None:
+            return cls()
+        return cls(**payload)
+
+    def validate(self) -> None:
+        if self.bucket_cap_mb <= 0.0:
+            raise ValueError("training.ddp.bucket_cap_mb must be positive")
+        if self.audit_steps < 0:
+            raise ValueError("training.ddp.audit_steps must be non-negative")
+        if self.static_graph and self.find_unused_parameters:
+            raise ValueError(
+                "training.ddp.static_graph=true requires find_unused_parameters=false"
+            )
+        if self.static_graph and not self.validated_static_graph:
+            raise ValueError(
+                "training.ddp.static_graph=true requires validated_static_graph=true "
+                "after a representative audit"
+            )
+        if (
+            not self.static_graph
+            and not self.find_unused_parameters
+            and not self.validated_no_unused_parameters
+        ):
+            raise ValueError(
+                "training.ddp.find_unused_parameters=false requires "
+                "validated_no_unused_parameters=true when static_graph is false"
+            )
+
+
+@dataclass(frozen=True)
 class TrainingConfig:
     """Optimizer, batch, schedule, and checkpoint settings."""
 
@@ -1267,6 +1481,7 @@ class TrainingConfig:
     lr_min_ratio: float = 0.0
     # Optimizer names are constrained for paper alignment and implementation scope.
     dense_optimizer: Literal["rmsprop"] = "rmsprop"
+    fused_dense_optimizer: bool = True
     rmsprop_alpha: float = 0.99999
     rmsprop_momentum: float = 0.0
     sparse_optimizer: Literal["adagrad"] = "adagrad"
@@ -1274,11 +1489,19 @@ class TrainingConfig:
     adagrad_weight_decay: float = 0.0
     adagrad_initial_accumulator_value: float = 0.1
     adagrad_eps: float = 1.0e-10
-    # Sparse embeddings keep a complete table replica on every rank. Under DDP,
-    # only touched rows are exchanged before the local Adagrad step.
+    # Replicated is the small-table correctness baseline. Sharded stores only
+    # the locally owned rows and optimizer state on each rank.
+    embedding_distribution: Literal["replicated", "sharded"] = "replicated"
+    dense_distribution: Literal["ddp"] = "ddp"
+    embedding_sharding: EmbeddingShardingConfig = field(
+        default_factory=EmbeddingShardingConfig
+    )
+    ddp: DDPConfig = field(default_factory=DDPConfig)
+    # Both built-in embedding distributions use sparse gradients. Replicated
+    # exchanges touched rows; sharded routes IDs/gradients only to row owners.
     embedding_sparse_gradients: bool = True
-    # ddp_synced_adagrad is synchronous replicated training without sharding;
-    # external_parameter_server is a handoff hook for secure production systems.
+    # Compatibility selector for the replicated path or an out-of-scope
+    # external adapter. embedding_distribution selects built-in owner sharding.
     sparse_update_mode: Literal["ddp_synced_adagrad", "external_parameter_server"] = "ddp_synced_adagrad"
     sparse_parameter_server_adapter: str | None = None
     # Optional gradient clipping for dense and sparse parameter groups.
@@ -1294,7 +1517,12 @@ class TrainingConfig:
     def from_mapping(cls, payload: dict[str, Any] | None) -> "TrainingConfig":
         if payload is None:
             return cls()
-        return cls(**payload)
+        values = dict(payload)
+        values["embedding_sharding"] = EmbeddingShardingConfig.from_mapping(
+            values.get("embedding_sharding")
+        )
+        values["ddp"] = DDPConfig.from_mapping(values.get("ddp"))
+        return cls(**values)
 
     def validate(self) -> None:
         if self.batch_size <= 0:
@@ -1330,6 +1558,26 @@ class TrainingConfig:
             raise ValueError("training.adagrad_initial_accumulator_value must be non-negative")
         if self.adagrad_eps <= 0.0:
             raise ValueError("training.adagrad_eps must be positive")
+        if self.embedding_distribution not in {"replicated", "sharded"}:
+            raise ValueError(
+                "training.embedding_distribution must be replicated or sharded"
+            )
+        if self.dense_distribution != "ddp":
+            raise ValueError("training.dense_distribution must be ddp")
+        self.embedding_sharding.validate()
+        self.ddp.validate()
+        if self.embedding_distribution == "sharded" and not self.embedding_sparse_gradients:
+            raise ValueError(
+                "training.embedding_sparse_gradients must be true for sharded embeddings"
+            )
+        if (
+            self.embedding_distribution == "sharded"
+            and self.sparse_update_mode != "ddp_synced_adagrad"
+        ):
+            raise ValueError(
+                "training.embedding_distribution=sharded uses the built-in owner-based "
+                "implementation and is incompatible with external_parameter_server"
+            )
         if self.sparse_update_mode not in {"ddp_synced_adagrad", "external_parameter_server"}:
             raise ValueError(
                 "training.sparse_update_mode must be ddp_synced_adagrad or external_parameter_server"
@@ -1490,7 +1738,17 @@ class ResolvedHashEncoding:
 @dataclass(frozen=True)
 class ResolvedIdentityEncoding:
     encoding: Literal["identity"] = "identity"
-    max_id: int = 0
+    num_buckets: int = 0
+    padding_id: int = 0
+    out_of_range: IdentityOutOfRangeType = "error"
+    share_with: str | None = None
+    share_embedding: bool = False
+
+    @property
+    def max_id(self) -> int:
+        """Compatibility view; new code must use the exclusive num_buckets."""
+
+        return self.num_buckets - 1
 
 
 @dataclass(frozen=True)
@@ -1518,6 +1776,39 @@ class ResolvedCategoricalInput:
     sequence_name: str | None
     field_name: str | None
     encoding: ResolvedEncoding
+
+
+def resolve_categorical_base_input(
+    categorical_input_by_name: dict[str, ResolvedCategoricalInput],
+    name: str,
+) -> ResolvedCategoricalInput:
+    """Resolve the non-alias ID namespace behind a shared categorical input.
+
+    ``shared_vocab`` historically meant that two inputs shared a fitted string
+    vocabulary. Industrial direct-ID configs also need the same aliasing
+    contract: multiple physical columns can already contain integers from one
+    bounded ID namespace while retaining independent embedding tables. The
+    returned input owns the effective bounds/lookup strategy; callers must
+    continue using the original input's physical source column.
+    """
+
+    current = name
+    seen: set[str] = set()
+    while True:
+        if current in seen:
+            raise ValueError(f"shared_vocab cycle detected at {name!r}")
+        seen.add(current)
+        try:
+            categorical_input = categorical_input_by_name[current]
+        except KeyError as error:
+            raise ValueError(
+                f"shared_vocab feature {name!r} references unknown categorical input "
+                f"{current!r}"
+            ) from error
+        encoding = categorical_input.encoding
+        if not isinstance(encoding, ResolvedSharedVocabEncoding):
+            return categorical_input
+        current = encoding.share_with
 
 
 @dataclass(frozen=True)
@@ -1603,9 +1894,25 @@ def _resolved_encoding_from_config(
             salt=encoding.salt,
         )
     if encoding.encoding == "identity":
-        if encoding.max_id is None or encoding.max_id <= 0:
-            raise ValueError(f"{path}.max_id must be positive for identity encoding")
-        return ResolvedIdentityEncoding(max_id=encoding.max_id)
+        _validate_identity_bounds(
+            num_buckets=encoding.num_buckets,
+            max_id=encoding.max_id,
+            padding_id=encoding.padding_id,
+            out_of_range=encoding.out_of_range,
+            path=path,
+        )
+        num_buckets = (
+            encoding.num_buckets
+            if encoding.num_buckets is not None
+            else int(encoding.max_id) + 1
+        )
+        return ResolvedIdentityEncoding(
+            num_buckets=num_buckets,
+            padding_id=encoding.padding_id,
+            out_of_range=encoding.out_of_range,
+            share_with=encoding.share_with,
+            share_embedding=encoding.share_embedding,
+        )
     if encoding.encoding == "shared_vocab":
         if not encoding.share_with:
             raise ValueError(f"{path}.share_with is required for shared_vocab encoding")
@@ -1719,9 +2026,39 @@ def resolve_encoding_strategies(config: AppConfig) -> tuple[ResolvedCategoricalI
     for item in inputs:
         if item.encoding.encoding != "shared_vocab":
             continue
-        if base_encoding(item.name, set()) != "vocab":
+        base = base_encoding(item.name, set())
+        if base not in {"vocab", "identity"}:
             raise ValueError(
-                f"shared_vocab feature {item.name!r} must ultimately share with a vocab-encoded feature"
+                f"shared_vocab feature {item.name!r} must ultimately share with a "
+                "vocab- or identity-encoded feature"
+            )
+
+    for item in inputs:
+        encoding = item.encoding
+        if not isinstance(encoding, ResolvedIdentityEncoding):
+            continue
+        if not encoding.share_embedding:
+            continue
+        if encoding.share_with not in by_name:
+            raise ValueError(
+                f"identity feature {item.name!r} references unknown embedding base "
+                f"{encoding.share_with!r}"
+            )
+        if encoding.share_with == item.name:
+            raise ValueError(
+                f"identity feature {item.name!r} cannot share embedding with itself"
+            )
+        base_input = resolve_categorical_base_input(by_name, encoding.share_with)
+        if not isinstance(base_input.encoding, ResolvedIdentityEncoding):
+            raise ValueError(
+                f"identity feature {item.name!r} can share an embedding only with "
+                "an identity-encoded feature"
+            )
+        if base_input.encoding.num_buckets != encoding.num_buckets:
+            raise ValueError(
+                f"identity feature {item.name!r} num_buckets={encoding.num_buckets} "
+                f"does not match embedding base {encoding.share_with!r} "
+                f"num_buckets={base_input.encoding.num_buckets}"
             )
     return tuple(inputs)
 
@@ -1932,8 +2269,13 @@ def resolve_categorical_embedding_dims(
             raise ValueError(f"shared_vocab cycle detected at {name!r}")
         resolving.add(name)
         encoding = categorical_input_by_name[name].encoding
-        if encoding.encoding == "shared_vocab" and encoding.share_embedding:
-            dim = resolve(encoding.share_with)
+        if getattr(encoding, "share_embedding", False):
+            share_with = getattr(encoding, "share_with", None)
+            if not share_with:
+                raise ValueError(
+                    f"categorical input {name!r} shares an embedding without share_with"
+                )
+            dim = resolve(share_with)
         elif name in feature_by_name:
             feature = feature_by_name[name]
             if feature.kind != "categorical":
@@ -2128,11 +2470,115 @@ def _validate_mdl_extra_embeddings(config: AppConfig, resolved: ResolvedConfig) 
                         f"embedding_scope={expected_scope!r}, not {feature.embedding_scope!r}"
                     )
                 encoding = resolved.categorical_input_by_name[input_name].encoding
-                if encoding.encoding == "shared_vocab" and encoding.share_embedding:
+                if getattr(encoding, "share_embedding", False):
                     raise ValueError(
                         f"important input {input_name!r} must set share_embedding=false so its "
                         "embedding table is independent from the feature-token embedding"
                     )
+
+
+def _validate_mdl_domain_priors(config: AppConfig, resolved: ResolvedConfig) -> None:
+    """Keep multi-domain MDL priors specific to the token they initialize.
+
+    The public smoke profile has one scenario and one task, where a generic
+    history remains a useful compact fixture.  Once a family contains multiple
+    tokens, however, accepting only the same generic prior for every token
+    weakens the paper's scenario/task tokenization into token identity plus a
+    per-token FFN.  Require an explicitly scoped, token-unique prior in that
+    case while still allowing additional common inputs.
+    """
+
+    if config.model.name != "mdl_rankmixer":
+        # MDL-OneTrans is an explicitly experimental composition. Its sequence
+        # context is carried by OneTrans S/NS interaction instead of a second
+        # set of MDL sequence priors.
+        return
+
+    input_scopes = {
+        feature.name: feature.embedding_scope for feature in config.features
+    }
+    input_scopes.update(
+        {
+            sequence.name: sequence.embedding_scope
+            for sequence in config.sequences
+        }
+    )
+
+    def validate_family(
+        section: str,
+        tokens: tuple[ResolvedDomainToken, ...],
+        names: list[str],
+        expected_scope: Literal["scenario", "task"],
+        enabled: bool,
+    ) -> None:
+        if not enabled or len(names) <= 1:
+            return
+
+        token_by_name = {token.name: token for token in tokens}
+        scoped_priors: dict[str, tuple[str, ...]] = {}
+        for name in names:
+            token = token_by_name[name]
+            if not token.prior_input_refs:
+                raise ValueError(
+                    f"tokenization.{section}.{name}.prior_inputs must declare a "
+                    f"{expected_scope}-related prior when multiple {expected_scope}s are configured"
+                )
+
+            wrong_domain_priors = [
+                input_name
+                for input_name in token.prior_input_refs
+                if input_scopes[input_name] in {"scenario", "task"}
+                and input_scopes[input_name] != expected_scope
+            ]
+            if wrong_domain_priors:
+                raise ValueError(
+                    f"tokenization.{section}.{name}.prior_inputs contains inputs scoped for "
+                    f"the other domain family: " + ", ".join(wrong_domain_priors)
+                )
+
+            scoped = tuple(
+                input_name
+                for input_name in token.prior_input_refs
+                if input_scopes[input_name] == expected_scope
+            )
+            if not scoped:
+                raise ValueError(
+                    f"tokenization.{section}.{name}.prior_inputs must include at least one "
+                    f"input with embedding_scope={expected_scope!r}; a generic shared history "
+                    "alone is not a paper-aligned domain prior"
+                )
+            scoped_priors[name] = scoped
+
+        use_counts: dict[str, int] = {}
+        for priors in scoped_priors.values():
+            for input_name in set(priors):
+                use_counts[input_name] = use_counts.get(input_name, 0) + 1
+        tokens_without_unique_prior = [
+            name
+            for name, priors in scoped_priors.items()
+            if not any(use_counts[input_name] == 1 for input_name in priors)
+        ]
+        if tokens_without_unique_prior:
+            raise ValueError(
+                f"tokenization.{section} must give every {expected_scope} token at least one "
+                f"{expected_scope}-scoped prior_input not reused by another token; shared-only "
+                "tokens: " + ", ".join(tokens_without_unique_prior)
+            )
+
+    validate_family(
+        "scenario_tokens",
+        resolved.tokenization.scenario_token_specs,
+        config.scenarios.names,
+        "scenario",
+        config.model.use_scenario_tokens,
+    )
+    validate_family(
+        "task_tokens",
+        resolved.tokenization.task_token_specs,
+        config.task_names,
+        "task",
+        config.model.use_task_tokens,
+    )
 
 
 def validate_vocab_strategy_references(config: AppConfig) -> None:
@@ -2143,6 +2589,63 @@ def validate_vocab_strategy_references(config: AppConfig) -> None:
         config,
         {item.name: item for item in categorical_inputs},
     )
+
+
+def resolve_onetrans_max_position_embeddings(
+    config: AppConfig,
+    resolved: ResolvedConfig | None = None,
+) -> int:
+    """Resolve capacity for OneTrans's unified learned position table."""
+
+    resolved = config.resolved if resolved is None else resolved
+    sequence_by_name = {sequence.name: sequence for sequence in config.sequences}
+    inferred_s_tokens = 0
+    has_dynamic_length = False
+    for group in resolved.tokenization.sequence_token_groups:
+        group_lengths: list[int] = []
+        for input_name in group.input_refs:
+            sequence = sequence_by_name.get(input_name)
+            if sequence is None:
+                continue
+            if sequence.max_length is None:
+                has_dynamic_length = True
+                continue
+            group_lengths.append(sequence.max_length)
+        if group_lengths:
+            inferred_s_tokens += max(group_lengths)
+
+    if (
+        config.model.sequence_fusion == "intent_ordered"
+        and config.model.use_sep_tokens
+    ):
+        inferred_s_tokens += max(
+            len(resolved.tokenization.sequence_token_groups) - 1,
+            0,
+        )
+
+    if config.model.ns_tokenizer == "auto_split":
+        ns_tokens = config.model.num_ns_tokens or max(
+            len(resolved.scalar_feature_names),
+            1,
+        )
+    else:
+        ns_tokens = len(resolved.tokenization.scalar_token_groups)
+    inferred_total = None if has_dynamic_length else inferred_s_tokens + ns_tokens
+
+    configured = config.model.max_position_embeddings
+    if configured is None:
+        if inferred_total is None:
+            raise ValueError(
+                "OneTrans requires model.max_position_embeddings when any S-token "
+                "sequence omits max_length"
+            )
+        return inferred_total
+    if inferred_total is not None and configured < inferred_total:
+        raise ValueError(
+            "model.max_position_embeddings is smaller than the configured OneTrans "
+            f"[S; NS] token maximum: {configured} < {inferred_total}"
+        )
+    return configured
 
 
 def validate_app_config(config: AppConfig) -> None:
@@ -2181,23 +2684,7 @@ def validate_app_config(config: AppConfig) -> None:
 
     resolved = resolve_app_config(config)
     _validate_mdl_extra_embeddings(config, resolved)
-    if config.model.name in {"mdl_rankmixer", "mdl_onetrans"}:
-        unsupported_ablations = [
-            name
-            for name, enabled in (
-                ("use_task_tokens", config.model.use_task_tokens),
-                ("use_scenario_tokens", config.model.use_scenario_tokens),
-                ("use_task_feature_interaction", config.model.use_task_feature_interaction),
-                ("use_scenario_feature_interaction", config.model.use_scenario_feature_interaction),
-            )
-            if not enabled
-        ]
-        if unsupported_ablations:
-            raise ValueError(
-                "the MDL paper ablations require task/scenario towers or RankMixer replacement "
-                "interactions; zeroing token/update paths is not equivalent. Unsupported switches: "
-                + ", ".join(f"model.{name}=false" for name in unsupported_ablations)
-            )
+    _validate_mdl_domain_priors(config, resolved)
     sequence_by_name = {sequence.name: sequence for sequence in config.sequences}
     if config.model.name in {"onetrans", "mdl_onetrans"} and config.model.sequence_fusion == "timestamp_aware":
         for group in resolved.tokenization.sequence_token_groups:
@@ -2208,6 +2695,52 @@ def validate_app_config(config: AppConfig) -> None:
                         f"timestamp-aware OneTrans requires sequences.{sequence.name}.timestamp_field; "
                         "use model.sequence_fusion=intent_ordered when timestamps are unavailable"
                     )
+    if config.model.name in {"onetrans", "mdl_onetrans"}:
+        encoded_sequences = [
+            sequence.name for sequence in config.sequences if sequence.encoder != "raw"
+        ]
+        if encoded_sequences:
+            raise ValueError(
+                f"model.name={config.model.name!r} requires encoder=raw for every behavior "
+                "sequence because OneTrans performs event-level sequence modeling itself; "
+                "pre-encoding would recreate an encode-then-interaction path: "
+                + ", ".join(encoded_sequences)
+            )
+    else:
+        raw_sequences = [
+            sequence.name for sequence in config.sequences if sequence.encoder == "raw"
+        ]
+        if raw_sequences:
+            raise ValueError(
+                "encoder=raw delegates sequence modeling to OneTrans and is only valid for "
+                "model.name=onetrans or mdl_onetrans: "
+                + ", ".join(raw_sequences)
+            )
+    if config.model.name == "mdl_onetrans":
+        s_sequence_names = {
+            input_name
+            for group in resolved.tokenization.sequence_token_groups
+            for input_name in group.input_refs
+            if input_name in sequence_by_name
+        }
+        duplicated_domain_inputs: list[str] = []
+        for section, tokens in (
+            ("scenario_tokens", resolved.tokenization.scenario_token_specs),
+            ("task_tokens", resolved.tokenization.task_token_specs),
+        ):
+            for token in tokens:
+                duplicated = sorted(set(token.input_refs) & s_sequence_names)
+                if duplicated:
+                    duplicated_domain_inputs.append(
+                        f"{section}.{token.name}=" + ",".join(duplicated)
+                    )
+        if duplicated_domain_inputs:
+            raise ValueError(
+                "model.name='mdl_onetrans' must model each behavior sequence exactly once as "
+                "OneTrans S-tokens; remove those sequences from MDL scenario/task prior_inputs. "
+                "Sequence context reaches MDL through the OneTrans-updated NS tokens: "
+                + "; ".join(duplicated_domain_inputs)
+            )
     for sequence in config.sequences:
         if sequence.encoder == "longer" and sequence.max_length is None:
             raise ValueError(
@@ -2264,6 +2797,7 @@ def validate_app_config(config: AppConfig) -> None:
                 f"model.name={config.model.name!r} with model.ns_tokenizer=groupwise "
                 "requires tokenization.ns_tokens or scalar feature inputs"
             )
+        resolve_onetrans_max_position_embeddings(config, resolved)
 
 
 def _merge_config_mappings(

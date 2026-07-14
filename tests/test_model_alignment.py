@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import Tensor, nn
@@ -13,17 +14,22 @@ from src.dataloader import FeatureBatch
 from src.config import SequenceConfig, SequenceFieldConfig, TokenGroupConfig, load_app_config
 from src.model import (
     MDLRankMixerBlock,
+    MDLRankMixerModel,
     MDLOneTransModel,
     ModelMetadata,
     OneTransBackbone,
     OneTransBackboneState,
     OneTransBlock,
+    OneTransOutput,
     OneTransRequestCache,
     OneTransTokenizer,
     RankMixerBlock,
     RankMixerModel,
     RankMixerSliceTokenizer,
+    ScenarioTower,
+    _mdl_logits,
 )
+from src.modules.attention import DomainFusedModule, RankMixerDomainInteraction
 from src.modules.mlp import SparseMoEPerTokenFFN
 from src.train import _loss_terms_from_batch, _step_sparse_moe_controllers
 
@@ -122,10 +128,9 @@ class RankMixerAlignmentTest(unittest.TestCase):
             token_dim=4,
         )
         with torch.no_grad():
-            for layer in tokenizer.projection.layers:
-                layer.weight.zero_()
-                layer.bias.zero_()
-                layer.weight[:3, :3] = torch.eye(3)
+            tokenizer.projection.weight.zero_()
+            tokenizer.projection.bias.zero_()
+            tokenizer.projection.weight[:, :3, :3] = torch.eye(3).unsqueeze(0)
         values = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]])
 
         tokens = tokenizer({"all_features": values})
@@ -143,7 +148,6 @@ class MDLFeatureInteractionAlignmentTest(unittest.TestCase):
         block = MDLRankMixerBlock(
             config,
             ModelMetadata(feature_token_count=2, scenario_count=1, task_count=1),
-            propagate_scenario_state=False,
         )
         with torch.no_grad():
             for parameter in block.feature_ffn.parameters():
@@ -189,7 +193,6 @@ class MDLFeatureInteractionAlignmentTest(unittest.TestCase):
         block = MDLRankMixerBlock(
             config,
             ModelMetadata(feature_token_count=2, scenario_count=2, task_count=2),
-            propagate_scenario_state=False,
         )
         with torch.no_grad():
             for module in (block.scenario_attention, block.task_attention, block.task_ffn):
@@ -216,6 +219,438 @@ class MDLFeatureInteractionAlignmentTest(unittest.TestCase):
         )
         expected = expected_scenario_average.unsqueeze(1).expand(-1, 2, -1)
         torch.testing.assert_close(actual_tasks, expected)
+
+
+class MDLAblationAlignmentTest(unittest.TestCase):
+    @staticmethod
+    def _sum_head(scale: float) -> nn.Linear:
+        head = nn.Linear(4, 1, bias=False)
+        with torch.no_grad():
+            head.weight.fill_(scale)
+        return head
+
+    def test_terminal_model_blocks_keep_scenario_ffn_parameters(self) -> None:
+        class Encoder(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.output_dims: dict[str, int] = {}
+
+        class OneTransBackboneStub(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.ns_token_count = 3
+                self.encoder_bank = Encoder()
+
+        root = Path(__file__).resolve().parents[1]
+        rankmixer_config = load_app_config(root / "configs" / "default.yaml")
+        with patch("src.model.FeatureEncoderBank", return_value=Encoder()), patch(
+            "src.model._build_rankmixer_feature_projector",
+            return_value=nn.Identity(),
+        ), patch(
+            "src.model.DomainTokenProjector",
+            side_effect=lambda *_args, **_kwargs: nn.Identity(),
+        ):
+            rankmixer_model = MDLRankMixerModel(rankmixer_config, {})
+
+        onetrans_config = load_app_config(root / "configs" / "mdl_onetrans.yaml")
+        with patch(
+            "src.model.OneTransBackbone",
+            return_value=OneTransBackboneStub(),
+        ), patch(
+            "src.model.DomainTokenProjector",
+            side_effect=lambda *_args, **_kwargs: nn.Identity(),
+        ):
+            onetrans_model = MDLOneTransModel(onetrans_config, {})
+
+        for name, model in (
+            ("mdl_rankmixer", rankmixer_model),
+            ("mdl_onetrans", onetrans_model),
+        ):
+            with self.subTest(model=name):
+                self.assertGreater(len(model.blocks), 0)
+                scenario_ffn = model.blocks[-1].scenario_ffn
+                self.assertIsNotNone(scenario_ffn)
+                assert scenario_ffn is not None
+                self.assertGreater(
+                    sum(parameter.numel() for parameter in scenario_ffn.parameters()),
+                    0,
+                )
+
+    def test_every_block_keeps_and_executes_scenario_ffn(self) -> None:
+        config = _rankmixer_config()
+        block = MDLRankMixerBlock(
+            config,
+            ModelMetadata(feature_token_count=2, scenario_count=1, task_count=1),
+        )
+
+        class AddOne(nn.Module):
+            def forward(self, values: Tensor) -> Tensor:
+                return torch.ones_like(values)
+
+        with torch.no_grad():
+            for module in (block.scenario_attention, block.task_attention, block.task_ffn):
+                assert module is not None
+                for parameter in module.parameters():
+                    parameter.zero_()
+        block.scenario_ffn = AddOne()
+        scenario_tokens = torch.randn(2, 2, 4)
+
+        _features, actual_scenarios, _tasks = block(
+            torch.randn(2, 2, 4),
+            scenario_tokens,
+            torch.zeros(2, 1, 4),
+            torch.ones(2, 1),
+        )
+
+        torch.testing.assert_close(actual_scenarios, scenario_tokens + 1.0)
+
+    def test_disabled_domain_attention_uses_feature_dependent_rankmixer(self) -> None:
+        config = _rankmixer_config()
+        config.model.use_task_feature_interaction = False
+        config.model.use_scenario_feature_interaction = False
+        block = MDLRankMixerBlock(
+            config,
+            ModelMetadata(feature_token_count=2, scenario_count=1, task_count=1),
+        )
+
+        self.assertIsNone(block.scenario_attention)
+        self.assertIsNone(block.task_attention)
+        self.assertIsInstance(block.scenario_rankmixer, RankMixerDomainInteraction)
+        self.assertIsInstance(block.task_rankmixer, RankMixerDomainInteraction)
+
+        scenario_tokens = torch.zeros(2, 2, 4)
+        zero_features = torch.zeros(2, 2, 4)
+        informative_features = torch.tensor(
+            [
+                [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+                [[8.0, 7.0, 6.0, 5.0], [4.0, 3.0, 2.0, 1.0]],
+            ]
+        )
+        assert block.scenario_rankmixer is not None
+        without_features = block.scenario_rankmixer(scenario_tokens, zero_features)
+        with_features = block.scenario_rankmixer(
+            scenario_tokens,
+            informative_features,
+        )
+
+        self.assertFalse(torch.allclose(with_features, without_features))
+
+    def test_disabled_tokens_remove_block_modules_and_scenario_tower_selects(self) -> None:
+        config = _rankmixer_config()
+        config.model.use_task_tokens = False
+        config.model.use_scenario_tokens = False
+        block = MDLRankMixerBlock(
+            config,
+            ModelMetadata(feature_token_count=2, scenario_count=2, task_count=2),
+        )
+
+        for module in (
+            block.scenario_attention,
+            block.scenario_rankmixer,
+            block.scenario_ffn,
+            block.task_attention,
+            block.task_rankmixer,
+            block.task_ffn,
+            block.domain_fused,
+        ):
+            self.assertIsNone(module)
+
+        feature_tokens = torch.randn(2, 2, 4)
+        empty_tokens = feature_tokens.new_empty(2, 0, 4)
+        _features, actual_scenarios, actual_tasks = block(
+            feature_tokens,
+            empty_tokens,
+            empty_tokens,
+            torch.eye(2),
+        )
+        self.assertEqual(tuple(actual_scenarios.shape), (2, 0, 4))
+        self.assertEqual(tuple(actual_tasks.shape), (2, 0, 4))
+
+        tower = ScenarioTower(2, token_dim=4, hidden_dim=4, activation="relu")
+        tower.networks[0] = nn.Linear(4, 4, bias=False)
+        tower.networks[1] = nn.Linear(4, 4, bias=False)
+        with torch.no_grad():
+            tower.networks[0].weight.copy_(torch.eye(4))
+            tower.networks[1].weight.copy_(2.0 * torch.eye(4))
+        selected = tower(torch.ones(2, 2, 4), torch.eye(2))
+        torch.testing.assert_close(
+            selected,
+            torch.tensor([[1.0] * 4, [2.0] * 4]),
+        )
+        self.assertFalse(
+            any(isinstance(module, DomainFusedModule) for module in tower.modules())
+        )
+
+    def test_each_token_switch_removes_only_its_block_path(self) -> None:
+        metadata = ModelMetadata(
+            feature_token_count=2,
+            scenario_count=1,
+            task_count=1,
+        )
+        for use_task_tokens, use_scenario_tokens in (
+            (False, True),
+            (True, False),
+        ):
+            with self.subTest(
+                use_task_tokens=use_task_tokens,
+                use_scenario_tokens=use_scenario_tokens,
+            ):
+                config = _rankmixer_config()
+                config.model.use_task_tokens = use_task_tokens
+                config.model.use_scenario_tokens = use_scenario_tokens
+                block = MDLRankMixerBlock(config, metadata)
+
+                self.assertEqual(
+                    block.scenario_attention is not None,
+                    use_scenario_tokens,
+                )
+                self.assertEqual(
+                    block.scenario_ffn is not None,
+                    use_scenario_tokens,
+                )
+                self.assertEqual(
+                    block.task_attention is not None,
+                    use_task_tokens,
+                )
+                self.assertEqual(block.task_ffn is not None, use_task_tokens)
+                self.assertEqual(
+                    block.domain_fused is not None,
+                    use_task_tokens and use_scenario_tokens,
+                )
+
+                feature_tokens = torch.randn(2, 2, 4)
+                scenario_tokens = feature_tokens.new_empty(
+                    2,
+                    2 if use_scenario_tokens else 0,
+                    4,
+                )
+                task_tokens = feature_tokens.new_empty(
+                    2,
+                    1 if use_task_tokens else 0,
+                    4,
+                )
+                _features, actual_scenarios, actual_tasks = block(
+                    feature_tokens,
+                    scenario_tokens,
+                    task_tokens,
+                    torch.ones(2, 1),
+                )
+                self.assertEqual(
+                    actual_scenarios.size(1),
+                    2 if use_scenario_tokens else 0,
+                )
+                self.assertEqual(
+                    actual_tasks.size(1),
+                    1 if use_task_tokens else 0,
+                )
+
+    def test_both_model_variants_omit_disabled_token_projectors(self) -> None:
+        class Encoder(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.output_dims: dict[str, int] = {}
+
+            def forward(
+                self,
+                features: dict[str, Tensor],
+                request_cache: object | None = None,
+            ) -> dict[str, Tensor]:
+                del request_cache
+                return features
+
+        class TokenProjector(nn.Module):
+            def forward(self, encoded: dict[str, Tensor]) -> Tensor:
+                return encoded["tokens"]
+
+        class OneTransBackboneStub(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.ns_token_count = 3
+                self.encoder_bank = Encoder()
+
+            def prepare(
+                self,
+                features: dict[str, Tensor],
+                request_cache: object | None = None,
+                encoded_features: dict[str, Tensor] | None = None,
+            ) -> OneTransBackboneState:
+                del features, request_cache
+                assert encoded_features is not None
+                tokens = encoded_features["tokens"]
+                return OneTransBackboneState(
+                    tokens=tokens,
+                    valid_mask=torch.ones(
+                        tokens.shape[:2],
+                        dtype=torch.bool,
+                        device=tokens.device,
+                    ),
+                    s_count=0,
+                    ns_count=tokens.size(1),
+                    initial_s_count=0,
+                    encoded_features=encoded_features,
+                )
+
+            def step(
+                self,
+                state: OneTransBackboneState,
+                layer_index: int,
+                layer_cache: object | None = None,
+            ) -> OneTransBackboneState:
+                del layer_index, layer_cache
+                return state
+
+        root = Path(__file__).resolve().parents[1]
+        rankmixer_config = load_app_config(root / "configs" / "default.yaml")
+        rankmixer_config = replace(
+            rankmixer_config,
+            model=replace(
+                rankmixer_config.model,
+                use_task_tokens=False,
+                use_scenario_tokens=False,
+            ),
+        )
+        with patch("src.model.FeatureEncoderBank", return_value=Encoder()), patch(
+            "src.model._build_rankmixer_feature_projector",
+            return_value=TokenProjector(),
+        ), patch("src.model.DomainTokenProjector") as domain_projector:
+            rankmixer_model = MDLRankMixerModel(rankmixer_config, {})
+        domain_projector.assert_not_called()
+
+        onetrans_config = load_app_config(root / "configs" / "mdl_onetrans.yaml")
+        onetrans_config = replace(
+            onetrans_config,
+            model=replace(
+                onetrans_config.model,
+                use_task_tokens=False,
+                use_scenario_tokens=False,
+            ),
+        )
+        with patch(
+            "src.model.OneTransBackbone",
+            return_value=OneTransBackboneStub(),
+        ), patch("src.model.DomainTokenProjector") as domain_projector:
+            onetrans_model = MDLOneTransModel(onetrans_config, {})
+        domain_projector.assert_not_called()
+
+        for name, model in (
+            ("mdl_rankmixer", rankmixer_model),
+            ("mdl_onetrans", onetrans_model),
+        ):
+            with self.subTest(model=name):
+                self.assertIsNone(model.scenario_projector)
+                self.assertIsNone(model.task_projector)
+                self.assertIsInstance(model.scenario_tower, ScenarioTower)
+                self.assertFalse(
+                    any(
+                        isinstance(module, DomainFusedModule)
+                        for module in model.modules()
+                    )
+                )
+                for block in model.blocks:
+                    self.assertIsNone(block.scenario_attention)
+                    self.assertIsNone(block.scenario_ffn)
+                    self.assertIsNone(block.task_attention)
+                    self.assertIsNone(block.task_ffn)
+                    self.assertIsNone(block.domain_fused)
+
+        for name, model, token_count in (
+            ("mdl_rankmixer", rankmixer_model, 4),
+            ("mdl_onetrans", onetrans_model, 3),
+        ):
+            with self.subTest(model_forward=name):
+                tokens = torch.randn(2, token_count, 32, requires_grad=True)
+                output = model(
+                    {"tokens": tokens},
+                    scenario_id=torch.zeros(2, dtype=torch.long),
+                )
+                self.assertEqual(tuple(output["logits"].shape), (2, 1))
+                output["logits"].sum().backward()
+                self.assertIsNotNone(tokens.grad)
+                self.assertTrue(bool(torch.isfinite(tokens.grad).all()))
+
+    def test_global_token_switch_removes_global_token_parameters(self) -> None:
+        config = _rankmixer_config()
+        config.model.use_global_scenario_token = False
+        block = MDLRankMixerBlock(
+            config,
+            ModelMetadata(feature_token_count=2, scenario_count=2, task_count=1),
+        )
+
+        assert block.scenario_attention is not None
+        assert block.scenario_ffn is not None
+        assert block.domain_fused is not None
+        self.assertEqual(block.scenario_attention.num_domain_tokens, 2)
+        self.assertEqual(len(block.scenario_ffn.networks), 2)
+        self.assertFalse(block.domain_fused.has_global_token)
+
+    def test_task_token_ablation_feeds_scenario_context_to_task_towers(self) -> None:
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                model=SimpleNamespace(
+                    use_scenario_tokens=True,
+                    use_task_tokens=False,
+                    use_global_scenario_token=True,
+                )
+            ),
+            logit_layers=nn.ModuleList(
+                [self._sum_head(1.0), self._sum_head(2.0)]
+            ),
+        )
+        feature_tokens = torch.zeros(2, 2, 4)
+        scenario_tokens = torch.tensor(
+            [
+                [[2.0] * 4, [8.0] * 4, [4.0] * 4],
+                [[2.0] * 4, [8.0] * 4, [4.0] * 4],
+            ]
+        )
+
+        logits = _mdl_logits(
+            model,
+            feature_tokens,
+            scenario_tokens,
+            feature_tokens.new_empty(2, 0, 4),
+            torch.eye(2),
+        )
+
+        # Selected scenario + global are mean pooled: [3, 3, 3, 3] and
+        # [6, 6, 6, 6], then independent task towers apply different weights.
+        torch.testing.assert_close(
+            logits,
+            torch.tensor([[12.0, 24.0], [24.0, 48.0]]),
+        )
+
+    def test_scenario_token_ablation_fuses_scenario_tower_at_output(self) -> None:
+        tower = ScenarioTower(2, token_dim=4, hidden_dim=4, activation="relu")
+        tower.networks[0] = nn.Linear(4, 4, bias=False)
+        tower.networks[1] = nn.Linear(4, 4, bias=False)
+        with torch.no_grad():
+            tower.networks[0].weight.copy_(torch.eye(4))
+            tower.networks[1].weight.copy_(2.0 * torch.eye(4))
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                model=SimpleNamespace(
+                    use_scenario_tokens=False,
+                    use_task_tokens=True,
+                )
+            ),
+            scenario_tower=tower,
+            logit_layers=nn.ModuleList(
+                [self._sum_head(1.0), self._sum_head(1.0)]
+            ),
+        )
+
+        logits = _mdl_logits(
+            model,
+            torch.ones(2, 2, 4),
+            torch.empty(2, 0, 4),
+            torch.zeros(2, 2, 4),
+            torch.eye(2),
+        )
+
+        torch.testing.assert_close(
+            logits,
+            torch.tensor([[4.0, 4.0], [8.0, 8.0]]),
+        )
 
 
 class MDLLossAlignmentTest(unittest.TestCase):
@@ -489,6 +924,7 @@ class OneTransCacheAlignmentTest(unittest.TestCase):
         backbone.config = config
         backbone.tokenizer = Tokenizer()
         backbone.ns_token_count = 2
+        backbone.unified_position_embeddings = nn.Embedding(32, 8)
         backbone.blocks = nn.ModuleList(
             OneTransBlock(config, ns_token_count=2) for _ in range(3)
         )
@@ -547,6 +983,135 @@ class OneTransCacheAlignmentTest(unittest.TestCase):
                 {"s_tokens": torch.cat([changed, torch.randn(1, 1, 8)], dim=1)},
                 old_cache,
             )
+
+
+class OneTransPositionEmbeddingAlignmentTest(unittest.TestCase):
+    def test_prepare_adds_logical_positions_to_unified_s_and_ns_tokens(self) -> None:
+        class Tokenizer(nn.Module):
+            def forward(self, _features: dict[str, Tensor], **_kwargs: object) -> OneTransOutput:
+                return OneTransOutput(
+                    feature_tokens=torch.zeros(2, 5, 2),
+                    encoded_features={},
+                    s_token_count=3,
+                    ns_token_count=2,
+                    s_valid_mask=torch.tensor(
+                        [[False, True, True], [True, True, True]]
+                    ),
+                )
+
+        backbone = OneTransBackbone.__new__(OneTransBackbone)
+        nn.Module.__init__(backbone)
+        backbone.tokenizer = Tokenizer()
+        backbone.unified_position_embeddings = nn.Embedding(5, 2)
+        with torch.no_grad():
+            backbone.unified_position_embeddings.weight.copy_(
+                torch.tensor(
+                    [
+                        [1.0, 10.0],
+                        [2.0, 20.0],
+                        [3.0, 30.0],
+                        [4.0, 40.0],
+                        [5.0, 50.0],
+                    ]
+                )
+            )
+
+        state = backbone.prepare({})
+
+        torch.testing.assert_close(
+            state.tokens,
+            torch.tensor(
+                [
+                    [
+                        [0.0, 0.0],
+                        [1.0, 10.0],
+                        [2.0, 20.0],
+                        [3.0, 30.0],
+                        [4.0, 40.0],
+                    ],
+                    [
+                        [1.0, 10.0],
+                        [2.0, 20.0],
+                        [3.0, 30.0],
+                        [4.0, 40.0],
+                        [5.0, 50.0],
+                    ],
+                ]
+            ),
+        )
+
+    def test_layer_cache_matches_full_path_with_unified_positions(self) -> None:
+        class Tokenizer(nn.Module):
+            num_ns_tokens = 2
+
+            def precompute_request_cache(
+                self,
+                features: dict[str, Tensor],
+            ) -> OneTransRequestCache:
+                s_tokens = features["s_tokens"]
+                return OneTransRequestCache(
+                    s_tokens=s_tokens,
+                    s_valid_mask=torch.ones(s_tokens.shape[:2], dtype=torch.bool),
+                )
+
+            def forward(
+                self,
+                features: dict[str, Tensor],
+                request_cache: OneTransRequestCache | None = None,
+                encoded_features: dict[str, Tensor] | None = None,
+            ) -> OneTransOutput:
+                cache = (
+                    self.precompute_request_cache(features)
+                    if request_cache is None
+                    else request_cache
+                )
+                ns_tokens = features["ns_tokens"]
+                return OneTransOutput(
+                    feature_tokens=torch.cat([cache.s_tokens, ns_tokens], dim=1),
+                    encoded_features=encoded_features or {},
+                    s_token_count=cache.s_tokens.size(1),
+                    ns_token_count=ns_tokens.size(1),
+                    s_valid_mask=cache.s_valid_mask,
+                )
+
+        config = SimpleNamespace(
+            model=SimpleNamespace(
+                token_dim=4,
+                num_heads=2,
+                hidden_dim=8,
+                num_layers=2,
+                use_pyramid=False,
+                final_s_tokens=None,
+                pyramid_round_to=32,
+                use_request_cache=False,
+            ),
+            runtime=SimpleNamespace(
+                attention_backend="auto",
+                activation_checkpoint=False,
+            ),
+        )
+        backbone = OneTransBackbone.__new__(OneTransBackbone)
+        nn.Module.__init__(backbone)
+        backbone.config = config
+        backbone.tokenizer = Tokenizer()
+        backbone.ns_token_count = 2
+        backbone.unified_position_embeddings = nn.Embedding(8, 4)
+        backbone.blocks = nn.ModuleList(
+            OneTransBlock(config, ns_token_count=2) for _ in range(2)
+        )
+        backbone.eval()
+        features = {
+            "s_tokens": torch.randn(1, 3, 4),
+            "ns_tokens": torch.randn(1, 2, 4),
+        }
+
+        with torch.no_grad():
+            full = backbone(features)
+            cache = backbone.precompute_request_cache(features)
+            cached = backbone(features, request_cache=cache)
+
+        torch.testing.assert_close(cached.feature_tokens, full.feature_tokens)
+        torch.testing.assert_close(cache.s_tokens, features["s_tokens"])
 
 
 class SparseMoEAlignmentTest(unittest.TestCase):
@@ -627,6 +1192,40 @@ class SparseMoEAlignmentTest(unittest.TestCase):
 
 
 class MDLOneTransLayerwiseAlignmentTest(unittest.TestCase):
+    def test_backbone_never_builds_a_separate_sequence_summary_encoder(self) -> None:
+        encoder_bank = nn.Module()
+
+        class Tokenizer(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.num_ns_tokens = 1
+
+        config = SimpleNamespace(
+            model=SimpleNamespace(
+                name="mdl_onetrans",
+                embedding_dim=4,
+                token_dim=4,
+                init_std=0.02,
+                num_layers=0,
+            )
+        )
+        with patch(
+            "src.model.FeatureEncoderBank",
+            return_value=encoder_bank,
+        ) as encoder_constructor, patch(
+            "src.model.OneTransTokenizer",
+            return_value=Tokenizer(),
+        ), patch(
+            "src.model.resolve_onetrans_max_position_embeddings",
+            return_value=8,
+        ):
+            backbone = OneTransBackbone(config, {})
+
+        self.assertIs(backbone.encoder_bank, encoder_bank)
+        self.assertFalse(
+            encoder_constructor.call_args.kwargs["build_sequence_summaries"]
+        )
+
     def test_domain_blocks_observe_corresponding_backbone_layer(self) -> None:
         token_dim = 4
         batch_size = 2

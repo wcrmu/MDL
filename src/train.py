@@ -5,9 +5,12 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from importlib import import_module
+import inspect
 import math
 import os
 from pathlib import Path
+import sqlite3
+import tempfile
 from time import perf_counter
 from typing import Any, Callable, Iterator
 
@@ -16,7 +19,8 @@ import torch.distributed as torch_dist
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel
 
-from .config import AppConfig, ParquetSplitConfig, ReaderConfig
+from .config import AppConfig, DDPConfig, ParquetSplitConfig, ReaderConfig
+from .checkpoint import load_model_checkpoint, save_model_checkpoint
 from .dataloader import (
     FeatureBatch,
     _require_pyarrow,
@@ -25,9 +29,15 @@ from .dataloader import (
     pin_feature_batch,
     table_to_feature_batch,
 )
-from .features import load_vocab_maps, vocab_strategy_fingerprint
+from .features import load_vocab_maps
+from .embeddings import (
+    ShardedEmbedding,
+    consume_sharded_embedding_stats,
+    sharded_embedding_modules,
+)
 from .model import build_model
 from .modules.mlp import SparseMoEPerTokenFFN
+from .optim import ShardedAdagrad
 
 
 @dataclass(frozen=True)
@@ -51,6 +61,38 @@ class TrainResult:
 
 
 @dataclass(frozen=True)
+class TrainStepTrace:
+    """Synchronized timings for one training step.
+
+    Tracing is opt-in because collecting phase timings synchronizes the device at
+    phase boundaries. Normal training therefore pays no synchronization or
+    callback overhead. Performance benchmarks use these traces for stable p95
+    and dataloader-wait measurements while aggregate throughput continues to be
+    reported separately by :class:`TrainResult`.
+    """
+
+    step: int
+    rank_active: bool
+    active_ranks: int
+    rows: int
+    input_tokens: int
+    padded_token_slots: int
+    step_seconds: float
+    dataloader_wait_seconds: float
+    h2d_seconds: float
+    forward_seconds: float
+    backward_seconds: float
+    sparse_sync_seconds: float
+    optimizer_seconds: float
+    sparse_local_rows: int
+    sparse_global_rows: int
+    sparse_payload_bytes: int
+
+
+TrainStepObserver = Callable[[TrainStepTrace], None]
+
+
+@dataclass(frozen=True)
 class PredictResult:
     rows: int
     output_path: Path | None
@@ -61,6 +103,7 @@ class EvaluateResult:
     rows: int
     group_metric_name: str
     metrics: dict[str, dict[str, float | None]]
+    auc_histogram_bins: int = 65536
 
 
 ExternalTrainAdapter = Callable[..., TrainResult | dict[str, Any]]
@@ -96,6 +139,8 @@ class _ParameterGroups:
     dense_optimizer: tuple[nn.Parameter, ...]
     embedding_optimizer: tuple[nn.Parameter, ...]
     sparse_sync: tuple[_NamedSparseParameter, ...]
+    sharded_optimizer: tuple[nn.Parameter, ...] = ()
+    sharded_ddp_ignore: tuple[_NamedSparseParameter, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -117,6 +162,66 @@ class _SparseGroupSpec:
     dtype: torch.dtype
     tables: tuple[_SparseTableSpec, ...]
     total_rows: int
+
+
+class _DDPGraphAuditor:
+    """Observe representative reducer participation without changing policy."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        *,
+        ignored_parameter_ids: set[int],
+        max_steps: int,
+    ) -> None:
+        self.parameters = tuple(
+            (name, parameter)
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and id(parameter) not in ignored_parameter_ids
+        )
+        self.max_steps = max_steps
+        self.patterns: list[tuple[str, ...]] = []
+
+    def observe(self) -> None:
+        if len(self.patterns) >= self.max_steps:
+            return
+        self.patterns.append(
+            tuple(
+                name
+                for name, parameter in self.parameters
+                if parameter.grad is None
+            )
+        )
+
+    def report(self, context: DistributedContext) -> str | None:
+        if not context.enabled or not self.patterns:
+            return None
+        gathered: list[list[tuple[str, ...]]] = [
+            [] for _ in range(context.world_size)
+        ]
+        torch_dist.all_gather_object(gathered, self.patterns)
+        all_patterns = [pattern for rank_patterns in gathered for pattern in rank_patterns]
+        unused = sorted({name for pattern in all_patterns for name in pattern})
+        stable = bool(all_patterns) and all(
+            pattern == all_patterns[0] for pattern in all_patterns[1:]
+        )
+        if unused:
+            recommendation = (
+                "candidate_static_graph_after_extended_validation"
+                if stable
+                else "keep_safe_find_unused"
+            )
+        else:
+            recommendation = (
+                "candidate_find_unused_false_or_static_graph_after_extended_validation"
+                if stable
+                else "keep_safe_find_unused"
+            )
+        return (
+            f"observed_rank_steps={len(all_patterns)} usage_stable={str(stable).lower()} "
+            f"unused_count={len(unused)} recommendation={recommendation} "
+            f"unused={','.join(unused[:20]) or '-'}"
+        )
 
 
 def _env_int(name: str, default: int) -> int:
@@ -142,6 +247,42 @@ def _select_device(config: AppConfig, local_rank: int | None = None) -> torch.de
     if requested != "cpu" and not torch.cuda.is_available():
         return torch.device("cpu")
     return torch.device(requested)
+
+
+def _attention_runtime_description(
+    config: AppConfig,
+    device: torch.device,
+) -> str:
+    # Keep programmatic/minimal configs created before this option compatible;
+    # validated YAML always materializes the explicit RuntimeConfig default.
+    requested = getattr(config.runtime, "attention_backend", "auto")
+    if requested == "flash":
+        if device.type != "cuda":
+            raise RuntimeError(
+                "runtime.attention_backend=flash was requested, but CUDA could not be initialized"
+            )
+        available = getattr(
+            torch.backends.cuda, "is_flash_attention_available", lambda: False
+        )()
+        if not available:
+            raise RuntimeError(
+                "runtime.attention_backend=flash was requested, but this PyTorch/GPU "
+                "build reports FlashAttention unavailable"
+            )
+        if config.model.name in {"onetrans", "mdl_onetrans"}:
+            implementation = "varlen_flash_bottom_right_causal"
+        elif config.model.name == "longer":
+            implementation = "varlen_flash_split_global_full_recent_causal"
+        else:
+            implementation = "sdpa_flash_only"
+        return (
+            f"requested=flash resolved={implementation} strict=true "
+            f"device={device} precision={config.runtime.precision}"
+        )
+    return (
+        f"requested={requested} resolved=runtime_dispatch strict=false "
+        f"device={device} precision={config.runtime.precision}"
+    )
 
 
 def _setup_distributed(config: AppConfig) -> DistributedContext:
@@ -222,20 +363,146 @@ def _slice_table(table: object, batch_size: int) -> Iterator[object]:
         yield table.slice(offset, batch_size)
 
 
-def _iter_batch_tables(
+def _table_effective_sequence_lengths(config: AppConfig, table: object) -> Tensor:
+    """Return a vectorized per-row maximum length over configured sequences."""
+
+    _pa, pc, _ds, _pq = _require_pyarrow()
+    result = torch.zeros(table.num_rows, dtype=torch.long)
+    for sequence in config.sequences:
+        if not sequence.fields:
+            continue
+        source = sequence.fields[0].source
+        array = table[source].combine_chunks()
+        lengths = pc.list_value_length(array)
+        if lengths.null_count:
+            lengths = pc.fill_null(lengths, 0)
+        values = torch.from_numpy(
+            lengths.to_numpy(zero_copy_only=False).copy()
+        ).to(dtype=torch.long)
+        if sequence.max_length is not None:
+            values.clamp_(max=sequence.max_length)
+        result = torch.maximum(result, values)
+    return result
+
+
+def _iter_length_bucketed_tables(
     config: AppConfig,
     split_name: str,
     shard_rank: int,
     shard_world_size: int,
 ) -> Iterator[object]:
-    batch_size = config.training.batch_size
+    """Group rows by sequence length before one vectorized padding operation."""
+
+    reader = _split_reader(config, split_name)
+    buckets = reader.length_buckets
+    if not buckets or not config.sequences:
+        for table in iter_candidate_tables(
+            config,
+            split_name,
+            shard_rank=shard_rank,
+            shard_world_size=shard_world_size,
+        ):
+            yield from _slice_table(table, config.training.batch_size)
+        return
+
+    pa, _pc, _ds, _pq = _require_pyarrow()
+    finite_boundaries = [
+        bucket.max_length
+        for bucket in buckets
+        if bucket.max_length is not None
+    ]
+    boundaries = torch.tensor(finite_boundaries, dtype=torch.long)
+    buffered: list[list[object]] = [[] for _ in buckets]
+    buffered_rows = [0] * len(buckets)
+
     for table in iter_candidate_tables(
         config,
         split_name,
         shard_rank=shard_rank,
         shard_world_size=shard_world_size,
     ):
-        yield from _slice_table(table, batch_size)
+        lengths = _table_effective_sequence_lengths(config, table)
+        assignments = torch.bucketize(lengths, boundaries, right=False)
+        for bucket_index, bucket in enumerate(buckets):
+            selected = torch.nonzero(
+                assignments == bucket_index, as_tuple=False
+            ).flatten()
+            if not selected.numel():
+                continue
+            selected_table = table.take(
+                pa.array(selected.numpy(), type=pa.int64())
+            )
+            buffered[bucket_index].append(selected_table)
+            buffered_rows[bucket_index] += selected_table.num_rows
+            if buffered_rows[bucket_index] < bucket.batch_size:
+                continue
+            combined = pa.concat_tables(buffered[bucket_index])
+            offset = 0
+            while combined.num_rows - offset >= bucket.batch_size:
+                yield combined.slice(offset, bucket.batch_size)
+                offset += bucket.batch_size
+            remainder = combined.slice(offset)
+            buffered[bucket_index] = [remainder] if remainder.num_rows else []
+            buffered_rows[bucket_index] = remainder.num_rows
+
+    for bucket_index in range(len(buckets)):
+        if not buffered_rows[bucket_index]:
+            continue
+        yield pa.concat_tables(buffered[bucket_index])
+
+
+def _iter_batch_tables(
+    config: AppConfig,
+    split_name: str,
+    shard_rank: int,
+    shard_world_size: int,
+) -> Iterator[object]:
+    yield from _iter_length_bucketed_tables(
+        config,
+        split_name,
+        shard_rank,
+        shard_world_size,
+    )
+
+
+def _feature_batch_tensor_bytes(batch: FeatureBatch) -> int:
+    def visit(value: Any) -> int:
+        if isinstance(value, Tensor):
+            return value.numel() * value.element_size()
+        if isinstance(value, dict):
+            return sum(visit(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return sum(visit(item) for item in value)
+        return 0
+
+    return (
+        visit(batch.features)
+        + visit(batch.labels)
+        + visit(batch.label_mask)
+        + visit(batch.scenario_id)
+    )
+
+
+def _estimate_prepared_batch_bytes(config: AppConfig, table: object) -> int:
+    """Conservative Arrow-plus-tensor reservation for the prefetch queue."""
+
+    rows = int(table.num_rows)
+    tensor_bytes = 0
+    for feature in config.features:
+        tensor_bytes += rows * feature.dimension * (8 if feature.kind == "categorical" else 4)
+    for sequence in config.sequences:
+        if not sequence.fields:
+            continue
+        lengths = _table_effective_sequence_lengths(config, table)
+        padded_length = int(lengths.max().item()) if lengths.numel() else 0
+        tensor_bytes += rows * 8
+        for field in sequence.fields:
+            element_bytes = 8 if field.kind == "categorical" else 4 * field.dimension
+            tensor_bytes += rows * padded_length * element_bytes
+    # Labels, masks, scenario IDs, and a margin for Python/allocator metadata.
+    tensor_bytes += rows * (4 * max(1, len(config.task_names)) + 16)
+    arrow_bytes = int(getattr(table, "nbytes", 0))
+    return max(1, arrow_bytes + tensor_bytes + tensor_bytes // 8)
 
 
 def _prepare_feature_batch(
@@ -287,7 +554,7 @@ def iter_feature_batches(
         shard_world_size=shard_world_size,
     )
 
-    if reader.num_workers <= 0 and reader.prefetch_batches <= 0:
+    if reader.prefetch_batches <= 0:
         for table in table_iter:
             yield _prepare_feature_batch(
                 config,
@@ -300,39 +567,37 @@ def iter_feature_batches(
             )
         return
 
-    worker_count = max(1, reader.num_workers)
-    max_pending = max(1, reader.prefetch_batches, worker_count)
-    pending: deque[Future[FeatureBatch]] = deque()
+    max_pending = max(1, reader.prefetch_batches)
+    worker_count = min(max_pending, max(1, reader.num_workers))
+    pending: deque[tuple[Future[FeatureBatch], int]] = deque()
+    pending_bytes = 0
+    buffered_table: object | None = None
+    buffered_reservation = 0
     with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="mdl-reader") as executor:
         exhausted = False
-        while not exhausted and len(pending) < max_pending:
-            try:
-                table = next(table_iter)
-            except StopIteration:
-                exhausted = True
-                break
-            pending.append(
-                executor.submit(
-                    _prepare_feature_batch,
-                    config,
-                    split,
-                    table,
-                    vocab_maps,
-                    require_labels,
-                    pin_memory,
-                    include_group_id,
-                )
-            )
-
-        while pending:
-            future = pending.popleft()
-            if not exhausted:
-                try:
-                    table = next(table_iter)
-                except StopIteration:
-                    exhausted = True
+        while pending or not exhausted or buffered_table is not None:
+            while len(pending) < max_pending and not exhausted:
+                if buffered_table is None:
+                    try:
+                        table = next(table_iter)
+                    except StopIteration:
+                        exhausted = True
+                        break
+                    reservation = _estimate_prepared_batch_bytes(config, table)
                 else:
-                    pending.append(
+                    table = buffered_table
+                    reservation = buffered_reservation
+                    buffered_table = None
+                    buffered_reservation = 0
+                if (
+                    pending
+                    and pending_bytes + reservation > reader.max_prefetch_bytes
+                ):
+                    buffered_table = table
+                    buffered_reservation = reservation
+                    break
+                pending.append(
+                    (
                         executor.submit(
                             _prepare_feature_batch,
                             config,
@@ -342,9 +607,44 @@ def iter_feature_batches(
                             require_labels,
                             pin_memory,
                             include_group_id,
+                        ),
+                        reservation,
+                    )
+                )
+                pending_bytes += reservation
+            if not pending:
+                if buffered_table is not None:
+                    # A single oversized batch is admitted to guarantee progress.
+                    table = buffered_table
+                    reservation = buffered_reservation
+                    buffered_table = None
+                    buffered_reservation = 0
+                    pending.append(
+                        (
+                            executor.submit(
+                                _prepare_feature_batch,
+                                config,
+                                split,
+                                table,
+                                vocab_maps,
+                                require_labels,
+                                pin_memory,
+                                include_group_id,
+                            ),
+                            reservation,
                         )
                     )
-            yield future.result()
+                    pending_bytes += reservation
+                else:
+                    break
+            future, reservation = pending.popleft()
+            batch = future.result()
+            actual_bytes = _feature_batch_tensor_bytes(batch)
+            if actual_bytes > reservation:
+                pending_bytes += actual_bytes - reservation
+                reservation = actual_bytes
+            yield batch
+            pending_bytes -= reservation
 
 
 def _classify_model_parameters(model: nn.Module) -> _ParameterGroups:
@@ -358,7 +658,15 @@ def _classify_model_parameters(model: nn.Module) -> _ParameterGroups:
 
     embedding_ids: set[int] = set()
     sparse_gradient_ids: set[int] = set()
+    sharded_ids: set[int] = set()
     for module in model.modules():
+        if isinstance(module, ShardedEmbedding):
+            module_parameter_ids = {
+                id(parameter) for parameter in module.parameters(recurse=False)
+            }
+            embedding_ids.update(module_parameter_ids)
+            sharded_ids.update(module_parameter_ids)
+            continue
         if not isinstance(module, nn.Embedding):
             continue
         module_parameter_ids = {
@@ -370,16 +678,28 @@ def _classify_model_parameters(model: nn.Module) -> _ParameterGroups:
 
     dense: list[nn.Parameter] = []
     embeddings: list[nn.Parameter] = []
+    sharded: list[nn.Parameter] = []
     sparse_sync: list[_NamedSparseParameter] = []
+    sharded_ignore: list[_NamedSparseParameter] = []
     seen_sparse_ids: set[int] = set()
+    seen_sharded_ids: set[int] = set()
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
         parameter_id = id(parameter)
-        if parameter_id in embedding_ids:
+        if parameter_id in sharded_ids:
+            sharded.append(parameter)
+        elif parameter_id in embedding_ids:
             embeddings.append(parameter)
         else:
             dense.append(parameter)
+        if parameter_id in sharded_ids:
+            if parameter_id not in seen_sharded_ids:
+                sharded_ignore.append(
+                    _NamedSparseParameter(name=name, parameter=parameter)
+                )
+                seen_sharded_ids.add(parameter_id)
+            continue
         if parameter_id not in sparse_gradient_ids:
             continue
         if parameter_id in seen_sparse_ids:
@@ -398,6 +718,8 @@ def _classify_model_parameters(model: nn.Module) -> _ParameterGroups:
         dense_optimizer=tuple(dense),
         embedding_optimizer=tuple(embeddings),
         sparse_sync=tuple(sparse_sync),
+        sharded_optimizer=tuple(sharded),
+        sharded_ddp_ignore=tuple(sharded_ignore),
     )
 
 
@@ -405,7 +727,42 @@ def _partition_embedding_parameters(model: nn.Module) -> tuple[list[nn.Parameter
     """Compatibility wrapper returning the two optimizer parameter groups."""
 
     groups = _classify_model_parameters(model)
-    return list(groups.dense_optimizer), list(groups.embedding_optimizer)
+    return (
+        list(groups.dense_optimizer),
+        list(groups.embedding_optimizer) + list(groups.sharded_optimizer),
+    )
+
+
+def _build_dense_optimizer(
+    parameters: list[nn.Parameter],
+    config: AppConfig,
+    device: torch.device,
+) -> torch.optim.Optimizer:
+    """Construct RMSprop and enable fused execution only when implemented."""
+
+    kwargs: dict[str, Any] = {
+        "lr": config.training.lr_dense,
+        "alpha": config.training.rmsprop_alpha,
+        "momentum": config.training.rmsprop_momentum,
+    }
+    fused_requested = (
+        getattr(config.training, "fused_dense_optimizer", False)
+        and device.type == "cuda"
+    )
+    try:
+        fused_supported = (
+            "fused" in inspect.signature(torch.optim.RMSprop).parameters
+        )
+    except (TypeError, ValueError):
+        fused_supported = False
+    if fused_requested and fused_supported:
+        kwargs["fused"] = True
+    elif fused_requested and is_main_process():
+        print(
+            "Dense optimizer | optimizer=RMSprop fused_requested=true "
+            "fused_supported=false"
+        )
+    return torch.optim.RMSprop(parameters, **kwargs)
 
 
 def _sparse_parameter_descriptors(
@@ -415,6 +772,36 @@ def _sparse_parameter_descriptors(
         (ref.name, tuple(ref.parameter.shape), str(ref.parameter.dtype))
         for ref in sparse_parameters
     )
+
+
+def _validate_sharded_embedding_metadata(
+    context: DistributedContext,
+    model: nn.Module,
+) -> None:
+    modules = sorted(sharded_embedding_modules(model), key=lambda item: item.table_name)
+    descriptors = tuple(
+        (
+            module.table_name,
+            module.num_embeddings,
+            module.embedding_dim,
+            module.padding_idx,
+            module.shard_spec.strategy,
+            module.shard_spec.cyclic_offset,
+            module.shard_spec.table_owner,
+            module.shard_spec.world_size,
+        )
+        for module in modules
+    )
+    if len({item[0] for item in descriptors}) != len(descriptors):
+        raise RuntimeError("sharded embedding table names must be unique after alias resolution")
+    if not context.enabled:
+        return
+    gathered: list[object | None] = [None] * context.world_size
+    torch_dist.all_gather_object(gathered, descriptors)
+    if any(item != descriptors for item in gathered):
+        raise RuntimeError(
+            "sharded embedding metadata or ownership plan differs across ranks"
+        )
 
 
 @torch.no_grad()
@@ -782,6 +1169,53 @@ def _non_blocking_transfer(config: AppConfig, split_name: str, device: torch.dev
     return _split_reader(config, split_name).pin_memory
 
 
+def _batch_input_token_count(batch: FeatureBatch) -> int:
+    """Count valid sequence events without materializing padding masks.
+
+    The count is deliberately an input-data metric: every sequence contributes
+    the sum of its configured ``lengths`` tensor. Models without sequence inputs
+    fall back to one token per row so ``tokens/s`` remains well-defined.
+    """
+
+    total = 0
+    found_sequence = False
+    for value in batch.features.values():
+        if not isinstance(value, dict):
+            continue
+        lengths = value.get("lengths")
+        if not isinstance(lengths, Tensor):
+            continue
+        found_sequence = True
+        total += int(lengths.detach().sum().cpu().item())
+    if found_sequence:
+        return total
+    return int(batch.scenario_id.size(0))
+
+
+def _batch_padded_token_slots(batch: FeatureBatch) -> int:
+    """Count dense sequence slots, including padding, across all sequences."""
+
+    total = 0
+    found_sequence = False
+    for value in batch.features.values():
+        if not isinstance(value, dict):
+            continue
+        lengths = value.get("lengths")
+        fields = value.get("fields")
+        if not isinstance(lengths, Tensor) or not isinstance(fields, dict):
+            continue
+        found_sequence = True
+        padded_length = 0
+        for field_value in fields.values():
+            if isinstance(field_value, Tensor) and field_value.dim() >= 2:
+                padded_length = int(field_value.size(1))
+                break
+        total += int(lengths.numel()) * padded_length
+    if found_sequence:
+        return total
+    return int(batch.scenario_id.size(0))
+
+
 def _resolve_lr_decay_steps(config: AppConfig, max_steps: int | None) -> int | None:
     if config.training.lr_schedule == "constant":
         return None
@@ -875,6 +1309,56 @@ def _log_sparse_replica_memory(
         f"job_replica_mib={per_rank_bytes * context.world_size / (1024 ** 2):.2f} "
         "sharded=false"
     )
+
+
+def _log_sharded_embedding_memory(
+    context: DistributedContext,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer | None,
+) -> None:
+    modules = sharded_embedding_modules(model)
+    if not modules:
+        return
+    local_tables: list[dict[str, Any]] = []
+    for module in modules:
+        state = optimizer.state.get(module.weight, {}) if optimizer is not None else {}
+        accumulator = state.get("sum")
+        local_tables.append(
+            {
+                "name": module.table_name,
+                "strategy": module.shard_spec.strategy,
+                "global_rows": module.num_embeddings,
+                "local_rows": int(module.weight.size(0)),
+                "weight_bytes": _tensor_nbytes(module.weight),
+                "state_bytes": (
+                    _tensor_nbytes(accumulator)
+                    if isinstance(accumulator, Tensor)
+                    else 0
+                ),
+            }
+        )
+    gathered: list[object] = [local_tables]
+    if context.enabled:
+        gathered = [None] * context.world_size
+        torch_dist.all_gather_object(gathered, local_tables)
+    if context.rank != 0:
+        return
+    for rank, rank_tables_raw in enumerate(gathered):
+        rank_tables = list(rank_tables_raw or [])
+        weight_bytes = sum(int(item["weight_bytes"]) for item in rank_tables)
+        state_bytes = sum(int(item["state_bytes"]) for item in rank_tables)
+        print(
+            "Sharded embedding memory | "
+            f"rank={rank} tables={len(rank_tables)} "
+            f"weight_mib={weight_bytes / (1024 ** 2):.2f} "
+            f"adagrad_state_mib={state_bytes / (1024 ** 2):.2f}"
+        )
+        for item in rank_tables:
+            print(
+                "Sharded embedding table | "
+                f"rank={rank} name={item['name']} strategy={item['strategy']} "
+                f"rows={item['local_rows']}/{item['global_rows']}"
+            )
 
 
 def _mark_sparse_invariant_checks_explicitly_disabled() -> None:
@@ -1059,6 +1543,7 @@ def train_mdl(
     max_steps: int | None = None,
     save_checkpoint: bool = True,
     log_steps: bool = True,
+    step_observer: TrainStepObserver | None = None,
 ) -> TrainResult:
     if config.training.sparse_update_mode == "external_parameter_server":
         adapter = _load_external_train_adapter(config.training.sparse_parameter_server_adapter)
@@ -1067,45 +1552,70 @@ def train_mdl(
     context = _setup_distributed(config)
     try:
         device = context.device
+        if device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = config.runtime.allow_tf32
+            torch.backends.cudnn.allow_tf32 = config.runtime.allow_tf32
+            torch.set_float32_matmul_precision(
+                "high" if config.runtime.allow_tf32 else "highest"
+            )
+        attention_runtime = _attention_runtime_description(config, device)
+        if log_steps and context.rank == 0:
+            print(f"Attention backend | {attention_runtime}")
         vocab_maps = load_vocab_maps(config)
         base_model = build_model(config, vocab_maps).to(device)
+        _validate_sharded_embedding_metadata(context, base_model)
         parameter_groups = _classify_model_parameters(base_model)
         _synchronize_sparse_parameter_replicas(
             context,
             parameter_groups.sparse_sync,
+        )
+        ddp_ignored = (
+            *parameter_groups.sparse_sync,
+            *parameter_groups.sharded_ddp_ignore,
+        )
+        ddp_config = getattr(config.training, "ddp", DDPConfig())
+        ddp_auditor = _DDPGraphAuditor(
+            base_model,
+            ignored_parameter_ids={id(ref.parameter) for ref in ddp_ignored},
+            max_steps=ddp_config.audit_steps,
         )
         forward_model = _maybe_compile_model(config, base_model)
         model: nn.Module = forward_model
         if context.enabled:
             _exclude_sparse_parameters_from_ddp(
                 forward_model,
-                parameter_groups.sparse_sync,
+                ddp_ignored,
             )
             model = DistributedDataParallel(
                 forward_model,
                 device_ids=[context.local_rank] if device.type == "cuda" else None,
                 output_device=context.local_rank if device.type == "cuda" else None,
-                find_unused_parameters=True,
+                find_unused_parameters=ddp_config.find_unused_parameters,
+                static_graph=ddp_config.static_graph,
+                gradient_as_bucket_view=ddp_config.gradient_as_bucket_view,
+                bucket_cap_mb=ddp_config.bucket_cap_mb,
             )
 
         dense_params = list(parameter_groups.dense_optimizer)
-        sparse_params = list(parameter_groups.embedding_optimizer)
+        replicated_embedding_params = list(parameter_groups.embedding_optimizer)
+        sharded_embedding_params = list(parameter_groups.sharded_optimizer)
+        sparse_params = replicated_embedding_params + sharded_embedding_params
         dense_optimizer: torch.optim.Optimizer | None = None
         embedding_optimizer: torch.optim.Optimizer | None = None
+        sharded_embedding_optimizer: torch.optim.Optimizer | None = None
         optimizers: list[torch.optim.Optimizer] = []
         if dense_params:
-            dense_optimizer = torch.optim.RMSprop(
+            dense_optimizer = _build_dense_optimizer(
                 dense_params,
-                lr=config.training.lr_dense,
-                alpha=config.training.rmsprop_alpha,
-                momentum=config.training.rmsprop_momentum,
+                config,
+                device,
             )
             optimizers.append(dense_optimizer)
-        if sparse_params:
+        if replicated_embedding_params:
             _mark_sparse_invariant_checks_explicitly_disabled()
             sparse_lr = config.training.lr_sparse or config.training.lr_dense
             embedding_optimizer = torch.optim.Adagrad(
-                sparse_params,
+                replicated_embedding_params,
                 lr=sparse_lr,
                 lr_decay=config.training.adagrad_lr_decay,
                 weight_decay=config.training.adagrad_weight_decay,
@@ -1113,6 +1623,18 @@ def train_mdl(
                 eps=config.training.adagrad_eps,
             )
             optimizers.append(embedding_optimizer)
+        if sharded_embedding_params:
+            _mark_sparse_invariant_checks_explicitly_disabled()
+            sparse_lr = config.training.lr_sparse or config.training.lr_dense
+            sharded_embedding_optimizer = ShardedAdagrad(
+                sharded_embedding_params,
+                lr=sparse_lr,
+                lr_decay=config.training.adagrad_lr_decay,
+                weight_decay=config.training.adagrad_weight_decay,
+                initial_accumulator_value=config.training.adagrad_initial_accumulator_value,
+                eps=config.training.adagrad_eps,
+            )
+            optimizers.append(sharded_embedding_optimizer)
         sparse_synchronizer = _ReplicatedSparseGradientSynchronizer(
             context,
             parameter_groups.sparse_sync,
@@ -1122,6 +1644,11 @@ def train_mdl(
                 context,
                 parameter_groups.sparse_sync,
                 embedding_optimizer,
+            )
+            _log_sharded_embedding_memory(
+                context,
+                base_model,
+                sharded_embedding_optimizer,
             )
         optimizer_base_lrs = [
             [float(group["lr"]) for group in optimizer.param_groups]
@@ -1153,10 +1680,18 @@ def train_mdl(
         )
         last_device_batch: FeatureBatch | None = None
         while max_steps is None or steps < max_steps:
+            tracing = step_observer is not None
+            if tracing:
+                _sync_device(device)
+            step_started = perf_counter() if tracing else 0.0
+            dataloader_started = step_started
             try:
                 local_batch = next(batch_iterator)
             except StopIteration:
                 local_batch = None
+            dataloader_wait_seconds = (
+                perf_counter() - dataloader_started if tracing else 0.0
+            )
             rank_active = local_batch is not None
             active_ranks = _active_rank_count(context, rank_active)
             if active_ranks == 0:
@@ -1166,6 +1701,7 @@ def train_mdl(
                     "replicated sparse DDP requires every rank to provide an initial batch; "
                     "reduce world_size or choose a finer reader.shard_unit"
                 )
+            h2d_started = perf_counter() if tracing else 0.0
             if rank_active:
                 if local_batch is None:
                     raise AssertionError("active rank is missing its training batch")
@@ -1179,11 +1715,15 @@ def train_mdl(
                 if last_device_batch is None:
                     raise RuntimeError("inactive rank has no batch available for zero-loss replay")
                 batch = last_device_batch
+            if tracing:
+                _sync_device(device)
+            h2d_seconds = perf_counter() - h2d_started if tracing else 0.0
 
             lr_multiplier = _lr_schedule_multiplier(config, steps + 1, lr_decay_steps)
             _set_optimizer_lrs(optimizers, optimizer_base_lrs, lr_multiplier)
             for optimizer in optimizers:
                 optimizer.zero_grad(set_to_none=True)
+            forward_started = perf_counter() if tracing else 0.0
             with _autocast_context(config, device):
                 output = model(batch.features, batch.scenario_id)
                 loss, loss_numerator, loss_denominator = _loss_terms_from_batch(
@@ -1194,11 +1734,40 @@ def train_mdl(
                     rank_active=rank_active,
                     active_rank_count=active_ranks,
                 )
+            if tracing:
+                _sync_device(device)
+            forward_seconds = perf_counter() - forward_started if tracing else 0.0
+            backward_started = perf_counter() if tracing else 0.0
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
+            ddp_auditor.observe()
+            if tracing:
+                _sync_device(device)
+            backward_seconds = perf_counter() - backward_started if tracing else 0.0
+            sparse_sync_started = perf_counter() if tracing else 0.0
             sparse_sync_stats = sparse_synchronizer.synchronize(rank_active=rank_active)
+            sharded_stats = consume_sharded_embedding_stats(base_model)
+            if sharded_stats:
+                sparse_sync_stats = _SparseSyncStats(
+                    local_rows=(
+                        sparse_sync_stats.local_rows
+                        + sum(item.local_unique_ids for item in sharded_stats)
+                    ),
+                    global_rows=(
+                        sparse_sync_stats.global_rows
+                        + sum(item.owner_unique_ids for item in sharded_stats)
+                    ),
+                    logical_payload_bytes=(
+                        sparse_sync_stats.logical_payload_bytes
+                        + sum(item.total_communication_bytes for item in sharded_stats)
+                    ),
+                )
+            if tracing:
+                _sync_device(device)
+            sparse_sync_seconds = perf_counter() - sparse_sync_started if tracing else 0.0
+            optimizer_started = perf_counter() if tracing else 0.0
             if scaler.is_enabled():
                 for optimizer in optimizers:
                     scaler.unscale_(optimizer)
@@ -1218,21 +1787,56 @@ def train_mdl(
             else:
                 for optimizer in optimizers:
                     optimizer.step()
+            if tracing:
+                _sync_device(device)
+            optimizer_seconds = perf_counter() - optimizer_started if tracing else 0.0
             steps += 1
             if rank_active:
                 rows += int(batch.scenario_id.size(0))
             last_loss = float(loss.detach().cpu().item())
             last_loss_numerator = float(loss_numerator.detach().cpu().item())
             last_loss_denominator = float(loss_denominator.detach().cpu().item())
+            if step_observer is not None:
+                step_observer(
+                    TrainStepTrace(
+                        step=steps,
+                        rank_active=rank_active,
+                        active_ranks=active_ranks,
+                        rows=(int(batch.scenario_id.size(0)) if rank_active else 0),
+                        input_tokens=(_batch_input_token_count(batch) if rank_active else 0),
+                        padded_token_slots=(
+                            _batch_padded_token_slots(batch) if rank_active else 0
+                        ),
+                        step_seconds=perf_counter() - step_started,
+                        dataloader_wait_seconds=dataloader_wait_seconds,
+                        h2d_seconds=h2d_seconds,
+                        forward_seconds=forward_seconds,
+                        backward_seconds=backward_seconds,
+                        sparse_sync_seconds=sparse_sync_seconds,
+                        optimizer_seconds=optimizer_seconds,
+                        sparse_local_rows=sparse_sync_stats.local_rows,
+                        sparse_global_rows=sparse_sync_stats.global_rows,
+                        sparse_payload_bytes=sparse_sync_stats.logical_payload_bytes,
+                    )
+                )
             if log_steps and context.rank == 0:
                 payload_mib = sparse_sync_stats.logical_payload_bytes / (1024 ** 2)
+                valid_tokens = _batch_input_token_count(batch) if rank_active else 0
+                padded_slots = _batch_padded_token_slots(batch) if rank_active else 0
+                padding_ratio = (
+                    1.0 - valid_tokens / padded_slots if padded_slots > 0 else 0.0
+                )
                 print(
                     f"Train step | step={steps} | loss={last_loss:.6f} "
                     f"active_ranks={active_ranks}/{context.world_size} "
+                    f"padding_ratio={padding_ratio:.4f} "
                     f"sparse_local_rows={sparse_sync_stats.local_rows} "
                     f"sparse_global_rows={sparse_sync_stats.global_rows} "
                     f"sparse_payload_mib={payload_mib:.2f}"
                 )
+        audit_report = ddp_auditor.report(context)
+        if log_steps and context.rank == 0 and audit_report is not None:
+            print(f"DDP graph audit | {audit_report}")
         _sync_device(device)
         elapsed = perf_counter() - start
 
@@ -1244,17 +1848,14 @@ def train_mdl(
             last_loss_denominator,
         )
 
-        if save_checkpoint and config.training.checkpoint_path and context.rank == 0:
-            checkpoint_path = Path(config.training.checkpoint_path)
-            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "model_state_dict": base_model.state_dict(),
-                    "model_name": config.model.name,
-                    "task_names": config.task_names,
-                    "vocab_strategy_hash": vocab_strategy_fingerprint(config),
-                },
-                checkpoint_path,
+        if save_checkpoint and config.training.checkpoint_path:
+            save_model_checkpoint(
+                config,
+                base_model,
+                config.training.checkpoint_path,
+                rank=context.rank,
+                world_size=context.world_size,
+                sharded_optimizer=sharded_embedding_optimizer,
             )
         return result
     finally:
@@ -1316,6 +1917,170 @@ def _group_auc(scores: Tensor, labels: Tensor, group_ids: list[str]) -> float | 
     return None if not values else float(sum(values) / len(values))
 
 
+class _StreamingHistogramAUC:
+    """Bounded-memory AUC using deterministic score bins."""
+
+    def __init__(self, bins: int) -> None:
+        if bins < 2:
+            raise ValueError("AUC histogram requires at least two bins")
+        self.bins = bins
+        self.positives = torch.zeros(bins, dtype=torch.float64)
+        self.negatives = torch.zeros(bins, dtype=torch.float64)
+
+    def update(self, scores: Tensor, labels: Tensor) -> None:
+        scores = scores.detach().float().flatten().cpu()
+        labels = labels.detach().float().flatten().cpu()
+        if scores.numel() != labels.numel():
+            raise ValueError("AUC scores and labels must have the same length")
+        if not scores.numel():
+            return
+        if not bool(torch.isfinite(scores).all()):
+            raise ValueError("AUC scores must be finite")
+        if not bool(((labels == 0.0) | (labels == 1.0)).all()):
+            raise ValueError("AUC labels must be binary")
+        indices = torch.clamp(
+            torch.floor(scores.clamp(0.0, 1.0) * self.bins).long(),
+            max=self.bins - 1,
+        )
+        self.positives += torch.bincount(
+            indices[labels == 1.0], minlength=self.bins
+        ).to(torch.float64)
+        self.negatives += torch.bincount(
+            indices[labels == 0.0], minlength=self.bins
+        ).to(torch.float64)
+
+    def compute(self) -> float | None:
+        positive_count = float(self.positives.sum().item())
+        negative_count = float(self.negatives.sum().item())
+        if positive_count == 0.0 or negative_count == 0.0:
+            return None
+        negatives_below = torch.cumsum(self.negatives, dim=0) - self.negatives
+        concordant = (
+            self.positives * (negatives_below + 0.5 * self.negatives)
+        ).sum()
+        return float((concordant / (positive_count * negative_count)).item())
+
+
+class _DiskBackedGroupAUC:
+    """Aggregate sparse (group, score-bin) counts without retaining predictions."""
+
+    def __init__(self, bins: int) -> None:
+        self.bins = bins
+        self.temporary = tempfile.TemporaryDirectory(prefix="mdl-group-auc-")
+        path = Path(self.temporary.name) / "groups.sqlite3"
+        self.connection = sqlite3.connect(path)
+        self.connection.execute("PRAGMA journal_mode=OFF")
+        self.connection.execute("PRAGMA synchronous=OFF")
+        self.connection.execute(
+            """
+            CREATE TABLE counts (
+                task INTEGER NOT NULL,
+                scenario INTEGER NOT NULL,
+                group_id TEXT NOT NULL,
+                score_bin INTEGER NOT NULL,
+                positives INTEGER NOT NULL,
+                negatives INTEGER NOT NULL,
+                PRIMARY KEY (task, scenario, group_id, score_bin)
+            ) WITHOUT ROWID
+            """
+        )
+
+    def add(
+        self,
+        task_index: int,
+        group_ids: list[str],
+        scores: Tensor,
+        labels: Tensor,
+        scenario_membership: Tensor,
+    ) -> None:
+        score_values = scores.detach().float().flatten().cpu()
+        label_values = labels.detach().long().flatten().cpu()
+        memberships = scenario_membership.detach().bool().cpu()
+        if (
+            len(group_ids) != score_values.numel()
+            or label_values.numel() != score_values.numel()
+            or memberships.size(0) != score_values.numel()
+        ):
+            raise ValueError("group AUC batch inputs must have matching rows")
+        score_bins = torch.clamp(
+            torch.floor(score_values.clamp(0.0, 1.0) * self.bins).long(),
+            max=self.bins - 1,
+        ).tolist()
+        records: list[tuple[int, int, str, int, int, int]] = []
+        membership_rows = memberships.tolist()
+        for group_id, score_bin, label, member_row in zip(
+            group_ids,
+            score_bins,
+            label_values.tolist(),
+            membership_rows,
+        ):
+            positive = int(label == 1)
+            negative = 1 - positive
+            records.append(
+                (task_index, -1, str(group_id), score_bin, positive, negative)
+            )
+            records.extend(
+                (task_index, scenario, str(group_id), score_bin, positive, negative)
+                for scenario, active in enumerate(member_row)
+                if active
+            )
+        self.connection.executemany(
+            """
+            INSERT INTO counts(task, scenario, group_id, score_bin, positives, negatives)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task, scenario, group_id, score_bin) DO UPDATE SET
+                positives = positives + excluded.positives,
+                negatives = negatives + excluded.negatives
+            """,
+            records,
+        )
+
+    @staticmethod
+    def _finish_group(rows: list[tuple[int, int, int]]) -> float | None:
+        positive_count = sum(item[1] for item in rows)
+        negative_count = sum(item[2] for item in rows)
+        if positive_count == 0 or negative_count == 0:
+            return None
+        negatives_below = 0
+        concordant = 0.0
+        for _score_bin, positives, negatives in rows:
+            concordant += positives * (negatives_below + 0.5 * negatives)
+            negatives_below += negatives
+        return concordant / (positive_count * negative_count)
+
+    def compute(self, task_index: int, scenario: int) -> float | None:
+        cursor = self.connection.execute(
+            """
+            SELECT group_id, score_bin, positives, negatives
+            FROM counts
+            WHERE task = ? AND scenario = ?
+            ORDER BY group_id, score_bin
+            """,
+            (task_index, scenario),
+        )
+        values: list[float] = []
+        current_group: str | None = None
+        group_rows: list[tuple[int, int, int]] = []
+        for group_id, score_bin, positives, negatives in cursor:
+            if current_group is not None and group_id != current_group:
+                value = self._finish_group(group_rows)
+                if value is not None:
+                    values.append(value)
+                group_rows = []
+            current_group = group_id
+            group_rows.append((score_bin, positives, negatives))
+        if group_rows:
+            value = self._finish_group(group_rows)
+            if value is not None:
+                values.append(value)
+        return None if not values else float(sum(values) / len(values))
+
+    def close(self) -> None:
+        self.connection.commit()
+        self.connection.close()
+        self.temporary.cleanup()
+
+
 def _load_inference_model(
     config: AppConfig,
     device: torch.device,
@@ -1331,16 +2096,12 @@ def _load_inference_model(
             "training.checkpoint_path, or pass --allow-random-init explicitly"
         )
     if resolved_checkpoint_path is not None:
-        checkpoint = torch.load(resolved_checkpoint_path, map_location=device)
-        if checkpoint.get("model_name") not in {None, config.model.name}:
-            raise ValueError("checkpoint model_name does not match current config")
-        checkpoint_task_names = checkpoint.get("task_names")
-        if checkpoint_task_names is not None and list(checkpoint_task_names) != config.task_names:
-            raise ValueError("checkpoint task_names do not match current config")
-        expected_hash = vocab_strategy_fingerprint(config)
-        if checkpoint.get("vocab_strategy_hash") != expected_hash:
-            raise ValueError("checkpoint vocab_strategy_hash does not match current config")
-        base_model.load_state_dict(checkpoint["model_state_dict"])
+        load_model_checkpoint(
+            config,
+            base_model,
+            resolved_checkpoint_path,
+            device=device,
+        )
     model = _maybe_compile_model(config, base_model)
     base_model.eval()
     model.eval()
@@ -1355,11 +2116,14 @@ def evaluate_mdl(
     max_batches: int | None = None,
     allow_random_init: bool = False,
     group_metric_name: str = "qauc",
+    auc_bins: int = 65536,
 ) -> EvaluateResult:
     if split_name not in {"train", "test"}:
         raise ValueError("evaluation split must be train or test")
     if group_metric_name not in {"qauc", "uauc"}:
         raise ValueError("group_metric_name must be qauc or uauc")
+    if auc_bins < 2:
+        raise ValueError("auc_bins must be at least 2")
     split = config.data.train if split_name == "train" else config.data.test
     if split is None:
         raise ValueError(f"split {split_name!r} is not configured")
@@ -1380,87 +2144,92 @@ def evaluate_mdl(
         checkpoint_path,
         allow_random_init,
     )
-    scores_by_task: list[list[Tensor]] = [[] for _ in config.task_names]
-    labels_by_task: list[list[Tensor]] = [[] for _ in config.task_names]
-    groups_by_task: list[list[str]] = [[] for _ in config.task_names]
-    scenarios_by_task: list[list[Tensor]] = [[] for _ in config.task_names]
+    scenario_count = len(config.scenarios.names)
+    auc_accumulators = [
+        [_StreamingHistogramAUC(auc_bins) for _ in range(scenario_count + 1)]
+        for _ in config.task_names
+    ]
+    grouped_auc = _DiskBackedGroupAUC(auc_bins)
     rows = 0
     non_blocking = _non_blocking_transfer(config, split_name, device)
-    for batch_index, batch in enumerate(
-        iter_feature_batches(
-            config,
-            split_name,
-            vocab_maps,
-            require_labels=True,
-            pin_memory=non_blocking,
-            include_group_id=True,
-        )
-    ):
-        if max_batches is not None and batch_index >= max_batches:
-            break
-        batch = move_feature_batch(batch, device, non_blocking=non_blocking)
-        with _autocast_context(config, device):
-            logits = model(batch.features, batch.scenario_id)["logits"]
-        if batch.labels is None or batch.label_mask is None:
-            raise RuntimeError("evaluation batch did not contain labels")
-        probabilities = torch.sigmoid(logits.float()).cpu()
-        labels = batch.labels.float().cpu()
-        label_mask = batch.label_mask.bool().cpu()
-        raw_scenarios = batch.scenario_id.cpu()
-        if raw_scenarios.ndim == 1:
-            scenario_membership = torch.nn.functional.one_hot(
-                raw_scenarios.long(),
-                num_classes=len(config.scenarios.names),
-            ).bool()
-        else:
-            scenario_membership = raw_scenarios.bool()
-        rows += int(labels.size(0))
-        for task_index in range(len(config.task_names)):
-            valid = label_mask[:, task_index]
-            scores_by_task[task_index].append(probabilities[valid, task_index])
-            labels_by_task[task_index].append(labels[valid, task_index])
-            scenarios_by_task[task_index].append(scenario_membership[valid])
-            groups_by_task[task_index].extend(
-                group_id
-                for group_id, keep in zip(batch.group_id, valid.tolist())
-                if keep
+    try:
+        for batch_index, batch in enumerate(
+            iter_feature_batches(
+                config,
+                split_name,
+                vocab_maps,
+                require_labels=True,
+                pin_memory=non_blocking,
+                include_group_id=True,
             )
+        ):
+            if max_batches is not None and batch_index >= max_batches:
+                break
+            batch = move_feature_batch(batch, device, non_blocking=non_blocking)
+            with _autocast_context(config, device):
+                logits = model(batch.features, batch.scenario_id)["logits"]
+            if batch.labels is None or batch.label_mask is None:
+                raise RuntimeError("evaluation batch did not contain labels")
+            probabilities = torch.sigmoid(logits.float()).cpu()
+            labels = batch.labels.float().cpu()
+            label_mask = batch.label_mask.bool().cpu()
+            raw_scenarios = batch.scenario_id.cpu()
+            if raw_scenarios.ndim == 1:
+                scenario_membership = torch.nn.functional.one_hot(
+                    raw_scenarios.long(),
+                    num_classes=scenario_count,
+                ).bool()
+            else:
+                scenario_membership = raw_scenarios.bool()
+            rows += int(labels.size(0))
+            for task_index in range(len(config.task_names)):
+                valid = label_mask[:, task_index]
+                task_scores = probabilities[valid, task_index]
+                task_labels = labels[valid, task_index]
+                task_scenarios = scenario_membership[valid]
+                task_groups = [
+                    group_id
+                    for group_id, keep in zip(batch.group_id, valid.tolist())
+                    if keep
+                ]
+                auc_accumulators[task_index][0].update(
+                    task_scores, task_labels
+                )
+                for scenario in range(scenario_count):
+                    selected = task_scenarios[:, scenario]
+                    auc_accumulators[task_index][scenario + 1].update(
+                        task_scores[selected], task_labels[selected]
+                    )
+                grouped_auc.add(
+                    task_index,
+                    task_groups,
+                    task_scores,
+                    task_labels,
+                    task_scenarios,
+                )
 
-    metrics: dict[str, dict[str, float | None]] = {}
-    for task_index, task_name in enumerate(config.task_names):
-        task_scores = torch.cat(scores_by_task[task_index]) if scores_by_task[task_index] else torch.empty(0)
-        task_labels = torch.cat(labels_by_task[task_index]) if labels_by_task[task_index] else torch.empty(0)
-        task_scenarios = (
-            torch.cat(scenarios_by_task[task_index])
-            if scenarios_by_task[task_index]
-            else torch.empty(0, len(config.scenarios.names), dtype=torch.bool)
+        metrics: dict[str, dict[str, float | None]] = {}
+        for task_index, task_name in enumerate(config.task_names):
+            values: dict[str, float | None] = {
+                "auc": auc_accumulators[task_index][0].compute(),
+                group_metric_name: grouped_auc.compute(task_index, -1),
+            }
+            for scenario in range(scenario_count):
+                values[f"scenario_{scenario}_auc"] = (
+                    auc_accumulators[task_index][scenario + 1].compute()
+                )
+                values[f"scenario_{scenario}_{group_metric_name}"] = (
+                    grouped_auc.compute(task_index, scenario)
+                )
+            metrics[task_name] = values
+        return EvaluateResult(
+            rows=rows,
+            group_metric_name=group_metric_name,
+            metrics=metrics,
+            auc_histogram_bins=auc_bins,
         )
-        task_groups = groups_by_task[task_index]
-        values: dict[str, float | None] = {
-            "auc": _binary_auc(task_scores, task_labels),
-            group_metric_name: _group_auc(task_scores, task_labels, task_groups),
-        }
-        for scenario in range(len(config.scenarios.names)):
-            selected = task_scenarios[:, scenario]
-            scenario_groups = [
-                group_id
-                for group_id, keep in zip(task_groups, selected.tolist())
-                if keep
-            ]
-            values[f"scenario_{scenario}_auc"] = _binary_auc(
-                task_scores[selected], task_labels[selected]
-            )
-            values[f"scenario_{scenario}_{group_metric_name}"] = _group_auc(
-                task_scores[selected],
-                task_labels[selected],
-                scenario_groups,
-            )
-        metrics[task_name] = values
-    return EvaluateResult(
-        rows=rows,
-        group_metric_name=group_metric_name,
-        metrics=metrics,
-    )
+    finally:
+        grouped_auc.close()
 
 
 @torch.no_grad()
@@ -1482,16 +2251,12 @@ def predict_mdl(
             "training.checkpoint_path, or pass --allow-random-init explicitly"
         )
     if resolved_checkpoint_path is not None:
-        checkpoint = torch.load(resolved_checkpoint_path, map_location=device)
-        if checkpoint.get("model_name") not in {None, config.model.name}:
-            raise ValueError("checkpoint model_name does not match current config")
-        checkpoint_task_names = checkpoint.get("task_names")
-        if checkpoint_task_names is not None and list(checkpoint_task_names) != config.task_names:
-            raise ValueError("checkpoint task_names do not match current config")
-        expected_hash = vocab_strategy_fingerprint(config)
-        if checkpoint.get("vocab_strategy_hash") != expected_hash:
-            raise ValueError("checkpoint vocab_strategy_hash does not match current config")
-        base_model.load_state_dict(checkpoint["model_state_dict"])
+        load_model_checkpoint(
+            config,
+            base_model,
+            resolved_checkpoint_path,
+            device=device,
+        )
     model = _maybe_compile_model(config, base_model)
     base_model.eval()
     model.eval()

@@ -5,12 +5,60 @@ import math
 from typing import Any
 
 import torch
+import torch.distributed as torch_dist
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-from .config import AppConfig, DomainTokenConfig, FeatureConfig, ResolvedEncoding, SequenceConfig, TokenGroupConfig
-from .modules.attention import DomainAwareAttention, DomainFusedModule, RankMixerTokenMixing, _sdpa_context
-from .modules.mlp import PerTokenFFN, PerTokenLinear, SparseMoEPerTokenFFN
+try:
+    from torch.nn.attention.varlen import varlen_attn
+except ImportError:  # pragma: no cover - older PyTorch compatibility.
+    varlen_attn = None
+
+from .config import (
+    AppConfig,
+    DomainTokenConfig,
+    FeatureConfig,
+    ResolvedEncoding,
+    SequenceConfig,
+    TokenGroupConfig,
+    resolve_categorical_base_input,
+    resolve_onetrans_max_position_embeddings,
+)
+from .embeddings import (
+    EmbeddingShardingPlan,
+    EmbeddingTableSpec,
+    ShardedEmbedding,
+    grouped_sharded_embedding_lookup,
+    plan_embedding_shards,
+)
+from .modules.attention import (
+    DomainAwareAttention,
+    DomainFusedModule,
+    RankMixerDomainInteraction,
+    RankMixerTokenMixing,
+    _sdpa_context,
+    masked_scenario_pool,
+)
+from .modules.mlp import (
+    PerTokenFFN,
+    PerTokenLinear,
+    SparseMoEPerTokenFFN,
+    StackedPerTokenFFN,
+)
+
+
+def _activation_checkpoint_enabled(
+    value: str | bool,
+    *,
+    full_only: bool = False,
+) -> bool:
+    """Normalize legacy booleans and the three explicit checkpoint modes."""
+
+    if isinstance(value, bool):
+        return value
+    if value not in {"none", "selective", "full"}:
+        raise ValueError("activation checkpoint mode must be none, selective, or full")
+    return value == "full" if full_only else value in {"selective", "full"}
 
 
 @dataclass(frozen=True)
@@ -67,11 +115,33 @@ def _encoding_for(config: AppConfig, feature_name: str) -> ResolvedEncoding:
         ) from error
 
 
-def _embedding_size(encoding: ResolvedEncoding, vocab_maps: dict[str, dict[str, int]], feature_name: str) -> int:
+def _embedding_share_target(encoding: ResolvedEncoding) -> str | None:
+    if not getattr(encoding, "share_embedding", False):
+        return None
+    target = getattr(encoding, "share_with", None)
+    if not target:
+        raise ValueError("share_embedding=true requires a non-empty share_with")
+    return target
+
+
+def _embedding_size(
+    config: AppConfig,
+    vocab_maps: dict[str, dict[str, int]],
+    feature_name: str,
+    override: int | None = None,
+) -> int:
+    if override is not None:
+        if override < 2:
+            raise ValueError("embedding size override must be at least 2")
+        return override
+    encoding = resolve_categorical_base_input(
+        config.resolved.categorical_input_by_name,
+        feature_name,
+    ).encoding
     if encoding.encoding == "hash":
         return encoding.num_buckets + 1
     if encoding.encoding == "identity":
-        return encoding.max_id + 1
+        return encoding.num_buckets
     if encoding.encoding in {"vocab", "shared_vocab"}:
         values = vocab_maps.get(feature_name, {})
         return max(values.values(), default=0) + 1
@@ -232,6 +302,117 @@ class LongerSequenceAttentionBlock(nn.Module):
         fallback[..., 0:1] = True
         return allowed_mask | (empty & fallback)
 
+    @staticmethod
+    def mixed_allowed_mask(
+        key_valid_mask: Tensor,
+        query_valid_mask: Tensor,
+        global_query_count: int,
+    ) -> Tensor:
+        """LONGER visibility contract for ``[global; recent]`` queries.
+
+        Global queries see every valid key. Recent queries use bottom-right
+        causal alignment, so a short recent suffix attends to the matching
+        historical prefix while still seeing any prepended global keys.
+        """
+
+        if key_valid_mask.ndim != 2 or query_valid_mask.ndim != 2:
+            raise ValueError("key/query validity masks must have shape [batch, tokens]")
+        if key_valid_mask.size(0) != query_valid_mask.size(0):
+            raise ValueError("key/query validity masks must have the same batch size")
+        if not 0 <= global_query_count <= query_valid_mask.size(1):
+            raise ValueError("global_query_count is outside the query range")
+        recent_count = query_valid_mask.size(1) - global_query_count
+        key_count = key_valid_mask.size(1)
+        parts: list[Tensor] = []
+        if global_query_count:
+            parts.append(
+                key_valid_mask.unsqueeze(1).expand(
+                    -1, global_query_count, -1
+                )
+                & query_valid_mask[:, :global_query_count].unsqueeze(-1)
+            )
+        if recent_count:
+            key_positions = torch.arange(
+                key_count, device=key_valid_mask.device
+            ).view(1, 1, key_count)
+            query_positions = torch.arange(
+                key_count - recent_count,
+                key_count,
+                device=key_valid_mask.device,
+            ).view(1, recent_count, 1)
+            parts.append(
+                key_valid_mask.unsqueeze(1)
+                & (key_positions <= query_positions)
+                & query_valid_mask[:, global_query_count:].unsqueeze(-1)
+            )
+        if not parts:
+            return torch.zeros(
+                key_valid_mask.size(0),
+                0,
+                key_count,
+                dtype=torch.bool,
+                device=key_valid_mask.device,
+            )
+        return torch.cat(parts, dim=1)
+
+    def _flash_varlen_attention(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        query_valid_mask: Tensor,
+        key_valid_mask: Tensor,
+        *,
+        causal: bool,
+    ) -> Tensor:
+        if varlen_attn is None:
+            raise RuntimeError(
+                "runtime.attention_backend='flash' requires torch.nn.attention.varlen"
+            )
+        if query.device.type != "cuda":
+            raise RuntimeError("Flash varlen attention requires CUDA tensors")
+        if query.dtype not in {torch.float16, torch.bfloat16}:
+            raise RuntimeError("Flash varlen attention requires FP16 or BF16 tensors")
+        if self.training and self.dropout.p:
+            raise RuntimeError(
+                "Flash varlen attention does not support this block's non-zero dropout"
+            )
+        query_tokens = query.transpose(1, 2)
+        key_tokens = key.transpose(1, 2)
+        value_tokens = value.transpose(1, 2)
+        packed_query = query_tokens[query_valid_mask]
+        packed_key = key_tokens[key_valid_mask]
+        packed_value = value_tokens[key_valid_mask]
+        if packed_query.numel() == 0:
+            return torch.zeros_like(query)
+        query_lengths = query_valid_mask.sum(dim=1, dtype=torch.int32)
+        key_lengths = key_valid_mask.sum(dim=1, dtype=torch.int32)
+        cu_query = torch.nn.functional.pad(
+            query_lengths.cumsum(0, dtype=torch.int32), (1, 0)
+        )
+        cu_key = torch.nn.functional.pad(
+            key_lengths.cumsum(0, dtype=torch.int32), (1, 0)
+        )
+        label = "causal" if causal else "full"
+        with torch.profiler.record_function(f"longer::flash_varlen_{label}"):
+            packed_output = varlen_attn(
+                packed_query.contiguous(),
+                packed_key.contiguous(),
+                packed_value.contiguous(),
+                cu_query,
+                cu_key,
+                query_valid_mask.size(1),
+                key_valid_mask.size(1),
+                window_size=(-1, 0) if causal else (-1, -1),
+            )
+        output = torch.zeros_like(query_tokens)
+        output[query_valid_mask] = packed_output
+        return output.transpose(1, 2)
+
+    def _finish_attention(self, query_tokens: Tensor, attended: Tensor) -> Tensor:
+        hidden = query_tokens + self.output_projection(self._merge_heads(attended))
+        return hidden + self.ffn(self.ffn_norm(hidden))
+
     def project_kv(self, key_tokens: Tensor) -> tuple[Tensor, Tensor]:
         key_input = self.key_norm(key_tokens)
         return (
@@ -260,8 +441,101 @@ class LongerSequenceAttentionBlock(nn.Module):
                 attn_mask=self._nonempty_mask(allowed_mask).unsqueeze(1),
                 dropout_p=dropout_p,
             )
-        hidden = query_tokens + self.output_projection(self._merge_heads(attended))
-        return hidden + self.ffn(self.ffn_norm(hidden))
+        return self._finish_attention(query_tokens, attended)
+
+    def forward_full_projected_kv(
+        self,
+        query_tokens: Tensor,
+        key: Tensor,
+        value: Tensor,
+        query_valid_mask: Tensor,
+        key_valid_mask: Tensor,
+    ) -> Tensor:
+        query = self._split_heads(self.query_projection(self.query_norm(query_tokens)))
+        if self.attention_backend == "flash":
+            attended = self._flash_varlen_attention(
+                query,
+                key,
+                value,
+                query_valid_mask,
+                key_valid_mask,
+                causal=False,
+            )
+        else:
+            allowed = query_valid_mask.unsqueeze(-1) & key_valid_mask.unsqueeze(1)
+            dropout_p = self.dropout.p if self.training else 0.0
+            with _sdpa_context(self.attention_backend):
+                attended = torch.nn.functional.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=self._nonempty_mask(allowed).unsqueeze(1),
+                    dropout_p=dropout_p,
+                )
+        return self._finish_attention(query_tokens, attended)
+
+    def forward_mixed_projected_kv(
+        self,
+        query_tokens: Tensor,
+        key: Tensor,
+        value: Tensor,
+        query_valid_mask: Tensor,
+        key_valid_mask: Tensor,
+        global_query_count: int,
+    ) -> Tensor:
+        """Evaluate LONGER globals and recent queries without semantic collapse."""
+
+        query = self._split_heads(self.query_projection(self.query_norm(query_tokens)))
+        if self.attention_backend != "flash":
+            allowed = self.mixed_allowed_mask(
+                key_valid_mask, query_valid_mask, global_query_count
+            )
+            dropout_p = self.dropout.p if self.training else 0.0
+            with _sdpa_context(self.attention_backend):
+                attended = torch.nn.functional.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=self._nonempty_mask(allowed).unsqueeze(1),
+                    dropout_p=dropout_p,
+                )
+            return self._finish_attention(query_tokens, attended)
+
+        parts: list[Tensor] = []
+        if global_query_count:
+            parts.append(
+                self._flash_varlen_attention(
+                    query[:, :, :global_query_count, :],
+                    key,
+                    value,
+                    query_valid_mask[:, :global_query_count],
+                    key_valid_mask,
+                    causal=False,
+                )
+            )
+        if global_query_count < query_tokens.size(1):
+            parts.append(
+                self._flash_varlen_attention(
+                    query[:, :, global_query_count:, :],
+                    key,
+                    value,
+                    query_valid_mask[:, global_query_count:],
+                    key_valid_mask,
+                    causal=True,
+                )
+            )
+        attended = torch.cat(parts, dim=2) if parts else torch.zeros_like(query)
+        return self._finish_attention(query_tokens, attended)
+
+    def forward_full(
+        self,
+        tokens: Tensor,
+        valid_mask: Tensor,
+    ) -> Tensor:
+        key, value = self.project_kv(tokens)
+        return self.forward_full_projected_kv(
+            tokens, key, value, valid_mask, valid_mask
+        )
 
     def forward(self, query_tokens: Tensor, key_tokens: Tensor, allowed_mask: Tensor) -> Tensor:
         key, value = self.project_kv(key_tokens)
@@ -322,9 +596,8 @@ class LongerTokenMerger(nn.Module):
         if self.inner_blocks:
             hidden = grouped.reshape(batch_size * group_count, self.merge_size, token_dim)
             hidden_mask = group_mask.reshape(batch_size * group_count, self.merge_size)
-            allowed = hidden_mask.unsqueeze(1) & hidden_mask.unsqueeze(2)
             for block in self.inner_blocks:
-                hidden = block(hidden, hidden, allowed)
+                hidden = block.forward_full(hidden, hidden_mask)
             grouped = hidden.view(batch_size, group_count, self.merge_size, token_dim)
         grouped = grouped * group_mask.unsqueeze(-1).to(dtype=grouped.dtype)
         merged = grouped.reshape(batch_size, group_count, self.output_dim)
@@ -345,6 +618,7 @@ class LongerSequenceEncoder(nn.Module):
         user_global_tokens: int = 0,
         attention_backend: str = "auto",
         activation_checkpoint: bool = False,
+        checkpoint_token_merger: bool | None = None,
     ) -> None:
         super().__init__()
         if query_token_count <= 0:
@@ -360,6 +634,11 @@ class LongerSequenceEncoder(nn.Module):
         self.user_global_tokens = user_global_tokens
         self.candidate_global_tokens = summary_tokens - user_global_tokens
         self.activation_checkpoint = activation_checkpoint
+        self.checkpoint_token_merger = (
+            activation_checkpoint
+            if checkpoint_token_merger is None
+            else checkpoint_token_merger
+        )
         self.input_dim = token_dim
         self.token_merger = LongerTokenMerger(
             token_dim,
@@ -400,43 +679,6 @@ class LongerSequenceEncoder(nn.Module):
             torch.cat([mask_pad, merged_mask], dim=1),
         )
 
-    def _recent_allowed_mask(self, key_mask: Tensor, query_mask: Tensor) -> Tensor:
-        key_count = key_mask.size(1)
-        query_count = query_mask.size(1)
-        key_positions = torch.arange(key_count, device=key_mask.device).view(1, 1, key_count)
-        query_positions = torch.arange(
-            key_count - query_count, key_count, device=key_mask.device
-        ).view(1, query_count, 1)
-        return (
-            key_mask.unsqueeze(1)
-            & (key_positions <= query_positions)
-            & query_mask.unsqueeze(-1)
-        )
-
-    def _recent_self_allowed_mask(self, recent_mask: Tensor) -> Tensor:
-        count = recent_mask.size(1)
-        causal = torch.arange(count, device=recent_mask.device).view(1, 1, count) <= torch.arange(
-            count, device=recent_mask.device
-        ).view(1, count, 1)
-        return recent_mask.unsqueeze(1) & causal & recent_mask.unsqueeze(-1)
-
-    def _cacheable_allowed_mask(
-        self,
-        user_mask: Tensor,
-        sequence_mask: Tensor,
-        sequence_allowed: Tensor,
-    ) -> Tensor:
-        key_mask = torch.cat([user_mask, sequence_mask], dim=1)
-        user_allowed = key_mask.unsqueeze(1).expand(-1, user_mask.size(1), -1)
-        sequence_queries = torch.cat(
-            [
-                user_mask.unsqueeze(1).expand(-1, sequence_allowed.size(1), -1),
-                sequence_allowed,
-            ],
-            dim=2,
-        )
-        return torch.cat([user_allowed, sequence_queries], dim=1)
-
     def precompute_cache(
         self,
         tokens: Tensor,
@@ -457,7 +699,7 @@ class LongerSequenceEncoder(nn.Module):
             dtype=torch.bool,
             device=tokens.device,
         )
-        if self.activation_checkpoint and self.training:
+        if self.checkpoint_token_merger and self.training:
             merged_tokens, merged_mask = checkpoint(
                 self.token_merger,
                 tokens,
@@ -469,23 +711,23 @@ class LongerSequenceEncoder(nn.Module):
         recent_tokens, recent_mask = self._recent_tokens(merged_tokens, merged_mask)
         cross_inputs = torch.cat([user_global_tokens, merged_tokens], dim=1)
         cross_queries = torch.cat([user_global_tokens, recent_tokens], dim=1)
-        cross_allowed = self._cacheable_allowed_mask(
-            user_mask,
-            merged_mask,
-            self._recent_allowed_mask(merged_mask, recent_mask),
-        )
+        cross_query_mask = torch.cat([user_mask, recent_mask], dim=1)
+        cross_key_mask = torch.cat([user_mask, merged_mask], dim=1)
         if self.activation_checkpoint and self.training:
             def cross_forward(
                 current_inputs: Tensor,
                 current_queries: Tensor,
-                current_allowed: Tensor,
+                current_query_mask: Tensor,
+                current_key_mask: Tensor,
             ) -> tuple[Tensor, Tensor, Tensor]:
                 current_key, current_value = self.cross_block.project_kv(current_inputs)
-                current_output = self.cross_block.forward_projected_kv(
+                current_output = self.cross_block.forward_mixed_projected_kv(
                     current_queries,
                     current_key,
                     current_value,
-                    current_allowed,
+                    current_query_mask,
+                    current_key_mask,
+                    self.user_global_tokens,
                 )
                 return current_key, current_value, current_output
 
@@ -493,16 +735,19 @@ class LongerSequenceEncoder(nn.Module):
                 cross_forward,
                 cross_inputs,
                 cross_queries,
-                cross_allowed,
+                cross_query_mask,
+                cross_key_mask,
                 use_reentrant=False,
             )
         else:
             cross_key, cross_value = self.cross_block.project_kv(cross_inputs)
-            cross_output = self.cross_block.forward_projected_kv(
+            cross_output = self.cross_block.forward_mixed_projected_kv(
                 cross_queries,
                 cross_key,
                 cross_value,
-                cross_allowed,
+                cross_query_mask,
+                cross_key_mask,
+                self.user_global_tokens,
             )
         cross_user_output = cross_output[:, : self.user_global_tokens, :]
         cross_recent_output = cross_output[:, self.user_global_tokens :, :]
@@ -513,39 +758,39 @@ class LongerSequenceEncoder(nn.Module):
         layer_caches: list[LongerSelfLayerCache] = []
         for block in self.self_blocks:
             cacheable_inputs = torch.cat([current_user, current_recent], dim=1)
-            cacheable_allowed = self._cacheable_allowed_mask(
-                user_mask,
-                recent_mask,
-                self._recent_self_allowed_mask(recent_mask),
-            )
+            cacheable_mask = torch.cat([user_mask, recent_mask], dim=1)
             if self.activation_checkpoint and self.training:
                 def self_forward(
                     current_inputs: Tensor,
-                    current_allowed: Tensor,
+                    current_mask: Tensor,
                     current_block: LongerSequenceAttentionBlock = block,
                 ) -> tuple[Tensor, Tensor, Tensor]:
                     current_key, current_value = current_block.project_kv(current_inputs)
-                    current_output = current_block.forward_projected_kv(
+                    current_output = current_block.forward_mixed_projected_kv(
                         current_inputs,
                         current_key,
                         current_value,
-                        current_allowed,
+                        current_mask,
+                        current_mask,
+                        self.user_global_tokens,
                     )
                     return current_key, current_value, current_output
 
                 cacheable_key, cacheable_value, cacheable_output = checkpoint(
                     self_forward,
                     cacheable_inputs,
-                    cacheable_allowed,
+                    cacheable_mask,
                     use_reentrant=False,
                 )
             else:
                 cacheable_key, cacheable_value = block.project_kv(cacheable_inputs)
-                cacheable_output = block.forward_projected_kv(
+                cacheable_output = block.forward_mixed_projected_kv(
                     cacheable_inputs,
                     cacheable_key,
                     cacheable_value,
-                    cacheable_allowed,
+                    cacheable_mask,
+                    cacheable_mask,
+                    self.user_global_tokens,
                 )
             user_output = cacheable_output[:, : self.user_global_tokens, :]
             recent_output = cacheable_output[:, self.user_global_tokens :, :]
@@ -644,26 +889,23 @@ class LongerSequenceEncoder(nn.Module):
             [candidate_valid, sequence_cache.user_mask, sequence_cache.merged_mask],
             dim=1,
         )
-        candidate_allowed = cross_key_mask.unsqueeze(1).expand(
-            -1,
-            self.candidate_global_tokens,
-            -1,
-        )
         if self.activation_checkpoint and self.training:
             candidate_hidden = checkpoint(
-                self.cross_block.forward_projected_kv,
+                self.cross_block.forward_full_projected_kv,
                 candidate_global_tokens,
                 cross_key,
                 cross_value,
-                candidate_allowed,
+                candidate_valid,
+                cross_key_mask,
                 use_reentrant=False,
             )
         else:
-            candidate_hidden = self.cross_block.forward_projected_kv(
+            candidate_hidden = self.cross_block.forward_full_projected_kv(
                 candidate_global_tokens,
                 cross_key,
                 cross_value,
-                candidate_allowed,
+                candidate_valid,
+                cross_key_mask,
             )
         hidden = torch.cat(
             [
@@ -682,26 +924,23 @@ class LongerSequenceEncoder(nn.Module):
                 [candidate_valid, sequence_cache.user_mask, sequence_cache.recent_mask],
                 dim=1,
             )
-            candidate_allowed = key_mask.unsqueeze(1).expand(
-                -1,
-                self.candidate_global_tokens,
-                -1,
-            )
             if self.activation_checkpoint and self.training:
                 candidate_hidden = checkpoint(
-                    block.forward_projected_kv,
+                    block.forward_full_projected_kv,
                     candidate_hidden,
                     key,
                     value,
-                    candidate_allowed,
+                    candidate_valid,
+                    key_mask,
                     use_reentrant=False,
                 )
             else:
-                candidate_hidden = block.forward_projected_kv(
+                candidate_hidden = block.forward_full_projected_kv(
                     candidate_hidden,
                     key,
                     value,
-                    candidate_allowed,
+                    candidate_valid,
+                    key_mask,
                 )
             hidden = torch.cat(
                 [layer_cache.user_output, candidate_hidden, layer_cache.recent_output],
@@ -718,11 +957,13 @@ class FeatureEncoderBank(nn.Module):
         embedding_dim: int,
         build_sequence_summaries: bool = True,
         included_scalar_feature_names: set[str] | None = None,
+        embedding_size_override: int | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.build_sequence_summaries = build_sequence_summaries
         self.sequence_token_dim = config.model.token_dim
+        self.embedding_size_override = embedding_size_override
         default_scalar_feature_names = {
             feature.name
             for feature in config.features
@@ -769,10 +1010,68 @@ class FeatureEncoderBank(nn.Module):
         scalar_feature_names = {feature.name for feature in config.features}
         for qualified in self.sequence_field_embedding_keys:
             encoding = _encoding_for(config, qualified)
-            if encoding.encoding == "shared_vocab" and encoding.share_embedding:
+            if _embedding_share_target(encoding) is not None:
                 base_name = self._shared_base_name(qualified)
                 if base_name in scalar_feature_names:
                     self.included_scalar_feature_names.add(base_name)
+
+        self.embedding_sharding_plan: EmbeddingShardingPlan | None = None
+        if config.training.embedding_distribution == "sharded":
+            table_specs: list[EmbeddingTableSpec] = []
+            for feature in config.features:
+                if (
+                    feature.name not in self.included_scalar_feature_names
+                    or feature.kind != "categorical"
+                ):
+                    continue
+                encoding = _encoding_for(config, feature.name)
+                if _embedding_share_target(encoding) is not None:
+                    continue
+                table_specs.append(
+                    EmbeddingTableSpec(
+                        name=feature.name,
+                        num_embeddings=_embedding_size(
+                            config,
+                            vocab_maps,
+                            feature.name,
+                            embedding_size_override,
+                        ),
+                        embedding_dim=categorical_dims[feature.name],
+                    )
+                )
+            for sequence in config.sequences:
+                for field in sequence.fields:
+                    if field.kind != "categorical":
+                        continue
+                    qualified = field.qualified_name(sequence.name)
+                    encoding = _encoding_for(config, qualified)
+                    if _embedding_share_target(encoding) is not None:
+                        continue
+                    table_specs.append(
+                        EmbeddingTableSpec(
+                            name=qualified,
+                            num_embeddings=_embedding_size(
+                                config,
+                                vocab_maps,
+                                qualified,
+                                embedding_size_override,
+                            ),
+                            embedding_dim=categorical_dims[qualified],
+                        )
+                    )
+            world_size = (
+                torch_dist.get_world_size()
+                if torch_dist.is_available() and torch_dist.is_initialized()
+                else 1
+            )
+            self.embedding_sharding_plan = plan_embedding_shards(
+                table_specs,
+                world_size=world_size,
+                strategy=config.training.embedding_sharding.strategy,
+                table_wise_max_rows=(
+                    config.training.embedding_sharding.table_wise_max_rows
+                ),
+            )
 
         for feature in config.features:
             if feature.name not in self.included_scalar_feature_names:
@@ -780,18 +1079,20 @@ class FeatureEncoderBank(nn.Module):
             if feature.kind == "dense":
                 continue
             encoding = _encoding_for(config, feature.name)
-            if encoding.encoding == "shared_vocab" and encoding.share_embedding:
+            if _embedding_share_target(encoding) is not None:
                 continue
             feature_embedding_dim = categorical_dims[feature.name]
-            size = _embedding_size(encoding, vocab_maps, feature.name)
-            self.embeddings[feature.name] = _init_embedding(
-                nn.Embedding(
-                    size,
-                    feature_embedding_dim,
-                    padding_idx=0,
-                    sparse=sparse_gradients,
-                ),
-                config.model.init_std,
+            size = _embedding_size(
+                config,
+                vocab_maps,
+                feature.name,
+                embedding_size_override,
+            )
+            self.embeddings[feature.name] = self._build_id_embedding(
+                feature.name,
+                size,
+                feature_embedding_dim,
+                sparse_gradients,
             )
 
         for sequence in config.sequences:
@@ -804,18 +1105,20 @@ class FeatureEncoderBank(nn.Module):
                     encoding = _encoding_for(config, qualified)
                     field_embedding_dim = categorical_dims[qualified]
                     field_input_dims[field.name] = field_embedding_dim
-                    if encoding.encoding == "shared_vocab" and encoding.share_embedding:
+                    if _embedding_share_target(encoding) is not None:
                         step_input_dim += field_embedding_dim
                         continue
-                    size = _embedding_size(encoding, vocab_maps, qualified)
-                    self.embeddings[key] = _init_embedding(
-                        nn.Embedding(
-                            size,
-                            field_embedding_dim,
-                            padding_idx=0,
-                            sparse=sparse_gradients,
-                        ),
-                        config.model.init_std,
+                    size = _embedding_size(
+                        config,
+                        vocab_maps,
+                        qualified,
+                        embedding_size_override,
+                    )
+                    self.embeddings[key] = self._build_id_embedding(
+                        qualified,
+                        size,
+                        field_embedding_dim,
+                        sparse_gradients,
                     )
                     step_input_dim += field_embedding_dim
                 else:
@@ -868,7 +1171,13 @@ class FeatureEncoderBank(nn.Module):
                     sequence.longer_inner_layers,
                     user_global_tokens=user_global_tokens,
                     attention_backend=config.runtime.attention_backend,
-                    activation_checkpoint=config.runtime.activation_checkpoint,
+                    activation_checkpoint=_activation_checkpoint_enabled(
+                        config.runtime.activation_checkpoint
+                    ),
+                    checkpoint_token_merger=_activation_checkpoint_enabled(
+                        config.runtime.activation_checkpoint,
+                        full_only=True,
+                    ),
                 )
                 self.sequence_longer_encoders[sequence_key] = longer_encoder
                 query_token_dim = longer_encoder.token_dim
@@ -919,13 +1228,17 @@ class FeatureEncoderBank(nn.Module):
             if feature.kind != "categorical":
                 continue
             encoding = _encoding_for(config, feature.name)
-            if encoding.encoding == "shared_vocab" and encoding.share_embedding:
+            if _embedding_share_target(encoding) is not None:
                 if feature.name not in categorical_dims:
-                    raise ValueError(f"shared_vocab feature {feature.name!r} references unknown feature")
+                    raise ValueError(
+                        f"shared embedding feature {feature.name!r} references unknown feature"
+                    )
                 base_name = self._shared_base_name(feature.name)
                 base_key = self._embedding_key(base_name)
                 if base_key not in self.embeddings:
-                    raise ValueError(f"shared_vocab base {base_name!r} has no embedding")
+                    raise ValueError(
+                        f"shared embedding base {base_name!r} has no embedding"
+                    )
                 self.embeddings[feature.name] = self.embeddings[base_key]
                 self.output_dims[feature.name] = categorical_dims[feature.name]
 
@@ -935,18 +1248,60 @@ class FeatureEncoderBank(nn.Module):
                     continue
                 qualified = field.qualified_name(sequence.name)
                 encoding = _encoding_for(config, qualified)
-                if encoding.encoding == "shared_vocab" and encoding.share_embedding:
+                if _embedding_share_target(encoding) is not None:
                     if qualified not in categorical_dims:
-                        raise ValueError(f"shared_vocab sequence field {qualified!r} references unknown feature")
+                        raise ValueError(
+                            f"shared embedding sequence field {qualified!r} references "
+                            "unknown feature"
+                        )
                     base_name = self._shared_base_name(qualified)
                     base_key = self._embedding_key(base_name)
                     if base_key not in self.embeddings:
-                        raise ValueError(f"shared_vocab base {base_name!r} has no embedding")
+                        raise ValueError(
+                            f"shared embedding base {base_name!r} has no embedding"
+                        )
                     self.embeddings[self.sequence_field_embedding_keys[qualified]] = self.embeddings[base_key]
 
     @staticmethod
     def _module_key(name: str) -> str:
         return name.replace(".", "__")
+
+    def _build_id_embedding(
+        self,
+        table_name: str,
+        num_embeddings: int,
+        embedding_dim: int,
+        sparse_gradients: bool,
+    ) -> nn.Module:
+        if self.config.training.embedding_distribution == "replicated":
+            embedding = _init_embedding(
+                nn.Embedding(
+                    num_embeddings,
+                    embedding_dim,
+                    padding_idx=0,
+                    sparse=sparse_gradients,
+                ),
+                self.config.model.init_std,
+            )
+            embedding._mdl_id_embedding = True  # type: ignore[attr-defined]
+            return embedding
+        if self.embedding_sharding_plan is None:
+            raise RuntimeError("sharded embedding plan was not initialized")
+        try:
+            shard_spec = self.embedding_sharding_plan.tables[table_name]
+        except KeyError as error:
+            raise RuntimeError(
+                f"missing sharding plan entry for embedding {table_name!r}"
+            ) from error
+        return ShardedEmbedding(
+            num_embeddings,
+            embedding_dim,
+            table_name=table_name,
+            shard_spec=shard_spec,
+            padding_idx=0,
+            local_dedup=self.config.training.embedding_sharding.local_dedup,
+            init_std=self.config.model.init_std,
+        )
 
     def _embedding_key(self, name: str) -> str:
         return self.sequence_field_embedding_keys.get(name, name)
@@ -956,12 +1311,13 @@ class FeatureEncoderBank(nn.Module):
         current = name
         while True:
             if current in seen:
-                raise ValueError(f"shared_vocab cycle detected at {name!r}")
+                raise ValueError(f"shared embedding cycle detected at {name!r}")
             seen.add(current)
             encoding = _encoding_for(self.config, current)
-            if encoding.encoding != "shared_vocab" or not encoding.share_embedding:
+            target = _embedding_share_target(encoding)
+            if target is None:
                 return current
-            current = encoding.share_with
+            current = target
 
     def _encode_scalar_feature(self, feature: FeatureConfig, value: Tensor) -> Tensor:
         if feature.kind == "dense":
@@ -1008,13 +1364,19 @@ class FeatureEncoderBank(nn.Module):
         field_values = value["fields"]
         lengths = value["lengths"].long()
         parts: dict[str, Tensor] = {}
+        sharded_requests: list[tuple[str, ShardedEmbedding, Tensor]] = []
         for field in sequence.fields:
             tensor = field_values[field.name]
             if field.kind == "categorical":
                 qualified = field.qualified_name(sequence.name)
-                parts[field.name] = self.embeddings[
+                embedding = self.embeddings[
                     self.sequence_field_embedding_keys[qualified]
-                ](tensor.long())
+                ]
+                indices = tensor.long()
+                if isinstance(embedding, ShardedEmbedding):
+                    sharded_requests.append((field.name, embedding, indices))
+                else:
+                    parts[field.name] = embedding(indices)
             else:
                 dense = tensor.float()
                 if dense.dim() == 2:
@@ -1025,6 +1387,15 @@ class FeatureEncoderBank(nn.Module):
                         f"dimension {field.dimension}, got {dense.size(-1)}"
                     )
                 parts[field.name] = dense
+        if sharded_requests:
+            sharded_outputs = grouped_sharded_embedding_lookup(
+                (embedding, indices)
+                for _name, embedding, indices in sharded_requests
+            )
+            for (name, _embedding, _indices), output in zip(
+                sharded_requests, sharded_outputs
+            ):
+                parts[name] = output
         if not parts:
             raise ValueError(f"sequence {sequence.name!r} has no fields")
         return parts, lengths
@@ -1225,6 +1596,7 @@ class FeatureEncoderBank(nn.Module):
         names: set[str] | None = None,
     ) -> dict[str, Tensor]:
         encoded: dict[str, Tensor] = {}
+        sharded_requests: list[tuple[str, ShardedEmbedding, Tensor]] = []
         for feature in self.config.features:
             if feature.name not in self.included_scalar_feature_names:
                 continue
@@ -1233,7 +1605,21 @@ class FeatureEncoderBank(nn.Module):
             value = features[feature.name]
             if not isinstance(value, Tensor):
                 raise ValueError(f"scalar feature {feature.name!r} must be a tensor")
+            if feature.kind == "categorical":
+                embedding = self.embeddings[feature.name]
+                if isinstance(embedding, ShardedEmbedding):
+                    sharded_requests.append((feature.name, embedding, value.long()))
+                    continue
             encoded[feature.name] = self._encode_scalar_feature(feature, value)
+        if sharded_requests:
+            sharded_outputs = grouped_sharded_embedding_lookup(
+                (embedding, indices)
+                for _name, embedding, indices in sharded_requests
+            )
+            for (name, _embedding, _indices), output in zip(
+                sharded_requests, sharded_outputs
+            ):
+                encoded[name] = output
         return encoded
 
 
@@ -1270,22 +1656,7 @@ class FeatureEncoderBank(nn.Module):
     ) -> dict[str, Tensor]:
         if request_cache is None and self.config.model.use_request_cache:
             request_cache = self.precompute_request_cache(features)
-        encoded: dict[str, Tensor] = {}
-        for feature in self.config.features:
-            if feature.name not in self.included_scalar_feature_names:
-                continue
-            value = features[feature.name]
-            if feature.kind == "dense":
-                if not isinstance(value, Tensor):
-                    raise ValueError(f"dense feature {feature.name!r} must be a tensor")
-                encoded[feature.name] = self._encode_scalar_feature(feature, value)
-                continue
-            if feature.kind == "categorical":
-                if not isinstance(value, Tensor):
-                    raise ValueError(f"categorical feature {feature.name!r} must be a tensor")
-                encoded[feature.name] = self._encode_scalar_feature(feature, value)
-                continue
-            raise ValueError(f"unsupported feature kind {feature.kind!r}")
+        encoded = self.encode_scalar_features(features)
 
         if not self.build_sequence_summaries:
             return encoded
@@ -1826,6 +2197,82 @@ class MixedCausalAttention(nn.Module):
             )
         return self.output(self._merge_heads(attended))
 
+    def attend_causal_suffix(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        query_valid_mask: Tensor,
+        key_valid_mask: Tensor,
+    ) -> Tensor:
+        """Attend a packed query suffix with exact bottom-right causality."""
+
+        if self.attention_backend != "flash":
+            key_count = key.size(2)
+            query_count = query.size(2)
+            key_positions = torch.arange(
+                key_count, device=query.device
+            ).view(1, 1, key_count)
+            query_positions = torch.arange(
+                key_count - query_count,
+                key_count,
+                device=query.device,
+            ).view(1, query_count, 1)
+            allowed = (
+                (key_positions <= query_positions)
+                & key_valid_mask.unsqueeze(1)
+                & query_valid_mask.unsqueeze(-1)
+            )
+            with _sdpa_context(self.attention_backend):
+                attended = torch.nn.functional.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=allowed.unsqueeze(1),
+                    dropout_p=0.0,
+                )
+            return self.output(self._merge_heads(attended))
+
+        if varlen_attn is None:
+            raise RuntimeError(
+                "runtime.attention_backend='flash' requires torch.nn.attention.varlen"
+            )
+        if query.device.type != "cuda":
+            raise RuntimeError("Flash varlen attention requires CUDA tensors")
+        if query.dtype not in {torch.float16, torch.bfloat16}:
+            raise RuntimeError("Flash varlen attention requires FP16 or BF16 tensors")
+        query_tokens = query.transpose(1, 2)
+        key_tokens = key.transpose(1, 2)
+        value_tokens = value.transpose(1, 2)
+        packed_query = query_tokens[query_valid_mask]
+        packed_key = key_tokens[key_valid_mask]
+        packed_value = value_tokens[key_valid_mask]
+        if packed_query.numel() == 0:
+            return self.output(self._merge_heads(torch.zeros_like(query)))
+        query_lengths = query_valid_mask.sum(dim=1, dtype=torch.int32)
+        key_lengths = key_valid_mask.sum(dim=1, dtype=torch.int32)
+        cu_query = torch.nn.functional.pad(
+            query_lengths.cumsum(0, dtype=torch.int32), (1, 0)
+        )
+        cu_key = torch.nn.functional.pad(
+            key_lengths.cumsum(0, dtype=torch.int32), (1, 0)
+        )
+        with torch.profiler.record_function("onetrans::flash_varlen_causal"):
+            packed_output = varlen_attn(
+                packed_query.contiguous(),
+                packed_key.contiguous(),
+                packed_value.contiguous(),
+                cu_query,
+                cu_key,
+                query_valid_mask.size(1),
+                key_valid_mask.size(1),
+                window_size=(-1, 0),
+            )
+        attended_tokens = torch.zeros_like(query_tokens)
+        attended_tokens[query_valid_mask] = packed_output
+        attended = attended_tokens.transpose(1, 2)
+        return self.output(self._merge_heads(attended))
+
 
     def forward(
         self,
@@ -1840,19 +2287,14 @@ class MixedCausalAttention(nn.Module):
         key = self._split_heads(self._project_all(tokens, s_count, self.s_key, self.ns_key))
         value = self._split_heads(self._project_all(tokens, s_count, self.s_value, self.ns_value))
 
-        key_positions = torch.arange(tokens.size(1), device=tokens.device).view(1, -1)
-        causal = key_positions <= query_indices.view(-1, 1)
-        valid = causal.unsqueeze(0) & key_valid_mask.unsqueeze(1)
-
-        with _sdpa_context(self.attention_backend):
-            attended = torch.nn.functional.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=valid.unsqueeze(1),
-                dropout_p=0.0,
-            )
-        return self.output(self._merge_heads(attended))
+        query_valid_mask = key_valid_mask.index_select(1, query_indices)
+        return self.attend_causal_suffix(
+            query,
+            key,
+            value,
+            query_valid_mask,
+            key_valid_mask,
+        )
 
 
 class MixedFFN(nn.Module):
@@ -1909,12 +2351,13 @@ class OneTransBlock(nn.Module):
         else:
             query_tokens = normalized[:, -query_s_count:, :]
             query = self.attention.project_s_query(query_tokens)
-            key_positions = torch.arange(s_tokens.size(1), device=s_tokens.device).view(1, -1)
-            query_positions = torch.arange(
-                s_tokens.size(1) - query_s_count, s_tokens.size(1), device=s_tokens.device
-            ).view(-1, 1)
-            allowed = (key_positions <= query_positions).unsqueeze(0) & valid_mask.unsqueeze(1)
-            attended = self.attention.attend_projected(query, s_key, s_value, allowed)
+            attended = self.attention.attend_causal_suffix(
+                query,
+                s_key,
+                s_value,
+                output_mask,
+                valid_mask,
+            )
             residual = s_tokens[:, -query_s_count:, :]
             hidden = residual + attended
             output = hidden + self.ffn.s_ffn(self.norm_ffn(hidden))
@@ -1988,14 +2431,13 @@ class OneTransBlock(nn.Module):
         else:
             query_tokens = normalized[:, -query_s_count:, :]
             query = self.attention.project_s_query(query_tokens)
-            key_positions = torch.arange(s_tokens.size(1), device=s_tokens.device).view(1, -1)
-            query_positions = torch.arange(
-                s_tokens.size(1) - query_s_count,
-                s_tokens.size(1),
-                device=s_tokens.device,
-            ).view(-1, 1)
-            allowed = (key_positions <= query_positions).unsqueeze(0) & valid_mask.unsqueeze(1)
-            attended = self.attention.attend_projected(query, s_key, s_value, allowed)
+            attended = self.attention.attend_causal_suffix(
+                query,
+                s_key,
+                s_value,
+                output_mask,
+                valid_mask,
+            )
             residual = s_tokens[:, -query_s_count:, :]
             hidden = residual + attended
             output = hidden + self.ffn.s_ffn(self.norm_ffn(hidden))
@@ -2027,19 +2469,15 @@ class OneTransBlock(nn.Module):
         value = torch.cat([s_value, ns_value], dim=2)
         ns_count = ns_tokens.size(1)
         s_count = s_key.size(2)
-        ns_causal = torch.arange(ns_count, device=ns_tokens.device).view(1, 1, ns_count) <= torch.arange(
-            ns_count, device=ns_tokens.device
-        ).view(1, ns_count, 1)
-        allowed = torch.cat(
-            [
-                s_mask.unsqueeze(1).expand(-1, ns_count, -1),
-                ns_causal.expand(ns_tokens.size(0), -1, -1),
-            ],
-            dim=2,
-        )
         if key.size(2) != s_count + ns_count:
             raise RuntimeError("OneTrans cached key shape is inconsistent")
-        attended = self.attention.attend_projected(query, key, value, allowed)
+        query_mask = torch.ones(
+            ns_tokens.size(0), ns_count, dtype=torch.bool, device=ns_tokens.device
+        )
+        key_mask = torch.cat([s_mask, query_mask], dim=1)
+        attended = self.attention.attend_causal_suffix(
+            query, key, value, query_mask, key_mask
+        )
         hidden = ns_tokens + attended
         return hidden + self.ffn(self.norm_ffn(hidden), query_s_count=0)
 
@@ -2066,7 +2504,14 @@ class OneTransBlock(nn.Module):
 
 
 class OneTransBackbone(nn.Module):
-    def __init__(self, config: AppConfig, vocab_maps: dict[str, dict[str, int]], embedding_dim: int | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        vocab_maps: dict[str, dict[str, int]],
+        embedding_dim: int | None = None,
+        included_scalar_feature_names: set[str] | None = None,
+        embedding_size_override: int | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
         embedding_dim = config.model.embedding_dim if embedding_dim is None else embedding_dim
@@ -2074,11 +2519,49 @@ class OneTransBackbone(nn.Module):
             config,
             vocab_maps,
             embedding_dim,
-            build_sequence_summaries=config.model.name == "mdl_onetrans",
+            # OneTrans consumes raw event embeddings as S-tokens. Building a
+            # summary encoder here (especially LONGER for mdl_onetrans) would
+            # model the same history twice and restore encode-then-interaction.
+            build_sequence_summaries=False,
+            included_scalar_feature_names=included_scalar_feature_names,
+            embedding_size_override=embedding_size_override,
         )
         self.tokenizer = OneTransTokenizer(config, self.encoder_bank)
         self.ns_token_count = self.tokenizer.num_ns_tokens
+        self.unified_position_embeddings = _init_embedding(
+            nn.Embedding(
+                resolve_onetrans_max_position_embeddings(config),
+                config.model.token_dim,
+            ),
+            config.model.init_std,
+        )
         self.blocks = nn.ModuleList(OneTransBlock(config, self.ns_token_count) for _ in range(config.model.num_layers))
+
+    def _add_unified_position_embeddings(
+        self,
+        tokens: Tensor,
+        valid_mask: Tensor,
+    ) -> Tensor:
+        if tokens.dim() != 3:
+            raise ValueError("OneTrans tokens must have shape [batch, tokens, dim]")
+        if valid_mask.shape != tokens.shape[:2]:
+            raise ValueError("OneTrans position mask must match the token batch and length")
+        capacity = self.unified_position_embeddings.num_embeddings
+        if tokens.size(1) > capacity:
+            raise ValueError(
+                "OneTrans unified token count exceeds model.max_position_embeddings: "
+                f"{tokens.size(1)} > {capacity}"
+            )
+
+        # Padding is kept as a masked prefix so pyramid queries remain aligned.
+        # Count only valid tokens to make logical positions independent of other
+        # samples' padding; the first NS token follows the final valid S token.
+        position_ids = valid_mask.to(torch.long).cumsum(dim=1).sub(1).clamp_min(0)
+        position_inputs = self.unified_position_embeddings(position_ids).to(tokens.dtype)
+        position_inputs = position_inputs * valid_mask.unsqueeze(-1).to(
+            position_inputs.dtype
+        )
+        return tokens + position_inputs
 
     def _layer_s_count(self, initial_s_count: int, current_s_count: int, layer_index: int) -> int:
         if not self.config.model.use_pyramid or initial_s_count == 0:
@@ -2099,8 +2582,11 @@ class OneTransBackbone(nn.Module):
 
     def precompute_request_cache(self, features: dict[str, Any]) -> OneTransRequestCache:
         token_cache = self.tokenizer.precompute_request_cache(features)
-        current_tokens = token_cache.s_tokens
         current_mask = token_cache.s_valid_mask
+        current_tokens = self._add_unified_position_embeddings(
+            token_cache.s_tokens,
+            current_mask,
+        )
         initial_s_count = current_tokens.size(1)
         current_start = 0
         layer_caches: list[OneTransLayerCache] = []
@@ -2150,8 +2636,11 @@ class OneTransBackbone(nn.Module):
         if token_cache.s_tokens.size(1) == old_count:
             return previous
 
-        current_tokens = token_cache.s_tokens
         current_mask = token_cache.s_valid_mask
+        current_tokens = self._add_unified_position_embeddings(
+            token_cache.s_tokens,
+            current_mask,
+        )
         initial_s_count = current_tokens.size(1)
         current_start = 0
         layer_caches: list[OneTransLayerCache] = []
@@ -2198,8 +2687,12 @@ class OneTransBackbone(nn.Module):
             device=tokenized.feature_tokens.device,
         )
         valid_mask = torch.cat([tokenized.s_valid_mask, ns_mask], dim=1)
+        tokens = self._add_unified_position_embeddings(
+            tokenized.feature_tokens,
+            valid_mask,
+        )
         return OneTransBackboneState(
-            tokens=tokenized.feature_tokens,
+            tokens=tokens,
             valid_mask=valid_mask,
             s_count=tokenized.s_token_count,
             ns_count=tokenized.ns_token_count,
@@ -2236,7 +2729,9 @@ class OneTransBackbone(nn.Module):
                 [s_output_mask, state.valid_mask[:, state.s_count :]],
                 dim=1,
             )
-        elif self.config.runtime.activation_checkpoint and self.training:
+        elif _activation_checkpoint_enabled(
+            self.config.runtime.activation_checkpoint
+        ) and self.training:
             tokens, valid_mask = checkpoint(
                 lambda current_tokens, current_mask: block(
                     current_tokens, state.s_count, query_s_count, current_mask
@@ -2292,6 +2787,7 @@ class LongerModel(nn.Module):
         config: AppConfig,
         vocab_maps: dict[str, dict[str, int]],
         embedding_dim: int | None = None,
+        embedding_size_override: int | None = None,
     ) -> None:
         super().__init__()
         if len(config.sequences) != 1 or config.sequences[0].encoder != "longer":
@@ -2308,6 +2804,7 @@ class LongerModel(nn.Module):
             vocab_maps,
             embedding_dim,
             included_scalar_feature_names=target_inputs,
+            embedding_size_override=embedding_size_override,
         )
         output_dim = self.encoder_bank.output_dims[self.sequence_name]
         self.logit_layers = _build_task_heads(config, output_dim, len(config.task_names))
@@ -2332,7 +2829,7 @@ class LongerModel(nn.Module):
 
 def _build_rankmixer_ffn(config: AppConfig, num_tokens: int) -> nn.Module:
     if config.model.rankmixer_ffn_type == "dense":
-        return PerTokenFFN(
+        return StackedPerTokenFFN(
             num_tokens,
             config.model.token_dim,
             config.model.hidden_dim,
@@ -2382,7 +2879,13 @@ class RankMixerBlock(nn.Module):
 
 
 class RankMixerModel(nn.Module):
-    def __init__(self, config: AppConfig, vocab_maps: dict[str, dict[str, int]], embedding_dim: int | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        vocab_maps: dict[str, dict[str, int]],
+        embedding_dim: int | None = None,
+        embedding_size_override: int | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
         self.feature_groups = config.tokenization.resolved_feature_tokens(config.features, config.sequences)
@@ -2391,7 +2894,12 @@ class RankMixerModel(nn.Module):
         if config.model.token_dim % self.feature_token_count != 0:
             raise ValueError("rankmixer requires token_dim divisible by feature token count")
         embedding_dim = config.model.embedding_dim if embedding_dim is None else embedding_dim
-        self.encoder_bank = FeatureEncoderBank(config, vocab_maps, embedding_dim)
+        self.encoder_bank = FeatureEncoderBank(
+            config,
+            vocab_maps,
+            embedding_dim,
+            embedding_size_override=embedding_size_override,
+        )
         self.feature_projector = _build_rankmixer_feature_projector(
             config,
             self.encoder_bank,
@@ -2415,7 +2923,9 @@ class RankMixerModel(nn.Module):
         encoded = self.encoder_bank(features, request_cache=request_cache)
         feature_tokens = self.feature_projector(encoded)
         for block in self.blocks:
-            if self.config.runtime.activation_checkpoint and self.training:
+            if _activation_checkpoint_enabled(
+                self.config.runtime.activation_checkpoint
+            ) and self.training:
                 feature_tokens = checkpoint(block, feature_tokens, use_reentrant=False)
             else:
                 feature_tokens = block(feature_tokens)
@@ -2426,11 +2936,49 @@ class RankMixerModel(nn.Module):
         return output
 
 
+class ScenarioTower(nn.Module):
+    """Top-level per-scenario MLP fallback used by the no-token ablation.
+
+    The MDL paper names a scenario-tower replacement but does not publish its
+    exact topology. The repository convention is one independent two-layer MLP
+    per scenario over the final mean-pooled feature state. Only the towers
+    selected by ``scenario_mask`` contribute to each example.
+    """
+
+    def __init__(
+        self,
+        scenario_count: int,
+        token_dim: int,
+        hidden_dim: int,
+        activation: str,
+    ) -> None:
+        super().__init__()
+        if scenario_count <= 0:
+            raise ValueError("scenario tower requires at least one scenario")
+        self.scenario_count = scenario_count
+        self.networks = nn.ModuleList(
+            _projection_mlp(token_dim, token_dim, hidden_dim, activation)
+            for _ in range(scenario_count)
+        )
+
+    def forward(self, feature_tokens: Tensor, scenario_mask: Tensor) -> Tensor:
+        pooled_features = feature_tokens.mean(dim=1)
+        scenario_states = torch.stack(
+            [network(pooled_features) for network in self.networks],
+            dim=1,
+        )
+        return masked_scenario_pool(
+            scenario_states,
+            scenario_mask,
+            include_global=False,
+            has_global_state=False,
+        )
+
+
 def _init_domain_interaction_modules(
     block: nn.Module,
     config: AppConfig,
     metadata: ModelMetadata,
-    propagate_scenario_state: bool = True,
 ) -> None:
     token_dim = config.model.token_dim
     hidden_dim = config.model.hidden_dim
@@ -2439,41 +2987,102 @@ def _init_domain_interaction_modules(
     block.use_global_scenario_token = config.model.use_global_scenario_token
     block.use_task_feature_interaction = config.model.use_task_feature_interaction
     block.use_scenario_feature_interaction = config.model.use_scenario_feature_interaction
-    block.scenario_attention = DomainAwareAttention(
-        token_dim,
-        config.model.num_heads,
-        metadata.scenario_count + 1,
-        metadata.feature_token_count,
-        hidden_dim,
-        attention_backend=config.runtime.attention_backend,
-        activation=config.model.ffn_activation,
+
+    scenario_token_count = metadata.scenario_count + int(
+        config.model.use_global_scenario_token
     )
-    block.scenario_ffn = (
-        PerTokenFFN(
-            metadata.scenario_count + 1,
+    if block.use_scenario_tokens:
+        block.scenario_attention = (
+            DomainAwareAttention(
+                token_dim,
+                config.model.num_heads,
+                scenario_token_count,
+                metadata.feature_token_count,
+                hidden_dim,
+                attention_backend=config.runtime.attention_backend,
+                activation=config.model.ffn_activation,
+            )
+            if block.use_scenario_feature_interaction
+            else None
+        )
+        block.scenario_rankmixer = (
+            None
+            if block.use_scenario_feature_interaction
+            else RankMixerDomainInteraction(
+                token_dim,
+                scenario_token_count,
+                metadata.feature_token_count,
+            )
+        )
+        # Keep this FFN in every block, including the final block, to match the
+        # published MDL propagation equation exactly.
+        block.scenario_ffn = PerTokenFFN(
+            scenario_token_count,
             token_dim,
             hidden_dim,
             activation=config.model.ffn_activation,
         )
-        if propagate_scenario_state
-        else None
-    )
-    block.task_attention = DomainAwareAttention(
-        token_dim,
-        config.model.num_heads,
-        metadata.task_count,
-        metadata.feature_token_count,
-        hidden_dim,
-        attention_backend=config.runtime.attention_backend,
-        activation=config.model.ffn_activation,
-    )
-    block.domain_fused = DomainFusedModule(include_global=config.model.use_global_scenario_token)
-    block.task_ffn = PerTokenFFN(
-        metadata.task_count,
-        token_dim,
-        hidden_dim,
-        activation=config.model.ffn_activation,
-    )
+    else:
+        block.scenario_attention = None
+        block.scenario_rankmixer = None
+        block.scenario_ffn = None
+
+    if block.use_task_tokens:
+        block.task_attention = (
+            DomainAwareAttention(
+                token_dim,
+                config.model.num_heads,
+                metadata.task_count,
+                metadata.feature_token_count,
+                hidden_dim,
+                attention_backend=config.runtime.attention_backend,
+                activation=config.model.ffn_activation,
+            )
+            if block.use_task_feature_interaction
+            else None
+        )
+        block.task_rankmixer = (
+            None
+            if block.use_task_feature_interaction
+            else RankMixerDomainInteraction(
+                token_dim,
+                metadata.task_count,
+                metadata.feature_token_count,
+            )
+        )
+        block.task_ffn = PerTokenFFN(
+            metadata.task_count,
+            token_dim,
+            hidden_dim,
+            activation=config.model.ffn_activation,
+        )
+        block.domain_fused = (
+            DomainFusedModule(
+                include_global=config.model.use_global_scenario_token,
+                has_global_token=config.model.use_global_scenario_token,
+            )
+            if block.use_scenario_tokens
+            else None
+        )
+    else:
+        block.task_attention = None
+        block.task_rankmixer = None
+        block.task_ffn = None
+        block.domain_fused = None
+
+
+def _domain_interaction_hat(
+    domain_tokens: Tensor,
+    feature_tokens: Tensor,
+    attention: DomainAwareAttention | None,
+    rankmixer: RankMixerDomainInteraction | None,
+) -> Tensor:
+    if attention is not None:
+        update, _weights = attention(domain_tokens, feature_tokens)
+        return domain_tokens + update
+    if rankmixer is not None:
+        return rankmixer(domain_tokens, feature_tokens)
+    raise RuntimeError("enabled domain tokens require one feature interaction module")
 
 
 def _forward_domain_interaction(
@@ -2483,38 +3092,132 @@ def _forward_domain_interaction(
     task_tokens: Tensor,
     scenario_mask: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    if not block.use_scenario_tokens:
-        scenario_tokens = torch.zeros_like(scenario_tokens)
-    elif not block.use_global_scenario_token:
-        scenario_tokens = scenario_tokens.clone()
-        scenario_tokens[:, -1, :] = 0.0
-    if not block.use_task_tokens:
-        task_tokens = torch.zeros_like(task_tokens)
-
-    if block.use_scenario_feature_interaction:
-        scenario_update, _weights = block.scenario_attention(scenario_tokens, feature_tokens)
-    else:
-        scenario_update = torch.zeros_like(scenario_tokens)
-    scenario_hat = scenario_tokens + scenario_update
-    if not block.use_global_scenario_token:
-        scenario_hat = scenario_hat.clone()
-        scenario_hat[:, -1, :] = 0.0
-    scenario_tokens = scenario_hat
-    if block.scenario_ffn is not None:
+    scenario_hat: Tensor | None = None
+    if block.use_scenario_tokens:
+        scenario_hat = _domain_interaction_hat(
+            scenario_tokens,
+            feature_tokens,
+            block.scenario_attention,
+            block.scenario_rankmixer,
+        )
         scenario_tokens = scenario_hat + block.scenario_ffn(scenario_hat)
-    if not block.use_global_scenario_token:
-        scenario_tokens = scenario_tokens.clone()
-        scenario_tokens[:, -1, :] = 0.0
+    elif scenario_tokens.size(1) != 0:
+        raise ValueError("disabled scenario-token path expects an empty tensor")
 
-    if block.use_task_feature_interaction:
-        task_update, _weights = block.task_attention(task_tokens, feature_tokens)
-    else:
-        task_update = torch.zeros_like(task_tokens)
-    task_hat = task_tokens + task_update
-    if block.use_scenario_tokens or block.use_scenario_feature_interaction:
-        task_hat = block.domain_fused(task_hat, scenario_hat, scenario_mask)
-    task_tokens = task_hat + block.task_ffn(task_hat)
+    if block.use_task_tokens:
+        task_hat = _domain_interaction_hat(
+            task_tokens,
+            feature_tokens,
+            block.task_attention,
+            block.task_rankmixer,
+        )
+        if scenario_hat is not None:
+            task_hat = block.domain_fused(task_hat, scenario_hat, scenario_mask)
+        task_tokens = task_hat + block.task_ffn(task_hat)
+    elif task_tokens.size(1) != 0:
+        raise ValueError("disabled task-token path expects an empty tensor")
     return scenario_tokens, task_tokens
+
+
+def _empty_domain_tokens(feature_tokens: Tensor) -> Tensor:
+    return feature_tokens.new_empty(
+        feature_tokens.size(0),
+        0,
+        feature_tokens.size(2),
+    )
+
+
+def _active_scenario_token_specs(
+    config: AppConfig,
+    specs: list[DomainTokenConfig],
+) -> list[DomainTokenConfig]:
+    if not config.model.use_scenario_tokens:
+        return []
+    if config.model.use_global_scenario_token:
+        return specs
+    return [spec for spec in specs if spec.name != "global"]
+
+
+def _mdl_scalar_feature_names(config: AppConfig) -> set[str]:
+    active_scopes = {"feature", "shared"}
+    if config.model.use_scenario_tokens:
+        active_scopes.add("scenario")
+    if config.model.use_task_tokens:
+        active_scopes.add("task")
+    included = {
+        feature.name
+        for feature in config.features
+        if feature.embedding_scope in active_scopes
+    }
+    for sequence in config.sequences:
+        included.update(sequence.target_inputs)
+        included.update(sequence.longer_user_global_inputs)
+    return included
+
+
+def _init_mdl_output_modules(
+    model: nn.Module,
+    config: AppConfig,
+    metadata: ModelMetadata,
+) -> None:
+    model.scenario_tower = (
+        None
+        if config.model.use_scenario_tokens
+        else ScenarioTower(
+            metadata.scenario_count,
+            config.model.token_dim,
+            config.model.hidden_dim,
+            config.model.ffn_activation,
+        )
+    )
+    model.logit_layers = _build_task_heads(
+        config,
+        config.model.token_dim,
+        metadata.task_count,
+    )
+
+
+def _mdl_logits(
+    model: Any,
+    feature_tokens: Tensor,
+    scenario_tokens: Tensor,
+    task_tokens: Tensor,
+    scenario_mask: Tensor,
+) -> Tensor:
+    use_scenario_tokens = getattr(model.config.model, "use_scenario_tokens", True)
+    use_task_tokens = getattr(model.config.model, "use_task_tokens", True)
+    scenario_context: Tensor | None = None
+    if not use_scenario_tokens:
+        scenario_context = model.scenario_tower(feature_tokens, scenario_mask)
+    elif not use_task_tokens:
+        use_global_scenario_token = getattr(
+            model.config.model,
+            "use_global_scenario_token",
+            True,
+        )
+        scenario_context = masked_scenario_pool(
+            scenario_tokens,
+            scenario_mask,
+            include_global=use_global_scenario_token,
+            has_global_state=use_global_scenario_token,
+        )
+
+    if use_task_tokens:
+        prediction_tokens = task_tokens
+        if scenario_context is not None:
+            prediction_tokens = prediction_tokens + scenario_context.unsqueeze(1)
+        return torch.cat(
+            [
+                layer(prediction_tokens[:, index, :])
+                for index, layer in enumerate(model.logit_layers)
+            ],
+            dim=1,
+        )
+
+    tower_input = feature_tokens.mean(dim=1)
+    if scenario_context is not None:
+        tower_input = tower_input + scenario_context
+    return torch.cat([layer(tower_input) for layer in model.logit_layers], dim=1)
 
 
 class MDLRankMixerBlock(nn.Module):
@@ -2522,7 +3225,6 @@ class MDLRankMixerBlock(nn.Module):
         self,
         config: AppConfig,
         metadata: ModelMetadata,
-        propagate_scenario_state: bool = True,
     ) -> None:
         super().__init__()
         token_dim = config.model.token_dim
@@ -2535,7 +3237,7 @@ class MDLRankMixerBlock(nn.Module):
             if config.model.mdl_feature_interaction == "rankmixer_full"
             else None
         )
-        _init_domain_interaction_modules(self, config, metadata, propagate_scenario_state)
+        _init_domain_interaction_modules(self, config, metadata)
 
     def forward(self, feature_tokens: Tensor, scenario_tokens: Tensor, task_tokens: Tensor, scenario_mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         mixed = self.feature_norm(self.token_mixing(feature_tokens) + feature_tokens)
@@ -2557,21 +3259,35 @@ class MDLRankMixerBlock(nn.Module):
 
 
 class MDLRankMixerModel(nn.Module):
-    def __init__(self, config: AppConfig, vocab_maps: dict[str, dict[str, int]], embedding_dim: int | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        vocab_maps: dict[str, dict[str, int]],
+        embedding_dim: int | None = None,
+        embedding_size_override: int | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
         self.feature_groups = config.tokenization.resolved_feature_tokens(config.features, config.sequences)
         self.feature_token_inputs = config.tokenization.resolved_feature_token_inputs(config.features, config.sequences)
         feature_token_count = config.tokenization.resolved_feature_token_count(config.features, config.sequences)
-        self.scenario_token_specs = config.tokenization.resolved_scenario_tokens(
+        resolved_scenario_specs = config.tokenization.resolved_scenario_tokens(
             config.features,
             config.scenarios.names,
             config.sequences,
         )
-        self.task_token_specs = config.tokenization.resolved_task_tokens(
-            config.features,
-            config.task_names,
-            config.sequences,
+        self.scenario_token_specs = _active_scenario_token_specs(
+            config,
+            resolved_scenario_specs,
+        )
+        self.task_token_specs = (
+            config.tokenization.resolved_task_tokens(
+                config.features,
+                config.task_names,
+                config.sequences,
+            )
+            if config.model.use_task_tokens
+            else []
         )
         self.metadata = ModelMetadata(
             feature_token_count=feature_token_count,
@@ -2581,7 +3297,13 @@ class MDLRankMixerModel(nn.Module):
         if config.model.token_dim % self.metadata.feature_token_count != 0:
             raise ValueError("mdl_rankmixer requires token_dim divisible by feature token count")
         embedding_dim = config.model.embedding_dim if embedding_dim is None else embedding_dim
-        self.encoder_bank = FeatureEncoderBank(config, vocab_maps, embedding_dim)
+        self.encoder_bank = FeatureEncoderBank(
+            config,
+            vocab_maps,
+            embedding_dim,
+            included_scalar_feature_names=_mdl_scalar_feature_names(config),
+            embedding_size_override=embedding_size_override,
+        )
         self.feature_projector = _build_rankmixer_feature_projector(
             config,
             self.encoder_bank,
@@ -2589,29 +3311,33 @@ class MDLRankMixerModel(nn.Module):
             self.feature_token_inputs,
             self.metadata.feature_token_count,
         )
-        self.scenario_projector = DomainTokenProjector(
-            self.scenario_token_specs,
-            self.encoder_bank.output_dims,
-            config.model.token_dim,
-            config.model.hidden_dim,
-            activation=config.model.ffn_activation,
+        self.scenario_projector = (
+            DomainTokenProjector(
+                self.scenario_token_specs,
+                self.encoder_bank.output_dims,
+                config.model.token_dim,
+                config.model.hidden_dim,
+                activation=config.model.ffn_activation,
+            )
+            if config.model.use_scenario_tokens
+            else None
         )
-        self.task_projector = DomainTokenProjector(
-            self.task_token_specs,
-            self.encoder_bank.output_dims,
-            config.model.token_dim,
-            config.model.hidden_dim,
-            activation=config.model.ffn_activation,
+        self.task_projector = (
+            DomainTokenProjector(
+                self.task_token_specs,
+                self.encoder_bank.output_dims,
+                config.model.token_dim,
+                config.model.hidden_dim,
+                activation=config.model.ffn_activation,
+            )
+            if config.model.use_task_tokens
+            else None
         )
         self.blocks = nn.ModuleList(
-            MDLRankMixerBlock(
-                config,
-                self.metadata,
-                propagate_scenario_state=layer_index < config.model.num_layers - 1,
-            )
-            for layer_index in range(config.model.num_layers)
+            MDLRankMixerBlock(config, self.metadata)
+            for _layer_index in range(config.model.num_layers)
         )
-        self.logit_layers = _build_task_heads(config, config.model.token_dim, self.metadata.task_count)
+        _init_mdl_output_modules(self, config, self.metadata)
 
     def precompute_request_cache(self, features: dict[str, Any]) -> dict[str, LongerSequenceCache]:
         return self.encoder_bank.precompute_request_cache(features)
@@ -2624,11 +3350,21 @@ class MDLRankMixerModel(nn.Module):
     ) -> dict[str, Tensor]:
         encoded = self.encoder_bank(features, request_cache=request_cache)
         feature_tokens = self.feature_projector(encoded)
-        scenario_tokens = self.scenario_projector(encoded)
-        task_tokens = self.task_projector(encoded)
+        scenario_tokens = (
+            self.scenario_projector(encoded)
+            if self.scenario_projector is not None
+            else _empty_domain_tokens(feature_tokens)
+        )
+        task_tokens = (
+            self.task_projector(encoded)
+            if self.task_projector is not None
+            else _empty_domain_tokens(feature_tokens)
+        )
         scenario_mask = _scenario_mask_from_ids(scenario_id, self.metadata.scenario_count)
         for block in self.blocks:
-            if self.config.runtime.activation_checkpoint and self.training:
+            if _activation_checkpoint_enabled(
+                self.config.runtime.activation_checkpoint
+            ) and self.training:
                 feature_tokens, scenario_tokens, task_tokens = checkpoint(
                     block,
                     feature_tokens,
@@ -2644,9 +3380,12 @@ class MDLRankMixerModel(nn.Module):
                     task_tokens,
                     scenario_mask,
                 )
-        logits = torch.cat(
-            [layer(task_tokens[:, index, :]) for index, layer in enumerate(self.logit_layers)],
-            dim=1,
+        logits = _mdl_logits(
+            self,
+            feature_tokens,
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
         )
         output = {"logits": logits}
         output.update(_sparse_moe_outputs(self, logits))
@@ -2654,9 +3393,20 @@ class MDLRankMixerModel(nn.Module):
 
 
 class OneTransModel(nn.Module):
-    def __init__(self, config: AppConfig, vocab_maps: dict[str, dict[str, int]], embedding_dim: int | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        vocab_maps: dict[str, dict[str, int]],
+        embedding_dim: int | None = None,
+        embedding_size_override: int | None = None,
+    ) -> None:
         super().__init__()
-        self.backbone = OneTransBackbone(config, vocab_maps, embedding_dim)
+        self.backbone = OneTransBackbone(
+            config,
+            vocab_maps,
+            embedding_dim,
+            embedding_size_override=embedding_size_override,
+        )
         output_dim = self.backbone.ns_token_count * config.model.token_dim
         self.logit_layers = _build_task_heads(config, output_dim, len(config.task_names))
 
@@ -2688,12 +3438,9 @@ class MDLDomainBlock(nn.Module):
         self,
         config: AppConfig,
         metadata: ModelMetadata,
-        propagate_scenario_state: bool = True,
     ) -> None:
         super().__init__()
-        _init_domain_interaction_modules(
-            self, config, metadata, propagate_scenario_state
-        )
+        _init_domain_interaction_modules(self, config, metadata)
 
     def forward(
         self,
@@ -2706,49 +3453,72 @@ class MDLDomainBlock(nn.Module):
 
 
 class MDLOneTransModel(nn.Module):
-    def __init__(self, config: AppConfig, vocab_maps: dict[str, dict[str, int]], embedding_dim: int | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        vocab_maps: dict[str, dict[str, int]],
+        embedding_dim: int | None = None,
+        embedding_size_override: int | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
-        self.backbone = OneTransBackbone(config, vocab_maps, embedding_dim)
+        self.backbone = OneTransBackbone(
+            config,
+            vocab_maps,
+            embedding_dim,
+            included_scalar_feature_names=_mdl_scalar_feature_names(config),
+            embedding_size_override=embedding_size_override,
+        )
         self.metadata = ModelMetadata(
             feature_token_count=self.backbone.ns_token_count,
             scenario_count=len(config.scenarios.names),
             task_count=len(config.task_names),
         )
         output_dims = self.backbone.encoder_bank.output_dims
-        scenario_token_specs = config.tokenization.resolved_scenario_tokens(
-            config.features,
-            config.scenarios.names,
-            config.sequences,
+        scenario_token_specs = _active_scenario_token_specs(
+            config,
+            config.tokenization.resolved_scenario_tokens(
+                config.features,
+                config.scenarios.names,
+                config.sequences,
+            ),
         )
-        task_token_specs = config.tokenization.resolved_task_tokens(
-            config.features,
-            config.task_names,
-            config.sequences,
+        task_token_specs = (
+            config.tokenization.resolved_task_tokens(
+                config.features,
+                config.task_names,
+                config.sequences,
+            )
+            if config.model.use_task_tokens
+            else []
         )
-        self.scenario_projector = DomainTokenProjector(
-            scenario_token_specs,
-            output_dims,
-            config.model.token_dim,
-            config.model.hidden_dim,
-            activation=config.model.ffn_activation,
+        self.scenario_projector = (
+            DomainTokenProjector(
+                scenario_token_specs,
+                output_dims,
+                config.model.token_dim,
+                config.model.hidden_dim,
+                activation=config.model.ffn_activation,
+            )
+            if config.model.use_scenario_tokens
+            else None
         )
-        self.task_projector = DomainTokenProjector(
-            task_token_specs,
-            output_dims,
-            config.model.token_dim,
-            config.model.hidden_dim,
-            activation=config.model.ffn_activation,
+        self.task_projector = (
+            DomainTokenProjector(
+                task_token_specs,
+                output_dims,
+                config.model.token_dim,
+                config.model.hidden_dim,
+                activation=config.model.ffn_activation,
+            )
+            if config.model.use_task_tokens
+            else None
         )
         self.blocks = nn.ModuleList(
-            MDLDomainBlock(
-                config,
-                self.metadata,
-                propagate_scenario_state=layer_index < config.model.num_layers - 1,
-            )
-            for layer_index in range(config.model.num_layers)
+            MDLDomainBlock(config, self.metadata)
+            for _layer_index in range(config.model.num_layers)
         )
-        self.logit_layers = _build_task_heads(config, config.model.token_dim, self.metadata.task_count)
+        _init_mdl_output_modules(self, config, self.metadata)
 
     def precompute_request_cache(self, features: dict[str, Any]) -> OneTransRequestCache:
         return self.backbone.precompute_request_cache(features)
@@ -2772,9 +3542,17 @@ class MDLOneTransModel(nn.Module):
         state = self.backbone.prepare(
             features, request_cache=request_cache, encoded_features=encoded
         )
-        scenario_tokens = self.scenario_projector(encoded)
-        task_tokens = self.task_projector(encoded)
         scenario_mask = _scenario_mask_from_ids(scenario_id, self.metadata.scenario_count)
+        scenario_tokens: Tensor | None = (
+            self.scenario_projector(encoded)
+            if self.scenario_projector is not None
+            else None
+        )
+        task_tokens: Tensor | None = (
+            self.task_projector(encoded)
+            if self.task_projector is not None
+            else None
+        )
         if request_cache is not None and request_cache.layers:
             if len(request_cache.layers) != len(self.blocks):
                 raise ValueError("OneTrans request cache depth does not match MDL domain depth")
@@ -2784,7 +3562,13 @@ class MDLOneTransModel(nn.Module):
         for layer_index, (block, layer_cache) in enumerate(zip(self.blocks, layer_caches)):
             state = self.backbone.step(state, layer_index, layer_cache)
             feature_tokens = state.tokens[:, state.s_count :, :]
-            if self.config.runtime.activation_checkpoint and self.training:
+            if scenario_tokens is None:
+                scenario_tokens = _empty_domain_tokens(feature_tokens)
+            if task_tokens is None:
+                task_tokens = _empty_domain_tokens(feature_tokens)
+            if _activation_checkpoint_enabled(
+                self.config.runtime.activation_checkpoint
+            ) and self.training:
                 scenario_tokens, task_tokens = checkpoint(
                     block,
                     feature_tokens,
@@ -2797,22 +3581,50 @@ class MDLOneTransModel(nn.Module):
                 scenario_tokens, task_tokens = block(
                     feature_tokens, scenario_tokens, task_tokens, scenario_mask
                 )
-        logits = torch.cat(
-            [layer(task_tokens[:, index, :]) for index, layer in enumerate(self.logit_layers)],
-            dim=1,
+        logits = _mdl_logits(
+            self,
+            feature_tokens,
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
         )
         return {"logits": logits}
 
 
-def build_model(config: AppConfig, vocab_maps: dict[str, dict[str, int]]) -> nn.Module:
+def build_model(
+    config: AppConfig,
+    vocab_maps: dict[str, dict[str, int]],
+    *,
+    embedding_size_override: int | None = None,
+) -> nn.Module:
     if config.model.name == "rankmixer":
-        return RankMixerModel(config, vocab_maps)
+        return RankMixerModel(
+            config,
+            vocab_maps,
+            embedding_size_override=embedding_size_override,
+        )
     if config.model.name == "mdl_rankmixer":
-        return MDLRankMixerModel(config, vocab_maps)
+        return MDLRankMixerModel(
+            config,
+            vocab_maps,
+            embedding_size_override=embedding_size_override,
+        )
     if config.model.name == "onetrans":
-        return OneTransModel(config, vocab_maps)
+        return OneTransModel(
+            config,
+            vocab_maps,
+            embedding_size_override=embedding_size_override,
+        )
     if config.model.name == "mdl_onetrans":
-        return MDLOneTransModel(config, vocab_maps)
+        return MDLOneTransModel(
+            config,
+            vocab_maps,
+            embedding_size_override=embedding_size_override,
+        )
     if config.model.name == "longer":
-        return LongerModel(config, vocab_maps)
+        return LongerModel(
+            config,
+            vocab_maps,
+            embedding_size_override=embedding_size_override,
+        )
     raise NotImplementedError(f"model {config.model.name!r} is not implemented")

@@ -20,6 +20,7 @@ def _bootstrap_import_path() -> None:
 
 _bootstrap_import_path()
 
+from src.benchmark import BenchmarkOptions, run_benchmark, write_benchmark_report
 from src.config import load_app_config
 from src.dataloader import (
     discover_parquet_inputs,
@@ -150,6 +151,34 @@ def _cmd_train(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_benchmark(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    if _effective_distributed_mode(args, config) == "ddp" and not _in_distributed_launcher():
+        return _launch_ddp_train(args, config)
+    report = run_benchmark(
+        config,
+        BenchmarkOptions(
+            mode=args.mode,
+            warmup_steps=args.warmup_steps,
+            measured_steps=args.steps,
+            profile_steps=args.profile_steps,
+            seed=args.seed,
+            batch_size=args.batch_size,
+            sequence_length=args.sequence_length,
+            embedding_lookups_per_table=args.embedding_lookups_per_table,
+            id_distribution=args.id_distribution,
+            zipf_exponent=args.zipf_exponent,
+            peak_tflops=args.peak_tflops,
+        ),
+    )
+    if is_main_process():
+        print(report.to_json())
+        if args.output:
+            output_path = write_benchmark_report(report, args.output)
+            print(f"benchmark_report path={output_path}")
+    return 0
+
+
 def _cmd_predict(args: argparse.Namespace) -> int:
     config = _load_config(args)
     result = predict_mdl(
@@ -172,10 +201,12 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
         max_batches=args.max_batches,
         allow_random_init=args.allow_random_init,
         group_metric_name=args.group_metric_name,
+        auc_bins=args.auc_bins,
     )
     print(
         f"evaluate_result rows={result.rows} "
-        f"group_metric={result.group_metric_name}"
+        f"group_metric={result.group_metric_name} "
+        f"auc_histogram_bins={result.auc_histogram_bins}"
     )
     for task_name, metrics in result.metrics.items():
         formatted = " ".join(
@@ -214,6 +245,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--master-port", type=int, default=None)
     train.set_defaults(func=_cmd_train)
 
+    benchmark = subparsers.add_parser("benchmark")
+    benchmark.add_argument("--config", required=True)
+    benchmark.add_argument(
+        "--mode",
+        choices=["data", "embedding", "compute", "end-to-end"],
+        required=True,
+    )
+    benchmark.add_argument("--warmup-steps", type=int, default=10)
+    benchmark.add_argument("--steps", type=int, default=50)
+    benchmark.add_argument("--profile-steps", type=int, default=1)
+    benchmark.add_argument("--seed", type=int, default=2025)
+    benchmark.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="per-rank synthetic batch size for compute-only benchmarking",
+    )
+    benchmark.add_argument("--sequence-length", type=int, default=None)
+    benchmark.add_argument("--embedding-lookups-per-table", type=int, default=65536)
+    benchmark.add_argument(
+        "--id-distribution", choices=["uniform", "zipf"], default="uniform"
+    )
+    benchmark.add_argument("--zipf-exponent", type=float, default=1.2)
+    benchmark.add_argument("--peak-tflops", type=float, default=None)
+    benchmark.add_argument("--output", default=None)
+    benchmark.add_argument("--distributed", choices=["none", "ddp"], default=None)
+    benchmark.add_argument("--nproc-per-node", type=int, default=None)
+    benchmark.add_argument("--master-addr", default=None)
+    benchmark.add_argument("--master-port", type=int, default=None)
+    benchmark.set_defaults(func=_cmd_benchmark)
+
     predict = subparsers.add_parser("predict")
     predict.add_argument("--config", required=True)
     predict.add_argument("--checkpoint-path", default=None)
@@ -231,6 +293,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     evaluate.add_argument(
         "--group-metric-name", choices=["qauc", "uauc"], default="qauc"
     )
+    evaluate.add_argument("--auc-bins", type=int, default=65536)
     evaluate.set_defaults(func=_cmd_evaluate)
 
     return parser

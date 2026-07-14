@@ -1,0 +1,58 @@
+# LONGER extreme stress profile. This preserves the same mixed visibility as
+# longer_perf.yaml and changes only the configured maximum sequence length and
+# memory-oriented batch/reader sizes.
+extends: longer_perf.yaml
+
+data:
+  train:
+    reader:
+      scanner_batch_rows: 128
+      max_prefetch_bytes: 268435456
+      length_buckets:
+        - {max_length: 128, batch_size: 512}
+        - {max_length: 256, batch_size: 256}
+        - {max_length: 512, batch_size: 128}
+        - {max_length: 1024, batch_size: 64}
+        - {max_length: 2048, batch_size: 32}
+        - {max_length: null, batch_size: 16}
+  test:
+    reader:
+      scanner_batch_rows: 128
+      max_prefetch_bytes: 268435456
+      length_buckets:
+        - {max_length: 128, batch_size: 512}
+        - {max_length: 256, batch_size: 256}
+        - {max_length: 512, batch_size: 128}
+        - {max_length: 1024, batch_size: 64}
+        - {max_length: 2048, batch_size: 32}
+        - {max_length: null, batch_size: 16}
+
+# YAML lists replace their parent, so retain the complete semantic sequence
+# contract while raising max_length from 2000 to 5000.
+sequences:
+  - name: hist
+    embedding_scope: feature
+    max_length: 5000
+    truncation: head
+    sequence_order: newest_to_oldest
+    encoder: longer
+    rankmixer_summary_tokens: 3
+    longer_token_merge: 8
+    longer_inner_layers: 1
+    time_delta_field: time_delta
+    target_inputs: [item_id]
+    longer_user_global_inputs: [user_id]
+    longer_user_global_tokens: 1
+    longer_cls_tokens: 1
+    longer_candidate_global_tokens: 1
+    longer_query_tokens: 100
+    longer_self_layers: 1
+    fields:
+      - {name: item_id, kind: categorical, source: hist_item_id}
+      - {name: shop_id, kind: categorical, source: hist_shop_id}
+      - {name: action, kind: categorical, source: hist_action}
+      - {name: age, kind: dense, source: hist_age}
+      - {name: time_delta, kind: dense, source: hist_time_delta}
+
+training:
+  batch_size: 16

@@ -23,6 +23,7 @@ from .config import (
     ResolvedSharedVocabEncoding,
     ResolvedVocabEncoding,
     VocabStrategy,
+    resolve_categorical_base_input,
 )
 
 
@@ -185,6 +186,11 @@ def load_vocab_maps(config: AppConfig) -> dict[str, dict[str, int]]:
             maps[feature_name] = load_vocab_map(_artifact_path(config, feature_name, encoding))
             return maps[feature_name]
         if encoding.encoding == "shared_vocab":
+            base_input = resolve_categorical_base_input(by_name, feature_name)
+            if isinstance(base_input.encoding, ResolvedIdentityEncoding):
+                # The physical column already stores bounded integer IDs. No
+                # artifact or Python lookup is needed for this alias.
+                return {}
             resolving.add(feature_name)
             try:
                 maps[feature_name] = resolve(encoding.share_with)
@@ -196,7 +202,12 @@ def load_vocab_maps(config: AppConfig) -> dict[str, dict[str, int]]:
         )
 
     for categorical_input in config.resolved.categorical_inputs:
-        if categorical_input.encoding.encoding in {"vocab", "shared_vocab"}:
+        if categorical_input.encoding.encoding not in {"vocab", "shared_vocab"}:
+            continue
+        base_input = resolve_categorical_base_input(
+            by_name, categorical_input.name
+        )
+        if isinstance(base_input.encoding, ResolvedVocabEncoding):
             resolve(categorical_input.name)
     return maps
 
@@ -221,8 +232,24 @@ def _encoding_payload(encoding: ResolvedEncoding, source: str) -> dict[str, Any]
         "artifact": encoding.artifact if isinstance(encoding, ResolvedVocabEncoding) else None,
         "num_buckets": encoding.num_buckets if isinstance(encoding, ResolvedHashEncoding) else None,
         "salt": encoding.salt if isinstance(encoding, ResolvedHashEncoding) else None,
-        "max_id": encoding.max_id if isinstance(encoding, ResolvedIdentityEncoding) else None,
-        "share_with": encoding.share_with if isinstance(encoding, ResolvedSharedVocabEncoding) else None,
+        "identity_num_buckets": (
+            encoding.num_buckets if isinstance(encoding, ResolvedIdentityEncoding) else None
+        ),
+        "padding_id": (
+            encoding.padding_id if isinstance(encoding, ResolvedIdentityEncoding) else None
+        ),
+        "out_of_range": (
+            encoding.out_of_range if isinstance(encoding, ResolvedIdentityEncoding) else None
+        ),
+        "share_with": (
+            encoding.share_with
+            if isinstance(
+                encoding,
+                (ResolvedIdentityEncoding, ResolvedSharedVocabEncoding),
+            )
+            else None
+        ),
+        "share_embedding": bool(getattr(encoding, "share_embedding", False)),
     }
 
 
@@ -237,7 +264,10 @@ def _strategy_payload(strategy: VocabStrategy) -> dict[str, Any]:
             "num_buckets": feature.num_buckets,
             "salt": feature.salt,
             "max_id": feature.max_id,
+            "padding_id": feature.padding_id,
+            "out_of_range": feature.out_of_range,
             "share_with": feature.share_with,
+            "share_embedding": feature.share_embedding,
         }
         for name, feature in sorted(strategy.features.items())
     }
@@ -313,10 +343,10 @@ def encode_categorical_value(
         return stable_hash_bucket(value, encoding.num_buckets, encoding.salt)
     if encoding.encoding == "identity":
         encoded = int(value)
-        if encoded < 0 or encoded > encoding.max_id:
-            if unseen_policy == "error":
+        if encoded < 0 or encoded >= encoding.num_buckets:
+            if encoding.out_of_range == "error":
                 raise _unseen_value_error(categorical_input.name, value)
-            return 0
+            return encoding.padding_id
         return encoded
     raise ValueError(f"unsupported encoding {encoding.encoding!r}")
 
@@ -368,7 +398,7 @@ def vocab_artifacts(strategy_or_config: VocabStrategy | AppConfig) -> list[Vocab
             elif isinstance(encoding, ResolvedHashEncoding):
                 size_hint = encoding.num_buckets
             elif isinstance(encoding, ResolvedIdentityEncoding):
-                size_hint = encoding.max_id
+                size_hint = encoding.num_buckets
             refs.append(
                 VocabArtifactRef(
                     feature_name=categorical_input.name,
@@ -385,7 +415,11 @@ def vocab_artifacts(strategy_or_config: VocabStrategy | AppConfig) -> list[Vocab
         artifact_path = None
         if feature_strategy.artifact:
             artifact_path = f"{artifact_dir}/{feature_strategy.artifact}"
-        size_hint = feature_strategy.max_size or feature_strategy.num_buckets or feature_strategy.max_id
+        size_hint = (
+            feature_strategy.max_size
+            or feature_strategy.num_buckets
+            or (feature_strategy.max_id + 1 if feature_strategy.max_id is not None else None)
+        )
         refs.append(
             VocabArtifactRef(
                 feature_name=feature_name,

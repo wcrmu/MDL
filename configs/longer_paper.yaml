@@ -3,6 +3,16 @@
 # uses the equivalent key_position<=query_position mask internally.
 extends: default.yaml
 
+data:
+  train:
+    reader:
+      scanner_batch_rows: 256
+      max_prefetch_bytes: 536870912
+  test:
+    reader:
+      scanner_batch_rows: 256
+      max_prefetch_bytes: 536870912
+
 sequences:
   - name: hist
     embedding_scope: feature

@@ -1,0 +1,85 @@
+# 8-GPU RankMixer throughput profile.
+extends: rankmixer_paper.yaml
+
+runtime:
+  device: cuda
+  precision: bf16
+  activation_checkpoint: none
+
+vocab_strategy:
+  features:
+    user_id:
+      encoding: identity
+      num_buckets: 20000000
+      min_count: null
+      max_size: null
+      artifact: null
+      padding_id: 0
+      out_of_range: error
+    item_id:
+      encoding: identity
+      num_buckets: 50000000
+      min_count: null
+      max_size: null
+      artifact: null
+      padding_id: 0
+      out_of_range: error
+    scenario_user_id:
+      encoding: identity
+      num_buckets: 20000000
+      share_with: null
+      share_embedding: false
+      padding_id: 0
+      out_of_range: error
+    scenario_item_id:
+      encoding: identity
+      num_buckets: 50000000
+      share_with: null
+      share_embedding: false
+      padding_id: 0
+      out_of_range: error
+    task_user_id:
+      encoding: identity
+      num_buckets: 20000000
+      share_with: null
+      share_embedding: false
+      padding_id: 0
+      out_of_range: error
+    task_item_id:
+      encoding: identity
+      num_buckets: 50000000
+      share_with: null
+      share_embedding: false
+      padding_id: 0
+      out_of_range: error
+
+    shop_id:
+      encoding: identity
+      num_buckets: 10000000
+      salt: null
+      padding_id: 0
+      out_of_range: error
+    hist.item_id:
+      encoding: identity
+      num_buckets: 50000000
+      share_with: item_id
+      share_embedding: true
+      padding_id: 0
+      out_of_range: error
+
+    hist.shop_id:
+      encoding: identity
+      num_buckets: 10000000
+      salt: null
+      padding_id: 0
+      out_of_range: error
+    hist.action:
+      encoding: identity
+      num_buckets: 4096
+      salt: null
+      padding_id: 0
+      out_of_range: error
+
+training:
+  embedding_distribution: sharded
+  dense_distribution: ddp

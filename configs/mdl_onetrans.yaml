@@ -1,6 +1,19 @@
 # Experimental layerwise composition. No MDL or OneTrans paper defines this
 # combined model; the explicit acknowledgement prevents accidental mislabeling.
-extends: default.yaml
+extends: onetrans.yaml
+
+# MDL domain tokens start from dedicated non-sequential embeddings. Historical
+# context is already incorporated into OneTrans NS tokens before every MDL
+# domain-interaction block, so adding hist as a prior would encode it twice.
+tokenization:
+  scenario_tokens:
+    - name: default
+      important_inputs: [scenario_user_id, scenario_item_id]
+    - name: global
+      important_inputs: [scenario_user_id, scenario_item_id]
+  task_tokens:
+    - name: click
+      important_inputs: [task_user_id, task_item_id]
 
 model:
   name: mdl_onetrans

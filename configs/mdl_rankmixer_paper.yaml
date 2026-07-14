@@ -3,6 +3,13 @@
 # complete L/D/H configuration. The representative three-task surface below
 # exercises the published multi-scenario/multi-task information flow; the small
 # L/D/H values remain explicit implementation placeholders, not paper values.
+# The paper does not publish its private prior schema. This public contract
+# therefore makes the disclosed semantics explicit without claiming the
+# undisclosed production columns: each scenario consumes its own scenario
+# history, and each task consumes a history of that task's positive behavior.
+# All six prior sequences use independent embedding tables before the token's
+# own FFN. A data adapter may materialize these logical list columns from a
+# different physical layout.
 extends: default.yaml
 
 data:
@@ -11,6 +18,134 @@ data:
       click: click
       like: like
       favorite: favorite
+
+# Keep prior encodings in the strategy map rather than inline so the industrial
+# performance overlay can replace every field with an explicit bounded identity
+# contract without replacing the complete sequence list.
+vocab_strategy:
+  features:
+    scenario_single_column_history.item_id:
+      encoding: shared_vocab
+      source: scenario_single_column_hist_item_id
+      share_with: item_id
+      share_embedding: false
+    scenario_double_column_history.item_id:
+      encoding: shared_vocab
+      source: scenario_double_column_hist_item_id
+      share_with: item_id
+      share_embedding: false
+    scenario_inner_search_history.item_id:
+      encoding: shared_vocab
+      source: scenario_inner_search_hist_item_id
+      share_with: item_id
+      share_embedding: false
+    task_click_history.item_id:
+      encoding: shared_vocab
+      source: task_click_hist_item_id
+      share_with: item_id
+      share_embedding: false
+    task_like_history.item_id:
+      encoding: shared_vocab
+      source: task_like_hist_item_id
+      share_with: item_id
+      share_embedding: false
+    task_favorite_history.item_id:
+      encoding: shared_vocab
+      source: task_favorite_hist_item_id
+      share_with: item_id
+      share_embedding: false
+
+# Lists replace (rather than append to) the parent list, so retain the generic
+# feature history used by the RankMixer backbone and global scenario token.
+sequences:
+  - name: hist
+    embedding_scope: feature
+    max_length: 100
+    truncation: tail
+    sequence_order: oldest_to_newest
+    encoder: longer
+    rankmixer_summary_tokens: 3
+    longer_token_merge: 4
+    longer_inner_layers: 1
+    time_delta_field: time_delta
+    target_inputs: [item_id]
+    longer_user_global_inputs: [user_id]
+    longer_user_global_tokens: 1
+    longer_cls_tokens: 1
+    longer_candidate_global_tokens: 1
+    longer_query_tokens: 8
+    longer_self_layers: 1
+    fields:
+      - {name: item_id, kind: categorical, source: hist_item_id}
+      - {name: shop_id, kind: categorical, source: hist_shop_id}
+      - {name: action, kind: categorical, source: hist_action}
+      - {name: age, kind: dense, source: hist_age}
+      - {name: time_delta, kind: dense, source: hist_time_delta}
+
+  # Scenario-related priors: one behavior sequence per serving scenario.
+  - name: scenario_single_column_history
+    embedding_scope: scenario
+    max_length: 100
+    truncation: tail
+    sequence_order: oldest_to_newest
+    encoder: attention_pool
+    fields:
+      - name: item_id
+        kind: categorical
+        source: scenario_single_column_hist_item_id
+  - name: scenario_double_column_history
+    embedding_scope: scenario
+    max_length: 100
+    truncation: tail
+    sequence_order: oldest_to_newest
+    encoder: attention_pool
+    fields:
+      - name: item_id
+        kind: categorical
+        source: scenario_double_column_hist_item_id
+  - name: scenario_inner_search_history
+    embedding_scope: scenario
+    max_length: 100
+    truncation: tail
+    sequence_order: oldest_to_newest
+    encoder: attention_pool
+    fields:
+      - name: item_id
+        kind: categorical
+        source: scenario_inner_search_hist_item_id
+
+  # Task-related priors: histories are conditioned on the prediction behavior,
+  # and are inputs only; current-row labels must never be used as token priors.
+  - name: task_click_history
+    embedding_scope: task
+    max_length: 100
+    truncation: tail
+    sequence_order: oldest_to_newest
+    encoder: attention_pool
+    fields:
+      - name: item_id
+        kind: categorical
+        source: task_click_hist_item_id
+  - name: task_like_history
+    embedding_scope: task
+    max_length: 100
+    truncation: tail
+    sequence_order: oldest_to_newest
+    encoder: attention_pool
+    fields:
+      - name: item_id
+        kind: categorical
+        source: task_like_hist_item_id
+  - name: task_favorite_history
+    embedding_scope: task
+    max_length: 100
+    truncation: tail
+    sequence_order: oldest_to_newest
+    encoder: attention_pool
+    fields:
+      - name: item_id
+        kind: categorical
+        source: task_favorite_hist_item_id
 
 scenarios:
   names:
@@ -24,26 +159,26 @@ tokenization:
   scenario_tokens:
     - name: single_column
       important_inputs: [scenario_user_id, scenario_item_id]
-      prior_inputs: [hist]
+      prior_inputs: [scenario_single_column_history]
     - name: double_column
       important_inputs: [scenario_user_id, scenario_item_id]
-      prior_inputs: [hist]
+      prior_inputs: [scenario_double_column_history]
     - name: inner_search
       important_inputs: [scenario_user_id, scenario_item_id]
-      prior_inputs: [hist]
+      prior_inputs: [scenario_inner_search_history]
     - name: global
       important_inputs: [scenario_user_id, scenario_item_id]
       prior_inputs: [hist]
   task_tokens:
     - name: click
       important_inputs: [task_user_id, task_item_id]
-      prior_inputs: [hist]
+      prior_inputs: [task_click_history]
     - name: like
       important_inputs: [task_user_id, task_item_id]
-      prior_inputs: [hist]
+      prior_inputs: [task_like_history]
     - name: favorite
       important_inputs: [task_user_id, task_item_id]
-      prior_inputs: [hist]
+      prior_inputs: [task_favorite_history]
 
 model:
   name: mdl_rankmixer
@@ -64,4 +199,3 @@ training:
   lr_warmup_steps: 0
   lr_decay_steps: null
   lr_min_ratio: 0.0
-

@@ -9,7 +9,12 @@ from torch import Tensor, nn
 
 from src.config import SequenceConfig, SequenceFieldConfig
 from src.dataloader import _sequence_bounds
-from src.model import FeatureEncoderBank, LongerSequenceEncoder, LongerTokenMerger
+from src.model import (
+    FeatureEncoderBank,
+    LongerSequenceAttentionBlock,
+    LongerSequenceEncoder,
+    LongerTokenMerger,
+)
 
 
 def _zero_parameters(module: nn.Module) -> None:
@@ -146,6 +151,38 @@ class LongerSequenceEncoderAlignmentTest(unittest.TestCase):
             user_global_tokens=user_global_tokens,
             activation_checkpoint=activation_checkpoint,
         )
+
+    def test_mixed_visibility_contract_keeps_global_full_and_recent_causal(self) -> None:
+        key_valid = torch.tensor(
+            [
+                [True, False, False, True, True, True],
+                [True, False, False, False, False, True],
+            ]
+        )
+        # Query layout is [one global; two recent]. The first recent query in
+        # the second row is padding and must have no semantic visibility.
+        query_valid = torch.tensor(
+            [[True, True, True], [True, False, True]]
+        )
+
+        actual = LongerSequenceAttentionBlock.mixed_allowed_mask(
+            key_valid, query_valid, global_query_count=1
+        )
+        expected = torch.tensor(
+            [
+                [
+                    [True, False, False, True, True, True],
+                    [True, False, False, True, True, False],
+                    [True, False, False, True, True, True],
+                ],
+                [
+                    [True, False, False, False, False, True],
+                    [False, False, False, False, False, False],
+                    [True, False, False, False, False, True],
+                ],
+            ]
+        )
+        torch.testing.assert_close(actual, expected)
 
     def test_returns_full_global_and_recent_compressed_sequence(self) -> None:
         encoder = self._encoder().eval()

@@ -9,4 +9,8 @@ __pycache__/
 /paper/
 .PAPER_ALIGNMENT.md
 /PAPER_ALIGNMENT.md
-/src/benchmark.py
+AGENTS.md
+README.md
+note.md
+pyproject.toml
+requirements.txt

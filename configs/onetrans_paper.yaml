@@ -3,25 +3,24 @@
 # timestamps. FFN hidden width and embedding widths are not disclosed.
 extends: default.yaml
 
+data:
+  train:
+    reader:
+      scanner_batch_rows: 512
+      max_prefetch_bytes: 536870912
+  test:
+    reader:
+      scanner_batch_rows: 512
+      max_prefetch_bytes: 536870912
+
 sequences:
   - name: hist
     embedding_scope: feature
     max_length: 1190
     truncation: tail
     sequence_order: oldest_to_newest
-    encoder: longer
-    rankmixer_summary_tokens: 3
-    longer_token_merge: 4
-    longer_inner_layers: 1
+    encoder: raw
     timestamp_field: timestamp
-    time_delta_field: time_delta
-    target_inputs: [item_id]
-    longer_user_global_inputs: [user_id]
-    longer_user_global_tokens: 1
-    longer_cls_tokens: 1
-    longer_candidate_global_tokens: 1
-    longer_query_tokens: 8
-    longer_self_layers: 1
     fields:
       - name: item_id
         kind: categorical
@@ -51,6 +50,9 @@ model:
   ffn_activation: gelu
   ns_tokenizer: auto_split
   num_ns_tokens: 12
+  # Figure 2 requires Pos Emb but does not disclose its form. Learned absolute
+  # embeddings are an explicit implementation choice over 1190 S + 12 NS slots.
+  max_position_embeddings: 1202
   sequence_fusion: timestamp_aware
   use_sep_tokens: false
   use_pyramid: true
