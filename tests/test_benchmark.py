@@ -15,6 +15,7 @@ from src.benchmark import (
     _TraceCollector,
     _build_report,
     _id_embedding_modules,
+    _nvidia_smi_device_selector,
     _percentile,
     _replace_id_embeddings_with_synthetic,
     _synthetic_vocab_maps,
@@ -95,6 +96,34 @@ class TraceCollectorTest(unittest.TestCase):
         self.assertEqual(report.samples_per_second, 1.0)
         self.assertEqual(report.p95_step_seconds, 4.0)
         self.assertEqual(report.benchmark_options["measured_steps"], 2)
+
+
+class GpuUtilizationSamplerTest(unittest.TestCase):
+    def test_visible_device_index_maps_to_physical_nvidia_smi_selector(self) -> None:
+        with patch.dict(
+            "src.benchmark.os.environ",
+            {"CUDA_VISIBLE_DEVICES": "2, 5, GPU-example"},
+            clear=True,
+        ):
+            self.assertEqual(
+                _nvidia_smi_device_selector(torch.device("cuda", 0)),
+                "2",
+            )
+            self.assertEqual(
+                _nvidia_smi_device_selector(torch.device("cuda", 1)),
+                "5",
+            )
+            self.assertEqual(
+                _nvidia_smi_device_selector(torch.device("cuda", 2)),
+                "GPU-example",
+            )
+
+    def test_unrestricted_cuda_index_is_already_physical(self) -> None:
+        with patch.dict("src.benchmark.os.environ", {}, clear=True):
+            self.assertEqual(
+                _nvidia_smi_device_selector(torch.device("cuda", 3)),
+                "3",
+            )
 
 
 class SyntheticEmbeddingReplacementTest(unittest.TestCase):

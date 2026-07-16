@@ -6,30 +6,36 @@ runtime:
   precision: bf16
   attention_backend: flash
   activation_checkpoint: none
+  # Inductor fuses the large projection/FFN elementwise graph around the
+  # explicit varlen Flash kernels. Keep paper/default profiles eager.
+  compile: true
+  # The Parquet loader pads only to the longest row in each batch. Enforcing
+  # that invariant avoids a dynamic slice and its per-step device-host sync.
+  require_compact_sequence_batches: true
 
 data:
   train:
     reader:
-      scanner_batch_rows: 256
+      scanner_batch_rows: 320
       max_prefetch_bytes: 536870912
       length_buckets:
-        - {max_length: 128, batch_size: 256}
-        - {max_length: 256, batch_size: 128}
-        - {max_length: 512, batch_size: 64}
-        - {max_length: 1024, batch_size: 32}
-        - {max_length: 2048, batch_size: 24}
-        - {max_length: null, batch_size: 16}
+        - {max_length: 128, batch_size: 2048}
+        - {max_length: 256, batch_size: 1024}
+        - {max_length: 512, batch_size: 512}
+        - {max_length: 1024, batch_size: 384}
+        - {max_length: 2048, batch_size: 320}
+        - {max_length: null, batch_size: 128}
   test:
     reader:
-      scanner_batch_rows: 256
+      scanner_batch_rows: 320
       max_prefetch_bytes: 536870912
       length_buckets:
-        - {max_length: 128, batch_size: 256}
-        - {max_length: 256, batch_size: 128}
-        - {max_length: 512, batch_size: 64}
-        - {max_length: 1024, batch_size: 32}
-        - {max_length: 2048, batch_size: 24}
-        - {max_length: null, batch_size: 16}
+        - {max_length: 128, batch_size: 2048}
+        - {max_length: 256, batch_size: 1024}
+        - {max_length: 512, batch_size: 512}
+        - {max_length: 1024, batch_size: 384}
+        - {max_length: 2048, batch_size: 320}
+        - {max_length: null, batch_size: 128}
 
 vocab_strategy:
   features:
@@ -106,6 +112,15 @@ vocab_strategy:
       out_of_range: error
 
 training:
-  batch_size: 32
+  # Defaults to the validated 1190-token shape; shorter length buckets safely
+  # raise the per-rank batch as high as 2048.
+  batch_size: 320
   embedding_distribution: sharded
   dense_distribution: ddp
+  # Representative 4-GPU audits across 256/512-row batches found stable use
+  # of every dense parameter. Avoid reducer graph traversal on every step.
+  ddp:
+    static_graph: true
+    find_unused_parameters: false
+    validated_no_unused_parameters: true
+    validated_static_graph: true

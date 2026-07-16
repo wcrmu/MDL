@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import tempfile
 import unittest
 
 from src.config import (
+    ModelConfig,
     ResolvedIdentityEncoding,
+    RuntimeConfig,
+    ScenarioConfig,
     load_app_config,
     resolve_categorical_base_input,
     validate_app_config,
@@ -40,6 +44,7 @@ class ModelConfigOverlayTest(unittest.TestCase):
 
         experimental = load_app_config(root / "configs" / "mdl_onetrans.yaml")
         self.assertTrue(experimental.model.experimental_model_acknowledged)
+        self.assertEqual(experimental.model.first_domain_sequence_layer, 0)
         self.assertEqual(experimental.sequences[0].encoder, "raw")
         for token in [
             *experimental.tokenization.scenario_tokens,
@@ -56,7 +61,7 @@ class ModelConfigOverlayTest(unittest.TestCase):
         mdl = load_app_config(root / "configs" / "mdl_rankmixer_paper.yaml")
         self.assertEqual(len(mdl.scenarios.names), 3)
         self.assertEqual(len(mdl.task_names), 3)
-        self.assertEqual(mdl.model.mdl_feature_interaction, "paper")
+        self.assertEqual(mdl.model.mdl_feature_interaction, "direct_ffn")
         self.assertEqual(mdl.training.loss_reduction, "sum")
         scenario_priors = {
             token.name: tuple(token.prior_inputs)
@@ -117,6 +122,139 @@ class ModelConfigOverlayTest(unittest.TestCase):
         self.assertEqual(longer.sequences[0].longer_query_tokens, 100)
         self.assertEqual(longer.resolved.encoded_input_dims["hist"], 26_368)
 
+    def test_legacy_feature_interaction_names_are_normalized(self) -> None:
+        expected_by_legacy_name = {
+            "paper": "direct_ffn",
+            "rankmixer_full": "residual_ffn",
+        }
+        for legacy_name, expected in expected_by_legacy_name.items():
+            with self.subTest(legacy_name=legacy_name):
+                config = ModelConfig.from_mapping(
+                    {
+                        "name": "mdl_rankmixer",
+                        "mdl_feature_interaction": legacy_name,
+                    }
+                )
+
+                self.assertEqual(config.mdl_feature_interaction, expected)
+                config.validate()
+
+    def test_domain_sequence_attention_layer_is_bounded_and_mdl_onetrans_only(self) -> None:
+        for config, expected_error in (
+            (
+                ModelConfig(
+                    name="mdl_onetrans",
+                    num_layers=2,
+                    first_domain_sequence_layer=2,
+                    experimental_model_acknowledged=True,
+                ),
+                r"first_domain_sequence_layer must be in",
+            ),
+            (
+                ModelConfig(
+                    name="onetrans",
+                    first_domain_sequence_layer=0,
+                ),
+                r"only valid for mdl_onetrans",
+            ),
+        ):
+            with self.subTest(config=config):
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    config.validate()
+
+    def test_yaml_types_are_validated_before_config_coercion(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        invalid_overrides = (
+            (
+                "quoted runtime boolean",
+                'runtime:\n  compile: "false"\n',
+                r"runtime\.compile must be a boolean",
+            ),
+            (
+                "scalar scenario names",
+                "scenarios:\n  names: default\n  source: scenario_id\n",
+                r"scenarios\.names must be a list",
+            ),
+            (
+                "scalar token input list",
+                "tokenization:\n  feature_token_inputs: user_id\n",
+                r"tokenization\.feature_token_inputs must be a list",
+            ),
+            (
+                "boolean integer field",
+                "training:\n  batch_size: true\n",
+                r"training\.batch_size must be an integer",
+            ),
+            (
+                "quoted model boolean",
+                'model:\n  use_pyramid: "false"\n',
+                r"model\.use_pyramid must be a boolean",
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            for index, (name, override, expected_error) in enumerate(invalid_overrides):
+                with self.subTest(name=name):
+                    config_path = Path(temporary) / f"invalid_{index}.yaml"
+                    config_path.write_text(
+                        f'extends: "{(root / "configs" / "default.yaml").as_posix()}"\n'
+                        + override,
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(ValueError, expected_error):
+                        load_app_config(config_path)
+
+    def test_strict_type_validation_preserves_documented_compatibility(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "compatible.yaml"
+            config_path.write_text(
+                f'extends: "{(root / "configs" / "default.yaml").as_posix()}"\n'
+                "runtime:\n"
+                "  activation_checkpoint: false\n"
+                "data:\n"
+                "  train:\n"
+                "    inputs: /tmp/train.parquet\n",
+                encoding="utf-8",
+            )
+
+            config = load_app_config(config_path)
+
+        self.assertEqual(config.runtime.activation_checkpoint, "none")
+        self.assertEqual(config.data.train.inputs, ("/tmp/train.parquet",))
+
+    def test_dataclass_validation_rejects_programmatic_type_mismatches(self) -> None:
+        invalid_configs = (
+            (
+                ScenarioConfig(names="default", source="scenario_id"),
+                r"scenarios\.names must be a list",
+            ),
+            (
+                RuntimeConfig(compile="false"),
+                r"runtime\.compile must be a boolean",
+            ),
+            (
+                RuntimeConfig(compile_mode="fast"),
+                r"runtime\.compile_mode must be default or reduce-overhead",
+            ),
+            (
+                RuntimeConfig(allow_tf32="false"),
+                r"runtime\.allow_tf32 must be a boolean",
+            ),
+            (
+                RuntimeConfig(require_compact_sequence_batches="false"),
+                r"runtime\.require_compact_sequence_batches must be a boolean",
+            ),
+            (
+                RuntimeConfig(master_port=True),
+                r"runtime\.master_port must be an integer",
+            ),
+        )
+        for config, expected_error in invalid_configs:
+            with self.subTest(config=config):
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    config.validate()
+
     def test_performance_profiles_use_direct_bounded_ids(self) -> None:
         root = Path(__file__).resolve().parents[1]
         for filename in (
@@ -146,6 +284,40 @@ class ModelConfigOverlayTest(unittest.TestCase):
         stress = load_app_config(root / "configs" / "longer_5000_perf.yaml")
         self.assertEqual(stress.sequences[0].max_length, 5000)
 
+    def test_gpu_performance_profiles_keep_validated_occupancy_settings(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        mdl = load_app_config(root / "configs" / "mdl_perf.yaml")
+        onetrans = load_app_config(root / "configs" / "onetrans_perf.yaml")
+        longer = load_app_config(root / "configs" / "longer_perf.yaml")
+        longer_stress = load_app_config(root / "configs" / "longer_5000_perf.yaml")
+
+        self.assertEqual(mdl.training.batch_size, 4096)
+        self.assertTrue(mdl.runtime.compile)
+        self.assertEqual(mdl.runtime.compile_mode, "reduce-overhead")
+        self.assertEqual(onetrans.training.batch_size, 320)
+        self.assertEqual(longer.training.batch_size, 512)
+        self.assertTrue(onetrans.runtime.compile)
+        self.assertTrue(longer.runtime.compile)
+        self.assertEqual(onetrans.runtime.compile_mode, "default")
+        self.assertEqual(longer.runtime.compile_mode, "default")
+        self.assertTrue(onetrans.runtime.require_compact_sequence_batches)
+        self.assertFalse(longer.runtime.require_compact_sequence_batches)
+        self.assertEqual(
+            [bucket.batch_size for bucket in onetrans.data.train.reader.length_buckets],
+            [2048, 1024, 512, 384, 320, 128],
+        )
+        self.assertEqual(
+            [bucket.batch_size for bucket in longer.data.train.reader.length_buckets],
+            [3072, 1536, 768, 512, 512, 192],
+        )
+        for config in (mdl, onetrans, longer):
+            with self.subTest(model=config.model.name):
+                self.assertTrue(config.training.ddp.static_graph)
+                self.assertFalse(config.training.ddp.find_unused_parameters)
+                self.assertTrue(config.training.ddp.validated_static_graph)
+        self.assertEqual(longer.runtime.activation_checkpoint, "none")
+        self.assertEqual(longer_stress.runtime.activation_checkpoint, "selective")
+
     def test_onetrans_rejects_pre_encoded_behavior_sequences(self) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(root / "configs" / "onetrans.yaml")
@@ -167,6 +339,63 @@ class ModelConfigOverlayTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, r"\[S; NS\] token maximum"):
             validate_app_config(invalid)
+
+    def test_onetrans_ns_tokens_reject_sequences_in_inactive_scopes(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "onetrans.yaml")
+        hidden_sequence = replace(
+            config.sequences[0],
+            name="hidden_seq",
+            embedding_scope="scenario",
+        )
+        bad_ns_token = replace(
+            config.tokenization.ns_tokens[0],
+            name="bad_ns",
+            inputs=["hidden_seq"],
+        )
+        invalid = replace(
+            config,
+            sequences=[*config.sequences, hidden_sequence],
+            tokenization=replace(config.tokenization, ns_tokens=[bad_ns_token]),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"tokenization\.ns_tokens\.bad_ns must not include sequence inputs",
+        ):
+            validate_app_config(invalid)
+
+    def test_onetrans_sequence_tokens_only_accept_active_sequences(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "onetrans.yaml")
+        hidden_sequence = replace(
+            config.sequences[0],
+            name="hidden_seq",
+            embedding_scope="task",
+        )
+
+        for invalid_input in ("user_id", "hidden_seq"):
+            with self.subTest(invalid_input=invalid_input):
+                bad_sequence_token = replace(
+                    config.tokenization.sequence_tokens[0],
+                    name="bad_sequence",
+                    inputs=[config.sequences[0].name, invalid_input],
+                )
+                invalid = replace(
+                    config,
+                    sequences=[*config.sequences, hidden_sequence],
+                    tokenization=replace(
+                        config.tokenization,
+                        sequence_tokens=[bad_sequence_token],
+                    ),
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"tokenization\.sequence_tokens\.bad_sequence must only include "
+                    r"feature/shared sequence inputs",
+                ):
+                    validate_app_config(invalid)
 
     def test_dynamic_onetrans_length_requires_explicit_position_capacity(self) -> None:
         root = Path(__file__).resolve().parents[1]

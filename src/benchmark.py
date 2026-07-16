@@ -23,7 +23,6 @@ from typing import Any, Callable, Literal
 import torch
 import torch.distributed as torch_dist
 from torch import Tensor, nn
-from torch.nn.parallel import DistributedDataParallel
 
 from .config import AppConfig, ResolvedVocabEncoding, resolve_categorical_base_input
 from .dataloader import FeatureBatch
@@ -43,7 +42,7 @@ from .train import (
     _classify_model_parameters,
     _cleanup_distributed,
     _loss_terms_from_batch,
-    _maybe_compile_model,
+    _prepare_forward_model,
     _non_blocking_transfer,
     _setup_distributed,
     _step_sparse_moe_controllers,
@@ -187,6 +186,21 @@ def _process_peak_rss_bytes() -> int:
     return value if platform.system() == "Darwin" else value * 1024
 
 
+def _nvidia_smi_device_selector(device: torch.device) -> str:
+    """Map a process-local CUDA index back to nvidia-smi's physical selector."""
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible_devices:
+        selectors = [item.strip() for item in visible_devices.split(",")]
+        selectors = [item for item in selectors if item]
+        if 0 <= device_index < len(selectors):
+            return selectors[device_index]
+    return str(device_index)
+
+
 class _GpuUtilizationSampler:
     """Best-effort GPU utilization sampling without a mandatory NVML package."""
 
@@ -215,16 +229,14 @@ class _GpuUtilizationSampler:
         return _mean(self._values) if self._values else None
 
     def _run(self) -> None:
-        device_index = self.device.index
-        if device_index is None:
-            device_index = torch.cuda.current_device()
+        device_selector = _nvidia_smi_device_selector(self.device)
         while not self._stop.is_set():
             try:
                 result = subprocess.run(
                     [
                         "nvidia-smi",
                         "-i",
-                        str(device_index),
+                        device_selector,
                         "--query-gpu=utilization.gpu",
                         "--format=csv,noheader,nounits",
                     ],
@@ -1016,18 +1028,7 @@ def _benchmark_compute(
     if replaced == 0:
         raise ValueError("compute benchmark could not identify ID embedding modules")
     base_model = model.to(context.device)
-    forward_model = _maybe_compile_model(config, base_model)
-    model_for_forward: nn.Module = forward_model
-    if context.enabled:
-        model_for_forward = DistributedDataParallel(
-            forward_model,
-            device_ids=[context.local_rank] if context.device.type == "cuda" else None,
-            output_device=context.local_rank if context.device.type == "cuda" else None,
-            find_unused_parameters=config.training.ddp.find_unused_parameters,
-            static_graph=config.training.ddp.static_graph,
-            gradient_as_bucket_view=config.training.ddp.gradient_as_bucket_view,
-            bucket_cap_mb=config.training.ddp.bucket_cap_mb,
-        )
+    model_for_forward = _prepare_forward_model(config, base_model, context)
     parameters = [parameter for parameter in base_model.parameters() if parameter.requires_grad]
     optimizer = _build_dense_optimizer(
         parameters,

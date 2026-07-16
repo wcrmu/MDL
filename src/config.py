@@ -5,30 +5,163 @@ The YAML surface should stay stable. Internal helpers build the model-facing vie
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, fields as dataclass_fields, is_dataclass
 from functools import cached_property
 import importlib
 from pathlib import Path
-from typing import Any, Literal
+from types import MappingProxyType, UnionType
+from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
 import yaml
 
 
-# Public string choices used by YAML and type hints.
-EncodingType = Literal["vocab", "hash", "identity", "shared_vocab"]
-EmbeddingScope = Literal["feature", "scenario", "task", "shared"]
-ModelName = Literal["rankmixer", "mdl_rankmixer", "onetrans", "mdl_onetrans", "longer"]
-SequenceFieldKind = Literal["categorical", "dense"]
-SequenceEncoderType = Literal["raw", "attention_pool", "mean_pool", "longer"]
-LRScheduleType = Literal["constant", "cosine"]
-ActivationType = Literal["gelu", "relu"]
-SequenceFusionType = Literal["timestamp_aware", "intent_ordered"]
-RankMixerFFNType = Literal["dense", "sparse_moe"]
-SequenceOrderType = Literal["oldest_to_newest", "newest_to_oldest"]
-MDLFeatureInteractionType = Literal["paper", "rankmixer_full"]
-DTSITrainingOutputType = Literal["dense_router", "mean"]
-LossReductionType = Literal["sum", "mean_per_task"]
-IdentityOutOfRangeType = Literal["error", "padding"]
+class _FrozenMapping(Mapping[Any, Any]):
+    """Copy-backed, read-only mapping used inside frozen config objects."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, values: Mapping[Any, Any]) -> None:
+        data = {
+            key: _deep_freeze_config_value(value)
+            for key, value in values.items()
+        }
+        object.__setattr__(self, "_data", MappingProxyType(data))
+
+    def __getitem__(self, key: Any) -> Any:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        return repr(dict(self._data))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise TypeError(f"{type(self).__name__} is immutable")
+
+    def __copy__(self) -> "_FrozenMapping":
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_FrozenMapping":
+        memo[id(self)] = self
+        return self
+
+    def __reduce__(self) -> tuple[Any, tuple[dict[Any, Any]]]:
+        return type(self), (dict(self._data),)
+
+
+def _deep_freeze_config_value(value: Any) -> Any:
+    """Copy and recursively freeze standard mutable containers."""
+
+    if isinstance(value, _FrozenMapping):
+        return value
+    if isinstance(value, Mapping):
+        return _FrozenMapping(value)
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze_config_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_deep_freeze_config_value(item) for item in value)
+    return value
+
+
+class _DeeplyImmutableConfig:
+    """Normalize container fields before a frozen dataclass becomes observable."""
+
+    def __post_init__(self) -> None:
+        for config_field in dataclass_fields(self):
+            value = getattr(self, config_field.name)
+            frozen_value = _deep_freeze_config_value(value)
+            if frozen_value is not value:
+                object.__setattr__(self, config_field.name, frozen_value)
+
+
+# Public string choices used by YAML and type hints. A choice being part of the
+# shared schema does not mean that every model family consumes its field.
+
+# Model family selection.
+ModelName = Literal[
+    "rankmixer",  # Standalone RankMixer feature-token model.
+    "mdl_rankmixer",  # MDL scenario/task model with RankMixer feature blocks.
+    "onetrans",  # Standalone OneTrans unified S/NS-token model.
+    "mdl_onetrans",  # Experimental MDL-OneTrans composition; requires acknowledgement.
+    "longer",  # Standalone LONGER sequence recommendation model.
+]
+
+# Model-independent input and feature schema choices.
+EncodingType = Literal[
+    "vocab",  # Fit or load an explicit categorical value-to-ID vocabulary.
+    "hash",  # Map categorical values deterministically into fixed hash buckets.
+    "identity",  # Consume bounded, already encoded integer IDs without fitting a vocab.
+    "shared_vocab",  # Reuse the vocabulary mapping named by share_with.
+]
+IdentityOutOfRangeType = Literal[
+    "error",  # Reject identity IDs outside the configured bucket range.
+    "padding",  # Replace out-of-range identity IDs with padding_id.
+]
+EmbeddingScope = Literal[
+    "feature",  # Use the input in ordinary feature or OneTrans NS tokens.
+    "scenario",  # Reserve the input for MDL scenario-token context or priors.
+    "task",  # Reserve the input for MDL task-token context or priors.
+    "shared",  # Keep generic context available for reuse across token families.
+]
+SequenceFieldKind = Literal[
+    "categorical",  # Encode each event value through its categorical strategy.
+    "dense",  # Consume each event value as a dense floating-point scalar or vector.
+]
+SequenceOrderType = Literal[
+    "oldest_to_newest",  # Source events are already in canonical chronological order.
+    "newest_to_oldest",  # Reverse each valid event span into chronological order.
+]
+
+# Sequence encoder choices; individual values target different model paths.
+SequenceEncoderType = Literal[
+    "raw",  # Preserve event-level tokens for OneTrans; required by the OneTrans family.
+    "attention_pool",  # Produce a learned attention-pooled sequence summary.
+    "mean_pool",  # Produce a masked mean-pooled sequence summary.
+    "longer",  # Use LONGER sequence encoding; required by model.name=longer.
+]
+
+# Architecture choices shared by all model families.
+ActivationType = Literal[
+    "gelu",  # Use GELU in configurable FFN and task-head activation sites.
+    "relu",  # Use ReLU in configurable FFN and task-head activation sites.
+]
+
+# Training choices shared by all model families.
+LRScheduleType = Literal[
+    "constant",  # Keep the base LR constant after optional linear warmup.
+    "cosine",  # Cosine-decay the LR to lr_min_ratio after optional warmup.
+]
+LossReductionType = Literal[
+    "sum",  # Sum all valid label losses across tasks and examples.
+    "mean_per_task",  # Mean each task over its valid labels, then sum task means.
+]
+
+# OneTrans-family choices: model.name=onetrans or experimental mdl_onetrans.
+SequenceFusionType = Literal[
+    "timestamp_aware",  # Add sequence-type embeddings and globally sort S tokens by time.
+    "intent_ordered",  # Concatenate S-token groups in config order with optional separators.
+]
+
+# RankMixer-family choices: model.name=rankmixer or mdl_rankmixer.
+RankMixerFFNType = Literal[
+    "dense",  # Use one dense per-token FFN.
+    "sparse_moe",  # Use a sparsely routed mixture of per-token FFN experts.
+]
+DTSITrainingOutputType = Literal[
+    "dense_router",  # Train with the dense softmax-router output while DTSI is enabled.
+    "mean",  # Train with the mean of dense-router and sparse-router outputs.
+]
+
+# MDL-RankMixer-only choices: model.name=mdl_rankmixer.
+MDLFeatureInteractionType = Literal[
+    "direct_ffn",  # Replace the mixed feature state with the MDL-style FFN output (MDL Eq. 6).
+    "residual_ffn",  # Apply original RankMixer-style residual addition and LayerNorm after the FFN.
+]
 
 
 def _validate_identity_bounds(
@@ -139,7 +272,7 @@ class CategoricalEncodingConfig:
 
 
 @dataclass(frozen=True)
-class ParquetAdapterConfig:
+class ParquetAdapterConfig(_DeeplyImmutableConfig):
     """External preprocessing hook for non-flat Parquet layouts.
 
     The callable is imported during config validation but is only executed by
@@ -147,8 +280,8 @@ class ParquetAdapterConfig:
     """
 
     callable: str
-    input_columns: list[str] | None = None
-    options: dict[str, Any] = field(default_factory=dict)
+    input_columns: tuple[str, ...] | None = None
+    options: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> "ParquetAdapterConfig | None":
@@ -160,7 +293,7 @@ class ParquetAdapterConfig:
         if input_columns is not None:
             if isinstance(input_columns, str):
                 raise ValueError("data split adapter.input_columns must be a list of column names")
-            input_columns = list(input_columns)
+            input_columns = tuple(input_columns)
         return cls(
             callable=payload.get("callable", ""),
             input_columns=input_columns,
@@ -182,7 +315,7 @@ class ParquetAdapterConfig:
         if self.input_columns is not None:
             if not all(isinstance(column, str) and column for column in self.input_columns):
                 raise ValueError(f"{path}.input_columns must contain non-empty column names")
-        if not isinstance(self.options, dict):
+        if not isinstance(self.options, Mapping):
             raise ValueError(f"{path}.options must be an object")
         try:
             module = importlib.import_module(module_name)
@@ -224,7 +357,7 @@ class LengthBucketConfig:
 
 
 @dataclass(frozen=True)
-class ReaderConfig:
+class ReaderConfig(_DeeplyImmutableConfig):
     """Parquet reader options for one data split.
 
     The scanner currently has one supported backend. The fields below still stay
@@ -345,7 +478,7 @@ class SchemaPolicy:
 
 
 @dataclass(frozen=True)
-class ParquetSplitConfig:
+class ParquetSplitConfig(_DeeplyImmutableConfig):
     """Input paths and label columns for a train or test split.
 
     A split is intentionally file/path based. It does not know about feature
@@ -356,7 +489,7 @@ class ParquetSplitConfig:
     # external preprocessing function before feature encoding.
     format: Literal["flat_parquet", "adapter_parquet"]
     # Paths can be files, directories, or glob patterns. A single string is accepted.
-    inputs: list[str]
+    inputs: tuple[str, ...]
     # Reader options can differ per split, for example smaller test batches.
     reader: ReaderConfig = field(default_factory=ReaderConfig)
     # External preprocessing hook used only when format=adapter_parquet.
@@ -366,9 +499,9 @@ class ParquetSplitConfig:
     # Group id is used by evaluation/prediction code when preserving request groups.
     group_id: str | None = None
     # Mapping from task name to label column. Train must declare at least one task.
-    labels: dict[str, str] = field(default_factory=dict)
+    labels: Mapping[str, str] = field(default_factory=dict)
     # Optional per-task mask columns. If present, masks must match labels exactly.
-    label_masks: dict[str, str] = field(default_factory=dict)
+    label_masks: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "ParquetSplitConfig":
@@ -381,12 +514,12 @@ class ParquetSplitConfig:
             )
         reader = ReaderConfig.from_mapping(payload.get("reader"))
         inputs = payload.get("inputs")
-        # YAML authors often use one path during smoke tests; normalize to a list.
+        # YAML authors often use one path during smoke tests; normalize it here.
         if isinstance(inputs, str):
             inputs = [inputs]
         return cls(
             format=payload["format"],
-            inputs=list(inputs or []),
+            inputs=tuple(inputs or ()),
             reader=reader,
             adapter=ParquetAdapterConfig.from_mapping(payload.get("adapter")),
             request_id=payload.get("request_id"),
@@ -589,7 +722,7 @@ class SequenceFieldConfig:
 
 
 @dataclass(frozen=True)
-class SequenceConfig:
+class SequenceConfig(_DeeplyImmutableConfig):
     """A top-level behavior sequence made from aligned list columns.
 
     The sequence encoder converts variable-length behavior steps into one or
@@ -599,7 +732,7 @@ class SequenceConfig:
     # Logical sequence name. Also used as the encoded input name after pooling.
     name: str
     # Step fields. Every row must have equal list lengths across all fields.
-    fields: list[SequenceFieldConfig]
+    fields: tuple[SequenceFieldConfig, ...]
     # Feature/shared sequences can become model feature tokens. Other scopes are reserved.
     embedding_scope: EmbeddingScope = "feature"
     # Optional maximum and physical head/tail window kept during tensorization.
@@ -612,7 +745,7 @@ class SequenceConfig:
     # are summary baselines; longer is the paper-aligned standalone encoder path.
     encoder: SequenceEncoderType = "attention_pool"
     # Scalar features used as target context for LONGER query construction.
-    target_inputs: list[str] = field(default_factory=list)
+    target_inputs: tuple[str, ...] = ()
     # Number of fixed summary slices exposed to RankMixer token packing.
     rankmixer_summary_tokens: int = 1
     # LONGER-specific query/self-attention parameters. Ignored by simpler encoders.
@@ -622,7 +755,7 @@ class SequenceConfig:
     longer_inner_layers: int = 0
     # Cacheable user/CLS globals are kept separate from candidate globals so
     # candidate information cannot leak into reusable sequence-side states.
-    longer_user_global_inputs: list[str] = field(default_factory=list)
+    longer_user_global_inputs: tuple[str, ...] = ()
     longer_user_global_tokens: int = 0
     longer_cls_tokens: int = 0
     # None assigns all remaining rankmixer_summary_tokens to target_inputs.
@@ -643,22 +776,24 @@ class SequenceConfig:
             )
         return cls(
             name=payload["name"],
-            fields=[
+            fields=tuple(
                 SequenceFieldConfig.from_mapping(item)
                 for item in payload.get("fields", [])
-            ],
+            ),
             embedding_scope=payload.get("embedding_scope", "feature"),
             max_length=payload.get("max_length"),
             truncation=payload.get("truncation", "tail"),
             sequence_order=payload.get("sequence_order", "oldest_to_newest"),
             encoder=payload.get("encoder", "attention_pool"),
-            target_inputs=list(payload.get("target_inputs", [])),
+            target_inputs=tuple(payload.get("target_inputs", [])),
             rankmixer_summary_tokens=payload.get("rankmixer_summary_tokens", 1),
             longer_query_tokens=payload.get("longer_query_tokens", 32),
             longer_self_layers=payload.get("longer_self_layers", 1),
             longer_token_merge=payload.get("longer_token_merge", 1),
             longer_inner_layers=payload.get("longer_inner_layers", 0),
-            longer_user_global_inputs=list(payload.get("longer_user_global_inputs", [])),
+            longer_user_global_inputs=tuple(
+                payload.get("longer_user_global_inputs", [])
+            ),
             longer_user_global_tokens=payload.get("longer_user_global_tokens", 0),
             longer_cls_tokens=payload.get("longer_cls_tokens", 0),
             longer_candidate_global_tokens=payload.get("longer_candidate_global_tokens"),
@@ -787,7 +922,7 @@ class SequenceConfig:
 
 
 @dataclass(frozen=True)
-class ScenarioConfig:
+class ScenarioConfig(_DeeplyImmutableConfig):
     """Scenario ids used by MDL scenario-aware modules.
 
     A single default scenario does not need a source column. Multiple scenarios
@@ -795,7 +930,7 @@ class ScenarioConfig:
     """
 
     # Ordered scenario names define model output token order.
-    names: list[str] = field(default_factory=lambda: ["default"])
+    names: tuple[str, ...] = ("default",)
     # Optional parquet column carrying scenario id or scenario mask information.
     source: str | None = None
 
@@ -803,9 +938,12 @@ class ScenarioConfig:
     def from_mapping(cls, payload: dict[str, Any] | None) -> "ScenarioConfig":
         if payload is None:
             return cls()
+        _validate_config_mapping_types(payload, cls, "scenarios")
         return cls(**payload)
 
     def validate(self) -> None:
+        if not isinstance(self.names, tuple):
+            raise ValueError("scenarios.names must be a list")
         if not self.names:
             raise ValueError("scenarios.names must contain at least one scenario")
         if any(not isinstance(name, str) for name in self.names):
@@ -816,20 +954,21 @@ class ScenarioConfig:
             raise ValueError("scenarios.names must not contain duplicates")
         if "global" in self.names:
             raise ValueError("scenarios.names must not contain reserved scenario name 'global'")
-        if self.source is not None and not self.source:
-            raise ValueError("scenarios.source must be null or a non-empty column name")
+        if self.source is not None:
+            if not isinstance(self.source, str) or not self.source:
+                raise ValueError("scenarios.source must be null or a non-empty column name")
         if len(self.names) > 1 and self.source is None:
             raise ValueError("scenarios.source is required when multiple scenarios are configured")
 
 
 @dataclass(frozen=True)
-class TokenGroupConfig:
+class TokenGroupConfig(_DeeplyImmutableConfig):
     """A named token built from one or more encoded inputs."""
 
     # Token name is model-visible and must be unique within its token section.
     name: str
     # Input references point to FeatureConfig.name or SequenceConfig.name, not columns.
-    inputs: list[str]
+    inputs: tuple[str, ...]
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "TokenGroupConfig":
@@ -849,7 +988,7 @@ class TokenGroupConfig:
 
 
 @dataclass(frozen=True)
-class DomainTokenConfig:
+class DomainTokenConfig(_DeeplyImmutableConfig):
     """A scenario or task token spec with ordered input groups.
 
     inputs, important_inputs, and prior_inputs are kept separate in YAML because
@@ -859,17 +998,17 @@ class DomainTokenConfig:
     # Scenario name or task name. Scenario tokens may also include reserved global.
     name: str
     # Generic inputs, followed by paper-specific important/prior groups.
-    inputs: list[str] = field(default_factory=list)
-    important_inputs: list[str] = field(default_factory=list)
-    prior_inputs: list[str] = field(default_factory=list)
+    inputs: tuple[str, ...] = ()
+    important_inputs: tuple[str, ...] = ()
+    prior_inputs: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "DomainTokenConfig":
         return cls(
             name=payload["name"],
-            inputs=list(payload.get("inputs", [])),
-            important_inputs=list(payload.get("important_inputs", [])),
-            prior_inputs=list(payload.get("prior_inputs", [])),
+            inputs=tuple(payload.get("inputs", [])),
+            important_inputs=tuple(payload.get("important_inputs", [])),
+            prior_inputs=tuple(payload.get("prior_inputs", [])),
         )
 
     def resolved_inputs(self) -> list[str]:
@@ -892,7 +1031,7 @@ class DomainTokenConfig:
 
 
 @dataclass(frozen=True)
-class TokenizationConfig:
+class TokenizationConfig(_DeeplyImmutableConfig):
     """Raw tokenization settings from YAML.
 
     Public resolved_* methods stay for compatibility. They delegate to the
@@ -905,20 +1044,20 @@ class TokenizationConfig:
     # Required for auto_split/rankmixer so output token count is explicit.
     num_feature_tokens: int | None = None
     # Ordered input list for auto_split/rankmixer. Empty means all tokenizable inputs.
-    feature_token_inputs: list[str] = field(default_factory=list)
+    feature_token_inputs: tuple[str, ...] = ()
     # Optional explicit feature token groups for groupwise tokenization.
-    feature_tokens: list[TokenGroupConfig] = field(default_factory=list)
+    feature_tokens: tuple[TokenGroupConfig, ...] = ()
     # S-token groups for OneTrans-style sequence tokenization.
-    sequence_tokens: list[TokenGroupConfig] = field(default_factory=list)
+    sequence_tokens: tuple[TokenGroupConfig, ...] = ()
     # Non-sequence token groups. Kept as ns_tokens to preserve the YAML surface.
-    ns_tokens: list[TokenGroupConfig] = field(default_factory=list)
+    ns_tokens: tuple[TokenGroupConfig, ...] = ()
     # MDL domain tokens. Scenario tokens also get a global token during resolution.
-    scenario_tokens: list[DomainTokenConfig] = field(default_factory=list)
+    scenario_tokens: tuple[DomainTokenConfig, ...] = ()
     # Task token names must match train label task names.
-    task_tokens: list[DomainTokenConfig] = field(default_factory=list)
+    task_tokens: tuple[DomainTokenConfig, ...] = ()
     # Fallback input sets used when scenario/task tokens are omitted.
-    scenario_token_inputs: list[str] = field(default_factory=list)
-    task_token_inputs: list[str] = field(default_factory=list)
+    scenario_token_inputs: tuple[str, ...] = ()
+    task_token_inputs: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> "TokenizationConfig":
@@ -927,125 +1066,130 @@ class TokenizationConfig:
         return cls(
             feature_tokenizer=payload.get("feature_tokenizer", "groupwise"),
             num_feature_tokens=payload.get("num_feature_tokens"),
-            feature_token_inputs=list(payload.get("feature_token_inputs", [])),
-            feature_tokens=[
+            feature_token_inputs=tuple(payload.get("feature_token_inputs", [])),
+            feature_tokens=tuple(
                 TokenGroupConfig.from_mapping(item)
                 for item in payload.get("feature_tokens", [])
-            ],
-            sequence_tokens=[
+            ),
+            sequence_tokens=tuple(
                 TokenGroupConfig.from_mapping(item)
                 for item in payload.get("sequence_tokens", [])
-            ],
-            ns_tokens=[
+            ),
+            ns_tokens=tuple(
                 TokenGroupConfig.from_mapping(item)
                 for item in payload.get("ns_tokens", [])
-            ],
-            scenario_tokens=[
+            ),
+            scenario_tokens=tuple(
                 DomainTokenConfig.from_mapping(item)
                 for item in payload.get("scenario_tokens", [])
-            ],
-            task_tokens=[
+            ),
+            task_tokens=tuple(
                 DomainTokenConfig.from_mapping(item)
                 for item in payload.get("task_tokens", [])
-            ],
-            scenario_token_inputs=list(payload.get("scenario_token_inputs", [])),
-            task_token_inputs=list(payload.get("task_token_inputs", [])),
+            ),
+            scenario_token_inputs=tuple(
+                payload.get("scenario_token_inputs", [])
+            ),
+            task_token_inputs=tuple(payload.get("task_token_inputs", [])),
         )
 
-    def _sequences(self, sequences: list[SequenceConfig] | None) -> list[SequenceConfig]:
-        return [] if sequences is None else sequences
+    def _sequences(
+        self,
+        sequences: Sequence[SequenceConfig] | None,
+    ) -> Sequence[SequenceConfig]:
+        return () if sequences is None else sequences
 
     def _tokenizable_input_names(
         self,
-        features: list[FeatureConfig],
-        sequences: list[SequenceConfig] | None = None,
+        features: Sequence[FeatureConfig],
+        sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[str]:
         return tokenizable_input_names(features, self._sequences(sequences))
 
     def _sequence_input_names(
         self,
-        features: list[FeatureConfig],
-        sequences: list[SequenceConfig] | None = None,
+        features: Sequence[FeatureConfig],
+        sequences: Sequence[SequenceConfig] | None = None,
     ) -> set[str]:
         return sequence_input_names(self._sequences(sequences))
 
     def resolved_feature_token_inputs(
         self,
-        features: list[FeatureConfig],
-        sequences: list[SequenceConfig] | None = None,
+        features: Sequence[FeatureConfig],
+        sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[str]:
         resolved = resolve_tokenization(self, features, self._sequences(sequences), [], [])
         return list(resolved.feature_token_inputs)
 
     def resolved_feature_token_count(
         self,
-        features: list[FeatureConfig],
-        sequences: list[SequenceConfig] | None = None,
+        features: Sequence[FeatureConfig],
+        sequences: Sequence[SequenceConfig] | None = None,
     ) -> int:
         resolved = resolve_tokenization(self, features, self._sequences(sequences), [], [])
         return resolved.feature_token_count
 
     def resolved_feature_tokens(
         self,
-        features: list[FeatureConfig],
-        sequences: list[SequenceConfig] | None = None,
+        features: Sequence[FeatureConfig],
+        sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[TokenGroupConfig]:
         resolved = resolve_tokenization(self, features, self._sequences(sequences), [], [])
         return [group.as_token_group() for group in resolved.feature_token_groups]
 
     def resolved_sequence_tokens(
         self,
-        features: list[FeatureConfig],
-        sequences: list[SequenceConfig] | None = None,
+        features: Sequence[FeatureConfig],
+        sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[TokenGroupConfig]:
         resolved = resolve_tokenization(self, features, self._sequences(sequences), [], [])
         return [group.as_token_group() for group in resolved.sequence_token_groups]
 
     def resolved_ns_tokens(
         self,
-        features: list[FeatureConfig],
-        sequences: list[SequenceConfig] | None = None,
+        features: Sequence[FeatureConfig],
+        sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[TokenGroupConfig]:
         resolved = resolve_tokenization(self, features, self._sequences(sequences), [], [])
         return [group.as_token_group() for group in resolved.scalar_token_groups]
 
     def resolved_scenario_inputs(
         self,
-        features: list[FeatureConfig],
-        sequences: list[SequenceConfig] | None = None,
+        features: Sequence[FeatureConfig],
+        sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[str]:
         resolved = resolve_tokenization(self, features, self._sequences(sequences), [], [])
         return list(resolved.scenario_token_inputs)
 
     def resolved_task_inputs(
         self,
-        features: list[FeatureConfig],
-        sequences: list[SequenceConfig] | None = None,
+        features: Sequence[FeatureConfig],
+        sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[str]:
         resolved = resolve_tokenization(self, features, self._sequences(sequences), [], [])
         return list(resolved.task_token_inputs)
 
     def resolved_scenario_tokens(
         self,
-        features: list[FeatureConfig],
-        scenario_names: list[str],
-        sequences: list[SequenceConfig] | None = None,
+        features: Sequence[FeatureConfig],
+        scenario_names: Sequence[str],
+        sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[DomainTokenConfig]:
         resolved = resolve_tokenization(self, features, self._sequences(sequences), scenario_names, [])
         return [token.as_domain_token() for token in resolved.scenario_token_specs]
 
     def resolved_task_tokens(
         self,
-        features: list[FeatureConfig],
-        task_names: list[str],
-        sequences: list[SequenceConfig] | None = None,
+        features: Sequence[FeatureConfig],
+        task_names: Sequence[str],
+        sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[DomainTokenConfig]:
         resolved = resolve_tokenization(self, features, self._sequences(sequences), [], task_names)
         return [token.as_domain_token() for token in resolved.task_token_specs]
 
     def _validate_unique_domain_token_names(
         self,
-        tokens: list[DomainTokenConfig],
+        tokens: Sequence[DomainTokenConfig],
         section: str,
     ) -> None:
         names: set[str] = set()
@@ -1062,10 +1206,10 @@ class TokenizationConfig:
 
     def validate(
         self,
-        features: list[FeatureConfig],
-        sequences: list[SequenceConfig],
-        scenario_names: list[str],
-        task_names: list[str],
+        features: Sequence[FeatureConfig],
+        sequences: Sequence[SequenceConfig],
+        scenario_names: Sequence[str],
+        task_names: Sequence[str],
     ) -> None:
         validate_tokenization_config(self, features, sequences, scenario_names, task_names)
 
@@ -1155,11 +1299,11 @@ class VocabFeatureStrategy:
 
 
 @dataclass(frozen=True)
-class VocabStrategy:
+class VocabStrategy(_DeeplyImmutableConfig):
     """All categorical encoding strategies keyed by input name."""
 
     defaults: VocabDefaults = field(default_factory=VocabDefaults)
-    features: dict[str, VocabFeatureStrategy] = field(default_factory=dict)
+    features: Mapping[str, VocabFeatureStrategy] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> "VocabStrategy":
@@ -1195,6 +1339,12 @@ class RuntimeConfig:
     precision: Literal["fp32", "bf16", "fp16"] = "fp32"
     # torch.compile toggle. Keep false for easier debugging and wider compatibility.
     compile: bool = False
+    # reduce-overhead enables CUDA Graph capture for fixed-shape launch-bound
+    # workloads; default preserves ordinary Inductor execution.
+    compile_mode: Literal["default", "reduce-overhead"] = "default"
+    # OneTrans can avoid a dynamic slice when the reader guarantees that no
+    # prefix column is padding for every row in the batch.
+    require_compact_sequence_batches: bool = False
     # TensorFloat-32 accelerates FP32 matrix multiplications on supported GPUs.
     allow_tf32: bool = True
     # none avoids recompute; selective checkpoints large blocks; full also
@@ -1212,6 +1362,7 @@ class RuntimeConfig:
     def from_mapping(cls, payload: dict[str, Any] | None) -> "RuntimeConfig":
         if payload is None:
             return cls()
+        _validate_config_mapping_types(payload, cls, "runtime")
         values = dict(payload)
         legacy_checkpoint = values.get("activation_checkpoint")
         if isinstance(legacy_checkpoint, bool):
@@ -1221,8 +1372,34 @@ class RuntimeConfig:
         return cls(**values)
 
     def validate(self) -> None:
+        for field_name in (
+            "device",
+            "precision",
+            "compile_mode",
+            "activation_checkpoint",
+            "attention_backend",
+            "distributed",
+            "master_addr",
+        ):
+            if not isinstance(getattr(self, field_name), str):
+                raise ValueError(f"runtime.{field_name} must be a string")
+        for field_name in (
+            "compile",
+            "allow_tf32",
+            "require_compact_sequence_batches",
+        ):
+            if type(getattr(self, field_name)) is not bool:
+                raise ValueError(f"runtime.{field_name} must be a boolean")
+        if self.nproc_per_node is not None and type(self.nproc_per_node) is not int:
+            raise ValueError("runtime.nproc_per_node must be an integer or null")
+        if type(self.master_port) is not int:
+            raise ValueError("runtime.master_port must be an integer")
         if self.precision not in {"fp32", "bf16", "fp16"}:
             raise ValueError("runtime.precision must be fp32, bf16, or fp16")
+        if self.compile_mode not in {"default", "reduce-overhead"}:
+            raise ValueError(
+                "runtime.compile_mode must be default or reduce-overhead"
+            )
         if self.attention_backend not in {"auto", "sdpa", "flash"}:
             raise ValueError("runtime.attention_backend must be auto, sdpa, or flash")
         if self.activation_checkpoint not in {"none", "selective", "full"}:
@@ -1276,11 +1453,14 @@ class ModelConfig:
     # means a zero update.
     use_task_feature_interaction: bool = True
     use_scenario_feature_interaction: bool = True
-    # MDL Eq. (6) has no second residual/LayerNorm. rankmixer_full is retained
-    # only as an explicit ablation/compatibility path.
-    mdl_feature_interaction: MDLFeatureInteractionType = "paper"
+    # direct_ffn uses the FFN output directly; residual_ffn applies a second
+    # residual connection and LayerNorm around the FFN.
+    mdl_feature_interaction: MDLFeatureInteractionType = "direct_ffn"
     # Local request-cache support for sequence encoders.
     use_request_cache: bool = False
+    # Experimental mdl_onetrans only. None keeps the conservative NS-only MDL
+    # path; an index enables direct masked S-token attention from that layer on.
+    first_domain_sequence_layer: int | None = None
     # OneTrans pyramid controls for reducing S tokens over layers.
     use_pyramid: bool = True
     pyramid_round_to: int = 32
@@ -1313,6 +1493,12 @@ class ModelConfig:
     def from_mapping(cls, payload: dict[str, Any]) -> "ModelConfig":
         if not isinstance(payload, dict):
             raise ValueError("model must be an object")
+        legacy_interaction = {
+            "paper": "direct_ffn",
+            "rankmixer_full": "residual_ffn",
+        }.get(payload.get("mdl_feature_interaction"))
+        if legacy_interaction is not None:
+            payload = {**payload, "mdl_feature_interaction": legacy_interaction}
         return cls(**payload)
 
     def validate(self) -> None:
@@ -1342,8 +1528,23 @@ class ModelConfig:
             raise ValueError("model.task_head_dropout must be in [0, 1)")
         if self.task_head_activation not in {"gelu", "relu"}:
             raise ValueError("model.task_head_activation must be gelu or relu")
-        if self.mdl_feature_interaction not in {"paper", "rankmixer_full"}:
-            raise ValueError("model.mdl_feature_interaction must be paper or rankmixer_full")
+        if self.mdl_feature_interaction not in {"direct_ffn", "residual_ffn"}:
+            raise ValueError(
+                "model.mdl_feature_interaction must be direct_ffn or residual_ffn"
+            )
+        if self.first_domain_sequence_layer is not None:
+            if type(self.first_domain_sequence_layer) is not int:
+                raise ValueError(
+                    "model.first_domain_sequence_layer must be an integer or null"
+                )
+            if not 0 <= self.first_domain_sequence_layer < self.num_layers:
+                raise ValueError(
+                    "model.first_domain_sequence_layer must be in [0, model.num_layers)"
+                )
+            if self.name != "mdl_onetrans":
+                raise ValueError(
+                    "model.first_domain_sequence_layer is only valid for mdl_onetrans"
+                )
         if self.pyramid_round_to <= 0:
             raise ValueError("model.pyramid_round_to must be positive")
         if self.ns_tokenizer not in {"auto_split", "groupwise"}:
@@ -1595,12 +1796,12 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True)
-class AppConfig:
+class AppConfig(_DeeplyImmutableConfig):
     """Top-level config object used by CLI, data, model, and training code."""
 
     data: DataConfig
-    features: list[FeatureConfig]
-    sequences: list[SequenceConfig]
+    features: tuple[FeatureConfig, ...]
+    sequences: tuple[SequenceConfig, ...]
     vocab_strategy: VocabStrategy
     model: ModelConfig
     scenarios: ScenarioConfig = field(default_factory=ScenarioConfig)
@@ -1612,8 +1813,14 @@ class AppConfig:
     def from_mapping(cls, payload: dict[str, Any]) -> "AppConfig":
         if not isinstance(payload, dict):
             raise ValueError("config must be an object")
-        features = [FeatureConfig.from_mapping(item) for item in payload.get("features", [])]
-        sequences = [SequenceConfig.from_mapping(item) for item in payload.get("sequences", [])]
+        _validate_config_mapping_types(payload, cls, "")
+        features = tuple(
+            FeatureConfig.from_mapping(item) for item in payload.get("features", [])
+        )
+        sequences = tuple(
+            SequenceConfig.from_mapping(item)
+            for item in payload.get("sequences", [])
+        )
         return cls(
             data=DataConfig.from_mapping(payload["data"]),
             features=features,
@@ -1631,7 +1838,7 @@ class AppConfig:
         return list(self.data.train.labels.keys())
 
     @cached_property
-    def resolved(self):
+    def resolved(self) -> "ResolvedConfig":
         # Derived config is immutable for this AppConfig instance, so cache it.
         return resolve_app_config(self)
 
@@ -1648,9 +1855,160 @@ class AppConfig:
         validate_app_config(self)
 
 
+def _config_type_description(expected_type: Any) -> str:
+    """Return a concise YAML-facing name for one config annotation."""
+
+    origin = get_origin(expected_type)
+    if origin in {Union, UnionType}:
+        descriptions = []
+        for member_type in get_args(expected_type):
+            description = _config_type_description(member_type)
+            if description not in descriptions:
+                descriptions.append(description)
+        return " or ".join(descriptions)
+    if origin is Literal:
+        literal_types = {type(value) for value in get_args(expected_type)}
+        if len(literal_types) == 1:
+            return _config_type_description(next(iter(literal_types)))
+        return "a scalar value"
+    if origin in {list, tuple}:
+        return "a list"
+    if origin in {dict, Mapping} or (
+        isinstance(expected_type, type) and is_dataclass(expected_type)
+    ):
+        return "an object"
+    if expected_type is bool:
+        return "a boolean"
+    if expected_type is int:
+        return "an integer"
+    if expected_type is float:
+        return "a number"
+    if expected_type is str:
+        return "a string"
+    if expected_type is type(None):
+        return "null"
+    return "the configured type"
+
+
+def _validate_config_value_type(value: Any, expected_type: Any, path: str) -> None:
+    """Validate a raw YAML value without coercing away its original type."""
+
+    if expected_type is Any:
+        return
+
+    origin = get_origin(expected_type)
+    if origin in {Union, UnionType}:
+        errors: list[ValueError] = []
+        for member_type in get_args(expected_type):
+            try:
+                _validate_config_value_type(value, member_type, path)
+                return
+            except ValueError as error:
+                errors.append(error)
+        raise ValueError(
+            f"{path} must be {_config_type_description(expected_type)}"
+        ) from errors[0]
+
+    if origin is Literal:
+        literal_types = {type(item) for item in get_args(expected_type)}
+        if not any(type(value) is literal_type for literal_type in literal_types):
+            raise ValueError(
+                f"{path} must be {_config_type_description(expected_type)}"
+            )
+        return
+
+    if origin in {list, tuple}:
+        valid_container = isinstance(value, list) or (
+            origin is tuple and isinstance(value, tuple)
+        )
+        if not valid_container:
+            raise ValueError(f"{path} must be a list")
+        item_types = get_args(expected_type)
+        if item_types:
+            item_type = item_types[0]
+            for index, item in enumerate(value):
+                _validate_config_value_type(item, item_type, f"{path}[{index}]")
+        return
+
+    if origin in {dict, Mapping}:
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{path} must be an object")
+        key_type, value_type = get_args(expected_type)
+        for key, item in value.items():
+            _validate_config_value_type(key, key_type, f"{path} keys")
+            _validate_config_value_type(item, value_type, f"{path}.{key}")
+        return
+
+    if isinstance(expected_type, type) and is_dataclass(expected_type):
+        _validate_config_mapping_types(value, expected_type, path)
+        return
+
+    if expected_type is bool:
+        valid = type(value) is bool
+    elif expected_type is int:
+        # bool is an int subclass, but YAML booleans are never valid integer fields.
+        valid = type(value) is int
+    elif expected_type is float:
+        # Integer YAML scalars are valid real-number inputs; booleans are not.
+        valid = type(value) in {int, float}
+    elif expected_type is str:
+        valid = isinstance(value, str)
+    elif expected_type is type(None):
+        valid = value is None
+    else:
+        valid = isinstance(value, expected_type)
+    if not valid:
+        raise ValueError(f"{path} must be {_config_type_description(expected_type)}")
+
+
+def _validate_config_mapping_types(
+    payload: Any,
+    config_type: type[Any],
+    path: str,
+) -> None:
+    """Recursively enforce dataclass annotations on an unmodified YAML mapping."""
+
+    if not isinstance(payload, dict):
+        section = path or "config"
+        raise ValueError(f"{section} must be an object")
+
+    field_types = get_type_hints(config_type)
+    # Validate accepted compatibility aliases using the destination field type.
+    aliases: dict[str, Any] = {}
+    if config_type is CategoricalEncodingConfig:
+        aliases["type"] = EncodingType
+    if config_type is ReaderConfig:
+        aliases["batch_size_rows"] = int
+
+    for field_name, value in payload.items():
+        expected_type = field_types.get(field_name, aliases.get(field_name))
+        if expected_type is None:
+            # Existing constructors retain responsibility for unknown-key errors
+            # and deprecated-key guidance; this pass only enforces value types.
+            continue
+        field_path = f"{path}.{field_name}" if path else field_name
+
+        # Preserve documented compatibility conversions before enforcing the
+        # destination dataclass annotation.
+        if (
+            config_type is ParquetSplitConfig
+            and field_name == "inputs"
+            and isinstance(value, str)
+        ):
+            continue
+        if (
+            config_type is RuntimeConfig
+            and field_name == "activation_checkpoint"
+            and type(value) is bool
+        ):
+            continue
+
+        _validate_config_value_type(value, expected_type, field_path)
+
+
 # Resolved configuration helpers keep derived model-facing state separate from raw YAML fields.
 @dataclass(frozen=True)
-class ResolvedTokenGroup:
+class ResolvedTokenGroup(_DeeplyImmutableConfig):
     """Model-facing token group with immutable input references."""
 
     name: str
@@ -1661,11 +2019,11 @@ class ResolvedTokenGroup:
         return list(self.input_refs)
 
     def as_token_group(self) -> TokenGroupConfig:
-        return TokenGroupConfig(name=self.name, inputs=list(self.input_refs))
+        return TokenGroupConfig(name=self.name, inputs=self.input_refs)
 
 
 @dataclass(frozen=True)
-class ResolvedDomainToken:
+class ResolvedDomainToken(_DeeplyImmutableConfig):
     """Model-facing scenario or task token with flattened inputs."""
 
     name: str
@@ -1693,14 +2051,14 @@ class ResolvedDomainToken:
         # Preserve the public DomainTokenConfig shape for legacy callers.
         return DomainTokenConfig(
             name=self.name,
-            inputs=list(self.direct_input_refs),
-            important_inputs=list(self.important_input_refs),
-            prior_inputs=list(self.prior_input_refs),
+            inputs=self.direct_input_refs,
+            important_inputs=self.important_input_refs,
+            prior_inputs=self.prior_input_refs,
         )
 
 
 @dataclass(frozen=True)
-class ResolvedTokenization:
+class ResolvedTokenization(_DeeplyImmutableConfig):
     """Fully derived token layout used by model builders and validators."""
 
     feature_tokenizer: str
@@ -1779,7 +2137,7 @@ class ResolvedCategoricalInput:
 
 
 def resolve_categorical_base_input(
-    categorical_input_by_name: dict[str, ResolvedCategoricalInput],
+    categorical_input_by_name: Mapping[str, ResolvedCategoricalInput],
     name: str,
 ) -> ResolvedCategoricalInput:
     """Resolve the non-alias ID namespace behind a shared categorical input.
@@ -1812,26 +2170,29 @@ def resolve_categorical_base_input(
 
 
 @dataclass(frozen=True)
-class ResolvedConfig:
+class ResolvedConfig(_DeeplyImmutableConfig):
     """Cached derived state for cross-section validation and model setup."""
 
     # Token layout after defaults and implicit groups have been expanded.
     tokenization: ResolvedTokenization
     # Embedding widths after per-feature overrides and shared vocab chains resolve.
-    categorical_embedding_dims: dict[str, int]
+    categorical_embedding_dims: Mapping[str, int]
     # Encoded width for every model input after scalar and sequence encoding.
-    encoded_input_dims: dict[str, int]
+    encoded_input_dims: Mapping[str, int]
     # All logical categorical inputs that need vocab_strategy coverage.
-    categorical_input_names: set[str]
+    categorical_input_names: frozenset[str]
     # Ordered categorical inputs resolved from inline encoding or vocab_strategy.
     categorical_inputs: tuple[ResolvedCategoricalInput, ...]
     # Name lookup for hot paths; values are resolved and do not expose raw YAML strategy objects.
-    categorical_input_by_name: dict[str, ResolvedCategoricalInput]
+    categorical_input_by_name: Mapping[str, ResolvedCategoricalInput]
     # Scalar feature names available to OneTrans NS auto_split.
     scalar_feature_names: tuple[str, ...]
 
 
-def tokenizable_input_names(features: list[FeatureConfig], sequences: list[SequenceConfig]) -> list[str]:
+def tokenizable_input_names(
+    features: Sequence[FeatureConfig],
+    sequences: Sequence[SequenceConfig],
+) -> list[str]:
     """Inputs that can become feature tokens by default."""
 
     return [
@@ -1845,7 +2206,7 @@ def tokenizable_input_names(features: list[FeatureConfig], sequences: list[Seque
     ]
 
 
-def sequence_input_names(sequences: list[SequenceConfig]) -> set[str]:
+def sequence_input_names(sequences: Sequence[SequenceConfig]) -> set[str]:
     """Sequence names that are active in feature/shared token scopes."""
 
     return {
@@ -2078,9 +2439,9 @@ def _resolved_domain_token(token: DomainTokenConfig) -> ResolvedDomainToken:
 
 
 def _default_domain_inputs(
-    explicit_inputs: list[str],
-    features: list[FeatureConfig],
-    sequences: list[SequenceConfig],
+    explicit_inputs: Sequence[str],
+    features: Sequence[FeatureConfig],
+    sequences: Sequence[SequenceConfig],
 ) -> tuple[str, ...]:
     # This keeps the old fallback behavior: first scalar feature, then first sequence.
     if explicit_inputs:
@@ -2094,8 +2455,8 @@ def _default_domain_inputs(
 
 def _feature_token_groups(
     tokenization: TokenizationConfig,
-    features: list[FeatureConfig],
-    sequences: list[SequenceConfig],
+    features: Sequence[FeatureConfig],
+    sequences: Sequence[SequenceConfig],
 ) -> tuple[ResolvedTokenGroup, ...]:
     # Explicit groups win. Otherwise each tokenizable input becomes its own group.
     if tokenization.feature_tokens:
@@ -2108,7 +2469,7 @@ def _feature_token_groups(
 
 def _sequence_token_groups(
     tokenization: TokenizationConfig,
-    sequences: list[SequenceConfig],
+    sequences: Sequence[SequenceConfig],
 ) -> tuple[ResolvedTokenGroup, ...]:
     # OneTrans S tokens default to one token group per active behavior sequence.
     if tokenization.sequence_tokens:
@@ -2122,8 +2483,8 @@ def _sequence_token_groups(
 
 def _scalar_token_groups(
     tokenization: TokenizationConfig,
-    features: list[FeatureConfig],
-    sequences: list[SequenceConfig],
+    features: Sequence[FeatureConfig],
+    sequences: Sequence[SequenceConfig],
 ) -> tuple[ResolvedTokenGroup, ...]:
     # ns_tokens means non-sequence tokens. The YAML name follows OneTrans wording.
     if tokenization.ns_tokens:
@@ -2146,9 +2507,9 @@ def _scalar_token_groups(
 
 def _scenario_tokens(
     tokenization: TokenizationConfig,
-    features: list[FeatureConfig],
-    sequences: list[SequenceConfig],
-    scenario_names: list[str],
+    features: Sequence[FeatureConfig],
+    sequences: Sequence[SequenceConfig],
+    scenario_names: Sequence[str],
     scenario_inputs: tuple[str, ...],
 ) -> tuple[ResolvedDomainToken, ...]:
     # Scenario tokens always include a global token for MDL domain fusion.
@@ -2184,7 +2545,7 @@ def _scenario_tokens(
 
 def _task_tokens(
     tokenization: TokenizationConfig,
-    task_names: list[str],
+    task_names: Sequence[str],
     task_inputs: tuple[str, ...],
 ) -> tuple[ResolvedDomainToken, ...]:
     # Task tokens map one-to-one with train labels.
@@ -2209,10 +2570,10 @@ def _task_tokens(
 
 def resolve_tokenization(
     tokenization: TokenizationConfig,
-    features: list[FeatureConfig],
-    sequences: list[SequenceConfig],
-    scenario_names: list[str],
-    task_names: list[str],
+    features: Sequence[FeatureConfig],
+    sequences: Sequence[SequenceConfig],
+    scenario_names: Sequence[str],
+    task_names: Sequence[str],
 ) -> ResolvedTokenization:
     # Build the complete token layout without changing the raw YAML object.
     feature_token_inputs = tuple(tokenization.feature_token_inputs or tokenizable_input_names(features, sequences))
@@ -2246,7 +2607,7 @@ def resolve_tokenization(
 
 def resolve_categorical_embedding_dims(
     config: AppConfig,
-    categorical_input_by_name: dict[str, ResolvedCategoricalInput] | None = None,
+    categorical_input_by_name: Mapping[str, ResolvedCategoricalInput] | None = None,
 ) -> dict[str, int]:
     # Shared vocab entries can also share embedding size; resolve chains once here.
     if categorical_input_by_name is None:
@@ -2295,7 +2656,10 @@ def resolve_categorical_embedding_dims(
     return resolved
 
 
-def resolve_encoded_input_dims(config: AppConfig, categorical_dims: dict[str, int]) -> dict[str, int]:
+def resolve_encoded_input_dims(
+    config: AppConfig,
+    categorical_dims: Mapping[str, int],
+) -> dict[str, int]:
     # RankMixer validates token packing from these encoded widths.
     dims: dict[str, int] = {}
     for feature in config.features:
@@ -2386,14 +2750,15 @@ def _validate_unique_domain_names(tokens: tuple[ResolvedDomainToken, ...], secti
 
 def validate_tokenization_config(
     tokenization: TokenizationConfig,
-    features: list[FeatureConfig],
-    sequences: list[SequenceConfig],
-    scenario_names: list[str],
-    task_names: list[str],
+    features: Sequence[FeatureConfig],
+    sequences: Sequence[SequenceConfig],
+    scenario_names: Sequence[str],
+    task_names: Sequence[str],
 ) -> None:
     # Validate both raw token declarations and their resolved defaults.
     input_names = {feature.name for feature in features} | {sequence.name for sequence in sequences}
-    sequence_names = sequence_input_names(sequences)
+    all_sequence_names = {sequence.name for sequence in sequences}
+    active_sequence_names = sequence_input_names(sequences)
     tokenization._validate_unique_domain_token_names(tokenization.scenario_tokens, "scenario_tokens")
     tokenization._validate_unique_domain_token_names(tokenization.task_tokens, "task_tokens")
     if tokenization.feature_tokenizer not in {"groupwise", "rankmixer", "auto_split"}:
@@ -2422,11 +2787,16 @@ def validate_tokenization_config(
         _validate_unique_group_names(groups, section)
         for group in groups:
             _validate_token_group(group, input_names, section)
-            if section == "sequence_tokens" and not any(name in sequence_names for name in group.input_refs):
+            if section == "sequence_tokens" and any(
+                name not in active_sequence_names for name in group.input_refs
+            ):
                 raise ValueError(
-                    f"tokenization.sequence_tokens.{group.name} must include at least one sequence input"
+                    f"tokenization.sequence_tokens.{group.name} must only include "
+                    "feature/shared sequence inputs"
                 )
-            if section == "ns_tokens" and any(name in sequence_names for name in group.input_refs):
+            if section == "ns_tokens" and any(
+                name in all_sequence_names for name in group.input_refs
+            ):
                 raise ValueError(f"tokenization.ns_tokens.{group.name} must not include sequence inputs")
 
     for section, inputs in (
@@ -2490,8 +2860,9 @@ def _validate_mdl_domain_priors(config: AppConfig, resolved: ResolvedConfig) -> 
 
     if config.model.name != "mdl_rankmixer":
         # MDL-OneTrans is an explicitly experimental composition. Its sequence
-        # context is carried by OneTrans S/NS interaction instead of a second
-        # set of MDL sequence priors.
+        # context is owned by the OneTrans S stream and reaches domains through
+        # S-to-NS propagation plus optional direct S attention, rather than a
+        # second set of MDL sequence priors.
         return
 
     input_scopes = {
@@ -2507,7 +2878,7 @@ def _validate_mdl_domain_priors(config: AppConfig, resolved: ResolvedConfig) -> 
     def validate_family(
         section: str,
         tokens: tuple[ResolvedDomainToken, ...],
-        names: list[str],
+        names: Sequence[str],
         expected_scope: Literal["scenario", "task"],
         enabled: bool,
     ) -> None:
@@ -2738,7 +3109,8 @@ def validate_app_config(config: AppConfig) -> None:
             raise ValueError(
                 "model.name='mdl_onetrans' must model each behavior sequence exactly once as "
                 "OneTrans S-tokens; remove those sequences from MDL scenario/task prior_inputs. "
-                "Sequence context reaches MDL through the OneTrans-updated NS tokens: "
+                "Sequence context reaches MDL through OneTrans-updated NS tokens and the "
+                "configured layers' direct masked S attention: "
                 + "; ".join(duplicated_domain_inputs)
             )
     for sequence in config.sequences:

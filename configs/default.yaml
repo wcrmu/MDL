@@ -2,6 +2,8 @@ runtime:
   device: cuda
   precision: bf16
   compile: false
+  compile_mode: default
+  require_compact_sequence_batches: false
   allow_tf32: true
   activation_checkpoint: none
   attention_backend: auto
@@ -297,8 +299,11 @@ model:
   # replacement; it does not disable interaction.
   use_task_feature_interaction: true
   use_scenario_feature_interaction: true
-  mdl_feature_interaction: paper
+  mdl_feature_interaction: direct_ffn
   use_request_cache: false
+  # mdl_onetrans only. null preserves the NS-only domain path; an integer
+  # enables gated direct S attention from that zero-based layer onward.
+  first_domain_sequence_layer: null
   sparse_moe_dtsi_training_output: null
 
 training:

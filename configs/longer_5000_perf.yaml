@@ -3,6 +3,11 @@
 # memory-oriented batch/reader sizes.
 extends: longer_perf.yaml
 
+runtime:
+  # The 5k stress profile trades recompute for memory headroom; the regular
+  # 2k throughput profile intentionally disables checkpointing.
+  activation_checkpoint: selective
+
 data:
   train:
     reader:

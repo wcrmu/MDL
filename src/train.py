@@ -1125,7 +1125,39 @@ def _maybe_compile_model(config: AppConfig, model: nn.Module) -> nn.Module:
         return model
     if not hasattr(torch, "compile"):
         raise RuntimeError("runtime.compile requires torch.compile support")
-    return torch.compile(model)
+    compile_mode = getattr(config.runtime, "compile_mode", "default")
+    if compile_mode == "default":
+        return torch.compile(model)
+    return torch.compile(model, mode=compile_mode)
+
+
+def _prepare_forward_model(
+    config: AppConfig,
+    base_model: nn.Module,
+    context: DistributedContext,
+    ddp_ignored: tuple[_NamedSparseParameter, ...] = (),
+) -> nn.Module:
+    """Wrap DDP before compile so reducer buckets remain overlap boundaries."""
+
+    forward_model: nn.Module = base_model
+    if context.enabled:
+        _exclude_sparse_parameters_from_ddp(base_model, ddp_ignored)
+        ddp_config = getattr(config.training, "ddp", DDPConfig())
+        forward_model = DistributedDataParallel(
+            base_model,
+            device_ids=[context.local_rank] if context.device.type == "cuda" else None,
+            output_device=(
+                context.local_rank if context.device.type == "cuda" else None
+            ),
+            find_unused_parameters=ddp_config.find_unused_parameters,
+            static_graph=ddp_config.static_graph,
+            gradient_as_bucket_view=ddp_config.gradient_as_bucket_view,
+            bucket_cap_mb=ddp_config.bucket_cap_mb,
+        )
+    # Compiling the wrapper lets Dynamo's DDPOptimizer split the backward graph
+    # at reducer bucket boundaries instead of delaying all reductions until a
+    # monolithic compiled backward has completed.
+    return _maybe_compile_model(config, forward_model)
 
 
 def _autocast_dtype(config: AppConfig, device: torch.device) -> torch.dtype | None:
@@ -1579,22 +1611,12 @@ def train_mdl(
             ignored_parameter_ids={id(ref.parameter) for ref in ddp_ignored},
             max_steps=ddp_config.audit_steps,
         )
-        forward_model = _maybe_compile_model(config, base_model)
-        model: nn.Module = forward_model
-        if context.enabled:
-            _exclude_sparse_parameters_from_ddp(
-                forward_model,
-                ddp_ignored,
-            )
-            model = DistributedDataParallel(
-                forward_model,
-                device_ids=[context.local_rank] if device.type == "cuda" else None,
-                output_device=context.local_rank if device.type == "cuda" else None,
-                find_unused_parameters=ddp_config.find_unused_parameters,
-                static_graph=ddp_config.static_graph,
-                gradient_as_bucket_view=ddp_config.gradient_as_bucket_view,
-                bucket_cap_mb=ddp_config.bucket_cap_mb,
-            )
+        model = _prepare_forward_model(
+            config,
+            base_model,
+            context,
+            ddp_ignored,
+        )
 
         dense_params = list(parameter_groups.dense_optimizer)
         replicated_embedding_params = list(parameter_groups.embedding_optimizer)

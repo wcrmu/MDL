@@ -1,8 +1,7 @@
 """Self-contained distributed embedding tables built on PyTorch collectives.
 
-The implementation deliberately has no TorchRec/FBGEMM dependency. Row-wise
-tables use cyclic ownership for hashed IDs; small table-wise shards use a
-deterministic LPT plan. Forward requests and backward gradients are routed with
+Row-wise tables use cyclic ownership for hashed IDs; small table-wise shards use
+a deterministic LPT plan. Forward requests and backward gradients are routed with
 variable-size ``all_to_all_single`` collectives.
 """
 
@@ -20,6 +19,16 @@ from torch import Tensor, nn
 
 
 EmbeddingShardStrategy = Literal["row_wise", "table_wise"]
+
+
+def _invalid_any(invalid: Tensor, message: str) -> bool:
+    """Validate CUDA tensors without a per-lookup device-to-host barrier."""
+
+    invalid_result = invalid.any()
+    if invalid.device.type == "cuda" and hasattr(torch, "_assert_async"):
+        torch._assert_async(~invalid_result, message)
+        return False
+    return bool(invalid_result.item())
 
 
 @dataclass(frozen=True)
@@ -285,7 +294,10 @@ class _ShardedEmbeddingLookup(torch.autograd.Function):
             )
         flat = indices.reshape(-1)
         invalid = (flat < 0) | (flat >= num_embeddings)
-        if bool(invalid.any().item()):
+        if _invalid_any(
+            invalid,
+            f"embedding {table_name!r} received an out-of-range ID",
+        ):
             examples = flat[invalid][:5].detach().cpu().tolist()
             raise IndexError(
                 f"embedding {table_name!r} received IDs outside [0, {num_embeddings}): "
@@ -325,7 +337,10 @@ class _ShardedEmbeddingLookup(torch.autograd.Function):
             received_local_rows = shard_spec.local_row_ids(received_ids)
             if received_ids.numel():
                 expected_owner = shard_spec.owner(received_ids)
-                if bool((expected_owner != rank).any().item()):
+                if _invalid_any(
+                    expected_owner != rank,
+                    "received embedding IDs owned by another rank",
+                ):
                     raise RuntimeError("received embedding IDs owned by another rank")
             owner_unique_rows, owner_inverse = torch.unique(
                 received_local_rows,
@@ -621,7 +636,10 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             request = packed_indices.narrow(0, request_offset, request_numel)
             request_offset += request_numel
             invalid = (request < 0) | (request >= module.num_embeddings)
-            if bool(invalid.any().item()):
+            if _invalid_any(
+                invalid,
+                f"embedding {module.table_name!r} received an out-of-range ID",
+            ):
                 examples = request[invalid][:5].detach().cpu().tolist()
                 raise IndexError(
                     f"embedding {module.table_name!r} received IDs outside "
@@ -691,7 +709,10 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
                 global_ids = owner_unique_keys.index_select(0, selected)
                 global_ids = global_ids - metadata.table_offsets[table_index]
                 expected_owner = module.shard_spec.owner(global_ids)
-                if bool((expected_owner != rank).any().item()):
+                if _invalid_any(
+                    expected_owner != rank,
+                    "received embedding IDs owned by another rank",
+                ):
                     raise RuntimeError("received embedding IDs owned by another rank")
                 local_rows = module.shard_spec.local_row_ids(global_ids)
                 values = local_weight.index_select(0, local_rows)

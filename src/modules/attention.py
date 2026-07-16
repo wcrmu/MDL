@@ -196,6 +196,102 @@ class DomainAwareAttention(nn.Module):
         return self._merge_heads(attended), weights if need_weights else None
 
 
+class VariableLengthDomainAttention(nn.Module):
+    """Cross-attention from fixed domain tokens to masked sequence states.
+
+    Unlike :class:`DomainAwareAttention`, the key/value projections are shared
+    across sequence positions.  This keeps the module valid when OneTrans's
+    pyramid changes the number of S tokens from one layer to the next.
+    """
+
+    def __init__(
+        self,
+        token_dim: int,
+        num_heads: int,
+        attention_backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        if token_dim % num_heads != 0:
+            raise ValueError("token_dim must be divisible by num_heads")
+
+        self.token_dim = token_dim
+        self.num_heads = num_heads
+        self.head_dim = token_dim // num_heads
+        self.attention_backend = attention_backend
+
+        self.query_norm = nn.LayerNorm(token_dim)
+        self.memory_norm = nn.LayerNorm(token_dim)
+        self.query_projection = nn.Linear(token_dim, token_dim)
+        self.key_projection = nn.Linear(token_dim, token_dim)
+        self.value_projection = nn.Linear(token_dim, token_dim)
+        self.output_projection = nn.Linear(token_dim, token_dim)
+
+    def _split_heads(self, values: Tensor) -> Tensor:
+        batch_size, token_count, _token_dim = values.shape
+        return values.view(
+            batch_size,
+            token_count,
+            self.num_heads,
+            self.head_dim,
+        ).transpose(1, 2)
+
+    def forward(
+        self,
+        domain_tokens: Tensor,
+        sequence_tokens: Tensor,
+        sequence_mask: Tensor,
+    ) -> Tensor:
+        if domain_tokens.ndim != 3 or domain_tokens.size(-1) != self.token_dim:
+            raise ValueError(
+                f"domain_tokens must have shape [batch, tokens, {self.token_dim}]"
+            )
+        if sequence_tokens.ndim != 3 or sequence_tokens.size(-1) != self.token_dim:
+            raise ValueError(
+                f"sequence_tokens must have shape [batch, length, {self.token_dim}]"
+            )
+        if sequence_mask.shape != sequence_tokens.shape[:2]:
+            raise ValueError("sequence_mask must match the sequence token batch and length")
+        if domain_tokens.size(0) != sequence_tokens.size(0):
+            raise ValueError("domain and sequence token batches must match")
+        if sequence_tokens.size(1) == 0:
+            return torch.zeros_like(domain_tokens)
+
+        sequence_mask = sequence_mask.to(device=sequence_tokens.device, dtype=torch.bool)
+        has_valid_sequence = sequence_mask.any(dim=1)
+
+        # SDPA backends need at least one allowed key per row.  Empty-history
+        # rows temporarily expose one zeroed key and are explicitly zeroed again
+        # after projection, so neither padding values nor projection biases leak.
+        safe_mask = sequence_mask.clone()
+        safe_mask[:, 0] |= ~has_valid_sequence
+        memory = sequence_tokens.masked_fill(~sequence_mask.unsqueeze(-1), 0.0)
+
+        query = self._split_heads(
+            self.query_projection(self.query_norm(domain_tokens))
+        )
+        normalized_memory = self.memory_norm(memory)
+        key = self._split_heads(self.key_projection(normalized_memory))
+        value = self._split_heads(self.value_projection(normalized_memory))
+        allowed = safe_mask[:, None, None, :]
+
+        with _sdpa_context(self.attention_backend):
+            attended = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=allowed,
+                dropout_p=0.0,
+            )
+
+        attended = attended.transpose(1, 2).contiguous().view(
+            domain_tokens.size(0),
+            domain_tokens.size(1),
+            self.token_dim,
+        )
+        output = self.output_projection(attended)
+        return output * has_valid_sequence[:, None, None].to(output.dtype)
+
+
 def masked_scenario_pool(
     scenario_states: Tensor,
     scenario_mask: Tensor,

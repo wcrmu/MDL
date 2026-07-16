@@ -3,8 +3,9 @@
 extends: onetrans.yaml
 
 # MDL domain tokens start from dedicated non-sequential embeddings. Historical
-# context is already incorporated into OneTrans NS tokens before every MDL
-# domain-interaction block, so adding hist as a prior would encode it twice.
+# context remains owned by the OneTrans S stream: it reaches domains through
+# both S-to-NS propagation and the selected layers' masked direct S attention.
+# Adding hist as a domain prior would therefore encode the same history twice.
 tokenization:
   scenario_tokens:
     - name: default
@@ -20,3 +21,6 @@ model:
   experimental_model_acknowledged: true
   sequence_fusion: intent_ordered
   ns_tokenizer: auto_split
+  # This two-layer smoke profile reads S states at both layers. Larger profiles
+  # can set this to num_layers - 2 to limit direct history reads to late layers.
+  first_domain_sequence_layer: 0

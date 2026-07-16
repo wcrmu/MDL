@@ -132,6 +132,107 @@ class LongerTokenMergerAlignmentTest(unittest.TestCase):
         ]
         self.assertEqual(unused, [], f"registered but unused merger parameters: {unused}")
 
+    def test_chunked_inner_transformer_matches_unchunked_forward_and_backward(self) -> None:
+        torch.manual_seed(11)
+        reference = LongerTokenMerger(
+            token_dim=4,
+            num_heads=2,
+            hidden_dim=8,
+            merge_size=2,
+            inner_layers=1,
+        )
+        chunked = LongerTokenMerger(
+            token_dim=4,
+            num_heads=2,
+            hidden_dim=8,
+            merge_size=2,
+            inner_layers=1,
+        )
+        chunked.load_state_dict(reference.state_dict())
+        chunked._INNER_ATTENTION_BATCH_LIMIT = 2
+        reference_tokens = torch.randn(2, 6, 4, requires_grad=True)
+        chunked_tokens = reference_tokens.detach().clone().requires_grad_(True)
+        mask = torch.tensor(
+            [[True, True, True, True, True, True], [False, True, True, True, True, True]]
+        )
+
+        reference_output, reference_mask = reference(reference_tokens, mask)
+        chunked_output, chunked_mask = chunked(chunked_tokens, mask)
+        torch.testing.assert_close(chunked_output, reference_output)
+        torch.testing.assert_close(chunked_mask, reference_mask)
+
+        reference_output.square().sum().backward()
+        chunked_output.square().sum().backward()
+        torch.testing.assert_close(chunked_tokens.grad, reference_tokens.grad)
+        for (reference_name, reference_parameter), (chunked_name, chunked_parameter) in zip(
+            reference.named_parameters(), chunked.named_parameters()
+        ):
+            self.assertEqual(chunked_name, reference_name)
+            torch.testing.assert_close(chunked_parameter.grad, reference_parameter.grad)
+
+    def test_leading_padding_compaction_preserves_merged_valid_groups(self) -> None:
+        merger = LongerTokenMerger(
+            token_dim=2,
+            num_heads=1,
+            hidden_dim=8,
+            merge_size=4,
+            inner_layers=0,
+        )
+        compact_tokens = torch.arange(10, dtype=torch.float32).view(1, 5, 2)
+        compact_mask = torch.ones(1, 5, dtype=torch.bool)
+        padded_tokens = torch.cat(
+            [torch.zeros(1, 11, 2), compact_tokens],
+            dim=1,
+        )
+        padded_mask = torch.cat(
+            [torch.zeros(1, 11, dtype=torch.bool), compact_mask],
+            dim=1,
+        )
+
+        compact, compact_merged_mask = merger(compact_tokens, compact_mask)
+        padded, padded_merged_mask = merger(padded_tokens, padded_mask)
+
+        torch.testing.assert_close(padded[:, -compact.size(1) :], compact)
+        torch.testing.assert_close(
+            padded_merged_mask[:, -compact_merged_mask.size(1) :],
+            compact_merged_mask,
+        )
+        self.assertFalse(bool(padded_merged_mask[:, :-compact_merged_mask.size(1)].any()))
+
+
+class FeatureEncoderSequenceCompactionTest(unittest.TestCase):
+    def test_default_alignment_keeps_batch_physical_width(self) -> None:
+        encoder = FeatureEncoderBank.__new__(FeatureEncoderBank)
+        sequence = SequenceConfig(
+            name="hist",
+            fields=[
+                SequenceFieldConfig(
+                    name="value",
+                    kind="dense",
+                    source="hist_value",
+                )
+            ],
+            max_length=2000,
+            encoder="longer",
+            time_delta_field="value",
+        )
+        inputs = torch.arange(20, dtype=torch.float32).view(2, 5, 2)
+        lengths = torch.tensor([3, 5])
+
+        aligned, mask = encoder._align_sequence_inputs(
+            sequence,
+            inputs,
+            lengths,
+        )
+
+        self.assertEqual(tuple(aligned.shape), (2, 5, 2))
+        torch.testing.assert_close(
+            mask,
+            torch.tensor(
+                [[False, False, True, True, True], [True, True, True, True, True]]
+            ),
+        )
+
 
 class LongerSequenceEncoderAlignmentTest(unittest.TestCase):
     def _encoder(
@@ -151,6 +252,40 @@ class LongerSequenceEncoderAlignmentTest(unittest.TestCase):
             user_global_tokens=user_global_tokens,
             activation_checkpoint=activation_checkpoint,
         )
+
+    def test_compacting_leading_padding_preserves_encoder_output(self) -> None:
+        torch.manual_seed(5)
+        encoder = LongerSequenceEncoder(
+            token_dim=4,
+            num_heads=2,
+            hidden_dim=8,
+            query_token_count=2,
+            self_layers=1,
+            summary_tokens=2,
+            token_merge=2,
+            inner_layers=1,
+        ).eval()
+        compact_tokens = torch.randn(2, 5, 4)
+        compact_mask = torch.tensor(
+            [
+                [False, False, True, True, True],
+                [True, True, True, True, True],
+            ]
+        )
+        padded_tokens = torch.cat(
+            [torch.zeros(2, 7, 4), compact_tokens],
+            dim=1,
+        )
+        padded_mask = torch.cat(
+            [torch.zeros(2, 7, dtype=torch.bool), compact_mask],
+            dim=1,
+        )
+        candidate_globals = torch.randn(2, 2, 8)
+
+        compact = encoder(compact_tokens, compact_mask, candidate_globals)
+        padded = encoder(padded_tokens, padded_mask, candidate_globals)
+
+        torch.testing.assert_close(compact, padded, rtol=1.0e-5, atol=1.0e-6)
 
     def test_mixed_visibility_contract_keeps_global_full_and_recent_causal(self) -> None:
         key_valid = torch.tensor(

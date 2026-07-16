@@ -186,7 +186,7 @@ model:
   num_layers: 2       # implementation choice; paper value is undisclosed
   num_heads: 4        # implementation choice; paper value is undisclosed
   hidden_dim: 64      # implementation choice; paper value is undisclosed
-  mdl_feature_interaction: paper
+  mdl_feature_interaction: direct_ffn
 
 training:
   batch_size: 2048

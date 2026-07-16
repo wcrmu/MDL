@@ -11,12 +11,17 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from src.dataloader import FeatureBatch
+from src.embeddings import grouped_sharded_embedding_lookup
 from src.config import SequenceConfig, SequenceFieldConfig, TokenGroupConfig, load_app_config
 from src.model import (
+    FeatureEncoderBank,
+    MDLDomainBlock,
     MDLRankMixerBlock,
     MDLRankMixerModel,
     MDLOneTransModel,
     ModelMetadata,
+    MixedCausalAttention,
+    MixedFFN,
     OneTransBackbone,
     OneTransBackboneState,
     OneTransBlock,
@@ -27,9 +32,19 @@ from src.model import (
     RankMixerModel,
     RankMixerSliceTokenizer,
     ScenarioTower,
+    _call_varlen_attention,
+    _embedding_size,
+    _forward_domain_interaction,
     _mdl_logits,
+    _scenario_mask_from_ids,
+    _VarlenPacking,
+    varlen_attn,
 )
-from src.modules.attention import DomainFusedModule, RankMixerDomainInteraction
+from src.modules.attention import (
+    DomainFusedModule,
+    RankMixerDomainInteraction,
+    VariableLengthDomainAttention,
+)
 from src.modules.mlp import SparseMoEPerTokenFFN
 from src.train import _loss_terms_from_batch, _step_sparse_moe_controllers
 
@@ -41,7 +56,7 @@ def _rankmixer_config() -> SimpleNamespace:
             hidden_dim=8,
             num_heads=2,
             ffn_activation="gelu",
-            mdl_feature_interaction="paper",
+            mdl_feature_interaction="direct_ffn",
             use_task_tokens=True,
             use_scenario_tokens=True,
             use_global_scenario_token=True,
@@ -154,8 +169,8 @@ class MDLFeatureInteractionAlignmentTest(unittest.TestCase):
                 parameter.zero_()
         return block
 
-    def test_paper_mode_matches_mdl_equation_six_without_second_add_norm(self) -> None:
-        block = self._block("paper")
+    def test_direct_ffn_mode_has_no_second_add_norm(self) -> None:
+        block = self._block("direct_ffn")
         feature_tokens = torch.randn(2, 2, 4)
         scenario_tokens = torch.randn(2, 2, 4)
         task_tokens = torch.randn(2, 1, 4)
@@ -171,8 +186,8 @@ class MDLFeatureInteractionAlignmentTest(unittest.TestCase):
         torch.testing.assert_close(actual, torch.zeros_like(actual))
         self.assertIsNone(block.feature_ffn_norm)
 
-    def test_rankmixer_full_mode_remains_an_explicit_compatibility_path(self) -> None:
-        block = self._block("rankmixer_full")
+    def test_residual_ffn_mode_keeps_second_add_norm(self) -> None:
+        block = self._block("residual_ffn")
         feature_tokens = torch.randn(2, 2, 4)
         mixed = block.feature_norm(block.token_mixing(feature_tokens) + feature_tokens)
         scenario_tokens = torch.randn(2, 2, 4)
@@ -683,6 +698,303 @@ class MDLLossAlignmentTest(unittest.TestCase):
         torch.testing.assert_close(balanced_mean, 2.0 * unit)
 
 
+class OneTransStackedProjectionTest(unittest.TestCase):
+    def test_ns_attention_projections_match_independent_linears(self) -> None:
+        torch.manual_seed(17)
+        attention = MixedCausalAttention(
+            token_dim=6,
+            num_heads=2,
+            ns_token_count=3,
+        )
+        tokens = torch.randn(4, 5, 6, requires_grad=True)
+
+        actual_ns = attention._project_ns_batched(
+            tokens[:, 2:, :],
+            attention.ns_key,
+        )
+        expected_ns = torch.cat(
+            [
+                layer(tokens[:, 2 + index, :]).unsqueeze(1)
+                for index, layer in enumerate(attention.ns_key)
+            ],
+            dim=1,
+        )
+
+        torch.testing.assert_close(actual_ns, expected_ns)
+        actual_ns.square().sum().backward()
+        self.assertTrue(
+            all(layer.weight.grad is not None for layer in attention.ns_key)
+        )
+        self.assertIn("ns_key.0.weight", attention.state_dict())
+
+    def test_ns_ffn_matches_independent_networks(self) -> None:
+        torch.manual_seed(19)
+        ffn = MixedFFN(token_dim=6, hidden_dim=10, ns_token_count=3)
+        tokens = torch.randn(4, 5, 6, requires_grad=True)
+
+        actual = ffn(tokens, query_s_count=2)
+        batched_ns = ffn._forward_ns_batched(tokens[:, 2:, :])
+        expected = torch.cat(
+            [
+                ffn.s_ffn(tokens[:, :2, :]),
+                *[
+                    network(tokens[:, 2 + index, :]).unsqueeze(1)
+                    for index, network in enumerate(ffn.ns_ffn)
+                ],
+            ],
+            dim=1,
+        )
+
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(batched_ns, expected[:, 2:, :])
+        actual.square().sum().backward()
+        self.assertTrue(
+            all(network[0].weight.grad is not None for network in ffn.ns_ffn)
+        )
+        self.assertIn("ns_ffn.0.0.weight", ffn.state_dict())
+
+    def test_stacked_ns_paths_keep_autocast_output_dtype(self) -> None:
+        attention = MixedCausalAttention(
+            token_dim=8,
+            num_heads=2,
+            ns_token_count=3,
+        )
+        ffn = MixedFFN(token_dim=8, hidden_dim=16, ns_token_count=3)
+        tokens = torch.randn(2, 3, 8)
+
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            projected = attention._project_all(
+                tokens,
+                0,
+                attention.s_key,
+                attention.ns_key,
+            )
+            transformed = ffn(tokens, query_s_count=0)
+
+        self.assertEqual(projected.dtype, torch.bfloat16)
+        self.assertEqual(transformed.dtype, torch.bfloat16)
+
+
+class VarlenPackingTest(unittest.TestCase):
+    def test_reused_indices_preserve_pack_unpack_values_and_gradients(self) -> None:
+        mask = torch.tensor(
+            [[False, True, True, False], [True, False, True, True]]
+        )
+        values = torch.randn(2, 4, 3, requires_grad=True)
+        reference_values = values.detach().clone().requires_grad_(True)
+        packing = _VarlenPacking.from_mask(mask)
+
+        packed = packing.pack(values)
+        output = packing.unpack(2.0 * packed, values)
+        expected = torch.zeros_like(reference_values)
+        expected[mask] = 2.0 * reference_values[mask]
+
+        torch.testing.assert_close(packed[: int(mask.sum())], values[mask])
+        torch.testing.assert_close(output, expected)
+        torch.testing.assert_close(
+            packing.lengths,
+            torch.tensor([2, 3], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            packing.cumulative_lengths,
+            torch.tensor([0, 2, 5], dtype=torch.int32),
+        )
+
+        output.square().sum().backward()
+        expected.square().sum().backward()
+        torch.testing.assert_close(values.grad, reference_values.grad)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and varlen_attn is not None,
+        "fixed-capacity varlen Flash test requires CUDA varlen attention",
+    )
+    def test_fixed_capacity_flash_matches_exact_dynamic_packing(self) -> None:
+        torch.manual_seed(23)
+        device = torch.device("cuda")
+        mask = torch.tensor(
+            [
+                [False, False, True, True, True],
+                [False, True, True, True, True],
+                [True, True, True, True, True],
+            ],
+            device=device,
+        )
+        packing = _VarlenPacking.from_mask(mask)
+        fixed_inputs = [
+            torch.randn(
+                3,
+                5,
+                2,
+                16,
+                device=device,
+                dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+            for _ in range(3)
+        ]
+        exact_inputs = [
+            value.detach().clone().requires_grad_(True) for value in fixed_inputs
+        ]
+
+        fixed_packed = _call_varlen_attention(
+            *(packing.pack(value) for value in fixed_inputs),
+            packing.cumulative_lengths,
+            packing.cumulative_lengths,
+            mask.size(1),
+            mask.size(1),
+            causal=False,
+        )
+        fixed_output = packing.unpack(fixed_packed, fixed_inputs[0])
+        exact_packed = _call_varlen_attention(
+            *(value[mask] for value in exact_inputs),
+            packing.cumulative_lengths,
+            packing.cumulative_lengths,
+            mask.size(1),
+            mask.size(1),
+            causal=False,
+        )
+        exact_output = torch.zeros_like(exact_inputs[0])
+        exact_output[mask] = exact_packed
+
+        torch.testing.assert_close(fixed_output, exact_output)
+        fixed_output.float().square().sum().backward()
+        exact_output.float().square().sum().backward()
+        for fixed, exact in zip(fixed_inputs, exact_inputs):
+            torch.testing.assert_close(fixed.grad, exact.grad)
+
+
+class FeatureEncoderShardedFusionTest(unittest.TestCase):
+    @staticmethod
+    def _features(config: object, batch_size: int = 2, length: int = 3) -> dict[str, object]:
+        values: dict[str, object] = {}
+        for feature in config.features:  # type: ignore[attr-defined]
+            values[feature.name] = (
+                torch.randint(1, 15, (batch_size,))
+                if feature.kind == "categorical"
+                else torch.randn(batch_size, feature.dimension)
+            )
+        for sequence in config.sequences:  # type: ignore[attr-defined]
+            fields: dict[str, Tensor] = {}
+            for field in sequence.fields:
+                shape = (
+                    (batch_size, length)
+                    if field.dimension == 1
+                    else (batch_size, length, field.dimension)
+                )
+                fields[field.name] = (
+                    torch.randint(1, 15, shape)
+                    if field.kind == "categorical"
+                    else torch.randn(shape)
+                )
+            values[sequence.name] = {
+                "fields": fields,
+                "lengths": torch.tensor([length, length - 1]),
+            }
+        return values
+
+    def test_mdl_fuses_scalar_and_all_sequence_lookups_with_output_parity(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "mdl_perf.yaml")
+        bank = FeatureEncoderBank(
+            config,
+            {},
+            config.model.embedding_dim,
+            embedding_size_override=16,
+        ).eval()
+        features = self._features(config)
+
+        with patch(
+            "src.model.grouped_sharded_embedding_lookup",
+            wraps=grouped_sharded_embedding_lookup,
+        ) as grouped_lookup, torch.no_grad():
+            fused = bank(features)
+
+        self.assertEqual(grouped_lookup.call_count, 1)
+        with patch.object(bank, "_preencode_sharded_inputs", return_value={}), torch.no_grad():
+            unfused = bank(features)
+        self.assertEqual(fused.keys(), unfused.keys())
+        for name in fused:
+            torch.testing.assert_close(fused[name], unfused[name])
+
+    def test_onetrans_fuses_ns_and_sequence_lookups(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "onetrans_perf.yaml")
+        bank = FeatureEncoderBank(
+            config,
+            {},
+            config.model.embedding_dim,
+            build_sequence_summaries=False,
+            embedding_size_override=16,
+        ).eval()
+        tokenizer = OneTransTokenizer(config, bank).eval()
+
+        with patch(
+            "src.model.grouped_sharded_embedding_lookup",
+            wraps=grouped_sharded_embedding_lookup,
+        ) as grouped_lookup, torch.no_grad():
+            output = tokenizer(self._features(config))
+
+        self.assertEqual(grouped_lookup.call_count, 1)
+        self.assertEqual(output.feature_tokens.size(0), 2)
+
+
+class VarlenAttentionCompatibilityTest(unittest.TestCase):
+    def _inputs(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        query = torch.randn(3, 2, 4)
+        key = torch.randn(5, 2, 4)
+        value = torch.randn(5, 2, 4)
+        return query, key, value, torch.tensor([0, 3]), torch.tensor([0, 5])
+
+    def test_pytorch_210_is_causal_api(self) -> None:
+        observed: list[bool] = []
+
+        def legacy(*args: Tensor | int, is_causal: bool = False) -> Tensor:
+            observed.append(is_causal)
+            assert isinstance(args[0], Tensor)
+            return args[0]
+
+        inputs = self._inputs()
+        with patch("src.model.varlen_attn", legacy), patch(
+            "src.model._VARLEN_ATTN_USES_WINDOW_SIZE",
+            False,
+        ):
+            output = _call_varlen_attention(
+                *inputs,
+                3,
+                5,
+                causal=True,
+            )
+
+        self.assertIs(output, inputs[0])
+        self.assertEqual(observed, [True])
+
+    def test_pytorch_212_window_size_api(self) -> None:
+        observed: list[tuple[int, int]] = []
+
+        def modern(
+            *args: Tensor | int,
+            window_size: tuple[int, int] = (-1, -1),
+        ) -> Tensor:
+            observed.append(window_size)
+            assert isinstance(args[0], Tensor)
+            return args[0]
+
+        inputs = self._inputs()
+        with patch("src.model.varlen_attn", modern), patch(
+            "src.model._VARLEN_ATTN_USES_WINDOW_SIZE",
+            True,
+        ):
+            output = _call_varlen_attention(
+                *inputs,
+                3,
+                5,
+                causal=False,
+            )
+
+        self.assertIs(output, inputs[0])
+        self.assertEqual(observed, [(-1, -1)])
+
+
 class OneTransTokenizerAlignmentTest(unittest.TestCase):
     class Encoder(nn.Module):
         def __init__(
@@ -698,17 +1010,48 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
             self,
             sequence_name: str,
             value: dict[str, Tensor | dict[str, Tensor]],
+            target_length: int | None = None,
         ) -> tuple[Tensor, Tensor]:
             del sequence_name
-            return value["event_inputs"], value["mask"]  # type: ignore[return-value]
+            tokens = value["event_inputs"]
+            mask = value["mask"]
+            assert isinstance(tokens, Tensor)
+            assert isinstance(mask, Tensor)
+            if target_length is None or target_length == tokens.size(1):
+                return tokens, mask
+            if target_length < tokens.size(1):
+                return tokens[:, -target_length:, :], mask[:, -target_length:]
+            padding = target_length - tokens.size(1)
+            return (
+                torch.cat(
+                    [
+                        tokens.new_zeros(tokens.size(0), padding, tokens.size(2)),
+                        tokens,
+                    ],
+                    dim=1,
+                ),
+                torch.cat(
+                    [
+                        torch.zeros(
+                            mask.size(0),
+                            padding,
+                            dtype=torch.bool,
+                            device=mask.device,
+                        ),
+                        mask,
+                    ],
+                    dim=1,
+                ),
+            )
 
         def _align_sequence_inputs(
             self,
             sequence: SequenceConfig,
             inputs: Tensor,
             lengths: Tensor,
+            target_length: int | None = None,
         ) -> tuple[Tensor, Tensor]:
-            del sequence, lengths
+            del sequence, lengths, target_length
             return inputs, torch.ones(inputs.shape[:2], dtype=torch.bool)
 
     def _base_config(self):
@@ -845,6 +1188,403 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
             cache.s_tokens[0, :, 0],
             torch.tensor([1.0, 3.0, 9.0, 2.0, 4.0]),
         )
+
+    def test_compact_sequence_contract_rejects_global_padding_prefix(self) -> None:
+        tokenizer = self._fusion_tokenizer("intent_ordered")
+        tokenizer.require_compact_sequence_batches = True
+        features = self._fusion_features()
+        for value in features.values():
+            value["mask"][:, 0] = False
+
+        with self.assertRaisesRegex(ValueError, "padded only to the longest row"):
+            tokenizer.precompute_request_cache(features)
+
+    def test_group_sequences_with_different_max_lengths_share_target_length(self) -> None:
+        base = self._base_config()
+        sequences = [
+            SequenceConfig(
+                name=name,
+                fields=[
+                    SequenceFieldConfig(
+                        name="value",
+                        kind="dense",
+                        source=f"{name}_value",
+                        dimension=2,
+                    )
+                ],
+                max_length=max_length,
+                encoder="raw",
+            )
+            for name, max_length in (("short", 3), ("long", 5))
+        ]
+        group = TokenGroupConfig(name="aligned", inputs=["short", "long"])
+        config = replace(
+            base,
+            sequences=sequences,
+            tokenization=replace(base.tokenization, sequence_tokens=[group]),
+            model=replace(base.model, token_dim=4),
+        )
+        scalar_names = [
+            feature.name
+            for feature in config.features
+            if feature.embedding_scope in {"feature", "shared"}
+        ]
+        encoder = self.Encoder(
+            {name: 1 for name in scalar_names},
+            {"short": 2, "long": 2},
+        )
+        tokenizer = OneTransTokenizer(config, encoder)
+        features = {
+            "short": {
+                "event_inputs": torch.randn(1, 3, 2),
+                "mask": torch.ones(1, 3, dtype=torch.bool),
+                "fields": {"value": torch.randn(1, 3, 2)},
+                "lengths": torch.tensor([3]),
+            },
+            "long": {
+                "event_inputs": torch.randn(1, 5, 2),
+                "mask": torch.tensor([[False, False, True, True, True]]),
+                "fields": {"value": torch.randn(1, 5, 2)},
+                "lengths": torch.tensor([3]),
+            },
+        }
+
+        tokens, mask, _timestamps = tokenizer._sequence_group_tokens(
+            group,
+            nn.Identity(),
+            features,
+        )
+
+        self.assertEqual(tuple(tokens.shape), (1, 5, 4))
+        torch.testing.assert_close(
+            mask,
+            torch.tensor([[False, False, True, True, True]]),
+        )
+
+    def test_group_uses_payload_width_below_configured_capacity(self) -> None:
+        base = self._base_config()
+        sequence = SequenceConfig(
+            name="compact",
+            fields=[
+                SequenceFieldConfig(
+                    name="value",
+                    kind="dense",
+                    source="compact_value",
+                    dimension=4,
+                )
+            ],
+            max_length=100,
+            encoder="raw",
+        )
+        group = TokenGroupConfig(name="compact", inputs=["compact"])
+        config = replace(
+            base,
+            sequences=[sequence],
+            tokenization=replace(base.tokenization, sequence_tokens=[group]),
+            model=replace(base.model, token_dim=4),
+        )
+        scalar_names = [
+            feature.name
+            for feature in config.features
+            if feature.embedding_scope in {"feature", "shared"}
+        ]
+        encoder = self.Encoder(
+            {name: 1 for name in scalar_names},
+            {"compact": 4},
+        )
+        tokenizer = OneTransTokenizer(config, encoder)
+        features = {
+            "compact": {
+                "event_inputs": torch.randn(2, 7, 4),
+                "mask": torch.tensor(
+                    [
+                        [False, False, True, True, True, True, True],
+                        [True, True, True, True, True, True, True],
+                    ]
+                ),
+                "fields": {"value": torch.randn(2, 7, 4)},
+                "lengths": torch.tensor([5, 7]),
+            }
+        }
+
+        tokens, mask, _timestamps = tokenizer._sequence_group_tokens(
+            group,
+            nn.Identity(),
+            features,
+        )
+
+        self.assertEqual(tuple(tokens.shape), (2, 7, 4))
+        self.assertEqual(tuple(mask.shape), (2, 7))
+
+
+class OneTransRuntimeCorrectnessTest(unittest.TestCase):
+    def test_shared_vocab_alias_uses_base_vocab_size_for_independent_table(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "mdl_onetrans.yaml")
+        vocab_maps = {
+            "user_id": {"one": 1, "seven": 7},
+            # A stale or partial alias map must not size the independent table.
+            "scenario_user_id": {"one": 1},
+        }
+
+        self.assertEqual(
+            _embedding_size(config, vocab_maps, "scenario_user_id"),
+            8,
+        )
+
+    def test_fractional_scenario_ids_are_rejected_before_integer_cast(self) -> None:
+        for value in (0.9, -0.1, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "integer-valued ids"):
+                    _scenario_mask_from_ids(torch.tensor([value]), scenario_count=2)
+
+        torch.testing.assert_close(
+            _scenario_mask_from_ids(torch.tensor([0.0, 1.0]), scenario_count=2),
+            torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        )
+
+
+class MDLOneTransSequenceAttentionTest(unittest.TestCase):
+    @staticmethod
+    def _small_model_and_features(
+        batch_size: int,
+    ) -> tuple[MDLOneTransModel, dict[str, object]]:
+        root = Path(__file__).resolve().parents[1]
+        base = load_app_config(root / "configs" / "mdl_onetrans.yaml")
+        sequence = replace(base.sequences[0], max_length=6)
+        config = replace(
+            base,
+            sequences=[sequence],
+            model=replace(
+                base.model,
+                embedding_dim=4,
+                token_dim=8,
+                num_layers=3,
+                num_heads=2,
+                hidden_dim=16,
+                use_pyramid=True,
+                pyramid_round_to=1,
+                final_s_tokens=2,
+                max_position_embeddings=10,
+                first_domain_sequence_layer=0,
+            ),
+        )
+        model = MDLOneTransModel(
+            config,
+            {},
+            embedding_size_override=16,
+        ).eval()
+        features: dict[str, object] = {}
+        for feature in config.features:
+            if feature.kind == "categorical":
+                features[feature.name] = torch.randint(1, 15, (batch_size,))
+            else:
+                features[feature.name] = torch.randn(batch_size, feature.dimension)
+        fields: dict[str, Tensor] = {}
+        for field in sequence.fields:
+            shape = (batch_size, sequence.max_length)
+            fields[field.name] = (
+                torch.randint(1, 15, shape)
+                if field.kind == "categorical"
+                else torch.randn(shape)
+            )
+        features[sequence.name] = {
+            "fields": fields,
+            "lengths": torch.full((batch_size,), 5, dtype=torch.long),
+        }
+        return model, features
+
+    def test_padding_values_do_not_affect_attention_and_empty_rows_are_zero(self) -> None:
+        torch.manual_seed(41)
+        attention = VariableLengthDomainAttention(8, 2).eval()
+        domain_tokens = torch.randn(2, 3, 8)
+        sequence_tokens = torch.randn(2, 5, 8)
+        sequence_mask = torch.tensor(
+            [
+                [False, False, True, True, True],
+                [False, False, False, False, False],
+            ]
+        )
+
+        expected = attention(domain_tokens, sequence_tokens, sequence_mask)
+        changed = sequence_tokens.clone()
+        changed[~sequence_mask] = torch.randn_like(changed[~sequence_mask]) * 1.0e4
+        actual = attention(domain_tokens, changed, sequence_mask)
+
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual[1], torch.zeros_like(actual[1]))
+        self.assertTrue(bool(torch.isfinite(actual).all()))
+
+    def test_attention_accepts_pyramid_sequence_lengths(self) -> None:
+        attention = VariableLengthDomainAttention(8, 2).eval()
+        domain_tokens = torch.randn(2, 3, 8)
+
+        for layer_index, sequence_length in enumerate((128, 64, 32)):
+            with self.subTest(layer_index=layer_index):
+                output = attention(
+                    domain_tokens,
+                    torch.randn(2, sequence_length, 8),
+                    torch.ones(2, sequence_length, dtype=torch.bool),
+                )
+                self.assertEqual(tuple(output.shape), (2, 3, 8))
+                self.assertTrue(bool(torch.isfinite(output).all()))
+
+    def test_zero_sequence_gate_exactly_matches_ns_only_domain_path(self) -> None:
+        class ZeroGate(nn.Module):
+            def forward(self, values: Tensor) -> Tensor:
+                return values[..., : values.size(-1) // 3] * 0.0
+
+        config = _rankmixer_config()
+        block = MDLDomainBlock(
+            config,
+            ModelMetadata(feature_token_count=2, scenario_count=2, task_count=2),
+            use_sequence_attention=True,
+        ).eval()
+        self.assertIsNotNone(block.scenario_sequence_gate)
+        self.assertIsNotNone(block.task_sequence_gate)
+        torch.testing.assert_close(
+            block.scenario_sequence_gate[0].bias,
+            torch.full_like(block.scenario_sequence_gate[0].bias, -2.0),
+        )
+        block.scenario_sequence_gate = ZeroGate()
+        block.task_sequence_gate = ZeroGate()
+
+        ns_tokens = torch.randn(2, 2, 4)
+        s_tokens = torch.randn(2, 5, 4)
+        s_mask = torch.tensor(
+            [[False, True, True, True, True], [True, True, True, True, True]]
+        )
+        scenario_tokens = torch.randn(2, 3, 4)
+        task_tokens = torch.randn(2, 2, 4)
+        scenario_mask = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+        expected = _forward_domain_interaction(
+            block,
+            ns_tokens,
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
+        )
+        actual = block(
+            ns_tokens,
+            s_tokens,
+            s_mask,
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
+        )
+
+        torch.testing.assert_close(actual[0], expected[0])
+        torch.testing.assert_close(actual[1], expected[1])
+
+    def test_empty_history_block_output_is_finite_and_matches_ns_only_path(self) -> None:
+        block = MDLDomainBlock(
+            _rankmixer_config(),
+            ModelMetadata(feature_token_count=2, scenario_count=1, task_count=1),
+            use_sequence_attention=True,
+        ).eval()
+        ns_tokens = torch.randn(2, 2, 4)
+        scenario_tokens = torch.randn(2, 2, 4)
+        task_tokens = torch.randn(2, 1, 4)
+        scenario_mask = torch.ones(2, 1)
+        expected = _forward_domain_interaction(
+            block,
+            ns_tokens,
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
+        )
+
+        actual = block(
+            ns_tokens,
+            torch.randn(2, 5, 4),
+            torch.zeros(2, 5, dtype=torch.bool),
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
+        )
+
+        torch.testing.assert_close(actual[0], expected[0])
+        torch.testing.assert_close(actual[1], expected[1])
+        self.assertTrue(bool(torch.isfinite(actual[0]).all()))
+        self.assertTrue(bool(torch.isfinite(actual[1]).all()))
+
+    def test_task_loss_has_gradient_through_sequence_attention_and_s_states(self) -> None:
+        torch.manual_seed(43)
+        block = MDLDomainBlock(
+            _rankmixer_config(),
+            ModelMetadata(feature_token_count=2, scenario_count=1, task_count=1),
+            use_sequence_attention=True,
+        )
+        s_tokens = torch.randn(2, 5, 4, requires_grad=True)
+        _scenario_tokens, task_tokens = block(
+            torch.randn(2, 2, 4),
+            s_tokens,
+            torch.tensor(
+                [[False, True, True, True, True], [True, True, True, True, True]]
+            ),
+            torch.randn(2, 2, 4),
+            torch.randn(2, 1, 4),
+            torch.ones(2, 1),
+        )
+
+        task_tokens.square().sum().backward()
+
+        assert block.task_sequence_attention is not None
+        gradient = block.task_sequence_attention.key_projection.weight.grad
+        self.assertIsNotNone(gradient)
+        assert gradient is not None and s_tokens.grad is not None
+        self.assertGreater(float(gradient.abs().sum().item()), 0.0)
+        self.assertGreater(float(s_tokens.grad.abs().sum().item()), 0.0)
+        self.assertTrue(bool(torch.isfinite(s_tokens.grad).all()))
+
+    def test_cached_candidate_fanout_matches_full_recompute_across_pyramid(self) -> None:
+        torch.manual_seed(47)
+        model, single_features = self._small_model_and_features(batch_size=1)
+        candidate_features = {
+            name: value.expand(3, *value.shape[1:]).clone()
+            for name, value in single_features.items()
+            if isinstance(value, Tensor)
+        }
+        for name in ("item_id", "scenario_item_id", "task_item_id"):
+            candidate_features[name] = torch.tensor([1, 2, 3])
+        single_history = single_features["hist"]
+        assert isinstance(single_history, dict)
+        single_fields = single_history["fields"]
+        assert isinstance(single_fields, dict)
+        candidate_features["hist"] = {
+            "fields": {
+                name: value.expand(3, -1).clone()
+                for name, value in single_fields.items()
+            },
+            "lengths": single_history["lengths"].expand(3).clone(),
+        }
+        scenario_id = torch.zeros(3, dtype=torch.long)
+        observed_lengths: list[int] = []
+        hooks = []
+        for block in model.blocks:
+            assert block.task_sequence_attention is not None
+            hooks.append(
+                block.task_sequence_attention.register_forward_pre_hook(
+                    lambda _module, args: observed_lengths.append(args[1].size(1))
+                )
+            )
+
+        try:
+            with torch.no_grad():
+                request_cache = model.precompute_request_cache(single_features)
+                uncached = model(candidate_features, scenario_id)["logits"]
+                cached = model(
+                    candidate_features,
+                    scenario_id,
+                    request_cache=request_cache,
+                )["logits"]
+        finally:
+            for hook in hooks:
+                hook.remove()
+
+        self.assertEqual(observed_lengths, [4, 3, 2, 4, 3, 2])
+        torch.testing.assert_close(cached, uncached, rtol=1.0e-5, atol=1.0e-6)
 
 
 class OneTransCacheAlignmentTest(unittest.TestCase):
@@ -1288,13 +2028,15 @@ class MDLOneTransLayerwiseAlignmentTest(unittest.TestCase):
 
             def forward(
                 self,
-                feature_tokens: Tensor,
+                ns_tokens: Tensor,
+                s_tokens: Tensor,
+                s_mask: Tensor,
                 scenario_tokens: Tensor,
                 task_tokens: Tensor,
                 scenario_mask: Tensor,
             ) -> tuple[Tensor, Tensor]:
-                del scenario_mask
-                self.seen.append(float(feature_tokens.mean().item()))
+                del s_tokens, s_mask, scenario_mask
+                self.seen.append(float(ns_tokens.mean().item()))
                 return scenario_tokens, task_tokens
 
         model = MDLOneTransModel.__new__(MDLOneTransModel)

@@ -39,7 +39,7 @@ class PerTokenLinear(nn.Module):
             tokens.transpose(0, 1),
             self.weight.transpose(1, 2),
         ).transpose(0, 1)
-        return output + self.bias.unsqueeze(0)
+        return output + self.bias.unsqueeze(0).to(dtype=output.dtype)
 
 
 def _activation_layer(name: str) -> type[nn.Module]:
@@ -62,6 +62,9 @@ class PerTokenFFN(nn.Module):
     ) -> None:
         super().__init__()
         activation_layer = _activation_layer(activation)
+        self.dropout = dropout
+        self.output_relu = output_relu
+        self.activation = activation
         self.networks = nn.ModuleList(
             nn.Sequential(
                 nn.Linear(token_dim, hidden_dim),
@@ -73,14 +76,60 @@ class PerTokenFFN(nn.Module):
             for _ in range(num_tokens)
         )
 
+    def _forward_independent(self, tokens: Tensor) -> Tensor:
+        return torch.cat(
+            [
+                network(tokens[:, token_index, :]).unsqueeze(1)
+                for token_index, network in enumerate(self.networks)
+            ],
+            dim=1,
+        )
+
+    def _forward_batched(self, tokens: Tensor) -> Tensor:
+        # Keep the historical ModuleList parameter layout for checkpoint
+        # compatibility, but execute the independent token MLPs as two batched
+        # GEMMs instead of launching two Linear kernels per token.
+        input_weight = torch.stack(
+            [network[0].weight for network in self.networks],
+            dim=0,
+        )
+        input_bias = torch.stack(
+            [network[0].bias for network in self.networks],
+            dim=0,
+        )
+        output_weight = torch.stack(
+            [network[3].weight for network in self.networks],
+            dim=0,
+        )
+        output_bias = torch.stack(
+            [network[3].bias for network in self.networks],
+            dim=0,
+        )
+        token_major = tokens.transpose(0, 1)
+        hidden = torch.bmm(
+            token_major,
+            input_weight.transpose(1, 2),
+        )
+        hidden = hidden + input_bias.unsqueeze(1).to(dtype=hidden.dtype)
+        hidden = F.gelu(hidden) if self.activation == "gelu" else F.relu(hidden)
+        hidden = F.dropout(hidden, p=self.dropout, training=self.training)
+        output = torch.bmm(
+            hidden,
+            output_weight.transpose(1, 2),
+        )
+        output = output + output_bias.unsqueeze(1).to(dtype=output.dtype)
+        if self.output_relu:
+            output = F.relu(output)
+        return output.transpose(0, 1)
+
     def forward(self, tokens: Tensor) -> Tensor:
         if tokens.size(1) != len(self.networks):
             raise ValueError(f"expected {len(self.networks)} tokens, got {tokens.size(1)}")
-        outputs = [
-            network(tokens[:, token_index, :]).unsqueeze(1)
-            for token_index, network in enumerate(self.networks)
-        ]
-        return torch.cat(outputs, dim=1)
+        # Small independent CPU GEMMs parallelize better through the host BLAS;
+        # CUDA benefits from amortizing their launch overhead as one batched op.
+        if tokens.device.type != "cuda":
+            return self._forward_independent(tokens)
+        return self._forward_batched(tokens)
 
 
 class StackedPerTokenFFN(nn.Module):
@@ -145,12 +194,14 @@ class StackedPerTokenFFN(nn.Module):
         token_major = tokens.transpose(0, 1)
         hidden = torch.bmm(
             token_major, self.input_weight.transpose(1, 2)
-        ) + self.input_bias.unsqueeze(1)
+        )
+        hidden = hidden + self.input_bias.unsqueeze(1).to(dtype=hidden.dtype)
         hidden = F.gelu(hidden) if self.activation == "gelu" else F.relu(hidden)
         hidden = F.dropout(hidden, p=self.dropout, training=self.training)
         output = torch.bmm(
             hidden, self.output_weight.transpose(1, 2)
-        ) + self.output_bias.unsqueeze(1)
+        )
+        output = output + self.output_bias.unsqueeze(1).to(dtype=output.dtype)
         if self.output_relu:
             output = F.relu(output)
         return output.transpose(0, 1)
