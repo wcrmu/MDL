@@ -19,7 +19,7 @@ import importlib
 import json
 import logging
 import math
-from numbers import Integral
+from numbers import Integral, Real
 import os
 import queue
 import threading
@@ -534,6 +534,8 @@ def required_columns_for_split(
     config: AppConfig,
     split: ParquetSplitConfig,
     extra_columns: Iterable[str] = (),
+    *,
+    require_labels: bool = True,
 ) -> list[str]:
     """Return the minimal physical columns needed to build one model batch.
 
@@ -545,8 +547,10 @@ def required_columns_for_split(
     for feature in config.features:
         columns.add(feature.source)
     columns.update(sequence_columns)
-    columns.update(split.labels.values())
-    columns.update(split.label_masks.values())
+    if require_labels:
+        columns.update(split.labels.values())
+        columns.update(split.label_masks.values())
+    columns.update(split.prediction_keys.values())
     if split.request_id:
         columns.add(split.request_id)
     if split.group_id:
@@ -569,10 +573,17 @@ def _scan_columns_for_split(split: ParquetSplitConfig, flat_columns: list[str]) 
             raise ValueError("adapter_parquet split requires adapter config")
         if split.adapter.input_columns is None:
             return []
-        return [
+        columns = [
             *split.adapter.input_columns,
             *split.adapter.optional_input_columns,
         ]
+        # Inference over req files commonly has no labels. Adapter input lists
+        # describe the superset used by train/evaluate, so omit raw label columns
+        # whenever the flat contract does not request them.
+        omitted_labels = (
+            set(split.labels.values()) | set(split.label_masks.values())
+        ) - set(flat_columns)
+        return [column for column in columns if column not in omitted_labels]
     return flat_columns
 
 
@@ -1408,6 +1419,103 @@ def _mapping(options: Mapping[str, Any], key: str) -> dict[str, str]:
     return result
 
 
+def _column_aliases(options: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
+    raw = options.get("column_aliases", {})
+    if not isinstance(raw, Mapping):
+        raise ValueError("adapter option 'column_aliases' must be an object")
+    result: dict[str, tuple[str, ...]] = {}
+    claimed: dict[str, str] = {}
+    for canonical_raw, aliases_raw in raw.items():
+        canonical = str(canonical_raw)
+        if not canonical:
+            raise ValueError("column_aliases canonical names must be non-empty")
+        if isinstance(aliases_raw, (str, bytes)) or not isinstance(
+            aliases_raw, Sequence
+        ):
+            raise ValueError(f"column_aliases.{canonical} must be a list")
+        aliases = tuple(str(alias) for alias in aliases_raw)
+        if (
+            not aliases
+            or any(not alias for alias in aliases)
+            or len(set(aliases)) != len(aliases)
+            or canonical in aliases
+        ):
+            raise ValueError(
+                f"column_aliases.{canonical} must contain unique non-empty alternate names"
+            )
+        for name in (canonical, *aliases):
+            owner = claimed.get(name)
+            if owner is not None and owner != canonical:
+                raise ValueError(
+                    f"column alias {name!r} belongs to both {owner!r} and "
+                    f"{canonical!r}"
+                )
+            claimed[name] = canonical
+        result[canonical] = aliases
+    return result
+
+
+def _label_missing_values(
+    options: Mapping[str, Any],
+    labels: Mapping[str, str],
+) -> dict[str, tuple[Any, ...]]:
+    """Resolve explicitly declared missing-label sentinels per task.
+
+    A list applies to every task; an object can declare different sentinels for
+    different tasks. Binary 0/1 can never be configured as missing.
+    """
+
+    raw = options.get("label_missing_values", ())
+    by_task: dict[str, Any]
+    if isinstance(raw, Mapping):
+        unknown = sorted(set(str(task) for task in raw) - set(labels))
+        if unknown:
+            raise ValueError(
+                "label_missing_values contains unknown tasks: " + ", ".join(unknown)
+            )
+        by_task = {task: raw.get(task, ()) for task in labels}
+    else:
+        by_task = {task: raw for task in labels}
+
+    result: dict[str, tuple[Any, ...]] = {}
+    for task, values in by_task.items():
+        if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+            raise ValueError(
+                f"label_missing_values.{task} must be a list of explicit sentinels"
+            )
+        sentinels = tuple(values)
+        for sentinel in sentinels:
+            if sentinel is not None and not isinstance(sentinel, (Real, str)):
+                raise ValueError(
+                    f"label_missing_values.{task} must contain only null, numeric, "
+                    "or string scalar sentinels"
+                )
+            if isinstance(sentinel, bool) or (
+                isinstance(sentinel, Real) and float(sentinel) in {0.0, 1.0}
+            ):
+                raise ValueError(
+                    f"label_missing_values.{task} cannot mark binary value {sentinel!r} as missing"
+                )
+            if isinstance(sentinel, Real) and not math.isfinite(float(sentinel)):
+                raise ValueError(
+                    f"label_missing_values.{task} cannot contain non-finite values"
+                )
+        result[task] = sentinels
+    return result
+
+
+def _is_missing_label(value: Any, sentinels: Sequence[Any]) -> bool:
+    for sentinel in sentinels:
+        if value is sentinel:
+            return True
+        try:
+            if value == sentinel:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _request_value_maps(
     options: Mapping[str, Any],
     request_columns: set[str],
@@ -1909,6 +2017,27 @@ def _output_array(
     return pa.array(values)
 
 
+def _candidate_metadata_arrow_type(pa: Any, raw_type: Any) -> Any:
+    """Derive the scalar output type from a candidate-list Arrow field."""
+
+    while pa.types.is_dictionary(raw_type):
+        raw_type = raw_type.value_type
+    if not _is_arrow_list_type(pa, raw_type):
+        raise ValueError(
+            f"candidate metadata must be list-valued, got Arrow type {raw_type}"
+        )
+    output_type = raw_type.value_type
+    while pa.types.is_dictionary(output_type):
+        output_type = output_type.value_type
+    # Some producers retain the singleton feature axis (list<list<T>>), while
+    # others write candidate metadata directly as list<T>.
+    if _is_arrow_list_type(pa, output_type):
+        output_type = output_type.value_type
+        while pa.types.is_dictionary(output_type):
+            output_type = output_type.value_type
+    return output_type
+
+
 @dataclass(frozen=True)
 class _MdlRankMixerAdapterPlan:
     context_features: tuple[str, ...]
@@ -1919,6 +2048,11 @@ class _MdlRankMixerAdapterPlan:
     request_maps: Mapping[str, Mapping[Any, int]]
     integer_request_columns: frozenset[str]
     labels: Mapping[str, str]
+    label_masks: Mapping[str, str]
+    label_missing_values: Mapping[str, tuple[Any, ...]]
+    candidate_position_column: str | None
+    candidate_metadata_columns: tuple[str, ...]
+    column_aliases: Mapping[str, tuple[str, ...]]
     time_delta_outputs: Mapping[str, str]
     time_delta_transform: str
     compact_request_lists: bool
@@ -1930,15 +2064,19 @@ class _MdlRankMixerAdapterPlan:
     item_set: frozenset[str]
     scalar_features: frozenset[str]
     label_columns: frozenset[str]
+    label_mask_columns: frozenset[str]
     sequence_columns_by_type: Mapping[str, tuple[str, ...]]
     sequence_columns: frozenset[str]
     time_delta_columns: frozenset[str]
     label_output_columns: tuple[str, ...]
+    label_mask_output_columns: tuple[str, ...]
+    candidate_metadata_output_columns: tuple[str, ...]
     sequence_output_columns: tuple[str, ...]
     item_output_columns: tuple[str, ...]
     request_output_columns: tuple[str, ...]
     compact_list_columns: frozenset[str]
     raw_sequence_columns: frozenset[str]
+    integer_output_columns: frozenset[str]
 
 
 def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
@@ -1953,6 +2091,31 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         _string_list(options, "integer_request_columns")
     )
     labels = _mapping(options, "labels")
+    label_masks = _mapping(options, "label_masks")
+    if label_masks and set(label_masks) != set(labels):
+        missing = sorted(set(labels) - set(label_masks))
+        unknown = sorted(set(label_masks) - set(labels))
+        details = []
+        if missing:
+            details.append("missing tasks: " + ", ".join(missing))
+        if unknown:
+            details.append("unknown tasks: " + ", ".join(unknown))
+        raise ValueError("adapter label_masks must match labels exactly; " + "; ".join(details))
+    label_missing_values = _label_missing_values(options, labels)
+    if any(label_missing_values.values()) and not label_masks:
+        raise ValueError(
+            "adapter label_missing_values requires label_masks so missing labels cannot become negatives"
+        )
+    raw_candidate_position_column = options.get("candidate_position_column")
+    candidate_position_column = (
+        None
+        if raw_candidate_position_column is None
+        else str(raw_candidate_position_column)
+    )
+    if candidate_position_column == "":
+        raise ValueError("adapter candidate_position_column must be a non-empty name")
+    candidate_metadata_columns = _string_list(options, "candidate_metadata_columns")
+    column_aliases = _column_aliases(options)
     time_delta_outputs = _mapping(options, "time_delta_outputs")
     time_delta_transform = str(options.get("time_delta_transform", "raw_ms"))
     compact_request_lists = options.get("compact_request_lists", False)
@@ -1977,6 +2140,19 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     item_set = frozenset(item_features)
     if context_set & item_set:
         raise ValueError("context_features and item_features must be disjoint")
+    known_alias_targets = (
+        context_set
+        | item_set
+        | set(request_columns)
+        | set(labels.values())
+        | set(candidate_metadata_columns)
+    )
+    unknown_alias_targets = sorted(set(column_aliases) - known_alias_targets)
+    if unknown_alias_targets:
+        raise ValueError(
+            "column_aliases contains unknown canonical fields: "
+            + ", ".join(unknown_alias_targets)
+        )
     if not bag_features <= context_set | item_set:
         unknown = sorted(bag_features - context_set - item_set)
         raise ValueError("multivalue_features contains unknown fields: " + ", ".join(unknown))
@@ -1992,6 +2168,23 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     required_set = frozenset(required)
     scalar_features = frozenset((context_set | item_set) - bag_features)
     label_columns = frozenset(labels.values())
+    label_mask_columns = frozenset(label_masks.values())
+    if label_columns & label_mask_columns:
+        raise ValueError("adapter label and label-mask output columns must be disjoint")
+    generated_candidate_columns = frozenset(
+        [
+            *candidate_metadata_columns,
+            *(() if candidate_position_column is None else (candidate_position_column,)),
+        ]
+    )
+    expected_generated_count = len(candidate_metadata_columns) + int(
+        candidate_position_column is not None
+    )
+    if len(generated_candidate_columns) != expected_generated_count:
+        raise ValueError(
+            "candidate_position_column and candidate_metadata_columns must use "
+            "distinct output names"
+        )
     sequence_columns_by_type = {
         ups: tuple(
             column
@@ -2007,19 +2200,43 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         for column in columns
     )
     time_delta_columns = frozenset(time_delta_outputs.values())
+    generated_overlap = generated_candidate_columns & (
+        context_set
+        | item_set
+        | set(request_columns)
+        | label_columns
+        | label_mask_columns
+        | sequence_columns
+        | time_delta_columns
+    )
+    if generated_overlap:
+        raise ValueError(
+            "generated candidate identity columns conflict with feature/label outputs: "
+            + ", ".join(sorted(generated_overlap))
+        )
     label_output_columns = tuple(
         column for column in required if column in label_columns
+    )
+    label_mask_output_columns = tuple(
+        column for column in required if column in label_mask_columns
+    )
+    candidate_metadata_output_columns = tuple(
+        column for column in required if column in generated_candidate_columns
     )
     sequence_output_columns = tuple(
         column
         for column in required
         if column not in label_columns
+        and column not in label_mask_columns
+        and column not in generated_candidate_columns
         and (column in sequence_columns or column in time_delta_columns)
     )
     item_output_columns = tuple(
         column
         for column in required
         if column not in label_columns
+        and column not in label_mask_columns
+        and column not in generated_candidate_columns
         and column not in sequence_columns
         and column not in time_delta_columns
         and column in item_set
@@ -2028,6 +2245,8 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         column
         for column in required
         if column not in label_columns
+        and column not in label_mask_columns
+        and column not in generated_candidate_columns
         and column not in sequence_columns
         and column not in time_delta_columns
         and column not in item_set
@@ -2035,6 +2254,8 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     )
     classified_output_columns = {
         *label_output_columns,
+        *label_mask_output_columns,
+        *candidate_metadata_output_columns,
         *sequence_output_columns,
         *item_output_columns,
         *request_output_columns,
@@ -2054,6 +2275,13 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
             *(f"{ups}_x_time" for ups in ups_types if ups in time_delta_outputs),
         }
     )
+    integer_output_columns = frozenset(
+        {
+            *integer_request_columns,
+            *label_mask_columns,
+            *(() if candidate_position_column is None else (candidate_position_column,)),
+        }
+    )
     return _MdlRankMixerAdapterPlan(
         context_features=context_features,
         item_features=item_features,
@@ -2063,6 +2291,11 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         request_maps=request_maps,
         integer_request_columns=integer_request_columns,
         labels=labels,
+        label_masks=label_masks,
+        label_missing_values=label_missing_values,
+        candidate_position_column=candidate_position_column,
+        candidate_metadata_columns=candidate_metadata_columns,
+        column_aliases=column_aliases,
         time_delta_outputs=time_delta_outputs,
         time_delta_transform=time_delta_transform,
         compact_request_lists=compact_request_lists,
@@ -2074,15 +2307,19 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         item_set=item_set,
         scalar_features=scalar_features,
         label_columns=label_columns,
+        label_mask_columns=label_mask_columns,
         sequence_columns_by_type=sequence_columns_by_type,
         sequence_columns=sequence_columns,
         time_delta_columns=time_delta_columns,
         label_output_columns=label_output_columns,
+        label_mask_output_columns=label_mask_output_columns,
+        candidate_metadata_output_columns=candidate_metadata_output_columns,
         sequence_output_columns=sequence_output_columns,
         item_output_columns=item_output_columns,
         request_output_columns=request_output_columns,
         compact_list_columns=compact_list_columns,
         raw_sequence_columns=raw_sequence_columns,
+        integer_output_columns=integer_output_columns,
     )
 
 
@@ -2113,6 +2350,11 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
     request_maps = plan.request_maps
     integer_request_columns = plan.integer_request_columns
     labels = plan.labels
+    label_masks = plan.label_masks
+    label_missing_values = plan.label_missing_values
+    candidate_position_column = plan.candidate_position_column
+    candidate_metadata_columns = plan.candidate_metadata_columns
+    column_aliases = plan.column_aliases
     time_delta_outputs = plan.time_delta_outputs
     time_delta_transform = plan.time_delta_transform
     compact_request_lists = plan.compact_request_lists
@@ -2128,6 +2370,8 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
     sequence_columns = plan.sequence_columns
     time_delta_columns = plan.time_delta_columns
     label_output_columns = plan.label_output_columns
+    label_mask_output_columns = plan.label_mask_output_columns
+    candidate_metadata_output_columns = plan.candidate_metadata_output_columns
     sequence_output_columns = plan.sequence_output_columns
     item_output_columns = plan.item_output_columns
     request_output_columns = plan.request_output_columns
@@ -2137,6 +2381,33 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
         table,
         plan.raw_sequence_columns,
     )
+    candidate_metadata_types: dict[str, Any] = {}
+    schema_names = set(table.schema.names)
+    for column in candidate_metadata_columns:
+        present = [
+            name
+            for name in (column, *column_aliases.get(column, ()))
+            if name in schema_names
+        ]
+        if len(present) == 1:
+            candidate_metadata_types[column] = _candidate_metadata_arrow_type(
+                pa,
+                table.schema.field(present[0]).type,
+            )
+    validated_flat = set(validated_flat_sequence_columns)
+    alias_to_canonical: dict[str, str] = {}
+    for canonical, aliases in column_aliases.items():
+        alias_to_canonical.update({alias: canonical for alias in aliases})
+        present = [name for name in (canonical, *aliases) if name in raw]
+        if len(present) > 1:
+            raise ValueError(
+                f"raw schema contains multiple aliases for {canonical!r}: {present}"
+            )
+        if present and present[0] != canonical:
+            raw[canonical] = raw[present[0]]
+            if present[0] in validated_flat:
+                validated_flat.add(canonical)
+    validated_flat_sequence_columns = frozenset(validated_flat)
 
     has_context_indices = "context_indices" in raw
     has_target_indices = "target_indices" in raw
@@ -2146,9 +2417,9 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
         )
     is_agg = has_context_indices
     nested_req_context = {
-        field.name
+        alias_to_canonical.get(field.name, field.name)
         for field in table.schema
-        if field.name in context_set
+        if alias_to_canonical.get(field.name, field.name) in context_set
         and (pa.types.is_list(field.type) or pa.types.is_large_list(field.type))
         and (
             pa.types.is_list(field.type.value_type)
@@ -2195,17 +2466,57 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
 
         label_arrays: dict[str, list[Any]] = {}
         for task, column in labels.items():
-            if column not in required_set:
+            mask_column = label_masks.get(task)
+            if column not in required_set and mask_column not in required_set:
                 continue
             if column not in row:
                 raise ValueError(f"missing label column {column!r} for task {task!r}")
-            values = _as_list(row[column], column=column, row_index=raw_row)
+            if row[column] is None and _is_missing_label(
+                None,
+                label_missing_values[task],
+            ):
+                values = [None] * candidate_count
+            else:
+                values = _as_list(row[column], column=column, row_index=raw_row)
             if len(values) != candidate_count:
                 raise ValueError(
                     f"label {column!r} length {len(values)} != candidate count "
                     f"{candidate_count} at raw row {raw_row}"
                 )
             label_arrays[column] = values
+
+        candidate_metadata: dict[str, list[Any]] = {}
+        request_ordinals: defaultdict[int, int] = defaultdict(int)
+        if (
+            candidate_position_column is not None
+            and candidate_position_column in required_set
+        ):
+            positions_by_candidate: list[int] = []
+            for request_index in candidate_requests:
+                positions_by_candidate.append(request_ordinals[request_index])
+                request_ordinals[request_index] += 1
+            candidate_metadata[candidate_position_column] = positions_by_candidate
+        for column in candidate_metadata_columns:
+            if column not in required_set:
+                continue
+            if column not in row:
+                candidate_metadata[column] = [None] * candidate_count
+                continue
+            values = _as_list(row[column], column=column, row_index=raw_row)
+            if len(values) != candidate_count:
+                raise ValueError(
+                    f"candidate metadata {column!r} length {len(values)} != candidate "
+                    f"count {candidate_count} at raw row {raw_row}"
+                )
+            candidate_metadata[column] = [
+                _scalarize(
+                    value,
+                    column=column,
+                    raw_row=raw_row,
+                    logical_row=candidate_index,
+                )
+                for candidate_index, value in enumerate(values)
+            ]
 
         context_arrays: dict[str, Any] = {}
         request_count = len(positions)
@@ -2393,16 +2704,37 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         f"candidate {candidate_index}: {lengths}"
                     )
 
+        normalized_labels: dict[str, list[int | None]] = {}
+        normalized_label_masks: dict[str, list[int]] = {}
         for task, column in labels.items():
-            if column not in required_set:
+            mask_column = label_masks.get(task)
+            if column not in required_set and mask_column not in required_set:
                 continue
             values = label_arrays[column]
+            task_labels: list[int | None] = []
+            task_masks: list[int] = []
             for candidate_index, value in enumerate(values):
-                if isinstance(value, bool) or not isinstance(value, int) or value not in {0, 1}:
+                if _is_missing_label(value, label_missing_values[task]):
+                    task_labels.append(None)
+                    task_masks.append(0)
+                    continue
+                valid_binary = (
+                    not isinstance(value, bool)
+                    and isinstance(value, Real)
+                    and math.isfinite(float(value))
+                    and float(value) in {0.0, 1.0}
+                )
+                if not valid_binary:
                     raise ValueError(
-                        f"label {column!r} must be 0 or 1 at raw row {raw_row}, "
-                        f"candidate {candidate_index}; got {value!r}"
+                        f"label {column!r} must be numeric 0/1 or an explicitly configured "
+                        f"missing sentinel at raw row {raw_row}, candidate {candidate_index}; "
+                        f"got {value!r}"
                     )
+                task_labels.append(int(value))
+                task_masks.append(1)
+            normalized_labels[column] = task_labels
+            if mask_column is not None:
+                normalized_label_masks[mask_column] = task_masks
 
         for column in request_output_columns:
             output[column].extend(
@@ -2411,16 +2743,24 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             )
         for column in item_output_columns:
             output[column].extend(normalized_items[column])
+        for column in candidate_metadata_output_columns:
+            output[column].extend(candidate_metadata[column])
         for column in sequence_output_columns:
             output[column].extend(
                 sequence_cache[request_index][column]
                 for request_index in candidate_requests
             )
         for column in label_output_columns:
-            output[column].extend(label_arrays[column])
+            output[column].extend(normalized_labels[column])
+        for column in label_mask_output_columns:
+            output[column].extend(normalized_label_masks[column])
 
-    arrays = {
-        column: _output_array(
+    arrays: dict[str, Any] = {}
+    for column, values in output.items():
+        if column in candidate_metadata_types:
+            arrays[column] = pa.array(values, type=candidate_metadata_types[column])
+            continue
+        arrays[column] = _output_array(
             pa,
             column,
             values,
@@ -2429,14 +2769,13 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             sequence_columns=sequence_columns,
             time_delta_columns=time_delta_columns,
             label_columns=label_columns,
-            integer_request_columns=integer_request_columns,
+            integer_request_columns=plan.integer_output_columns,
             dictionary_encode=(
                 compact_request_lists and column in compact_list_columns
             ),
         )
-        for column, values in output.items()
-    }
     return pa.table(arrays)
+
 
 def _split_for_name(config: AppConfig, split_name: str) -> ParquetSplitConfig:
     split = config.data.train if split_name == "train" else config.data.test
@@ -2646,6 +2985,7 @@ def iter_flat_tables(
     shard_rank: int = 0,
     shard_world_size: int = 1,
     extra_columns: Iterable[str] = (),
+    require_labels: bool = True,
 ) -> Iterator[Any]:
     """Yield flat Arrow tables for any configured Parquet split.
 
@@ -2654,13 +2994,21 @@ def iter_flat_tables(
     adapter before validating the flat contract.
     """
     split = _split_for_name(config, split_name)
-    required_columns = required_columns_for_split(config, split, extra_columns=extra_columns)
+    required_columns = required_columns_for_split(
+        config,
+        split,
+        extra_columns=extra_columns,
+        require_labels=require_labels,
+    )
+    scan_columns = _scan_columns_for_split(split, required_columns)
     scanner = ParquetScanner(
         split,
-        _scan_columns_for_split(split, required_columns),
+        scan_columns,
         shard_rank=shard_rank,
         shard_world_size=shard_world_size,
-        optional_columns=_optional_scan_columns_for_split(split),
+        optional_columns=(
+            set(_optional_scan_columns_for_split(split)) & set(scan_columns)
+        ),
     )
     adapter_name, adapter = _load_parquet_adapter(split)
     context = _adapter_context(split_name, split, required_columns)
@@ -2726,6 +3074,7 @@ class FeatureBatch:
     label_mask: Tensor | None
     scenario_id: Tensor
     group_id: list[str]
+    prediction_keys: dict[str, list[Any]] = field(default_factory=dict)
     # Optional same-dtype base buffers. Tensor leaves are views into these
     # buffers so one H2D copy per dtype replaces hundreds of small copies.
     _packed_buffers: tuple[Tensor, ...] = field(default_factory=tuple, repr=False)
@@ -3546,6 +3895,7 @@ def resolve_auto_scenarios(
                 scenario,
                 names=tuple(str(value) for value in ordered),
                 auto_discover=False,
+                source_encoding="raw",
             ),
         )
         resolved.validate()
@@ -3617,6 +3967,7 @@ def resolve_auto_scenarios(
             scenario,
             names=tuple(str(value) for value in ordered),
             auto_discover=False,
+            source_encoding="raw",
         ),
         tokenization=replace(
             config.tokenization,
@@ -3632,6 +3983,7 @@ def _encode_scenario_item(
     scenario_to_id: dict[str, int],
     scenario_count: int,
     row_index: int,
+    source_encoding: str,
 ) -> int:
     """Resolve a configured scenario name or ID, rejecting unknown routing values.
 
@@ -3645,8 +3997,12 @@ def _encode_scenario_item(
         raise ValueError(f"scenario value must be a name or integer id at row {row_index}, got bool")
     if isinstance(value, Integral):
         raw_name = str(int(value))
-        if raw_name in scenario_to_id:
+        if source_encoding != "index" and raw_name in scenario_to_id:
             return scenario_to_id[raw_name]
+        if source_encoding == "raw":
+            raise ValueError(
+                f"unknown raw scenario id {int(value)} at row {row_index}"
+            )
         index = int(value)
         if 0 <= index < scenario_count:
             return index
@@ -3654,6 +4010,10 @@ def _encode_scenario_item(
             f"scenario id {index} at row {row_index} is outside [0, {scenario_count - 1}]"
         )
     if isinstance(value, str):
+        if source_encoding == "index":
+            raise ValueError(
+                f"scenario index must be an integer at row {row_index}, got {value!r}"
+            )
         if value in scenario_to_id:
             return scenario_to_id[value]
         raise ValueError(f"unknown scenario name {value!r} at row {row_index}")
@@ -3684,7 +4044,13 @@ def _scenario_tensor(config: AppConfig, table: Any, batch_size: int) -> Tensor:
         else:
             items = [value]
         row_indices.append([
-            _encode_scenario_item(item, scenario_to_id, scenario_count, row_index)
+            _encode_scenario_item(
+                item,
+                scenario_to_id,
+                scenario_count,
+                row_index,
+                config.scenarios.source_encoding,
+            )
             for item in items
         ])
 
@@ -3706,6 +4072,21 @@ def _group_ids(split: ParquetSplitConfig, table: Any, batch_size: int) -> list[s
     if source not in table.column_names:
         raise ValueError(f"missing configured group-id column {source!r}")
     return ["" if value is None else str(value) for value in _column_values(table, source)]
+
+
+def _prediction_keys(split: ParquetSplitConfig, table: Any) -> dict[str, list[Any]]:
+    """Preserve configured candidate identity without coercing scalar types."""
+
+    result: dict[str, list[Any]] = {}
+    for output_name, source in split.prediction_keys.items():
+        values = _column_values(table, source)
+        if len(values) != table.num_rows:
+            raise RuntimeError(
+                f"prediction key source {source!r} produced {len(values)} values for "
+                f"{table.num_rows} rows"
+            )
+        result[output_name] = values
+    return result
 
 
 def _request_deduplication_plan(
@@ -3858,6 +4239,7 @@ def table_to_feature_batch(
         label_mask=label_mask,
         scenario_id=_scenario_tensor(config, table, batch_size),
         group_id=_group_ids(active_split, table, batch_size) if include_group_id else [],
+        prediction_keys=_prediction_keys(active_split, table),
     )
 
 
@@ -3933,6 +4315,7 @@ def _coalesce_feature_batch(
         ),
         scenario_id=replace_tensor(batch.scenario_id),
         group_id=batch.group_id,
+        prediction_keys=batch.prediction_keys,
         _packed_buffers=tuple(buffers),
     )
 
@@ -3954,6 +4337,7 @@ def pin_feature_batch(
         label_mask=None if batch.label_mask is None else batch.label_mask.pin_memory(),
         scenario_id=batch.scenario_id.pin_memory(),
         group_id=batch.group_id,
+        prediction_keys=batch.prediction_keys,
     )
 
 
@@ -3989,6 +4373,7 @@ def move_feature_batch(
             ),
             scenario_id=move_view(batch.scenario_id),
             group_id=batch.group_id,
+            prediction_keys=batch.prediction_keys,
             _packed_buffers=moved_buffers,
         )
     return FeatureBatch(
@@ -4007,4 +4392,5 @@ def move_feature_batch(
         ),
         scenario_id=batch.scenario_id.to(device, non_blocking=non_blocking),
         group_id=batch.group_id,
+        prediction_keys=batch.prediction_keys,
     )

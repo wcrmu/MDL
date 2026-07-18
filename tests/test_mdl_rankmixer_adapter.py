@@ -152,10 +152,16 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
                 "label_a": pa.array([[0, 1, 0]], type=pa.list_(pa.int64())),
                 "label_b": pa.array([[1, 0, 1]], type=pa.list_(pa.int64())),
                 "label_c": pa.array([[0, 0, 1]], type=pa.list_(pa.int64())),
+                "example_ids": pa.array(
+                    [["e0", "e1", "e2"]], type=pa.list_(pa.string())
+                ),
             }
         )
 
-        actual = adapt(table, context=_context(REQUIRED)).to_pydict()
+        context = _context([*REQUIRED, "candidate_position", "example_ids"])
+        context.options["candidate_position_column"] = "candidate_position"
+        context.options["candidate_metadata_columns"] = ["example_ids"]
+        actual = adapt(table, context=context).to_pydict()
 
         self.assertEqual(actual["ctx_scalar_hn"], [101, 102, 102])
         self.assertEqual(actual["ctx_bag_hn"], [[1, 2], None, None])
@@ -172,6 +178,94 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         self.assertEqual(actual["scene_id"], [7, 8, 8])
         self.assertEqual(actual["search_id"], ["r0", "r1", "r1"])
         self.assertEqual(actual["label_c"], [0, 0, 1])
+        self.assertEqual(actual["candidate_position"], [0, 0, 1])
+        self.assertEqual(actual["example_ids"], ["e0", "e1", "e2"])
+
+    def test_missing_labels_emit_independent_masks_and_aliases_are_exact(self) -> None:
+        table = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[1, 2]],
+                "item_scalar_11_hn": [[[201], [202]]],
+                "sku_a_hn": [[[11], [12]]],
+                "sku_b_hn": [[[21], [22]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "scene_id": [7],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": pa.array([[0.0, None]], type=pa.list_(pa.float64())),
+                "label_b": [[-1, 1]],
+                "label_c": [[1, 0]],
+            }
+        )
+        masks = {task: f"label_{task}_valid" for task in ("a", "b", "c")}
+        context = _context([*REQUIRED, *masks.values()])
+        context.options["label_masks"] = masks
+        context.options["label_missing_values"] = {
+            "a": [None],
+            "b": [-1],
+            "c": [],
+        }
+        context.options["column_aliases"] = {
+            "item_scalar_hn": ["item_scalar_11_hn"]
+        }
+
+        actual = adapt(table, context=context).to_pydict()
+
+        self.assertEqual(actual["item_scalar_hn"], [201, 202])
+        self.assertEqual(actual["label_a"], [0, None])
+        self.assertEqual(actual["label_b"], [None, 1])
+        self.assertEqual(actual["label_c"], [1, 0])
+        self.assertEqual(actual["label_a_valid"], [1, 0])
+        self.assertEqual(actual["label_b_valid"], [0, 1])
+        self.assertEqual(actual["label_c_valid"], [1, 1])
+
+        ambiguous = table.append_column("item_scalar_hn", table["item_scalar_11_hn"])
+        with self.assertRaisesRegex(ValueError, "multiple aliases"):
+            adapt(ambiguous, context=context)
+
+        null_outer = table.set_column(
+            table.schema.get_field_index("label_b"),
+            "label_b",
+            pa.array([None], type=pa.list_(pa.int64())),
+        )
+        context.options["label_missing_values"]["b"] = [None]
+        null_result = adapt(null_outer, context=context).to_pydict()
+        self.assertEqual(null_result["label_b"], [None, None])
+        self.assertEqual(null_result["label_b_valid"], [0, 0])
+
+    def test_all_null_candidate_metadata_keeps_its_physical_scalar_type(self) -> None:
+        table = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[1, 2]],
+                "item_scalar_hn": [[[201], [202]]],
+                "sku_a_hn": [[[11], [12]]],
+                "sku_b_hn": [[[21], [22]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "scene_id": [7],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": [[0, 1]],
+                "label_b": [[1, 0]],
+                "label_c": [[0, 1]],
+                "example_ids": pa.array(
+                    [[None, None]],
+                    type=pa.list_(pa.string()),
+                ),
+            }
+        )
+        context = _context([*REQUIRED, "example_ids"])
+        context.options["candidate_metadata_columns"] = ["example_ids"]
+
+        actual = adapt(table, context=context)
+
+        self.assertEqual(actual["example_ids"].to_pylist(), [None, None])
+        self.assertTrue(pa.types.is_string(actual.schema.field("example_ids").type))
+        combined = pa.concat_tables([actual, actual])
+        self.assertEqual(combined.num_rows, 4)
 
     def test_compact_request_lists_survive_concat_and_decode(self) -> None:
         table = pa.table(

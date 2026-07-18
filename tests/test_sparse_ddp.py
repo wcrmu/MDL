@@ -18,6 +18,7 @@ from src.train import (
     _ReplicatedSparseGradientSynchronizer,
     _classify_model_parameters,
     _clip_grad_norm,
+    _clip_sparse_grad_norm,
     _exclude_sparse_parameters_from_ddp,
     _mark_sparse_invariant_checks_explicitly_disabled,
     _synchronize_sparse_parameter_replicas,
@@ -118,6 +119,38 @@ def _sparse_sync_worker(rank: int, world_size: int, port: int) -> None:
             rank_zero = tensor.clone()
             torch_dist.broadcast(rank_zero, src=0)
             torch.testing.assert_close(tensor, rank_zero, rtol=0.0, atol=0.0)
+    finally:
+        torch_dist.destroy_process_group()
+
+
+def _global_sparse_clip_worker(rank: int, world_size: int, port: int) -> None:
+    _init_gloo(rank, world_size, port)
+    try:
+        replicated = nn.Parameter(torch.zeros(2))
+        sharded = nn.Parameter(torch.zeros(1, 1))
+        replicated.grad = torch.tensor([3.0, 4.0])
+        local_value = 12.0 if rank == 0 else 84.0
+        sharded.grad = torch.sparse_coo_tensor(
+            torch.tensor([[0]]),
+            torch.tensor([[local_value]]),
+            sharded.shape,
+        )
+
+        norm = _clip_sparse_grad_norm([replicated], [sharded], 8.5)
+
+        torch.testing.assert_close(norm, torch.tensor(85.0))
+        torch.testing.assert_close(
+            replicated.grad,
+            torch.tensor([0.3, 0.4]),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(
+            sharded.grad.coalesce().values(),
+            torch.tensor([[local_value / 10.0]]),
+            rtol=1e-5,
+            atol=1e-5,
+        )
     finally:
         torch_dist.destroy_process_group()
 
@@ -287,6 +320,15 @@ def _nccl_sparse_worker(rank: int, world_size: int, port: int) -> None:
 
 
 class SparseDDPTest(unittest.TestCase):
+    def test_sharded_sparse_clip_uses_one_global_norm(self) -> None:
+        torch_mp.start_processes(
+            _global_sparse_clip_worker,
+            args=(2, _free_port()),
+            nprocs=2,
+            join=True,
+            start_method="spawn",
+        )
+
     def test_clip_grad_norm_handles_dense_and_sparse_values_without_branching(self) -> None:
         _mark_sparse_invariant_checks_explicitly_disabled()
         dense = nn.Parameter(torch.zeros(2))

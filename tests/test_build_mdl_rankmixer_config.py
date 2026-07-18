@@ -10,6 +10,7 @@ import yaml
 
 from scripts.build_mdl_rankmixer_config import (
     CONTEXT_SCALAR_FIELDS,
+    EXPECTED_LABELS,
     EXPECTED_UPS_TYPES,
     ITEM_BAG_FIELDS,
     ONETRANS_SEQUENCE_LENGTH_CAPS,
@@ -281,15 +282,26 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         self.assertNotIn("share_with", upid_goods["encoding"])
         self.assertNotIn("share_with", cateid_goods["encoding"])
 
-        self.assertEqual(payload["scenarios"], {"names": ["7", "19"], "source": "scene_id"})
+        self.assertEqual(
+            payload["scenarios"],
+            {
+                "names": ["7", "19"],
+                "source": "scene_id",
+                "source_encoding": "index",
+            },
+        )
         adapter_options = payload["data"]["train"]["adapter"]["options"]
         self.assertEqual(
             payload["data"]["train"]["adapter"]["callable"],
             "src.dataloader:adapt_mdl_rankmixer_parquet",
         )
         adapter_payload = payload["data"]["train"]["adapter"]
-        self.assertEqual(len(adapter_payload["input_columns"]), 282)
-        self.assertEqual(len(adapter_payload["optional_input_columns"]), 11)
+        self.assertEqual(len(adapter_payload["input_columns"]), 281)
+        self.assertEqual(len(adapter_payload["optional_input_columns"]), 13)
+        self.assertEqual(
+            len(payload["data"]["test"]["adapter"]["optional_input_columns"]),
+            14,
+        )
         self.assertIn("impr_x_time", adapter_payload["input_columns"])
         self.assertNotIn("impr_x_indices", adapter_payload["input_columns"])
         self.assertIn("impr_x_indices", adapter_payload["optional_input_columns"])
@@ -299,6 +311,17 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         self.assertEqual(
             adapter_options["labels"]["cateid_filter"],
             "cateid_is_fst_scene_sp_filter",
+        )
+        self.assertEqual(
+            payload["data"]["test"]["prediction_keys"]["candidate_position"],
+            "candidate_position",
+        )
+        self.assertNotIn("prediction_keys", payload["data"]["train"])
+        self.assertEqual(payload["data"]["test"]["prediction_score_suffix"], "_score")
+        self.assertEqual(adapter_options["label_missing_values"], [None])
+        self.assertEqual(
+            adapter_options["column_aliases"]["f_goods_view_times_tg_l1_hn"],
+            ["f_goods_view_times_tg_11_hn"],
         )
         self.assertEqual(adapter_options["time_delta_transform"], "log1p_seconds")
 
@@ -330,6 +353,33 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             config.resolved.categorical_embedding_dims["goods_id_hn"],
             config.resolved.categorical_embedding_dims["impr.goods_id_hn"],
         )
+
+    def test_report_derives_task_specific_missing_label_sentinels(self) -> None:
+        report = _synthetic_report(self.sample)
+        report["contract"]["label_distribution"] = {
+            task: {
+                "total": 10,
+                "null": 1 if task == "fst_cart" else 0,
+                "minus_one": 2 if task == "upid_pay" else 0,
+                "zero": 4,
+                "one": 3,
+                "other": 0,
+            }
+            for task in EXPECTED_LABELS
+        }
+
+        payload, _summary = build_config(self.sample, report)
+        missing = payload["data"]["train"]["adapter"]["options"][
+            "label_missing_values"
+        ]
+
+        self.assertEqual(missing["fst_cart"], [None])
+        self.assertEqual(missing["upid_pay"], [None, -1])
+        self.assertEqual(missing["cateid_filter"], [None])
+
+        report["contract"]["label_distribution"]["fst_cart"]["other"] = 1
+        with self.assertRaisesRegex(ValueError, "label_distribution.fst_cart.other"):
+            build_config(self.sample, report)
 
     def test_builds_name_estimated_config_with_runtime_scene_discovery(self) -> None:
         report = build_name_estimate_report(self.sample)
@@ -363,6 +413,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
 
         self.assertTrue(config.scenarios.auto_discover)
         self.assertEqual(config.scenarios.names, ("__auto__",))
+        self.assertEqual(config.scenarios.source_encoding, "raw")
         self.assertNotIn(
             "request_value_maps",
             payload["data"]["train"]["adapter"]["options"],
@@ -395,6 +446,13 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             2,
         )
         self.assertEqual(scene_tensor.tolist(), [1, 0])
+        self.assertEqual(resolved.scenarios.source_encoding, "raw")
+        with self.assertRaisesRegex(ValueError, "unknown raw scenario id 0"):
+            _scenario_tensor(
+                resolved,
+                pa.table({"scene_id": [0]}),
+                1,
+            )
 
         by_name = {item["name"]: item for item in payload["features"]}
         self.assertEqual(
@@ -634,12 +692,21 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     config.scenarios.discovery_cache_path,
                     "artifacts/scenarios/cvr_allscene.json",
                 )
+                self.assertEqual(config.scenarios.source_encoding, "raw")
                 self.assertTrue(config.training.ddp.static_graph)
                 self.assertTrue(
                     config.data.train.reader.deduplicate_request_features
                 )
-                self.assertFalse(
+                self.assertTrue(
                     config.data.train.reader.validate_prehashed_nonzero
+                )
+                self.assertEqual(config.data.train.reader.shard_unit, "row_group")
+                self.assertEqual(config.data.train.reader.shuffle_buffer_rows, 8192)
+                self.assertEqual(config.data.train.reader.shuffle_seed, 2025)
+                self.assertFalse(config.data.train.prediction_keys)
+                self.assertEqual(
+                    config.data.test.prediction_keys["candidate_position"],
+                    "candidate_position",
                 )
                 self.assertTrue(
                     config.data.train.adapter.options["compact_request_lists"]

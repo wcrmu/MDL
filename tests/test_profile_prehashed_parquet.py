@@ -33,7 +33,7 @@ class PreHashedParquetProfileTest(unittest.TestCase):
         self.assertLessEqual(report[1]["projected_uniform_collision_rate"], 0.01)
         self.assertEqual(recommendation, 1 << 23)
 
-    def test_null_label_is_a_contract_violation(self) -> None:
+    def test_null_label_is_reported_as_an_explicit_missing_category(self) -> None:
         contract = ContractProfile(
             ProfileSpec(
                 all_sources=(),
@@ -52,7 +52,136 @@ class PreHashedParquetProfileTest(unittest.TestCase):
 
         contract.observe({"label": [0, None, 1], "scene_id": 7})
 
-        self.assertEqual(contract.as_dict()["invalid_labels"], {"task": 1})
+        report = contract.as_dict()
+        self.assertEqual(report["invalid_labels"], {"task": 1})
+        self.assertEqual(
+            report["label_distribution"]["task"],
+            {
+                "examples": 2,
+                "positives": 1,
+                "negatives": 1,
+                "invalid": 1,
+                "total": 3,
+                "null": 1,
+                "minus_one": 0,
+                "zero": 1,
+                "one": 1,
+                "other": 0,
+            },
+        )
+
+    def test_unlabeled_req_schema_does_not_report_missing_training_labels(self) -> None:
+        spec = ProfileSpec(
+            all_sources=("ctx_hn", "item_hn"),
+            categorical_sources=("ctx_hn", "item_hn"),
+            time_sources=(),
+            context_sources=("ctx_hn",),
+            item_sources=("item_hn",),
+            sequence_sources={},
+            sequence_time_sources={},
+            label_sources={"task": "label"},
+            shared_groups={},
+            sku_fields=(),
+            scene_source="scene_id",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "req.parquet"
+            pq.write_table(
+                pa.table(
+                    {
+                        "ctx_hn": [[11]],
+                        "item_hn": [[[21], [22]]],
+                        "scene_id": [7],
+                        "impr_time": [5000],
+                    }
+                ),
+                path,
+            )
+
+            report = profile_paths(
+                [str(path)],
+                spec,
+                candidate_buckets=(16,),
+                collision_target=1.0,
+                cardinality_headroom=1.0,
+                sample_size=16,
+                hll_precision=10,
+                progress=False,
+            )
+
+        self.assertEqual(report["missing_configured_columns_by_input"][str(path)], [])
+        self.assertEqual(report["contract"]["req_rows"], 1)
+        self.assertEqual(report["contract"]["label_distribution"]["task"]["total"], 0)
+
+    def test_known_field_alias_is_canonicalized_and_ambiguity_is_rejected(self) -> None:
+        canonical = "f_goods_view_times_tg_l1_hn"
+        alternate = "f_goods_view_times_tg_11_hn"
+        spec = ProfileSpec(
+            all_sources=(canonical,),
+            categorical_sources=(canonical,),
+            time_sources=(),
+            context_sources=(),
+            item_sources=(canonical,),
+            sequence_sources={},
+            sequence_time_sources={},
+            label_sources={},
+            shared_groups={},
+            sku_fields=(),
+            scene_source="scene_id",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            alias_path = root / "alias.parquet"
+            pq.write_table(
+                pa.table(
+                    {
+                        alternate: [[[-7]]],
+                        "scene_id": [3],
+                        "impr_time": [5000],
+                    }
+                ),
+                alias_path,
+            )
+            report = profile_paths(
+                [str(alias_path)],
+                spec,
+                candidate_buckets=(16,),
+                collision_target=1.0,
+                cardinality_headroom=1.0,
+                sample_size=16,
+                hll_precision=10,
+                progress=False,
+            )
+
+            ambiguous_path = root / "ambiguous.parquet"
+            pq.write_table(
+                pa.table(
+                    {
+                        canonical: [[[-7]]],
+                        alternate: [[[-8]]],
+                        "scene_id": [3],
+                        "impr_time": [5000],
+                    }
+                ),
+                ambiguous_path,
+            )
+            with self.assertRaisesRegex(ValueError, "multiple physical columns"):
+                profile_paths(
+                    [str(ambiguous_path)],
+                    spec,
+                    candidate_buckets=(16,),
+                    collision_target=1.0,
+                    cardinality_headroom=1.0,
+                    sample_size=16,
+                    hll_precision=10,
+                    progress=False,
+                )
+
+        self.assertEqual(
+            report["resolved_column_aliases_by_input"][str(alias_path)],
+            {canonical: alternate},
+        )
+        self.assertEqual(report["fields"][canonical]["negative_count"], 1)
 
     def test_nested_null_sign_and_power_of_two_collision_stats(self) -> None:
         profile = FieldProfile(sample_size=32, hll_precision=10)
@@ -179,7 +308,18 @@ class PreHashedParquetProfileTest(unittest.TestCase):
         )
         self.assertEqual(
             report["contract"]["label_distribution"]["a"],
-            {"examples": 2, "positives": 1, "negatives": 1, "invalid": 0},
+            {
+                "examples": 2,
+                "positives": 1,
+                "negatives": 1,
+                "invalid": 0,
+                "total": 2,
+                "null": 0,
+                "minus_one": 0,
+                "zero": 1,
+                "one": 1,
+                "other": 0,
+            },
         )
         self.assertEqual(report["contract"]["scene_values"], [
             {"scene_id": 3, "count": 1},

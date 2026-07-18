@@ -119,6 +119,12 @@ EXPECTED_LABELS = {
     "upid_pay": "upid_fst_trgt_noc_clk_pay_24h",
     "cateid_filter": "cateid_is_fst_scene_sp_filter",
 }
+LABEL_MASKS = {
+    task: f"{source}__valid" for task, source in EXPECTED_LABELS.items()
+}
+FIELD_ALIASES = {
+    "f_goods_view_times_tg_l1_hn": ("f_goods_view_times_tg_11_hn",),
+}
 TIME_DELTA_FIELD = "time_delta_log1p_seconds"
 AUTO_SCENARIO_NAME = "__auto__"
 ESTIMATED_SEQUENCE_LENGTHS = {
@@ -383,7 +389,6 @@ def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tup
         "context_outer_mismatches",
         "item_outer_mismatches",
         "label_length_mismatches",
-        "invalid_labels",
         "sequence_length_mismatches",
         "invalid_sequence_membership",
         "missing_sequence_membership",
@@ -392,6 +397,30 @@ def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tup
         "event_after_request_time",
     ):
         _require_empty_counter(contract.get(key, {}), f"contract.{key}", errors)
+    label_distribution = contract.get("label_distribution")
+    if isinstance(label_distribution, Mapping):
+        for task in EXPECTED_LABELS:
+            counts = _require_mapping(
+                label_distribution.get(task),
+                f"contract.label_distribution.{task}",
+            )
+            if not counts.get("total", 0):
+                errors.append(
+                    f"contract.label_distribution.{task}.total must be positive"
+                )
+            if counts.get("other", 0):
+                errors.append(
+                    f"contract.label_distribution.{task}.other must be zero"
+                )
+    else:
+        # Backward compatibility for format-v4 reports written before detailed
+        # null/-1 categories were added. Those reports can prove only that every
+        # label was binary, so any aggregate invalid count remains fatal.
+        _require_empty_counter(
+            contract.get("invalid_labels", {}),
+            "contract.invalid_labels",
+            errors,
+        )
     for key in ("invalid_request_time", "invalid_request_time_layout"):
         if contract.get(key, 0):
             errors.append(f"contract.{key} must be zero")
@@ -1039,6 +1068,7 @@ def _adapter_options(
     sample_features: Sequence[Mapping[str, Any]],
     bag_fields: set[str],
     scene_ids: Sequence[int] | None,
+    label_missing_values: Mapping[str, Sequence[Any]] | None = None,
 ) -> dict[str, Any]:
     context = [str(item["source"]) for item in sample_features[:CONTEXT_FEATURE_COUNT]]
     items = [str(item["source"]) for item in sample_features[CONTEXT_FEATURE_COUNT:]]
@@ -1055,6 +1085,20 @@ def _adapter_options(
         "request_columns": ["scene_id", "search_id", "impr_time"],
         "integer_request_columns": ["scene_id", "impr_time"],
         "labels": dict(EXPECTED_LABELS),
+        "label_masks": dict(LABEL_MASKS),
+        # The report may prove task-specific -1 missing encodings. Null remains
+        # accepted for every task because it cannot be a binary target.
+        "label_missing_values": (
+            {task: list(values) for task, values in label_missing_values.items()}
+            if label_missing_values is not None
+            else [None]
+        ),
+        "candidate_position_column": "candidate_position",
+        "candidate_metadata_columns": ["example_ids"],
+        "column_aliases": {
+            canonical: list(aliases)
+            for canonical, aliases in FIELD_ALIASES.items()
+        },
         "request_time_column": "impr_time",
         "time_delta_outputs": {
             name: f"{name}_x_{TIME_DELTA_FIELD}" for name in EXPECTED_UPS_TYPES
@@ -1068,8 +1112,29 @@ def _adapter_options(
     return options
 
 
-def _reader_config() -> dict[str, Any]:
-    return {
+def _profile_label_missing_values(
+    report: Mapping[str, Any],
+) -> dict[str, list[Any]] | None:
+    contract = report.get("contract")
+    if not isinstance(contract, Mapping):
+        return None
+    distributions = contract.get("label_distribution")
+    if not isinstance(distributions, Mapping):
+        return None
+    result: dict[str, list[Any]] = {}
+    for task in EXPECTED_LABELS:
+        counts = distributions.get(task)
+        if not isinstance(counts, Mapping):
+            return None
+        values: list[Any] = [None]
+        if counts.get("minus_one", 0):
+            values.append(-1)
+        result[task] = values
+    return result
+
+
+def _reader_config(*, training: bool) -> dict[str, Any]:
+    result = {
         "engine": "pyarrow_dataset",
         "columns_pruning": True,
         "num_workers": 8,
@@ -1077,20 +1142,31 @@ def _reader_config() -> dict[str, Any]:
         "max_prefetch_bytes": 2 * 1024**3,
         "scanner_batch_rows": 64,
         "pin_memory": True,
-        "shard_unit": "file",
+        "shard_unit": "row_group",
+        "validate_prehashed_nonzero": True,
     }
+    if training:
+        result.update({"shuffle_buffer_rows": 8192, "shuffle_seed": 2025})
+    return result
 
 
 def _split_config(
     inputs: Sequence[str],
     adapter_options: Mapping[str, Any],
     sequence_input_columns: Sequence[str],
+    *,
+    training: bool,
 ) -> dict[str, Any]:
+    alias_targets = set(FIELD_ALIASES)
     mandatory_columns = list(
         dict.fromkeys(
             [
                 *adapter_options["context_features"],
-                *adapter_options["item_features"],
+                *(
+                    source
+                    for source in adapter_options["item_features"]
+                    if source not in alias_targets
+                ),
                 *sequence_input_columns,
                 *adapter_options["request_columns"],
                 *adapter_options["labels"].values(),
@@ -1101,17 +1177,25 @@ def _split_config(
         "context_indices",
         "target_indices",
         *(
+            name
+            for canonical, aliases in FIELD_ALIASES.items()
+            for name in (canonical, *aliases)
+        ),
+        *(
             f"{ups_type}_x_indices"
             for ups_type in adapter_options["ups_types"]
         ),
     ]
-    return {
+    if not training:
+        optional_columns.append("example_ids")
+    split_config = {
         "format": "adapter_parquet",
         "inputs": list(inputs),
         "request_id": "search_id",
         "group_id": "search_id",
         "labels": dict(EXPECTED_LABELS),
-        "reader": _reader_config(),
+        "label_masks": dict(LABEL_MASKS),
+        "reader": _reader_config(training=training),
         "adapter": {
             "callable": "src.dataloader:adapt_mdl_rankmixer_parquet",
             # Mandatory raw fields are always projected. Agg-only indices are
@@ -1122,6 +1206,19 @@ def _split_config(
             "options": deepcopy(dict(adapter_options)),
         },
     }
+    if not training:
+        split_config.update(
+            {
+                "prediction_keys": {
+                    "search_id": "search_id",
+                    "candidate_position": "candidate_position",
+                    "example_id": "example_ids",
+                    "goods_id_hn": "goods_id_hn",
+                },
+                "prediction_score_suffix": "_score",
+            }
+        )
+    return split_config
 
 
 def _power_of_two_floor(value: int) -> int:
@@ -1362,6 +1459,7 @@ def build_config(
         scenario_config: dict[str, Any] = {
             "names": scenario_names,
             "source": "scene_id",
+            "source_encoding": "raw",
             "auto_discover": True,
             "max_discovered": 64,
         }
@@ -1389,7 +1487,11 @@ def build_config(
             scenario_tokens = []
     else:
         scenario_names = [str(scene_id) for scene_id in scene_ids]
-        scenario_config = {"names": scenario_names, "source": "scene_id"}
+        scenario_config = {
+            "names": scenario_names,
+            "source": "scene_id",
+            "source_encoding": "index",
+        }
         if mdl_family:
             scenario_priors = (
                 list(SCENARIO_SHARED_PRIOR_UPS)
@@ -1448,6 +1550,7 @@ def build_config(
         raw_features,
         bag_fields,
         None if auto_discover_scenes else scene_ids,
+        _profile_label_missing_values(report),
     )
     derived_time_columns = set(adapter_options["time_delta_outputs"].values())
     sequence_input_columns = list(
@@ -1471,6 +1574,7 @@ def build_config(
             resolved_train_inputs,
             adapter_options,
             sequence_input_columns,
+            training=True,
         ),
         "schema_policy": {
             "require_same_schema": True,
@@ -1483,6 +1587,7 @@ def build_config(
             resolved_test_inputs,
             adapter_options,
             sequence_input_columns,
+            training=False,
         )
 
     total_main_sequence_length = sum(

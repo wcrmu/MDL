@@ -28,6 +28,10 @@ data:
       fst_cart: label_fst_cart
       upid_pay: upid_fst_trgt_noc_clk_pay_24h
       cateid_filter: cateid_is_fst_scene_sp_filter
+    label_masks:
+      fst_cart: label_fst_cart__valid
+      upid_pay: upid_fst_trgt_noc_clk_pay_24h__valid
+      cateid_filter: cateid_is_fst_scene_sp_filter__valid
     reader:
       engine: pyarrow_dataset
       columns_pruning: true
@@ -36,13 +40,15 @@ data:
       max_prefetch_bytes: 4294967296
       scanner_batch_rows: 64
       pin_memory: true
-      shard_unit: file
+      shard_unit: row_group
       eager_schema_validation: sample
       schema_validation_samples: 64
       coalesce_pinned_tensors: true
       device_prefetch_batches: 2
       deduplicate_request_features: true
-      validate_prehashed_nonzero: false
+      validate_prehashed_nonzero: true
+      shuffle_buffer_rows: 8192
+      shuffle_seed: 2025
       length_bucket_metric: sum
       length_buckets:
       - max_length: 512
@@ -198,7 +204,6 @@ data:
       - sellr_type_hn
       - opt_id_hn
       - site_x_asian_code_hn
-      - f_goods_view_times_tg_l1_hn
       - target_gs_last_cart_tg_hn
       - impr_3h_tg_hn
       - impr_all_tg_hn
@@ -341,6 +346,8 @@ data:
       optional_input_columns:
       - context_indices
       - target_indices
+      - f_goods_view_times_tg_l1_hn
+      - f_goods_view_times_tg_11_hn
       - impr_x_indices
       - clk_long_x_indices
       - view_long_x_indices
@@ -604,6 +611,18 @@ data:
           fst_cart: label_fst_cart
           upid_pay: upid_fst_trgt_noc_clk_pay_24h
           cateid_filter: cateid_is_fst_scene_sp_filter
+        label_masks:
+          fst_cart: label_fst_cart__valid
+          upid_pay: upid_fst_trgt_noc_clk_pay_24h__valid
+          cateid_filter: cateid_is_fst_scene_sp_filter__valid
+        label_missing_values:
+        - null
+        candidate_position_column: candidate_position
+        candidate_metadata_columns:
+        - example_ids
+        column_aliases:
+          f_goods_view_times_tg_l1_hn:
+          - f_goods_view_times_tg_11_hn
         request_time_column: impr_time
         time_delta_outputs:
           impr: impr_x_time_delta_log1p_seconds
@@ -631,6 +650,16 @@ data:
       fst_cart: label_fst_cart
       upid_pay: upid_fst_trgt_noc_clk_pay_24h
       cateid_filter: cateid_is_fst_scene_sp_filter
+    label_masks:
+      fst_cart: label_fst_cart__valid
+      upid_pay: upid_fst_trgt_noc_clk_pay_24h__valid
+      cateid_filter: cateid_is_fst_scene_sp_filter__valid
+    prediction_keys:
+      search_id: search_id
+      candidate_position: candidate_position
+      example_id: example_ids
+      goods_id_hn: goods_id_hn
+    prediction_score_suffix: _score
     reader:
       engine: pyarrow_dataset
       columns_pruning: true
@@ -639,13 +668,13 @@ data:
       max_prefetch_bytes: 4294967296
       scanner_batch_rows: 64
       pin_memory: true
-      shard_unit: file
+      shard_unit: row_group
       eager_schema_validation: sample
       schema_validation_samples: 64
       coalesce_pinned_tensors: true
       device_prefetch_batches: 2
       deduplicate_request_features: true
-      validate_prehashed_nonzero: false
+      validate_prehashed_nonzero: true
       length_bucket_metric: sum
       length_buckets:
       - max_length: 512
@@ -801,7 +830,6 @@ data:
       - sellr_type_hn
       - opt_id_hn
       - site_x_asian_code_hn
-      - f_goods_view_times_tg_l1_hn
       - target_gs_last_cart_tg_hn
       - impr_3h_tg_hn
       - impr_all_tg_hn
@@ -944,6 +972,9 @@ data:
       optional_input_columns:
       - context_indices
       - target_indices
+      - example_ids
+      - f_goods_view_times_tg_l1_hn
+      - f_goods_view_times_tg_11_hn
       - impr_x_indices
       - clk_long_x_indices
       - view_long_x_indices
@@ -1207,6 +1238,18 @@ data:
           fst_cart: label_fst_cart
           upid_pay: upid_fst_trgt_noc_clk_pay_24h
           cateid_filter: cateid_is_fst_scene_sp_filter
+        label_masks:
+          fst_cart: label_fst_cart__valid
+          upid_pay: upid_fst_trgt_noc_clk_pay_24h__valid
+          cateid_filter: cateid_is_fst_scene_sp_filter__valid
+        label_missing_values:
+        - null
+        candidate_position_column: candidate_position
+        candidate_metadata_columns:
+        - example_ids
+        column_aliases:
+          f_goods_view_times_tg_l1_hn:
+          - f_goods_view_times_tg_11_hn
         request_time_column: impr_time
         time_delta_outputs:
           impr: impr_x_time_delta_log1p_seconds
@@ -4072,6 +4115,7 @@ scenarios:
   names:
   - __auto__
   source: scene_id
+  source_encoding: raw
   auto_discover: true
   max_discovered: 64
   discovery_cache_path: artifacts/scenarios/cvr_allscene.json

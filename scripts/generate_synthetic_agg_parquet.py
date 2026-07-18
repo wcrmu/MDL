@@ -459,6 +459,7 @@ def generate_synthetic_agg_dataset(
 
     base_table = pa.table(columns)
     projected = set(adapter.input_columns or ()) | set(adapter.optional_input_columns)
+    projected_present: set[str] | None = None
     total_file_bytes = 0
     total_projected_bytes = 0
     first_arrow_bytes = 0
@@ -494,6 +495,11 @@ def generate_synthetic_agg_dataset(
                 np.asarray(request_times, dtype=np.int64),
             ),
         )
+        present = projected & set(file_table.column_names)
+        if projected_present is None:
+            projected_present = present
+        elif present != projected_present:
+            raise RuntimeError("synthetic Parquet files produced inconsistent projected schemas")
         if first_arrow_bytes == 0:
             first_arrow_bytes = int(file_table.nbytes)
         path = output_dir / f"{file_index:06d}_0.gz.parquet"
@@ -523,7 +529,9 @@ def generate_synthetic_agg_dataset(
         raw_sequence_lengths=raw_sequence_lengths,
         bag_lengths=bag_lengths,
         physical_columns=len(base_table.column_names) + 3,
-        projected_columns=len(projected),
+        # Optional adapter columns absent from the physical schema are not read
+        # and therefore must not inflate the projected-column count.
+        projected_columns=len(projected_present or ()),
         arrow_bytes_per_file=first_arrow_bytes,
         parquet_file_bytes=total_file_bytes,
         projected_compressed_bytes=total_projected_bytes,

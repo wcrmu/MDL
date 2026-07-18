@@ -14,4 +14,9 @@ note.md
 pyproject.toml
 requirements.txt
 
-data.md
+# Local data adaptation notes / schemas — never publish.
+/data.md
+/DATA_ADAPTATION_*
+/sample.yaml
+/data format.md
+/A100_8X80G*

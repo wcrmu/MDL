@@ -16,6 +16,7 @@ from src.config import (
     LengthBucketConfig,
     ParquetAdapterConfig,
     ParquetSplitConfig,
+    ReaderConfig,
     load_app_config,
 )
 from src.dataloader import (
@@ -26,16 +27,62 @@ from src.dataloader import (
     _coalesce_feature_batch,
     _eager_schema_validation_refs,
     _request_deduplication_plan,
+    _scan_columns_for_split,
     move_feature_batch,
 )
 from src.train import (
     _estimate_prepared_batch_bytes,
     _iter_batch_tables,
+    _iter_shuffled_candidate_tables,
     _table_effective_sequence_lengths,
 )
 
 
 class LengthBucketTest(unittest.TestCase):
+    def test_streaming_shuffle_is_deterministic_and_preserves_exact_coverage(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "default.yaml")
+        train_split = replace(
+            config.data.train,
+            reader=replace(
+                config.data.train.reader,
+                shuffle_buffer_rows=3,
+                shuffle_seed=17,
+            ),
+        )
+        config = replace(config, data=replace(config.data, train=train_split))
+        tables = [
+            pa.table({"row_id": [0, 1, 2, 3]}),
+            pa.table({"row_id": [4, 5]}),
+            pa.table({"row_id": [6, 7, 8, 9]}),
+        ]
+
+        def shuffled(rank: int = 0) -> list[int]:
+            with patch(
+                "src.train.iter_candidate_tables",
+                return_value=iter(tables),
+            ):
+                output = list(
+                    _iter_shuffled_candidate_tables(
+                        config,
+                        "train",
+                        rank,
+                        2,
+                        True,
+                    )
+                )
+            return [
+                value
+                for table in output
+                for value in table["row_id"].to_pylist()
+            ]
+
+        first = shuffled()
+        self.assertEqual(first, shuffled())
+        self.assertEqual(sorted(first), list(range(10)))
+        self.assertNotEqual(first, list(range(10)))
+        self.assertNotEqual(first, shuffled(rank=1))
+
     def test_rows_are_vectorized_into_configured_length_buckets(self) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(root / "configs" / "default.yaml")
@@ -95,6 +142,69 @@ class LengthBucketTest(unittest.TestCase):
 
 
 class EagerSchemaValidationTest(unittest.TestCase):
+    def test_row_group_sharding_covers_rows_exactly_once_across_eight_ranks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            expected = list(range(24))
+            for file_index in range(4):
+                first = file_index * 6
+                pq.write_table(
+                    pa.table({"row_id": list(range(first, first + 6))}),
+                    Path(directory) / f"part-{file_index}.parquet",
+                    row_group_size=3,
+                )
+            split = ParquetSplitConfig(
+                format="flat_parquet",
+                inputs=(directory,),
+                reader=ReaderConfig(
+                    num_workers=0,
+                    prefetch_batches=0,
+                    shard_unit="row_group",
+                    scanner_batch_rows=2,
+                ),
+            )
+
+            rows_by_rank: list[list[int]] = []
+            fingerprints: set[str | None] = set()
+            for rank in range(8):
+                scanner = ParquetScanner(
+                    split,
+                    ["row_id"],
+                    shard_rank=rank,
+                    shard_world_size=8,
+                )
+                rows_by_rank.append(
+                    [
+                        value
+                        for batch in scanner.iter_record_batches()
+                        for value in batch.column("row_id").to_pylist()
+                    ]
+                )
+                fingerprints.add(scanner.shard_plan_fingerprint)
+
+        flattened = [value for rows in rows_by_rank for value in rows]
+        self.assertEqual(sorted(flattened), expected)
+        self.assertEqual(len(flattened), len(set(flattened)))
+        self.assertTrue(all(rows for rows in rows_by_rank))
+        self.assertEqual(len(fingerprints), 1)
+
+    def test_unlabeled_inference_omits_adapter_label_inputs(self) -> None:
+        split = ParquetSplitConfig(
+            format="adapter_parquet",
+            inputs=("/tmp/unused.parquet",),
+            adapter=ParquetAdapterConfig(
+                callable="examples.parquet_identity_adapter:adapt",
+                input_columns=("value", "label", "label_valid"),
+                optional_input_columns=("optional",),
+            ),
+            labels={"task": "label"},
+            label_masks={"task": "label_valid"},
+        )
+
+        self.assertEqual(
+            _scan_columns_for_split(split, ["value", "optional"]),
+            ["value", "optional"],
+        )
+
     @staticmethod
     def _refs(count: int) -> list[ParquetInputRef]:
         filesystem = object()

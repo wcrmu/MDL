@@ -419,18 +419,72 @@ def iter_candidate_tables(
     split_name: str,
     shard_rank: int = 0,
     shard_world_size: int = 1,
+    require_labels: bool = True,
 ) -> Iterator[object]:
     yield from iter_flat_tables(
         config,
         split_name,
         shard_rank=shard_rank,
         shard_world_size=shard_world_size,
+        require_labels=require_labels,
     )
 
 
 def _slice_table(table: object, batch_size: int) -> Iterator[object]:
     for offset in range(0, table.num_rows, batch_size):
         yield table.slice(offset, batch_size)
+
+
+def _shuffle_table(table: object, generator: torch.Generator) -> object:
+    if table.num_rows <= 1:
+        return table
+    pa, _pc, _ds, _pq = _require_pyarrow()
+    permutation = torch.randperm(table.num_rows, generator=generator)
+    return table.take(pa.array(permutation.numpy(), type=pa.int64()))
+
+
+def _iter_shuffled_candidate_tables(
+    config: AppConfig,
+    split_name: str,
+    shard_rank: int,
+    shard_world_size: int,
+    require_labels: bool,
+) -> Iterator[object]:
+    """Bounded deterministic streaming shuffle with exact row coverage."""
+
+    reader = _split_reader(config, split_name)
+    source = iter_candidate_tables(
+        config,
+        split_name,
+        shard_rank=shard_rank,
+        shard_world_size=shard_world_size,
+        require_labels=require_labels,
+    )
+    if reader.shuffle_buffer_rows == 0:
+        yield from source
+        return
+
+    pa, _pc, _ds, _pq = _require_pyarrow()
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(reader.shuffle_seed + shard_rank)
+    buffered: object | None = None
+    for table in source:
+        if table.num_rows == 0:
+            continue
+        combined = (
+            table
+            if buffered is None
+            else pa.concat_tables([buffered, table])
+        )
+        if combined.num_rows <= reader.shuffle_buffer_rows:
+            buffered = combined
+            continue
+        shuffled = _shuffle_table(combined, generator)
+        emitted_rows = shuffled.num_rows - reader.shuffle_buffer_rows
+        yield shuffled.slice(0, emitted_rows)
+        buffered = shuffled.slice(emitted_rows)
+    if buffered is not None and buffered.num_rows:
+        yield _shuffle_table(buffered, generator)
 
 
 def _table_sequence_lengths(config: AppConfig, sequence: Any, table: object) -> Tensor:
@@ -476,17 +530,19 @@ def _iter_length_bucketed_tables(
     split_name: str,
     shard_rank: int,
     shard_world_size: int,
+    require_labels: bool = True,
 ) -> Iterator[object]:
     """Group rows by sequence length before one vectorized padding operation."""
 
     reader = _split_reader(config, split_name)
     buckets = reader.length_buckets
     if not buckets or not config.sequences:
-        for table in iter_candidate_tables(
+        for table in _iter_shuffled_candidate_tables(
             config,
             split_name,
             shard_rank=shard_rank,
             shard_world_size=shard_world_size,
+            require_labels=require_labels,
         ):
             yield from _slice_table(table, config.training.batch_size)
         return
@@ -501,11 +557,12 @@ def _iter_length_bucketed_tables(
     buffered: list[list[object]] = [[] for _ in buckets]
     buffered_rows = [0] * len(buckets)
 
-    for table in iter_candidate_tables(
+    for table in _iter_shuffled_candidate_tables(
         config,
         split_name,
         shard_rank=shard_rank,
         shard_world_size=shard_world_size,
+        require_labels=require_labels,
     ):
         lengths = _table_effective_sequence_lengths(
             config,
@@ -546,12 +603,14 @@ def _iter_batch_tables(
     split_name: str,
     shard_rank: int,
     shard_world_size: int,
+    require_labels: bool = True,
 ) -> Iterator[object]:
     yield from _iter_length_bucketed_tables(
         config,
         split_name,
         shard_rank,
         shard_world_size,
+        require_labels,
     )
 
 
@@ -674,6 +733,7 @@ def iter_feature_batches(
         split_name,
         shard_rank=shard_rank,
         shard_world_size=shard_world_size,
+        require_labels=require_labels,
     )
 
     if reader.prefetch_batches <= 0:
@@ -1648,7 +1708,7 @@ def _mark_sparse_invariant_checks_explicitly_disabled() -> None:
 
 
 @torch.no_grad()
-def _clip_grad_norm(parameters: list[nn.Parameter], max_norm: float) -> Tensor:
+def _gradient_values(parameters: list[nn.Parameter]) -> list[Tensor]:
     grads: list[Tensor] = []
     for parameter in parameters:
         if parameter.grad is None:
@@ -1660,38 +1720,90 @@ def _clip_grad_norm(parameters: list[nn.Parameter], max_norm: float) -> Tensor:
             grads.append(grad._values())
         else:
             grads.append(grad)
-    if not grads:
-        return torch.tensor(0.0)
+    return grads
 
+
+def _gradient_squared_norm(grads: list[Tensor], device: torch.device) -> Tensor:
+    total = torch.zeros((), dtype=torch.float32, device=device)
+    for grad in grads:
+        values = grad.detach()
+        if values.dtype in {torch.float16, torch.bfloat16}:
+            values = values.float()
+        norm = torch.linalg.vector_norm(values, 2.0).to(device=device, dtype=torch.float32)
+        total.add_(norm.square())
+    return total
+
+
+def _scale_gradients(grads: list[Tensor], coefficient: Tensor) -> None:
+    if not grads:
+        return
     first = grads[0]
-    detached = [grad.detach() for grad in grads]
     foreach_compatible = all(
         grad.device == first.device and grad.dtype == first.dtype
-        for grad in detached
+        for grad in grads
     )
-    norms: list[Tensor] | tuple[Tensor, ...]
-    if foreach_compatible and hasattr(torch, "_foreach_norm"):
-        try:
-            norms = torch._foreach_norm(detached, 2.0)
-        except (RuntimeError, TypeError):
-            norms = [torch.linalg.vector_norm(grad, 2.0) for grad in detached]
-    else:
-        norms = [torch.linalg.vector_norm(grad, 2.0) for grad in detached]
-    total_norm = torch.linalg.vector_norm(
-        torch.stack([norm.to(first.device) for norm in norms]),
-        2.0,
-    )
-    # Clamping and applying on-device avoids the Python truth-value conversion
-    # that otherwise synchronizes CUDA every training step.
-    clip_coef = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
     if foreach_compatible and hasattr(torch, "_foreach_mul_"):
         try:
-            torch._foreach_mul_(grads, clip_coef)
-            return total_norm
+            torch._foreach_mul_(grads, coefficient.to(device=first.device, dtype=first.dtype))
+            return
         except (RuntimeError, TypeError):
             pass
     for grad in grads:
-        grad.mul_(clip_coef.to(grad.device))
+        grad.mul_(coefficient.to(device=grad.device, dtype=grad.dtype))
+
+
+@torch.no_grad()
+def _clip_grad_norm(parameters: list[nn.Parameter], max_norm: float) -> Tensor:
+    grads = _gradient_values(parameters)
+    if not grads:
+        return torch.tensor(0.0)
+    total_norm = _gradient_squared_norm(grads, grads[0].device).sqrt()
+    # Clamping and applying on-device avoids the Python truth-value conversion
+    # that otherwise synchronizes CUDA every training step.
+    clip_coef = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
+    _scale_gradients(grads, clip_coef)
+    return total_norm
+
+
+@torch.no_grad()
+def _clip_sparse_grad_norm(
+    replicated_parameters: list[nn.Parameter],
+    sharded_parameters: list[nn.Parameter],
+    max_norm: float,
+) -> Tensor:
+    """Clip one logical sparse group, reducing sharded norm squares globally.
+
+    Replicated embedding gradients are already identical after DDP/sparse-row
+    synchronization and therefore count once. Each sharded parameter contains a
+    disjoint portion of the logical tables, so its squared norm is summed across
+    ranks before one common coefficient is applied.
+    """
+
+    replicated_grads = _gradient_values(replicated_parameters)
+    sharded_grads = _gradient_values(sharded_parameters)
+    all_grads = [*replicated_grads, *sharded_grads]
+    parameter = next(
+        (
+            item
+            for item in [*replicated_parameters, *sharded_parameters]
+            if item.device is not None
+        ),
+        None,
+    )
+    if parameter is None:
+        return torch.tensor(0.0)
+    device = parameter.device
+    replicated_squared = _gradient_squared_norm(replicated_grads, device)
+    sharded_squared = _gradient_squared_norm(sharded_grads, device)
+    if (
+        sharded_parameters
+        and torch_dist.is_available()
+        and torch_dist.is_initialized()
+    ):
+        torch_dist.all_reduce(sharded_squared, op=torch_dist.ReduceOp.SUM)
+    total_norm = (replicated_squared + sharded_squared).sqrt()
+    coefficient = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
+    _scale_gradients(all_grads, coefficient)
     return total_norm
 
 
@@ -2089,7 +2201,11 @@ def train_mdl(
             if config.training.dense_clip_norm is not None and dense_params:
                 _clip_grad_norm(dense_params, config.training.dense_clip_norm)
             if config.training.sparse_clip_norm is not None and sparse_params:
-                _clip_grad_norm(sparse_params, config.training.sparse_clip_norm)
+                _clip_sparse_grad_norm(
+                    replicated_embedding_params,
+                    sharded_embedding_params,
+                    config.training.sparse_clip_norm,
+                )
             if scaler.is_enabled():
                 for optimizer in optimizers:
                     scaler.step(optimizer)
@@ -2628,6 +2744,20 @@ def predict_mdl(
     model.eval()
 
     rows: list[dict[str, object]] = []
+    split = config.data.test
+    if split is None:
+        raise ValueError("prediction requires data.test")
+    score_columns = {
+        task: f"{task}{split.prediction_score_suffix}"
+        for task in config.task_names
+    }
+    output_names = {"group_id", *split.prediction_keys, *score_columns.values()}
+    expected_name_count = 1 + len(split.prediction_keys) + len(score_columns)
+    if len(output_names) != expected_name_count:
+        raise ValueError(
+            "prediction key and score output column names must be unique and must not use group_id"
+        )
+    seen_candidate_keys: set[tuple[object, ...]] = set()
     non_blocking = _non_blocking_transfer(config, "test", device)
     for batch_index, batch in enumerate(
         iter_feature_batches(
@@ -2644,16 +2774,49 @@ def predict_mdl(
         with _autocast_context(config, device):
             logits = model(batch.features, batch.scenario_id)["logits"]
         probabilities = torch.sigmoid(logits.float()).cpu().tolist()
-        for group_id, scores in zip(batch.group_id, probabilities):
+        for row_index, (group_id, scores) in enumerate(
+            zip(batch.group_id, probabilities)
+        ):
             row = {"group_id": group_id}
-            row.update({task: float(score) for task, score in zip(config.task_names, scores)})
+            for output_name in split.prediction_keys:
+                values = batch.prediction_keys.get(output_name)
+                if values is None or len(values) != len(probabilities):
+                    raise RuntimeError(
+                        f"prediction batch is missing aligned key {output_name!r}"
+                    )
+                row[output_name] = values[row_index]
+            if split.prediction_keys:
+                identity = tuple(row[name] for name in split.prediction_keys)
+                try:
+                    duplicate = identity in seen_candidate_keys
+                except TypeError as error:
+                    raise ValueError(
+                        "prediction keys must be scalar/hashable values"
+                    ) from error
+                if duplicate:
+                    raise ValueError(
+                        "prediction candidate key is not unique: "
+                        + repr(dict(zip(split.prediction_keys, identity)))
+                    )
+                seen_candidate_keys.add(identity)
+            row.update(
+                {
+                    score_columns[task]: float(score)
+                    for task, score in zip(config.task_names, scores)
+                }
+            )
             rows.append(row)
 
     path = Path(output_path) if output_path else None
     if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        columns: dict[str, list[object]] = {"group_id": [row["group_id"] for row in rows]}
+        columns: dict[str, list[object]] = {
+            "group_id": [row["group_id"] for row in rows]
+        }
+        for output_name in split.prediction_keys:
+            columns[output_name] = [row[output_name] for row in rows]
         for task in config.task_names:
-            columns[task] = [row[task] for row in rows]
+            score_column = score_columns[task]
+            columns[score_column] = [row[score_column] for row in rows]
         pq.write_table(pa.table(columns), path)
     return PredictResult(rows=len(rows), output_path=path)

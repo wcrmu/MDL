@@ -485,6 +485,10 @@ class ReaderConfig(_DeeplyImmutableConfig):
     length_buckets: tuple[LengthBucketConfig, ...] = ()
     # max is backward compatible; sum tracks total work across heterogeneous UPS.
     length_bucket_metric: Literal["max", "sum"] = "max"
+    # Bounded streaming row shuffle. Zero preserves physical scan order. This is
+    # intended for the training split; evaluation and prediction stay stable.
+    shuffle_buffer_rows: int = 0
+    shuffle_seed: int = 0
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> "ReaderConfig":
@@ -530,6 +534,10 @@ class ReaderConfig(_DeeplyImmutableConfig):
             raise ValueError("reader.shard_unit must be file, row_group, or record_batch")
         if self.length_bucket_metric not in {"max", "sum"}:
             raise ValueError("reader.length_bucket_metric must be max or sum")
+        if type(self.shuffle_buffer_rows) is not int or self.shuffle_buffer_rows < 0:
+            raise ValueError("reader.shuffle_buffer_rows must be a non-negative integer")
+        if type(self.shuffle_seed) is not int or self.shuffle_seed < 0:
+            raise ValueError("reader.shuffle_seed must be a non-negative integer")
         if self.scanner_batch_rows is not None and self.scanner_batch_rows <= 0:
             raise ValueError("reader.scanner_batch_rows must be positive")
         if self.eager_schema_validation not in {"all", "sample"}:
@@ -620,6 +628,12 @@ class ParquetSplitConfig(_DeeplyImmutableConfig):
     labels: Mapping[str, str] = field(default_factory=dict)
     # Optional per-task mask columns. If present, masks must match labels exactly.
     label_masks: Mapping[str, str] = field(default_factory=dict)
+    # Stable candidate identity written by prediction. Keys are output column
+    # names and values are flat-table source columns.
+    prediction_keys: Mapping[str, str] = field(default_factory=dict)
+    # Optional suffix for prediction score columns. Empty preserves the legacy
+    # task-name columns; production configs can use ``_score`` explicitly.
+    prediction_score_suffix: str = ""
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "ParquetSplitConfig":
@@ -644,6 +658,8 @@ class ParquetSplitConfig(_DeeplyImmutableConfig):
             group_id=payload.get("group_id"),
             labels=dict(payload.get("labels", {})),
             label_masks=dict(payload.get("label_masks", {})),
+            prediction_keys=dict(payload.get("prediction_keys", {})),
+            prediction_score_suffix=payload.get("prediction_score_suffix", ""),
         )
 
     def validate(self, name: str) -> None:
@@ -709,6 +725,21 @@ class ParquetSplitConfig(_DeeplyImmutableConfig):
                 details.append("unknown label masks: " + ", ".join(unknown))
             if details:
                 raise ValueError(f"data.{name}.label_masks must match labels exactly; " + "; ".join(details))
+        for output_name, source in self.prediction_keys.items():
+            if not isinstance(output_name, str) or not output_name:
+                raise ValueError(
+                    f"data.{name}.prediction_keys output names must be non-empty strings"
+                )
+            if not isinstance(source, str) or not source:
+                raise ValueError(
+                    f"data.{name}.prediction_keys sources must be non-empty strings"
+                )
+        if "group_id" in self.prediction_keys:
+            raise ValueError(
+                f"data.{name}.prediction_keys reserves output name 'group_id'"
+            )
+        if not isinstance(self.prediction_score_suffix, str):
+            raise ValueError(f"data.{name}.prediction_score_suffix must be a string")
 
 
 @dataclass(frozen=True)
@@ -1107,6 +1138,10 @@ class ScenarioConfig(_DeeplyImmutableConfig):
     names: tuple[str, ...] = ("default",)
     # Optional parquet column carrying scenario id or scenario mask information.
     source: str | None = None
+    # ``raw`` requires integer values to match configured names exactly;
+    # ``index`` accepts already-remapped contiguous ids; ``auto`` preserves the
+    # historical name-first, index-second behavior.
+    source_encoding: Literal["auto", "raw", "index"] = "auto"
     # Discover the finite raw integer scenario set from the training Parquet
     # before model construction. ``names`` then contains one validation-only
     # placeholder and is replaced by the stable, sorted discovered values.
@@ -1142,6 +1177,8 @@ class ScenarioConfig(_DeeplyImmutableConfig):
         if self.source is not None:
             if not isinstance(self.source, str) or not self.source:
                 raise ValueError("scenarios.source must be null or a non-empty column name")
+        if self.source_encoding not in {"auto", "raw", "index"}:
+            raise ValueError("scenarios.source_encoding must be auto, raw, or index")
         if type(self.auto_discover) is not bool:
             raise ValueError("scenarios.auto_discover must be a boolean")
         if type(self.max_discovered) is not int or self.max_discovered <= 0:
@@ -1156,6 +1193,10 @@ class ScenarioConfig(_DeeplyImmutableConfig):
         if self.auto_discover:
             if self.source is None:
                 raise ValueError("scenarios.source is required when auto_discover=true")
+            if self.source_encoding == "index":
+                raise ValueError(
+                    "scenarios.source_encoding cannot be index when auto_discover=true"
+                )
             if self.names != ("__auto__",):
                 raise ValueError(
                     "scenarios.names must be [__auto__] when auto_discover=true"

@@ -22,6 +22,7 @@ import heapq
 from itertools import combinations
 import json
 import math
+from numbers import Real
 from pathlib import Path
 import sys
 from typing import Any, Iterable, Mapping, Sequence
@@ -35,6 +36,9 @@ MASK64 = (1 << 64) - 1
 # have to be repeated merely to diagnose that a strict collision target is
 # incompatible with the available embedding-memory budget.
 DEFAULT_BUCKETS = tuple(1 << exponent for exponent in range(10, 37))
+KNOWN_SOURCE_ALIASES = {
+    "f_goods_view_times_tg_l1_hn": ("f_goods_view_times_tg_11_hn",),
+}
 DEFAULT_SKU_FIELDS = (
     "sku_id_hn",
     "sku_price_v2_hn",
@@ -580,6 +584,23 @@ class ContractProfile:
             yield value
 
     @staticmethod
+    def _label_category(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool) or not isinstance(value, Real):
+            return "other"
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            return "other"
+        if numeric == -1.0:
+            return "minus_one"
+        if numeric == 0.0:
+            return "zero"
+        if numeric == 1.0:
+            return "one"
+        return "other"
+
+    @staticmethod
     def _sequence_scalar(value: Any) -> tuple[int | None, bool]:
         """Normalize scalar or singleton-list S-token storage."""
 
@@ -625,12 +646,17 @@ class ContractProfile:
             if source not in row:
                 continue
             for value in self._label_leaves(row[source]):
-                if isinstance(value, bool) or not isinstance(value, int) or value not in {0, 1}:
+                category = self._label_category(value)
+                self.label_counts[task]["total"] += 1
+                self.label_counts[task][category] += 1
+                if category not in {"zero", "one"}:
                     self.invalid_labels[task] += 1
                     self.label_counts[task]["invalid"] += 1
                 else:
                     self.label_counts[task]["examples"] += 1
-                    self.label_counts[task]["positives" if value else "negatives"] += 1
+                    self.label_counts[task][
+                        "positives" if category == "one" else "negatives"
+                    ] += 1
 
         known_requests: set[int] = set()
         if is_agg:
@@ -836,17 +862,17 @@ class ContractProfile:
                 continue
             per_scene = self.scene_label_counts[task]
             for scene, label in zip(candidate_scenes, labels):
-                if (
-                    not isinstance(scene, int)
-                    or isinstance(scene, bool)
-                    or isinstance(label, bool)
-                    or not isinstance(label, int)
-                    or label not in {0, 1}
-                ):
+                if not isinstance(scene, int) or isinstance(scene, bool):
                     continue
                 counts = per_scene.setdefault(scene, Counter())
+                category = self._label_category(label)
+                counts["total"] += 1
+                counts[category] += 1
+                if category not in {"zero", "one"}:
+                    counts["invalid"] += 1
+                    continue
                 counts["examples"] += 1
-                counts["positives" if label else "negatives"] += 1
+                counts["positives" if category == "one" else "negatives"] += 1
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -881,6 +907,12 @@ class ContractProfile:
                     "positives": counts["positives"],
                     "negatives": counts["negatives"],
                     "invalid": counts["invalid"],
+                    "total": counts["total"],
+                    "null": counts["null"],
+                    "minus_one": counts["minus_one"],
+                    "zero": counts["zero"],
+                    "one": counts["one"],
+                    "other": counts["other"],
                 }
                 for task, counts in self.label_counts.items()
             },
@@ -899,6 +931,13 @@ class ContractProfile:
                         "examples": counts["examples"],
                         "positives": counts["positives"],
                         "negatives": counts["negatives"],
+                        "invalid": counts["invalid"],
+                        "total": counts["total"],
+                        "null": counts["null"],
+                        "minus_one": counts["minus_one"],
+                        "zero": counts["zero"],
+                        "one": counts["one"],
+                        "other": counts["other"],
                     }
                     for scene, counts in sorted(per_scene.items())
                 ]
@@ -951,6 +990,7 @@ def profile_paths(
     contract = ContractProfile(spec)
     observed_schema: dict[str, str] = {}
     missing_by_input: dict[str, list[str]] = {}
+    resolved_aliases_by_input: dict[str, dict[str, str]] = {}
     files_scanned: list[str] = []
     rows_scanned = 0
 
@@ -966,16 +1006,49 @@ def profile_paths(
         *spec.all_sources,
         spec.scene_source,
         spec.request_time_source,
-        *spec.label_sources.values(),
     }
     for input_uri in inputs:
         dataset = _dataset_from_uri(input_uri)
         schema_names = set(dataset.schema.names)
-        missing_by_input[input_uri] = sorted(required_in_both_layouts - schema_names)
-        available = sorted((set(spec.all_sources) | required_contract_columns) & schema_names)
+        canonical_to_physical: dict[str, str] = {}
+        for source in set(spec.all_sources) | required_contract_columns:
+            candidates = [
+                name
+                for name in (source, *KNOWN_SOURCE_ALIASES.get(source, ()))
+                if name in schema_names
+            ]
+            if len(candidates) > 1:
+                raise ValueError(
+                    f"input {input_uri!r} contains multiple physical columns for "
+                    f"{source!r}: {candidates}"
+                )
+            if candidates:
+                canonical_to_physical[source] = candidates[0]
+        is_agg_schema = {
+            "context_indices",
+            "target_indices",
+        } <= schema_names
+        required_for_input = set(required_in_both_layouts)
+        if is_agg_schema:
+            required_for_input.update(spec.label_sources.values())
+        missing_by_input[input_uri] = sorted(
+            required_for_input - set(canonical_to_physical)
+        )
+        resolved_aliases_by_input[input_uri] = {
+            canonical: physical
+            for canonical, physical in canonical_to_physical.items()
+            if canonical != physical
+        }
+        physical_to_canonical = {
+            physical: canonical
+            for canonical, physical in canonical_to_physical.items()
+        }
+        available = sorted(set(canonical_to_physical.values()))
         for field in dataset.schema:
             if field.name in available:
-                observed_schema.setdefault(field.name, str(field.type))
+                observed_schema.setdefault(
+                    physical_to_canonical[field.name], str(field.type)
+                )
         fragments = sorted(dataset.get_fragments(), key=_fragment_path)
         for fragment in fragments:
             if max_files is not None and len(files_scanned) >= max_files:
@@ -991,7 +1064,11 @@ def profile_paths(
                         break
                     if batch.num_rows > remaining:
                         batch = batch.slice(0, remaining)
-                data = batch.to_pydict()
+                physical_data = batch.to_pydict()
+                data = {
+                    physical_to_canonical.get(name, name): values
+                    for name, values in physical_data.items()
+                }
                 for source, profile in profiles.items():
                     if source in data:
                         for value in data[source]:
@@ -1096,6 +1173,7 @@ def profile_paths(
             "max_rows": max_rows,
         },
         "missing_configured_columns_by_input": missing_by_input,
+        "resolved_column_aliases_by_input": resolved_aliases_by_input,
         "schema": observed_schema,
         "contract": contract.as_dict(),
         "fields": field_reports,
