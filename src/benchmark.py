@@ -44,6 +44,7 @@ from .train import (
     _loss_terms_from_batch,
     _prepare_forward_model,
     _non_blocking_transfer,
+    _resolve_distributed_auto_scenarios,
     _setup_distributed,
     _step_sparse_moe_controllers,
     _sync_device,
@@ -68,10 +69,16 @@ class BenchmarkOptions:
     seed: int = 2025
     batch_size: int | None = None
     sequence_length: int | None = None
+    sequence_lengths: dict[str, int] = field(default_factory=dict)
     embedding_lookups_per_table: int = 65536
     id_distribution: IdDistribution = "uniform"
     zipf_exponent: float = 1.2
     peak_tflops: float | None = None
+    # Compute-only mode replaces industrial embedding tables. Reserve their
+    # expected HBM footprint so batch-size tuning still sees realistic headroom.
+    reserve_hbm_gib: float = 0.0
+    # Mirror agg data where several candidates share Context and UPS payloads.
+    candidates_per_request: int = 1
 
     def validate(self) -> None:
         if self.mode not in {"data", "embedding", "compute", "end-to-end"}:
@@ -88,6 +95,15 @@ class BenchmarkOptions:
             raise ValueError("batch_size override is supported only in compute mode")
         if self.sequence_length is not None and self.sequence_length <= 0:
             raise ValueError("sequence_length must be positive")
+        if any(
+            not isinstance(name, str)
+            or not name
+            or isinstance(length, bool)
+            or not isinstance(length, int)
+            or length <= 0
+            for name, length in self.sequence_lengths.items()
+        ):
+            raise ValueError("sequence_lengths must map names to positive integers")
         if self.embedding_lookups_per_table <= 0:
             raise ValueError("embedding_lookups_per_table must be positive")
         if self.id_distribution not in {"uniform", "zipf"}:
@@ -96,6 +112,14 @@ class BenchmarkOptions:
             raise ValueError("zipf_exponent must be greater than 1")
         if self.peak_tflops is not None and self.peak_tflops <= 0.0:
             raise ValueError("peak_tflops must be positive")
+        if self.reserve_hbm_gib < 0.0:
+            raise ValueError("reserve_hbm_gib must be non-negative")
+        if self.reserve_hbm_gib > 0.0 and self.mode != "compute":
+            raise ValueError("reserve_hbm_gib is supported only in compute mode")
+        if self.candidates_per_request <= 0:
+            raise ValueError("candidates_per_request must be positive")
+        if self.candidates_per_request != 1 and self.mode != "compute":
+            raise ValueError("candidates_per_request is supported only in compute mode")
 
 
 @dataclass(frozen=True)
@@ -615,6 +639,8 @@ def _categorical_size(config: AppConfig, name: str) -> int:
     ).encoding
     if encoding.encoding == "hash":
         return encoding.num_buckets + 1
+    if encoding.encoding == "pre_hashed":
+        return encoding.num_buckets + 1
     if encoding.encoding == "identity":
         return encoding.num_buckets
     return 2
@@ -644,25 +670,73 @@ def _synthetic_feature_batch(
     batch_size: int,
     sequence_length: int | None,
     seed: int,
+    candidates_per_request: int = 1,
+    sequence_lengths: dict[str, int] | None = None,
 ) -> FeatureBatch:
     generator = torch.Generator(device=device.type)
     generator.manual_seed(seed)
+    request_rows = math.ceil(batch_size / candidates_per_request)
+    request_row_indices = torch.arange(
+        batch_size,
+        dtype=torch.long,
+        device=device,
+    ).div(candidates_per_request, rounding_mode="floor")
+    adapter_options = config.data.train.adapter.options if config.data.train.adapter else {}
+    context_sources = {
+        str(source) for source in adapter_options.get("context_features", ())
+    }
     features: dict[str, Any] = {}
     for feature in config.features:
+        request_level = candidates_per_request > 1 and feature.source in context_sources
+        rows = request_rows if request_level else batch_size
         if feature.kind == "categorical":
-            features[feature.name] = _synthetic_ids(
-                (batch_size,),
-                _categorical_size(config, feature.name),
-                device,
-                generator,
-            )
+            if feature.pooling == "mean":
+                bag_length = min(feature.max_length or 4, 8)
+                value: Any = {
+                    "values": _synthetic_ids(
+                        (rows, bag_length),
+                        _categorical_size(config, feature.name),
+                        device,
+                        generator,
+                    ),
+                    "lengths": torch.full(
+                        (rows,),
+                        bag_length,
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                }
+            else:
+                value = _synthetic_ids(
+                    (rows,),
+                    _categorical_size(config, feature.name),
+                    device,
+                    generator,
+                )
         else:
-            shape = (batch_size, feature.dimension)
+            shape = (rows, feature.dimension)
             values = torch.randn(shape, generator=generator, device=device)
-            features[feature.name] = values[:, 0] if feature.dimension == 1 else values
+            value = values[:, 0] if feature.dimension == 1 else values
+        if request_level:
+            value = (
+                {**value, "row_indices": request_row_indices}
+                if isinstance(value, dict)
+                else {"values": value, "row_indices": request_row_indices}
+            )
+        features[feature.name] = value
 
+    named_sequence_lengths = sequence_lengths or {}
+    unknown_sequences = set(named_sequence_lengths) - {
+        sequence.name for sequence in config.sequences
+    }
+    if unknown_sequences:
+        raise ValueError(
+            "synthetic sequence_lengths contains unknown sequences: "
+            + ", ".join(sorted(unknown_sequences))
+        )
+    sequence_rows = request_rows if candidates_per_request > 1 else batch_size
     for sequence in config.sequences:
-        length = sequence_length
+        length = named_sequence_lengths.get(sequence.name, sequence_length)
         if length is None:
             length = sequence.max_length or 128
         if sequence.max_length is not None and length > sequence.max_length:
@@ -675,23 +749,26 @@ def _synthetic_feature_batch(
             qualified = field_config.qualified_name(sequence.name)
             if field_config.kind == "categorical":
                 tensor_fields[field_config.name] = _synthetic_ids(
-                    (batch_size, length),
+                    (sequence_rows, length),
                     _categorical_size(config, qualified),
                     device,
                     generator,
                 )
             else:
-                shape = (batch_size, length, field_config.dimension)
+                shape = (sequence_rows, length, field_config.dimension)
                 values = torch.randn(shape, generator=generator, device=device)
                 if field_config.dimension == 1:
                     values = values[:, :, 0]
                 tensor_fields[field_config.name] = values
-        features[sequence.name] = {
+        sequence_value: dict[str, Any] = {
             "fields": tensor_fields,
             "lengths": torch.full(
-                (batch_size,), length, dtype=torch.long, device=device
+                (sequence_rows,), length, dtype=torch.long, device=device
             ),
         }
+        if candidates_per_request > 1:
+            sequence_value["row_indices"] = request_row_indices
+        features[sequence.name] = sequence_value
 
     scenario_count = len(config.scenarios.names)
     scenario_id = torch.randint(
@@ -1017,6 +1094,20 @@ def _benchmark_compute(
     context: DistributedContext,
     options: BenchmarkOptions,
 ) -> LocalBenchmarkSummary:
+    reserved_hbm: tuple[Tensor, ...] = ()
+    if options.reserve_hbm_gib > 0.0:
+        if context.device.type != "cuda":
+            raise ValueError("reserve_hbm_gib requires CUDA")
+        remaining = int(options.reserve_hbm_gib * (1024 ** 3))
+        chunks: list[Tensor] = []
+        chunk_bytes = 1024 ** 3
+        while remaining > 0:
+            current = min(remaining, chunk_bytes)
+            chunks.append(
+                torch.empty(current, dtype=torch.uint8, device=context.device)
+            )
+            remaining -= current
+        reserved_hbm = tuple(chunks)
     # Compute-only must not briefly materialize industrial embedding tables
     # before replacing their lookups with zero-cost shape-preserving modules.
     model = build_model(
@@ -1041,15 +1132,24 @@ def _benchmark_compute(
         options.batch_size or config.training.batch_size,
         options.sequence_length,
         options.seed + context.rank,
+        options.candidates_per_request,
+        options.sequence_lengths,
     )
     collector = _TraceCollector(options.warmup_steps, options.measured_steps, context.device)
     model_for_forward.train()
 
-    def run_step(step: int, collect: bool) -> None:
-        _sync_device(context.device)
-        step_started = perf_counter()
+    def execute_step(
+        timing_events: tuple[
+            torch.cuda.Event,
+            torch.cuda.Event,
+            torch.cuda.Event,
+            torch.cuda.Event,
+        ]
+        | None = None,
+    ) -> None:
+        if timing_events is not None:
+            timing_events[0].record()
         optimizer.zero_grad(set_to_none=True)
-        forward_started = perf_counter()
         with _autocast_context(config, context.device):
             output = model_for_forward(batch.features, batch.scenario_id)
             loss, _numerator, _denominator = _loss_terms_from_batch(
@@ -1060,28 +1160,97 @@ def _benchmark_compute(
                 rank_active=True,
                 active_rank_count=context.world_size,
             )
-        _sync_device(context.device)
-        forward_seconds = perf_counter() - forward_started
-        backward_started = perf_counter()
+        if timing_events is not None:
+            timing_events[1].record()
         loss.backward()
-        _sync_device(context.device)
-        backward_seconds = perf_counter() - backward_started
-        optimizer_started = perf_counter()
+        if timing_events is not None:
+            timing_events[2].record()
         _step_sparse_moe_controllers(
             base_model,
             rank_active=True,
             active_rank_count=context.world_size,
         )
         optimizer.step()
+        if timing_events is not None:
+            timing_events[3].record()
+
+    rows = int(batch.scenario_id.size(0))
+    input_tokens = _batch_input_token_count(batch)
+    padded_token_slots = _batch_padded_token_slots(batch)
+    total_steps = options.warmup_steps + options.measured_steps
+    if context.device.type == "cuda":
+        for _step in range(options.warmup_steps):
+            execute_step()
         _sync_device(context.device)
-        optimizer_seconds = perf_counter() - optimizer_started
-        if collect:
+        collector._start_measurement()
+        pending_events: list[
+            tuple[
+                int,
+                tuple[
+                    torch.cuda.Event,
+                    torch.cuda.Event,
+                    torch.cuda.Event,
+                    torch.cuda.Event,
+                ],
+            ]
+        ] = []
+        for step in range(options.warmup_steps + 1, total_steps + 1):
+            events = tuple(
+                torch.cuda.Event(enable_timing=True) for _ in range(4)
+            )
+            execute_step(events)  # type: ignore[arg-type]
+            pending_events.append((step, events))  # type: ignore[arg-type]
+        _sync_device(context.device)
+        for step, events in pending_events:
+            forward_seconds = events[0].elapsed_time(events[1]) / 1000.0
+            backward_seconds = events[1].elapsed_time(events[2]) / 1000.0
+            optimizer_seconds = events[2].elapsed_time(events[3]) / 1000.0
             collector.observe(
                 _trace(
                     step=step,
-                    rows=int(batch.scenario_id.size(0)),
-                    input_tokens=_batch_input_token_count(batch),
-                    padded_token_slots=_batch_padded_token_slots(batch),
+                    rows=rows,
+                    input_tokens=input_tokens,
+                    padded_token_slots=padded_token_slots,
+                    step_seconds=events[0].elapsed_time(events[3]) / 1000.0,
+                    forward_seconds=forward_seconds,
+                    backward_seconds=backward_seconds,
+                    optimizer_seconds=optimizer_seconds,
+                    active_ranks=context.world_size,
+                )
+            )
+    else:
+        for step in range(1, total_steps + 1):
+            step_started = perf_counter()
+            optimizer.zero_grad(set_to_none=True)
+            forward_started = perf_counter()
+            with _autocast_context(config, context.device):
+                output = model_for_forward(batch.features, batch.scenario_id)
+                loss, _numerator, _denominator = _loss_terms_from_batch(
+                    output,
+                    batch,
+                    moe_loss_weight=config.model.sparse_moe_loss_weight,
+                    loss_reduction=config.training.loss_reduction,
+                    rank_active=True,
+                    active_rank_count=context.world_size,
+                )
+            forward_seconds = perf_counter() - forward_started
+            backward_started = perf_counter()
+            loss.backward()
+            backward_seconds = perf_counter() - backward_started
+            optimizer_started = perf_counter()
+            _step_sparse_moe_controllers(
+                base_model,
+                rank_active=True,
+                active_rank_count=context.world_size,
+            )
+            optimizer.step()
+            optimizer_seconds = perf_counter() - optimizer_started
+            collector.observe(
+                _trace(
+                    step=step,
+                    rows=rows,
+                    input_tokens=input_tokens,
+                    padded_token_slots=padded_token_slots,
                     step_seconds=perf_counter() - step_started,
                     forward_seconds=forward_seconds,
                     backward_seconds=backward_seconds,
@@ -1089,16 +1258,15 @@ def _benchmark_compute(
                     active_ranks=context.world_size,
                 )
             )
-
-    total_steps = options.warmup_steps + options.measured_steps
-    for step in range(1, total_steps + 1):
-        run_step(step, collect=True)
     profiler = _profile_callable(
-        lambda: run_step(total_steps + 1, collect=False),
+        execute_step,
         context.device,
         options.profile_steps,
     )
-    return collector.finish(context.rank, profiler)
+    summary = collector.finish(context.rank, profiler)
+    # Keep the reservation alive through peak-memory collection.
+    del reserved_hbm
+    return summary
 
 
 def _benchmark_end_to_end(
@@ -1134,6 +1302,7 @@ def run_benchmark(config: AppConfig, options: BenchmarkOptions) -> BenchmarkRepo
     options.validate()
     context = _setup_distributed(config)
     try:
+        config = _resolve_distributed_auto_scenarios(config, context)
         torch.manual_seed(options.seed + context.rank)
         if context.device.type == "cuda":
             torch.cuda.manual_seed_all(options.seed + context.rank)

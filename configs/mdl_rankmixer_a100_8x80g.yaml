@@ -1,0 +1,4782 @@
+# Standalone single-node 8xA100-80G production training config.
+# Bucket sizes and embedding dimensions remain profiling estimates.
+runtime:
+  device: cuda
+  precision: bf16
+  compile: true
+  compile_mode: default
+  require_compact_sequence_batches: false
+  allow_tf32: true
+  activation_checkpoint: none
+  attention_backend: flash
+  distributed: ddp
+  nproc_per_node: 8
+  master_addr: 127.0.0.1
+  master_port: 29500
+  trim_all_invalid_sequence_prefix: false
+  validate_scenario_ids: false
+data:
+  train:
+    format: adapter_parquet
+    inputs:
+    - hdfs://temu-data-ns/apps/nothive/warehouse/searchrec/searchrec_cvr_allscene_agg_fgoutput_hour_dracarys_exp/pt=2026-07-10/hr=00
+    - hdfs://temu-data-ns/apps/nothive/warehouse/searchrec/searchrec_cvr_allscene_agg_fgoutput_hour_dracarys_exp/pt=2026-07-10/hr=01
+    - hdfs://temu-data-ns/apps/nothive/warehouse/searchrec/searchrec_cvr_allscene_agg_fgoutput_hour_dracarys_exp/pt=2026-07-10/hr=02
+    request_id: search_id
+    group_id: search_id
+    labels:
+      fst_cart: label_fst_cart
+      upid_pay: upid_fst_trgt_noc_clk_pay_24h
+      cateid_filter: cateid_is_fst_scene_sp_filter
+    reader:
+      engine: pyarrow_dataset
+      columns_pruning: true
+      num_workers: 8
+      prefetch_batches: 8
+      max_prefetch_bytes: 4294967296
+      scanner_batch_rows: 64
+      pin_memory: true
+      shard_unit: file
+      eager_schema_validation: sample
+      schema_validation_samples: 64
+      coalesce_pinned_tensors: true
+      device_prefetch_batches: 2
+      deduplicate_request_features: true
+      validate_prehashed_nonzero: false
+      length_bucket_metric: sum
+      length_buckets:
+      - max_length: 1024
+        batch_size: 72
+      - max_length: 2048
+        batch_size: 48
+      - max_length: 4096
+        batch_size: 32
+      - max_length: 6144
+        batch_size: 22
+      - max_length: null
+        batch_size: 16
+    adapter:
+      callable: src.dataloader:adapt_mdl_rankmixer_parquet
+      input_columns:
+      - currency_hn
+      - hash_language_site_hn
+      - language_hn
+      - page_elsn_hn
+      - page_sn_hn
+      - plat_hn
+      - region_hn
+      - scene_id_hn
+      - site_id_hn
+      - timezone_hn
+      - origin_query_hash_hn
+      - query_arr_hn
+      - query_hash_hn
+      - query_terms_hash_hn
+      - query_tfidf_term_hash_list_hn
+      - query_extend_translation_hash_hn
+      - search_method_hn
+      - sess_q2q_hash_list_hn
+      - recall_merge_cate_levels_hn
+      - recall_merge_cate1_ids_hn
+      - recall_merge_cate_ids_hn
+      - scene_clk_cnt_15d_hit_hn
+      - scene_impr_cnt_15d_hn
+      - scene_impr_cnt_15d_hit_hn
+      - uid_or_bg_hn
+      - u_fst_ordr_cnt_mix_d_hn
+      - clk_cnt_1d_hn
+      - clk_3d_cnt_hn
+      - clk_1d_cat_cnt_hn
+      - cart_cnt_1d_hn
+      - cart_cnt_3d_hn
+      - clk_7d_page_sns_hn
+      - clk_7d_page_elsns_hn
+      - cart_7d_cat1_ids_hn
+      - flip_mall_ids_hn
+      - list_clk_cat1_ids_hn
+      - list_clk_cat_ids_hn
+      - ups_in_cart_2h_sku_cur_prices_hn
+      - ups_in_cart_goods_hn_share
+      - ups_incart_cat1_id_nc_hn
+      - ups_in_cart_tg_hn
+      - ups_query_term_hash_v2_hn
+      - ups_query_tg_hn
+      - ups_search_method_hash_hn
+      - view_30m_cat1_ids_hn
+      - view_7d_page_sns_hn
+      - view_7d_page_elsns_hn
+      - cat_id_hn
+      - cat1_id_hn
+      - cat2_id_hn
+      - cat3_id_hn
+      - cat4_id_hn
+      - goods_id_hn
+      - goods_name_bigram_hn
+      - goods_ner_infos_hn
+      - goods_scene_clk_cnt_15d_hn
+      - goods_title_tfidf_term_hash_list_hn
+      - goods_avlb_sku_num_dis_hn
+      - goods_onsale_sku_num_dis_hn
+      - goods_cluster_id_1w_hn
+      - rev_ratings_cnt_crs_pos_hn
+      - g_sku_spec_hn
+      - g_sku_spec_hash_hn
+      - g_sku_spec_unit_list_hn
+      - g_prpty_val_id_list_hn
+      - sku_id_hn
+      - sku_price_v2_hn
+      - sku_sales_hn
+      - sku_spec_hash_hn
+      - sku_spec_hn
+      - sku_spec_vids_hn
+      - sku_cart_cnt_7d_hn
+      - sku_ordr_cnt_1m_hn
+      - sku_price_dis_hn
+      - sku_sales_dis_hn
+      - price_hn
+      - price_bef_coupon_hn
+      - price_after_promotion_hn
+      - price_after_promotion_div_hn
+      - mkt_prc_hn
+      - show_price_hn
+      - is_promotion_hn
+      - promotion_discount_hn
+      - auto_price_p05_dis
+      - auto_price_p10_dis_hn
+      - ori_price_hn_share
+      - sales_hn
+      - auto_sales_p10_dis
+      - c_adj_cart_cvr_15d_hn
+      - c_adj_ctr_15d_hn
+      - c_adj_ordr_cvr_15d_hn
+      - c_cart_cnt_15d_hn
+      - c_clk_cnt_15d_hn
+      - c_impr_cnt_15d_hn
+      - c_ordr_cnt_15d_hn
+      - c_simi_adj_cart_cvr_15d_hn
+      - c_simi_adj_ctr_15d_hn
+      - c_simi_cart_cnt_15d_hn
+      - c_simi_clk_cnt_15d_hn
+      - c_simi_impr_cnt_15d_hn
+      - idx_c_adj_cart_cvr_15d_hn
+      - idx_c_adj_ctr_15d_hn
+      - idx_c_adj_ordr_cvr_15d_hn
+      - idx_c_cart_cnt_15d_hn
+      - idx_c_clk_cnt_15d_hn
+      - idx_c_impr_cnt_15d_hn
+      - idx_c_ordr_cnt_15d_hn
+      - idx_c_simi_adj_cart_cvr_15d_hn
+      - idx_c_simi_adj_ctr_15d_hn
+      - idx_c_simi_cart_cnt_15d_hn
+      - idx_c_simi_clk_cnt_15d_hn
+      - idx_c_simi_impr_cnt_15d_hn
+      - scene_adj_cartcvr_15d_hn
+      - scene_adj_ctr_15d_hn
+      - scene_adj_cvr_15d_hn
+      - scene_cart_cnt_15d_hn
+      - nfk_sales_14d_hn
+      - nfk_price_14d_hn
+      - nfk_gmv_14d_hn
+      - i2i2cat2_swing_hn
+      - i2i_coclk_hn_share
+      - i2i_list_amazoni2ifullgmv_hn_share
+      - i2i_list_multimodal_hn_share
+      - i2i_list_swingv3gmv_hn_share
+      - i2i_hit_site_q2i_idx_hn
+      - only_semi_swingi2i_cut60_hn_share
+      - semi_swingi2i_cut30_hn_share
+      - offline_outside_goods_id_list_hn_share
+      - site_q2i_good_list_hn_share
+      - multimodal_i2i_hit_cart_size_hn
+      - multimodal_i2i_hit_clk_size_hn
+      - main_goods_ids_hn_share
+      - adj_cartcvr_hn
+      - adj_ctr_hn
+      - adj_cvr_hn
+      - buy_long_spec_vids_hn
+      - cart_long_spec_vids_hn
+      - create_time_hn
+      - mall_id_hn
+      - sellr_type_hn
+      - opt_id_hn
+      - site_x_asian_code_hn
+      - f_goods_view_times_tg_l1_hn
+      - target_gs_last_cart_tg_hn
+      - impr_3h_tg_hn
+      - impr_all_tg_hn
+      - impr_clk_6h_cnt_hn
+      - clk_long_goods_abs_timegap_1d_hn
+      - impr_long_goods_abs_timegap_1d_hn
+      - mid_goods_prc_list_dis
+      - mid_cmprc_diff_list_dis
+      - rel_score_hn
+      - rel_level_hn
+      - q_hit_good_correct_unigram_hn
+      - q2c_cart_15d_hit_val_hn
+      - tit_in_top_query_cnt_hn
+      - goods_query_emb32v3_cos_hn
+      - query_cat_hn
+      - query_pay_cnt_15d_hn
+      - clk_hit_i2i_idx_hn
+      - cart_hit_i2i_idx_hn
+      - cart_long_hit_samestyle_i2i_idx_hn
+      - ups_clkv2_i2i_goods_ids_hit_size
+      - ups_clkv2_i2i_goods_ids_hit_all_size
+      - us_ctr_price_dis50_hn
+      - impr_cat_clk_goods_ids_cnt_1d_hn
+      - ad_id_bin_hn
+      - campaign_id_hn
+      - idx_goods_creative_id_hn
+      - impr_x_cat1_id_hn
+      - impr_x_cat2_id_hn
+      - impr_x_cat3_id_hn
+      - impr_x_cat4_id_hn
+      - impr_x_cat_id_hn
+      - impr_x_goods_id_hn
+      - impr_x_mall_id_hn
+      - impr_x_page_sn_hn
+      - impr_x_sales_hn
+      - impr_x_price_hn
+      - impr_x_timegap_hn
+      - clk_long_x_cat1_id_hn
+      - clk_long_x_cat2_id_hn
+      - clk_long_x_cat3_id_hn
+      - clk_long_x_cat4_id_hn
+      - clk_long_x_cat_id_hn
+      - clk_long_x_goods_id_hn
+      - clk_long_x_mall_id_hn
+      - clk_long_x_page_sn_hn
+      - clk_long_x_sales_hn
+      - clk_long_x_price_hn
+      - clk_long_x_timegap_hn
+      - view_long_x_cat1_id_hn
+      - view_long_x_cat2_id_hn
+      - view_long_x_cat3_id_hn
+      - view_long_x_cat4_id_hn
+      - view_long_x_cat_id_hn
+      - view_long_x_goods_id_hn
+      - view_long_x_mall_id_hn
+      - view_long_x_page_sn_hn
+      - view_long_x_sales_hn
+      - view_long_x_price_hn
+      - view_long_x_timegap_hn
+      - view_long_x_clk_bottom_img_hn
+      - view_long_x_clk_cancel_wish_hn
+      - view_long_x_clk_carousel_hn
+      - view_long_x_clk_evaluate_hn
+      - view_long_x_clk_more_hn
+      - view_long_x_clk_svid_hn
+      - view_long_x_clk_wish_hn
+      - view_long_x_fvid_cv_hn
+      - view_long_x_fvid_ratio_hn
+      - view_long_x_vid_hn
+      - view_long_x_share_hn
+      - view_long_x_slide_bottom_detail_hn
+      - view_long_x_slide_bottom_img_hn
+      - view_long_x_slide_carousel_hn
+      - view_long_x_slide_carousel_cnt_hn
+      - view_long_x_stay_time_hn
+      - view_long_x_switch_sku_hn
+      - view_long_x_switch_sku_cnt_hn
+      - cart_long_x_cat1_id_hn
+      - cart_long_x_cat2_id_hn
+      - cart_long_x_cat3_id_hn
+      - cart_long_x_cat4_id_hn
+      - cart_long_x_cat_id_hn
+      - cart_long_x_goods_id_hn
+      - cart_long_x_mall_id_hn
+      - cart_long_x_price_hn
+      - cart_long_x_timegap_hn
+      - cart_long_x_spec_hn
+      - cart_long_x_sku_ids_hn
+      - buy_long_x_cat1_id_hn
+      - buy_long_x_cat2_id_hn
+      - buy_long_x_cat3_id_hn
+      - buy_long_x_cat4_id_hn
+      - buy_long_x_cat_id_hn
+      - buy_long_x_goods_id_hn
+      - buy_long_x_mall_id_hn
+      - buy_long_x_sales_hn
+      - buy_long_x_price_hn
+      - buy_long_x_timegap_hn
+      - buy_long_x_spec_hn
+      - buy_long_x_sku_ids_hn
+      - semi_clk_x_cat_id_hn
+      - semi_clk_x_goods_id_hn
+      - semi_clk_x_mall_id_hn
+      - semi_clk_x_page_sn_hn
+      - semi_clk_x_timegap_hn
+      - srch_q2i_x_cat1_id_hn
+      - srch_q2i_x_cat2_id_hn
+      - srch_q2i_x_cat3_id_hn
+      - srch_q2i_x_cat4_id_hn
+      - srch_q2i_x_cat_id_hn
+      - srch_q2i_x_goods_id_hn
+      - srch_q2i_x_mall_id_hn
+      - srch_q2i_x_timegap_hn
+      - ups_clk_sku_x_cat1_id_hn
+      - ups_clk_sku_x_cat2_id_hn
+      - ups_clk_sku_x_cat3_id_hn
+      - ups_clk_sku_x_cat4_id_hn
+      - ups_clk_sku_x_cat_id_hn
+      - ups_clk_sku_x_goods_id_hn
+      - ups_clk_sku_x_mall_id_hn
+      - ups_clk_sku_x_timegap_hn
+      - ups_clk_sku_x_spec_hn
+      - flatten_query_hash_x_flat_q_hash_hn
+      - flatten_query_hash_x_timegap_hn
+      - impr_x_time
+      - clk_long_x_time
+      - view_long_x_time
+      - cart_long_x_time
+      - buy_long_x_time
+      - semi_clk_x_time
+      - srch_q2i_x_time
+      - ups_clk_sku_x_time
+      - flatten_query_hash_x_time
+      - scene_id
+      - search_id
+      - impr_time
+      - label_fst_cart
+      - upid_fst_trgt_noc_clk_pay_24h
+      - cateid_is_fst_scene_sp_filter
+      optional_input_columns:
+      - context_indices
+      - target_indices
+      - impr_x_indices
+      - clk_long_x_indices
+      - view_long_x_indices
+      - cart_long_x_indices
+      - buy_long_x_indices
+      - semi_clk_x_indices
+      - srch_q2i_x_indices
+      - ups_clk_sku_x_indices
+      - flatten_query_hash_x_indices
+      options:
+        context_features:
+        - currency_hn
+        - hash_language_site_hn
+        - language_hn
+        - page_elsn_hn
+        - page_sn_hn
+        - plat_hn
+        - region_hn
+        - scene_id_hn
+        - site_id_hn
+        - timezone_hn
+        - origin_query_hash_hn
+        - query_arr_hn
+        - query_hash_hn
+        - query_terms_hash_hn
+        - query_tfidf_term_hash_list_hn
+        - query_extend_translation_hash_hn
+        - search_method_hn
+        - sess_q2q_hash_list_hn
+        - recall_merge_cate_levels_hn
+        - recall_merge_cate1_ids_hn
+        - recall_merge_cate_ids_hn
+        - scene_clk_cnt_15d_hit_hn
+        - scene_impr_cnt_15d_hn
+        - scene_impr_cnt_15d_hit_hn
+        - uid_or_bg_hn
+        - u_fst_ordr_cnt_mix_d_hn
+        - clk_cnt_1d_hn
+        - clk_3d_cnt_hn
+        - clk_1d_cat_cnt_hn
+        - cart_cnt_1d_hn
+        - cart_cnt_3d_hn
+        - clk_7d_page_sns_hn
+        - clk_7d_page_elsns_hn
+        - cart_7d_cat1_ids_hn
+        - flip_mall_ids_hn
+        - list_clk_cat1_ids_hn
+        - list_clk_cat_ids_hn
+        - ups_in_cart_2h_sku_cur_prices_hn
+        - ups_in_cart_goods_hn_share
+        - ups_incart_cat1_id_nc_hn
+        - ups_in_cart_tg_hn
+        - ups_query_term_hash_v2_hn
+        - ups_query_tg_hn
+        - ups_search_method_hash_hn
+        - view_30m_cat1_ids_hn
+        - view_7d_page_sns_hn
+        - view_7d_page_elsns_hn
+        item_features:
+        - cat_id_hn
+        - cat1_id_hn
+        - cat2_id_hn
+        - cat3_id_hn
+        - cat4_id_hn
+        - goods_id_hn
+        - goods_name_bigram_hn
+        - goods_ner_infos_hn
+        - goods_scene_clk_cnt_15d_hn
+        - goods_title_tfidf_term_hash_list_hn
+        - goods_avlb_sku_num_dis_hn
+        - goods_onsale_sku_num_dis_hn
+        - goods_cluster_id_1w_hn
+        - rev_ratings_cnt_crs_pos_hn
+        - g_sku_spec_hn
+        - g_sku_spec_hash_hn
+        - g_sku_spec_unit_list_hn
+        - g_prpty_val_id_list_hn
+        - sku_id_hn
+        - sku_price_v2_hn
+        - sku_sales_hn
+        - sku_spec_hash_hn
+        - sku_spec_hn
+        - sku_spec_vids_hn
+        - sku_cart_cnt_7d_hn
+        - sku_ordr_cnt_1m_hn
+        - sku_price_dis_hn
+        - sku_sales_dis_hn
+        - price_hn
+        - price_bef_coupon_hn
+        - price_after_promotion_hn
+        - price_after_promotion_div_hn
+        - mkt_prc_hn
+        - show_price_hn
+        - is_promotion_hn
+        - promotion_discount_hn
+        - auto_price_p05_dis
+        - auto_price_p10_dis_hn
+        - ori_price_hn_share
+        - sales_hn
+        - auto_sales_p10_dis
+        - c_adj_cart_cvr_15d_hn
+        - c_adj_ctr_15d_hn
+        - c_adj_ordr_cvr_15d_hn
+        - c_cart_cnt_15d_hn
+        - c_clk_cnt_15d_hn
+        - c_impr_cnt_15d_hn
+        - c_ordr_cnt_15d_hn
+        - c_simi_adj_cart_cvr_15d_hn
+        - c_simi_adj_ctr_15d_hn
+        - c_simi_cart_cnt_15d_hn
+        - c_simi_clk_cnt_15d_hn
+        - c_simi_impr_cnt_15d_hn
+        - idx_c_adj_cart_cvr_15d_hn
+        - idx_c_adj_ctr_15d_hn
+        - idx_c_adj_ordr_cvr_15d_hn
+        - idx_c_cart_cnt_15d_hn
+        - idx_c_clk_cnt_15d_hn
+        - idx_c_impr_cnt_15d_hn
+        - idx_c_ordr_cnt_15d_hn
+        - idx_c_simi_adj_cart_cvr_15d_hn
+        - idx_c_simi_adj_ctr_15d_hn
+        - idx_c_simi_cart_cnt_15d_hn
+        - idx_c_simi_clk_cnt_15d_hn
+        - idx_c_simi_impr_cnt_15d_hn
+        - scene_adj_cartcvr_15d_hn
+        - scene_adj_ctr_15d_hn
+        - scene_adj_cvr_15d_hn
+        - scene_cart_cnt_15d_hn
+        - nfk_sales_14d_hn
+        - nfk_price_14d_hn
+        - nfk_gmv_14d_hn
+        - i2i2cat2_swing_hn
+        - i2i_coclk_hn_share
+        - i2i_list_amazoni2ifullgmv_hn_share
+        - i2i_list_multimodal_hn_share
+        - i2i_list_swingv3gmv_hn_share
+        - i2i_hit_site_q2i_idx_hn
+        - only_semi_swingi2i_cut60_hn_share
+        - semi_swingi2i_cut30_hn_share
+        - offline_outside_goods_id_list_hn_share
+        - site_q2i_good_list_hn_share
+        - multimodal_i2i_hit_cart_size_hn
+        - multimodal_i2i_hit_clk_size_hn
+        - main_goods_ids_hn_share
+        - adj_cartcvr_hn
+        - adj_ctr_hn
+        - adj_cvr_hn
+        - buy_long_spec_vids_hn
+        - cart_long_spec_vids_hn
+        - create_time_hn
+        - mall_id_hn
+        - sellr_type_hn
+        - opt_id_hn
+        - site_x_asian_code_hn
+        - f_goods_view_times_tg_l1_hn
+        - target_gs_last_cart_tg_hn
+        - impr_3h_tg_hn
+        - impr_all_tg_hn
+        - impr_clk_6h_cnt_hn
+        - clk_long_goods_abs_timegap_1d_hn
+        - impr_long_goods_abs_timegap_1d_hn
+        - mid_goods_prc_list_dis
+        - mid_cmprc_diff_list_dis
+        - rel_score_hn
+        - rel_level_hn
+        - q_hit_good_correct_unigram_hn
+        - q2c_cart_15d_hit_val_hn
+        - tit_in_top_query_cnt_hn
+        - goods_query_emb32v3_cos_hn
+        - query_cat_hn
+        - query_pay_cnt_15d_hn
+        - clk_hit_i2i_idx_hn
+        - cart_hit_i2i_idx_hn
+        - cart_long_hit_samestyle_i2i_idx_hn
+        - ups_clkv2_i2i_goods_ids_hit_size
+        - ups_clkv2_i2i_goods_ids_hit_all_size
+        - us_ctr_price_dis50_hn
+        - impr_cat_clk_goods_ids_cnt_1d_hn
+        - ad_id_bin_hn
+        - campaign_id_hn
+        - idx_goods_creative_id_hn
+        multivalue_features:
+        - origin_query_hash_hn
+        - query_arr_hn
+        - query_hash_hn
+        - query_terms_hash_hn
+        - query_tfidf_term_hash_list_hn
+        - query_extend_translation_hash_hn
+        - sess_q2q_hash_list_hn
+        - recall_merge_cate_levels_hn
+        - recall_merge_cate1_ids_hn
+        - recall_merge_cate_ids_hn
+        - scene_impr_cnt_15d_hn
+        - u_fst_ordr_cnt_mix_d_hn
+        - clk_cnt_1d_hn
+        - clk_3d_cnt_hn
+        - clk_1d_cat_cnt_hn
+        - cart_cnt_1d_hn
+        - cart_cnt_3d_hn
+        - clk_7d_page_sns_hn
+        - clk_7d_page_elsns_hn
+        - cart_7d_cat1_ids_hn
+        - flip_mall_ids_hn
+        - list_clk_cat1_ids_hn
+        - list_clk_cat_ids_hn
+        - ups_in_cart_2h_sku_cur_prices_hn
+        - ups_in_cart_goods_hn_share
+        - ups_incart_cat1_id_nc_hn
+        - ups_in_cart_tg_hn
+        - ups_query_term_hash_v2_hn
+        - ups_query_tg_hn
+        - ups_search_method_hash_hn
+        - view_30m_cat1_ids_hn
+        - view_7d_page_sns_hn
+        - view_7d_page_elsns_hn
+        - goods_name_bigram_hn
+        - goods_ner_infos_hn
+        - goods_title_tfidf_term_hash_list_hn
+        - rev_ratings_cnt_crs_pos_hn
+        - g_sku_spec_hn
+        - g_sku_spec_hash_hn
+        - g_sku_spec_unit_list_hn
+        - g_prpty_val_id_list_hn
+        - sku_id_hn
+        - sku_price_v2_hn
+        - sku_sales_hn
+        - sku_spec_hash_hn
+        - sku_spec_hn
+        - sku_cart_cnt_7d_hn
+        - sku_ordr_cnt_1m_hn
+        - sku_price_dis_hn
+        - sku_sales_dis_hn
+        aligned_multivalue_groups:
+        - - sku_id_hn
+          - sku_price_v2_hn
+          - sku_sales_hn
+          - sku_spec_hash_hn
+          - sku_spec_hn
+          - sku_cart_cnt_7d_hn
+          - sku_ordr_cnt_1m_hn
+          - sku_price_dis_hn
+          - sku_sales_dis_hn
+        ups_types:
+        - impr
+        - clk_long
+        - view_long
+        - cart_long
+        - buy_long
+        - semi_clk
+        - srch_q2i
+        - ups_clk_sku
+        - flatten_query_hash
+        request_columns:
+        - scene_id
+        - search_id
+        - impr_time
+        integer_request_columns:
+        - scene_id
+        - impr_time
+        labels:
+          fst_cart: label_fst_cart
+          upid_pay: upid_fst_trgt_noc_clk_pay_24h
+          cateid_filter: cateid_is_fst_scene_sp_filter
+        request_time_column: impr_time
+        time_delta_outputs:
+          impr: impr_x_time_delta_log1p_seconds
+          clk_long: clk_long_x_time_delta_log1p_seconds
+          view_long: view_long_x_time_delta_log1p_seconds
+          cart_long: cart_long_x_time_delta_log1p_seconds
+          buy_long: buy_long_x_time_delta_log1p_seconds
+          semi_clk: semi_clk_x_time_delta_log1p_seconds
+          srch_q2i: srch_q2i_x_time_delta_log1p_seconds
+          ups_clk_sku: ups_clk_sku_x_time_delta_log1p_seconds
+          flatten_query_hash: flatten_query_hash_x_time_delta_log1p_seconds
+        time_delta_transform: log1p_seconds
+        compact_request_lists: true
+  schema_policy:
+    require_same_schema: true
+    allow_missing_nullable_columns: false
+    validate_before_train: true
+  test:
+    format: adapter_parquet
+    inputs:
+    - hdfs://temu-data-ns/apps/nothive/warehouse/searchrec/searchrec_cvr_allscene_agg_fgoutput_hour_dracarys_exp/pt=2026-07-10/hr=04
+    request_id: search_id
+    group_id: search_id
+    labels:
+      fst_cart: label_fst_cart
+      upid_pay: upid_fst_trgt_noc_clk_pay_24h
+      cateid_filter: cateid_is_fst_scene_sp_filter
+    reader:
+      engine: pyarrow_dataset
+      columns_pruning: true
+      num_workers: 8
+      prefetch_batches: 8
+      max_prefetch_bytes: 4294967296
+      scanner_batch_rows: 64
+      pin_memory: true
+      shard_unit: file
+      eager_schema_validation: sample
+      schema_validation_samples: 64
+      coalesce_pinned_tensors: true
+      device_prefetch_batches: 2
+      deduplicate_request_features: true
+      validate_prehashed_nonzero: false
+      length_bucket_metric: sum
+      length_buckets:
+      - max_length: 1024
+        batch_size: 72
+      - max_length: 2048
+        batch_size: 48
+      - max_length: 4096
+        batch_size: 32
+      - max_length: 6144
+        batch_size: 22
+      - max_length: null
+        batch_size: 16
+    adapter:
+      callable: src.dataloader:adapt_mdl_rankmixer_parquet
+      input_columns:
+      - currency_hn
+      - hash_language_site_hn
+      - language_hn
+      - page_elsn_hn
+      - page_sn_hn
+      - plat_hn
+      - region_hn
+      - scene_id_hn
+      - site_id_hn
+      - timezone_hn
+      - origin_query_hash_hn
+      - query_arr_hn
+      - query_hash_hn
+      - query_terms_hash_hn
+      - query_tfidf_term_hash_list_hn
+      - query_extend_translation_hash_hn
+      - search_method_hn
+      - sess_q2q_hash_list_hn
+      - recall_merge_cate_levels_hn
+      - recall_merge_cate1_ids_hn
+      - recall_merge_cate_ids_hn
+      - scene_clk_cnt_15d_hit_hn
+      - scene_impr_cnt_15d_hn
+      - scene_impr_cnt_15d_hit_hn
+      - uid_or_bg_hn
+      - u_fst_ordr_cnt_mix_d_hn
+      - clk_cnt_1d_hn
+      - clk_3d_cnt_hn
+      - clk_1d_cat_cnt_hn
+      - cart_cnt_1d_hn
+      - cart_cnt_3d_hn
+      - clk_7d_page_sns_hn
+      - clk_7d_page_elsns_hn
+      - cart_7d_cat1_ids_hn
+      - flip_mall_ids_hn
+      - list_clk_cat1_ids_hn
+      - list_clk_cat_ids_hn
+      - ups_in_cart_2h_sku_cur_prices_hn
+      - ups_in_cart_goods_hn_share
+      - ups_incart_cat1_id_nc_hn
+      - ups_in_cart_tg_hn
+      - ups_query_term_hash_v2_hn
+      - ups_query_tg_hn
+      - ups_search_method_hash_hn
+      - view_30m_cat1_ids_hn
+      - view_7d_page_sns_hn
+      - view_7d_page_elsns_hn
+      - cat_id_hn
+      - cat1_id_hn
+      - cat2_id_hn
+      - cat3_id_hn
+      - cat4_id_hn
+      - goods_id_hn
+      - goods_name_bigram_hn
+      - goods_ner_infos_hn
+      - goods_scene_clk_cnt_15d_hn
+      - goods_title_tfidf_term_hash_list_hn
+      - goods_avlb_sku_num_dis_hn
+      - goods_onsale_sku_num_dis_hn
+      - goods_cluster_id_1w_hn
+      - rev_ratings_cnt_crs_pos_hn
+      - g_sku_spec_hn
+      - g_sku_spec_hash_hn
+      - g_sku_spec_unit_list_hn
+      - g_prpty_val_id_list_hn
+      - sku_id_hn
+      - sku_price_v2_hn
+      - sku_sales_hn
+      - sku_spec_hash_hn
+      - sku_spec_hn
+      - sku_spec_vids_hn
+      - sku_cart_cnt_7d_hn
+      - sku_ordr_cnt_1m_hn
+      - sku_price_dis_hn
+      - sku_sales_dis_hn
+      - price_hn
+      - price_bef_coupon_hn
+      - price_after_promotion_hn
+      - price_after_promotion_div_hn
+      - mkt_prc_hn
+      - show_price_hn
+      - is_promotion_hn
+      - promotion_discount_hn
+      - auto_price_p05_dis
+      - auto_price_p10_dis_hn
+      - ori_price_hn_share
+      - sales_hn
+      - auto_sales_p10_dis
+      - c_adj_cart_cvr_15d_hn
+      - c_adj_ctr_15d_hn
+      - c_adj_ordr_cvr_15d_hn
+      - c_cart_cnt_15d_hn
+      - c_clk_cnt_15d_hn
+      - c_impr_cnt_15d_hn
+      - c_ordr_cnt_15d_hn
+      - c_simi_adj_cart_cvr_15d_hn
+      - c_simi_adj_ctr_15d_hn
+      - c_simi_cart_cnt_15d_hn
+      - c_simi_clk_cnt_15d_hn
+      - c_simi_impr_cnt_15d_hn
+      - idx_c_adj_cart_cvr_15d_hn
+      - idx_c_adj_ctr_15d_hn
+      - idx_c_adj_ordr_cvr_15d_hn
+      - idx_c_cart_cnt_15d_hn
+      - idx_c_clk_cnt_15d_hn
+      - idx_c_impr_cnt_15d_hn
+      - idx_c_ordr_cnt_15d_hn
+      - idx_c_simi_adj_cart_cvr_15d_hn
+      - idx_c_simi_adj_ctr_15d_hn
+      - idx_c_simi_cart_cnt_15d_hn
+      - idx_c_simi_clk_cnt_15d_hn
+      - idx_c_simi_impr_cnt_15d_hn
+      - scene_adj_cartcvr_15d_hn
+      - scene_adj_ctr_15d_hn
+      - scene_adj_cvr_15d_hn
+      - scene_cart_cnt_15d_hn
+      - nfk_sales_14d_hn
+      - nfk_price_14d_hn
+      - nfk_gmv_14d_hn
+      - i2i2cat2_swing_hn
+      - i2i_coclk_hn_share
+      - i2i_list_amazoni2ifullgmv_hn_share
+      - i2i_list_multimodal_hn_share
+      - i2i_list_swingv3gmv_hn_share
+      - i2i_hit_site_q2i_idx_hn
+      - only_semi_swingi2i_cut60_hn_share
+      - semi_swingi2i_cut30_hn_share
+      - offline_outside_goods_id_list_hn_share
+      - site_q2i_good_list_hn_share
+      - multimodal_i2i_hit_cart_size_hn
+      - multimodal_i2i_hit_clk_size_hn
+      - main_goods_ids_hn_share
+      - adj_cartcvr_hn
+      - adj_ctr_hn
+      - adj_cvr_hn
+      - buy_long_spec_vids_hn
+      - cart_long_spec_vids_hn
+      - create_time_hn
+      - mall_id_hn
+      - sellr_type_hn
+      - opt_id_hn
+      - site_x_asian_code_hn
+      - f_goods_view_times_tg_l1_hn
+      - target_gs_last_cart_tg_hn
+      - impr_3h_tg_hn
+      - impr_all_tg_hn
+      - impr_clk_6h_cnt_hn
+      - clk_long_goods_abs_timegap_1d_hn
+      - impr_long_goods_abs_timegap_1d_hn
+      - mid_goods_prc_list_dis
+      - mid_cmprc_diff_list_dis
+      - rel_score_hn
+      - rel_level_hn
+      - q_hit_good_correct_unigram_hn
+      - q2c_cart_15d_hit_val_hn
+      - tit_in_top_query_cnt_hn
+      - goods_query_emb32v3_cos_hn
+      - query_cat_hn
+      - query_pay_cnt_15d_hn
+      - clk_hit_i2i_idx_hn
+      - cart_hit_i2i_idx_hn
+      - cart_long_hit_samestyle_i2i_idx_hn
+      - ups_clkv2_i2i_goods_ids_hit_size
+      - ups_clkv2_i2i_goods_ids_hit_all_size
+      - us_ctr_price_dis50_hn
+      - impr_cat_clk_goods_ids_cnt_1d_hn
+      - ad_id_bin_hn
+      - campaign_id_hn
+      - idx_goods_creative_id_hn
+      - impr_x_cat1_id_hn
+      - impr_x_cat2_id_hn
+      - impr_x_cat3_id_hn
+      - impr_x_cat4_id_hn
+      - impr_x_cat_id_hn
+      - impr_x_goods_id_hn
+      - impr_x_mall_id_hn
+      - impr_x_page_sn_hn
+      - impr_x_sales_hn
+      - impr_x_price_hn
+      - impr_x_timegap_hn
+      - clk_long_x_cat1_id_hn
+      - clk_long_x_cat2_id_hn
+      - clk_long_x_cat3_id_hn
+      - clk_long_x_cat4_id_hn
+      - clk_long_x_cat_id_hn
+      - clk_long_x_goods_id_hn
+      - clk_long_x_mall_id_hn
+      - clk_long_x_page_sn_hn
+      - clk_long_x_sales_hn
+      - clk_long_x_price_hn
+      - clk_long_x_timegap_hn
+      - view_long_x_cat1_id_hn
+      - view_long_x_cat2_id_hn
+      - view_long_x_cat3_id_hn
+      - view_long_x_cat4_id_hn
+      - view_long_x_cat_id_hn
+      - view_long_x_goods_id_hn
+      - view_long_x_mall_id_hn
+      - view_long_x_page_sn_hn
+      - view_long_x_sales_hn
+      - view_long_x_price_hn
+      - view_long_x_timegap_hn
+      - view_long_x_clk_bottom_img_hn
+      - view_long_x_clk_cancel_wish_hn
+      - view_long_x_clk_carousel_hn
+      - view_long_x_clk_evaluate_hn
+      - view_long_x_clk_more_hn
+      - view_long_x_clk_svid_hn
+      - view_long_x_clk_wish_hn
+      - view_long_x_fvid_cv_hn
+      - view_long_x_fvid_ratio_hn
+      - view_long_x_vid_hn
+      - view_long_x_share_hn
+      - view_long_x_slide_bottom_detail_hn
+      - view_long_x_slide_bottom_img_hn
+      - view_long_x_slide_carousel_hn
+      - view_long_x_slide_carousel_cnt_hn
+      - view_long_x_stay_time_hn
+      - view_long_x_switch_sku_hn
+      - view_long_x_switch_sku_cnt_hn
+      - cart_long_x_cat1_id_hn
+      - cart_long_x_cat2_id_hn
+      - cart_long_x_cat3_id_hn
+      - cart_long_x_cat4_id_hn
+      - cart_long_x_cat_id_hn
+      - cart_long_x_goods_id_hn
+      - cart_long_x_mall_id_hn
+      - cart_long_x_price_hn
+      - cart_long_x_timegap_hn
+      - cart_long_x_spec_hn
+      - cart_long_x_sku_ids_hn
+      - buy_long_x_cat1_id_hn
+      - buy_long_x_cat2_id_hn
+      - buy_long_x_cat3_id_hn
+      - buy_long_x_cat4_id_hn
+      - buy_long_x_cat_id_hn
+      - buy_long_x_goods_id_hn
+      - buy_long_x_mall_id_hn
+      - buy_long_x_sales_hn
+      - buy_long_x_price_hn
+      - buy_long_x_timegap_hn
+      - buy_long_x_spec_hn
+      - buy_long_x_sku_ids_hn
+      - semi_clk_x_cat_id_hn
+      - semi_clk_x_goods_id_hn
+      - semi_clk_x_mall_id_hn
+      - semi_clk_x_page_sn_hn
+      - semi_clk_x_timegap_hn
+      - srch_q2i_x_cat1_id_hn
+      - srch_q2i_x_cat2_id_hn
+      - srch_q2i_x_cat3_id_hn
+      - srch_q2i_x_cat4_id_hn
+      - srch_q2i_x_cat_id_hn
+      - srch_q2i_x_goods_id_hn
+      - srch_q2i_x_mall_id_hn
+      - srch_q2i_x_timegap_hn
+      - ups_clk_sku_x_cat1_id_hn
+      - ups_clk_sku_x_cat2_id_hn
+      - ups_clk_sku_x_cat3_id_hn
+      - ups_clk_sku_x_cat4_id_hn
+      - ups_clk_sku_x_cat_id_hn
+      - ups_clk_sku_x_goods_id_hn
+      - ups_clk_sku_x_mall_id_hn
+      - ups_clk_sku_x_timegap_hn
+      - ups_clk_sku_x_spec_hn
+      - flatten_query_hash_x_flat_q_hash_hn
+      - flatten_query_hash_x_timegap_hn
+      - impr_x_time
+      - clk_long_x_time
+      - view_long_x_time
+      - cart_long_x_time
+      - buy_long_x_time
+      - semi_clk_x_time
+      - srch_q2i_x_time
+      - ups_clk_sku_x_time
+      - flatten_query_hash_x_time
+      - scene_id
+      - search_id
+      - impr_time
+      - label_fst_cart
+      - upid_fst_trgt_noc_clk_pay_24h
+      - cateid_is_fst_scene_sp_filter
+      optional_input_columns:
+      - context_indices
+      - target_indices
+      - impr_x_indices
+      - clk_long_x_indices
+      - view_long_x_indices
+      - cart_long_x_indices
+      - buy_long_x_indices
+      - semi_clk_x_indices
+      - srch_q2i_x_indices
+      - ups_clk_sku_x_indices
+      - flatten_query_hash_x_indices
+      options:
+        context_features:
+        - currency_hn
+        - hash_language_site_hn
+        - language_hn
+        - page_elsn_hn
+        - page_sn_hn
+        - plat_hn
+        - region_hn
+        - scene_id_hn
+        - site_id_hn
+        - timezone_hn
+        - origin_query_hash_hn
+        - query_arr_hn
+        - query_hash_hn
+        - query_terms_hash_hn
+        - query_tfidf_term_hash_list_hn
+        - query_extend_translation_hash_hn
+        - search_method_hn
+        - sess_q2q_hash_list_hn
+        - recall_merge_cate_levels_hn
+        - recall_merge_cate1_ids_hn
+        - recall_merge_cate_ids_hn
+        - scene_clk_cnt_15d_hit_hn
+        - scene_impr_cnt_15d_hn
+        - scene_impr_cnt_15d_hit_hn
+        - uid_or_bg_hn
+        - u_fst_ordr_cnt_mix_d_hn
+        - clk_cnt_1d_hn
+        - clk_3d_cnt_hn
+        - clk_1d_cat_cnt_hn
+        - cart_cnt_1d_hn
+        - cart_cnt_3d_hn
+        - clk_7d_page_sns_hn
+        - clk_7d_page_elsns_hn
+        - cart_7d_cat1_ids_hn
+        - flip_mall_ids_hn
+        - list_clk_cat1_ids_hn
+        - list_clk_cat_ids_hn
+        - ups_in_cart_2h_sku_cur_prices_hn
+        - ups_in_cart_goods_hn_share
+        - ups_incart_cat1_id_nc_hn
+        - ups_in_cart_tg_hn
+        - ups_query_term_hash_v2_hn
+        - ups_query_tg_hn
+        - ups_search_method_hash_hn
+        - view_30m_cat1_ids_hn
+        - view_7d_page_sns_hn
+        - view_7d_page_elsns_hn
+        item_features:
+        - cat_id_hn
+        - cat1_id_hn
+        - cat2_id_hn
+        - cat3_id_hn
+        - cat4_id_hn
+        - goods_id_hn
+        - goods_name_bigram_hn
+        - goods_ner_infos_hn
+        - goods_scene_clk_cnt_15d_hn
+        - goods_title_tfidf_term_hash_list_hn
+        - goods_avlb_sku_num_dis_hn
+        - goods_onsale_sku_num_dis_hn
+        - goods_cluster_id_1w_hn
+        - rev_ratings_cnt_crs_pos_hn
+        - g_sku_spec_hn
+        - g_sku_spec_hash_hn
+        - g_sku_spec_unit_list_hn
+        - g_prpty_val_id_list_hn
+        - sku_id_hn
+        - sku_price_v2_hn
+        - sku_sales_hn
+        - sku_spec_hash_hn
+        - sku_spec_hn
+        - sku_spec_vids_hn
+        - sku_cart_cnt_7d_hn
+        - sku_ordr_cnt_1m_hn
+        - sku_price_dis_hn
+        - sku_sales_dis_hn
+        - price_hn
+        - price_bef_coupon_hn
+        - price_after_promotion_hn
+        - price_after_promotion_div_hn
+        - mkt_prc_hn
+        - show_price_hn
+        - is_promotion_hn
+        - promotion_discount_hn
+        - auto_price_p05_dis
+        - auto_price_p10_dis_hn
+        - ori_price_hn_share
+        - sales_hn
+        - auto_sales_p10_dis
+        - c_adj_cart_cvr_15d_hn
+        - c_adj_ctr_15d_hn
+        - c_adj_ordr_cvr_15d_hn
+        - c_cart_cnt_15d_hn
+        - c_clk_cnt_15d_hn
+        - c_impr_cnt_15d_hn
+        - c_ordr_cnt_15d_hn
+        - c_simi_adj_cart_cvr_15d_hn
+        - c_simi_adj_ctr_15d_hn
+        - c_simi_cart_cnt_15d_hn
+        - c_simi_clk_cnt_15d_hn
+        - c_simi_impr_cnt_15d_hn
+        - idx_c_adj_cart_cvr_15d_hn
+        - idx_c_adj_ctr_15d_hn
+        - idx_c_adj_ordr_cvr_15d_hn
+        - idx_c_cart_cnt_15d_hn
+        - idx_c_clk_cnt_15d_hn
+        - idx_c_impr_cnt_15d_hn
+        - idx_c_ordr_cnt_15d_hn
+        - idx_c_simi_adj_cart_cvr_15d_hn
+        - idx_c_simi_adj_ctr_15d_hn
+        - idx_c_simi_cart_cnt_15d_hn
+        - idx_c_simi_clk_cnt_15d_hn
+        - idx_c_simi_impr_cnt_15d_hn
+        - scene_adj_cartcvr_15d_hn
+        - scene_adj_ctr_15d_hn
+        - scene_adj_cvr_15d_hn
+        - scene_cart_cnt_15d_hn
+        - nfk_sales_14d_hn
+        - nfk_price_14d_hn
+        - nfk_gmv_14d_hn
+        - i2i2cat2_swing_hn
+        - i2i_coclk_hn_share
+        - i2i_list_amazoni2ifullgmv_hn_share
+        - i2i_list_multimodal_hn_share
+        - i2i_list_swingv3gmv_hn_share
+        - i2i_hit_site_q2i_idx_hn
+        - only_semi_swingi2i_cut60_hn_share
+        - semi_swingi2i_cut30_hn_share
+        - offline_outside_goods_id_list_hn_share
+        - site_q2i_good_list_hn_share
+        - multimodal_i2i_hit_cart_size_hn
+        - multimodal_i2i_hit_clk_size_hn
+        - main_goods_ids_hn_share
+        - adj_cartcvr_hn
+        - adj_ctr_hn
+        - adj_cvr_hn
+        - buy_long_spec_vids_hn
+        - cart_long_spec_vids_hn
+        - create_time_hn
+        - mall_id_hn
+        - sellr_type_hn
+        - opt_id_hn
+        - site_x_asian_code_hn
+        - f_goods_view_times_tg_l1_hn
+        - target_gs_last_cart_tg_hn
+        - impr_3h_tg_hn
+        - impr_all_tg_hn
+        - impr_clk_6h_cnt_hn
+        - clk_long_goods_abs_timegap_1d_hn
+        - impr_long_goods_abs_timegap_1d_hn
+        - mid_goods_prc_list_dis
+        - mid_cmprc_diff_list_dis
+        - rel_score_hn
+        - rel_level_hn
+        - q_hit_good_correct_unigram_hn
+        - q2c_cart_15d_hit_val_hn
+        - tit_in_top_query_cnt_hn
+        - goods_query_emb32v3_cos_hn
+        - query_cat_hn
+        - query_pay_cnt_15d_hn
+        - clk_hit_i2i_idx_hn
+        - cart_hit_i2i_idx_hn
+        - cart_long_hit_samestyle_i2i_idx_hn
+        - ups_clkv2_i2i_goods_ids_hit_size
+        - ups_clkv2_i2i_goods_ids_hit_all_size
+        - us_ctr_price_dis50_hn
+        - impr_cat_clk_goods_ids_cnt_1d_hn
+        - ad_id_bin_hn
+        - campaign_id_hn
+        - idx_goods_creative_id_hn
+        multivalue_features:
+        - origin_query_hash_hn
+        - query_arr_hn
+        - query_hash_hn
+        - query_terms_hash_hn
+        - query_tfidf_term_hash_list_hn
+        - query_extend_translation_hash_hn
+        - sess_q2q_hash_list_hn
+        - recall_merge_cate_levels_hn
+        - recall_merge_cate1_ids_hn
+        - recall_merge_cate_ids_hn
+        - scene_impr_cnt_15d_hn
+        - u_fst_ordr_cnt_mix_d_hn
+        - clk_cnt_1d_hn
+        - clk_3d_cnt_hn
+        - clk_1d_cat_cnt_hn
+        - cart_cnt_1d_hn
+        - cart_cnt_3d_hn
+        - clk_7d_page_sns_hn
+        - clk_7d_page_elsns_hn
+        - cart_7d_cat1_ids_hn
+        - flip_mall_ids_hn
+        - list_clk_cat1_ids_hn
+        - list_clk_cat_ids_hn
+        - ups_in_cart_2h_sku_cur_prices_hn
+        - ups_in_cart_goods_hn_share
+        - ups_incart_cat1_id_nc_hn
+        - ups_in_cart_tg_hn
+        - ups_query_term_hash_v2_hn
+        - ups_query_tg_hn
+        - ups_search_method_hash_hn
+        - view_30m_cat1_ids_hn
+        - view_7d_page_sns_hn
+        - view_7d_page_elsns_hn
+        - goods_name_bigram_hn
+        - goods_ner_infos_hn
+        - goods_title_tfidf_term_hash_list_hn
+        - rev_ratings_cnt_crs_pos_hn
+        - g_sku_spec_hn
+        - g_sku_spec_hash_hn
+        - g_sku_spec_unit_list_hn
+        - g_prpty_val_id_list_hn
+        - sku_id_hn
+        - sku_price_v2_hn
+        - sku_sales_hn
+        - sku_spec_hash_hn
+        - sku_spec_hn
+        - sku_cart_cnt_7d_hn
+        - sku_ordr_cnt_1m_hn
+        - sku_price_dis_hn
+        - sku_sales_dis_hn
+        aligned_multivalue_groups:
+        - - sku_id_hn
+          - sku_price_v2_hn
+          - sku_sales_hn
+          - sku_spec_hash_hn
+          - sku_spec_hn
+          - sku_cart_cnt_7d_hn
+          - sku_ordr_cnt_1m_hn
+          - sku_price_dis_hn
+          - sku_sales_dis_hn
+        ups_types:
+        - impr
+        - clk_long
+        - view_long
+        - cart_long
+        - buy_long
+        - semi_clk
+        - srch_q2i
+        - ups_clk_sku
+        - flatten_query_hash
+        request_columns:
+        - scene_id
+        - search_id
+        - impr_time
+        integer_request_columns:
+        - scene_id
+        - impr_time
+        labels:
+          fst_cart: label_fst_cart
+          upid_pay: upid_fst_trgt_noc_clk_pay_24h
+          cateid_filter: cateid_is_fst_scene_sp_filter
+        request_time_column: impr_time
+        time_delta_outputs:
+          impr: impr_x_time_delta_log1p_seconds
+          clk_long: clk_long_x_time_delta_log1p_seconds
+          view_long: view_long_x_time_delta_log1p_seconds
+          cart_long: cart_long_x_time_delta_log1p_seconds
+          buy_long: buy_long_x_time_delta_log1p_seconds
+          semi_clk: semi_clk_x_time_delta_log1p_seconds
+          srch_q2i: srch_q2i_x_time_delta_log1p_seconds
+          ups_clk_sku: ups_clk_sku_x_time_delta_log1p_seconds
+          flatten_query_hash: flatten_query_hash_x_time_delta_log1p_seconds
+        time_delta_transform: log1p_seconds
+        compact_request_lists: true
+features:
+- name: currency_hn
+  kind: categorical
+  source: currency_hn
+  embedding_scope: feature
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 128
+    padding_id: 0
+- name: hash_language_site_hn
+  kind: categorical
+  source: hash_language_site_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: language_hn
+  kind: categorical
+  source: language_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 512
+    padding_id: 0
+- name: page_elsn_hn
+  kind: categorical
+  source: page_elsn_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: page_sn_hn
+  kind: categorical
+  source: page_sn_hn
+  embedding_scope: feature
+  embedding_dim: 24
+  encoding:
+    type: pre_hashed
+    num_buckets: 8192
+    padding_id: 0
+- name: plat_hn
+  kind: categorical
+  source: plat_hn
+  embedding_scope: feature
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 64
+    padding_id: 0
+- name: region_hn
+  kind: categorical
+  source: region_hn
+  embedding_scope: feature
+  embedding_dim: 24
+  encoding:
+    type: pre_hashed
+    num_buckets: 8192
+    padding_id: 0
+- name: scene_id_hn
+  kind: categorical
+  source: scene_id_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 1024
+    padding_id: 0
+- name: site_id_hn
+  kind: categorical
+  source: site_id_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 1024
+    padding_id: 0
+- name: timezone_hn
+  kind: categorical
+  source: timezone_hn
+  embedding_scope: feature
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+- name: origin_query_hash_hn
+  kind: categorical
+  source: origin_query_hash_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 33554432
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: query_arr_hn
+  kind: categorical
+  source: query_arr_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 16777216
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: query_hash_hn
+  kind: categorical
+  source: query_hash_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 33554432
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: query_terms_hash_hn
+  kind: categorical
+  source: query_terms_hash_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 8388608
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: query_tfidf_term_hash_list_hn
+  kind: categorical
+  source: query_tfidf_term_hash_list_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 8388608
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: query_extend_translation_hash_hn
+  kind: categorical
+  source: query_extend_translation_hash_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: search_method_hn
+  kind: categorical
+  source: search_method_hn
+  embedding_scope: feature
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+- name: sess_q2q_hash_list_hn
+  kind: categorical
+  source: sess_q2q_hash_list_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 8388608
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 64
+  truncation: head
+- name: recall_merge_cate_levels_hn
+  kind: categorical
+  source: recall_merge_cate_levels_hn
+  embedding_scope: feature
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 256
+  truncation: head
+- name: recall_merge_cate1_ids_hn
+  kind: categorical
+  source: recall_merge_cate1_ids_hn
+  embedding_scope: feature
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 256
+  truncation: head
+- name: recall_merge_cate_ids_hn
+  kind: categorical
+  source: recall_merge_cate_ids_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 256
+  truncation: head
+- name: scene_clk_cnt_15d_hit_hn
+  kind: categorical
+  source: scene_clk_cnt_15d_hit_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: scene_impr_cnt_15d_hn
+  kind: categorical
+  source: scene_impr_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: scene_impr_cnt_15d_hit_hn
+  kind: categorical
+  source: scene_impr_cnt_15d_hit_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: uid_or_bg_hn
+  kind: categorical
+  source: uid_or_bg_hn
+  embedding_scope: feature
+  embedding_dim: 64
+  encoding:
+    type: pre_hashed
+    num_buckets: 67108864
+    padding_id: 0
+- name: u_fst_ordr_cnt_mix_d_hn
+  kind: categorical
+  source: u_fst_ordr_cnt_mix_d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: clk_cnt_1d_hn
+  kind: categorical
+  source: clk_cnt_1d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: clk_3d_cnt_hn
+  kind: categorical
+  source: clk_3d_cnt_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: clk_1d_cat_cnt_hn
+  kind: categorical
+  source: clk_1d_cat_cnt_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: cart_cnt_1d_hn
+  kind: categorical
+  source: cart_cnt_1d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: cart_cnt_3d_hn
+  kind: categorical
+  source: cart_cnt_3d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: clk_7d_page_sns_hn
+  kind: categorical
+  source: clk_7d_page_sns_hn
+  embedding_scope: feature
+  embedding_dim: 24
+  encoding:
+    type: pre_hashed
+    num_buckets: 8192
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 512
+  truncation: head
+- name: clk_7d_page_elsns_hn
+  kind: categorical
+  source: clk_7d_page_elsns_hn
+  embedding_scope: feature
+  embedding_dim: 24
+  encoding:
+    type: pre_hashed
+    num_buckets: 8192
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 512
+  truncation: head
+- name: cart_7d_cat1_ids_hn
+  kind: categorical
+  source: cart_7d_cat1_ids_hn
+  embedding_scope: feature
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 256
+  truncation: head
+- name: flip_mall_ids_hn
+  kind: categorical
+  source: flip_mall_ids_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 4194304
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 512
+  truncation: head
+- name: list_clk_cat1_ids_hn
+  kind: categorical
+  source: list_clk_cat1_ids_hn
+  embedding_scope: feature
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 64
+  truncation: head
+- name: list_clk_cat_ids_hn
+  kind: categorical
+  source: list_clk_cat_ids_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 64
+  truncation: head
+- name: ups_in_cart_2h_sku_cur_prices_hn
+  kind: categorical
+  source: ups_in_cart_2h_sku_cur_prices_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 200
+  truncation: head
+- name: ups_in_cart_goods_hn_share
+  kind: categorical
+  source: ups_in_cart_goods_hn_share
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 16777216
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 256
+  truncation: head
+- name: ups_incart_cat1_id_nc_hn
+  kind: categorical
+  source: ups_incart_cat1_id_nc_hn
+  embedding_scope: feature
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 200
+  truncation: head
+- name: ups_in_cart_tg_hn
+  kind: categorical
+  source: ups_in_cart_tg_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 256
+  truncation: head
+- name: ups_query_term_hash_v2_hn
+  kind: categorical
+  source: ups_query_term_hash_v2_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 8388608
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 200
+  truncation: head
+- name: ups_query_tg_hn
+  kind: categorical
+  source: ups_query_tg_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 200
+  truncation: head
+- name: ups_search_method_hash_hn
+  kind: categorical
+  source: ups_search_method_hash_hn
+  embedding_scope: feature
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 200
+  truncation: head
+- name: view_30m_cat1_ids_hn
+  kind: categorical
+  source: view_30m_cat1_ids_hn
+  embedding_scope: feature
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 128
+  truncation: head
+- name: view_7d_page_sns_hn
+  kind: categorical
+  source: view_7d_page_sns_hn
+  embedding_scope: feature
+  embedding_dim: 24
+  encoding:
+    type: pre_hashed
+    num_buckets: 8192
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 512
+  truncation: head
+- name: view_7d_page_elsns_hn
+  kind: categorical
+  source: view_7d_page_elsns_hn
+  embedding_scope: feature
+  embedding_dim: 24
+  encoding:
+    type: pre_hashed
+    num_buckets: 8192
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 512
+  truncation: head
+- name: cat_id_hn
+  kind: categorical
+  source: cat_id_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+- name: cat1_id_hn
+  kind: categorical
+  source: cat1_id_hn
+  embedding_scope: feature
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+- name: cat2_id_hn
+  kind: categorical
+  source: cat2_id_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: cat3_id_hn
+  kind: categorical
+  source: cat3_id_hn
+  embedding_scope: feature
+  embedding_dim: 24
+  encoding:
+    type: pre_hashed
+    num_buckets: 32768
+    padding_id: 0
+- name: cat4_id_hn
+  kind: categorical
+  source: cat4_id_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 131072
+    padding_id: 0
+- name: goods_id_hn
+  kind: categorical
+  source: goods_id_hn
+  embedding_scope: feature
+  embedding_dim: 64
+  encoding:
+    type: pre_hashed
+    num_buckets: 134217728
+    padding_id: 0
+- name: goods_name_bigram_hn
+  kind: categorical
+  source: goods_name_bigram_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 4194304
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 64
+  truncation: head
+- name: goods_ner_infos_hn
+  kind: categorical
+  source: goods_ner_infos_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 1048576
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: goods_scene_clk_cnt_15d_hn
+  kind: categorical
+  source: goods_scene_clk_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: goods_title_tfidf_term_hash_list_hn
+  kind: categorical
+  source: goods_title_tfidf_term_hash_list_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 8388608
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: goods_avlb_sku_num_dis_hn
+  kind: categorical
+  source: goods_avlb_sku_num_dis_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: goods_onsale_sku_num_dis_hn
+  kind: categorical
+  source: goods_onsale_sku_num_dis_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: goods_cluster_id_1w_hn
+  kind: categorical
+  source: goods_cluster_id_1w_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 4194304
+    padding_id: 0
+- name: rev_ratings_cnt_crs_pos_hn
+  kind: categorical
+  source: rev_ratings_cnt_crs_pos_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 8
+  truncation: head
+- name: g_sku_spec_hn
+  kind: categorical
+  source: g_sku_spec_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 8388608
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: g_sku_spec_hash_hn
+  kind: categorical
+  source: g_sku_spec_hash_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 8388608
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: g_sku_spec_unit_list_hn
+  kind: categorical
+  source: g_sku_spec_unit_list_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 8388608
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
+- name: g_prpty_val_id_list_hn
+  kind: categorical
+  source: g_prpty_val_id_list_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 4194304
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 48
+  truncation: head
+- name: sku_id_hn
+  kind: categorical
+  source: sku_id_hn
+  embedding_scope: feature
+  embedding_dim: 64
+  encoding:
+    type: pre_hashed
+    num_buckets: 67108864
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: include_as_padding
+  max_length: 128
+  truncation: head
+- name: sku_price_v2_hn
+  kind: categorical
+  source: sku_price_v2_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: include_as_padding
+  max_length: 128
+  truncation: head
+- name: sku_sales_hn
+  kind: categorical
+  source: sku_sales_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: include_as_padding
+  max_length: 128
+  truncation: head
+- name: sku_spec_hash_hn
+  kind: categorical
+  source: sku_spec_hash_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 8388608
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: include_as_padding
+  max_length: 128
+  truncation: head
+- name: sku_spec_hn
+  kind: categorical
+  source: sku_spec_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 8388608
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: include_as_padding
+  max_length: 128
+  truncation: head
+- name: sku_spec_vids_hn
+  kind: categorical
+  source: sku_spec_vids_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 8388608
+    padding_id: 0
+- name: sku_cart_cnt_7d_hn
+  kind: categorical
+  source: sku_cart_cnt_7d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: include_as_padding
+  max_length: 128
+  truncation: head
+- name: sku_ordr_cnt_1m_hn
+  kind: categorical
+  source: sku_ordr_cnt_1m_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: include_as_padding
+  max_length: 128
+  truncation: head
+- name: sku_price_dis_hn
+  kind: categorical
+  source: sku_price_dis_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: include_as_padding
+  max_length: 128
+  truncation: head
+- name: sku_sales_dis_hn
+  kind: categorical
+  source: sku_sales_dis_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: include_as_padding
+  max_length: 128
+  truncation: head
+- name: price_hn
+  kind: categorical
+  source: price_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: price_bef_coupon_hn
+  kind: categorical
+  source: price_bef_coupon_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: price_after_promotion_hn
+  kind: categorical
+  source: price_after_promotion_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: price_after_promotion_div_hn
+  kind: categorical
+  source: price_after_promotion_div_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: mkt_prc_hn
+  kind: categorical
+  source: mkt_prc_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: show_price_hn
+  kind: categorical
+  source: show_price_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: is_promotion_hn
+  kind: categorical
+  source: is_promotion_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 16
+    padding_id: 0
+- name: promotion_discount_hn
+  kind: categorical
+  source: promotion_discount_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: auto_price_p05_dis
+  kind: categorical
+  source: auto_price_p05_dis
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: auto_price_p10_dis_hn
+  kind: categorical
+  source: auto_price_p10_dis_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: ori_price_hn_share
+  kind: categorical
+  source: ori_price_hn_share
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: sales_hn
+  kind: categorical
+  source: sales_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: auto_sales_p10_dis
+  kind: categorical
+  source: auto_sales_p10_dis
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: c_adj_cart_cvr_15d_hn
+  kind: categorical
+  source: c_adj_cart_cvr_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: c_adj_ctr_15d_hn
+  kind: categorical
+  source: c_adj_ctr_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: c_adj_ordr_cvr_15d_hn
+  kind: categorical
+  source: c_adj_ordr_cvr_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: c_cart_cnt_15d_hn
+  kind: categorical
+  source: c_cart_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: c_clk_cnt_15d_hn
+  kind: categorical
+  source: c_clk_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: c_impr_cnt_15d_hn
+  kind: categorical
+  source: c_impr_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: c_ordr_cnt_15d_hn
+  kind: categorical
+  source: c_ordr_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: c_simi_adj_cart_cvr_15d_hn
+  kind: categorical
+  source: c_simi_adj_cart_cvr_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: c_simi_adj_ctr_15d_hn
+  kind: categorical
+  source: c_simi_adj_ctr_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: c_simi_cart_cnt_15d_hn
+  kind: categorical
+  source: c_simi_cart_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: c_simi_clk_cnt_15d_hn
+  kind: categorical
+  source: c_simi_clk_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: c_simi_impr_cnt_15d_hn
+  kind: categorical
+  source: c_simi_impr_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: idx_c_adj_cart_cvr_15d_hn
+  kind: categorical
+  source: idx_c_adj_cart_cvr_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: idx_c_adj_ctr_15d_hn
+  kind: categorical
+  source: idx_c_adj_ctr_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: idx_c_adj_ordr_cvr_15d_hn
+  kind: categorical
+  source: idx_c_adj_ordr_cvr_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: idx_c_cart_cnt_15d_hn
+  kind: categorical
+  source: idx_c_cart_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: idx_c_clk_cnt_15d_hn
+  kind: categorical
+  source: idx_c_clk_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: idx_c_impr_cnt_15d_hn
+  kind: categorical
+  source: idx_c_impr_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: idx_c_ordr_cnt_15d_hn
+  kind: categorical
+  source: idx_c_ordr_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: idx_c_simi_adj_cart_cvr_15d_hn
+  kind: categorical
+  source: idx_c_simi_adj_cart_cvr_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: idx_c_simi_adj_ctr_15d_hn
+  kind: categorical
+  source: idx_c_simi_adj_ctr_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: idx_c_simi_cart_cnt_15d_hn
+  kind: categorical
+  source: idx_c_simi_cart_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: idx_c_simi_clk_cnt_15d_hn
+  kind: categorical
+  source: idx_c_simi_clk_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: idx_c_simi_impr_cnt_15d_hn
+  kind: categorical
+  source: idx_c_simi_impr_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: scene_adj_cartcvr_15d_hn
+  kind: categorical
+  source: scene_adj_cartcvr_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: scene_adj_ctr_15d_hn
+  kind: categorical
+  source: scene_adj_ctr_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: scene_adj_cvr_15d_hn
+  kind: categorical
+  source: scene_adj_cvr_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: scene_cart_cnt_15d_hn
+  kind: categorical
+  source: scene_cart_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: nfk_sales_14d_hn
+  kind: categorical
+  source: nfk_sales_14d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: nfk_price_14d_hn
+  kind: categorical
+  source: nfk_price_14d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: nfk_gmv_14d_hn
+  kind: categorical
+  source: nfk_gmv_14d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: i2i2cat2_swing_hn
+  kind: categorical
+  source: i2i2cat2_swing_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+- name: i2i_coclk_hn_share
+  kind: categorical
+  source: i2i_coclk_hn_share
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+- name: i2i_list_amazoni2ifullgmv_hn_share
+  kind: categorical
+  source: i2i_list_amazoni2ifullgmv_hn_share
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: i2i_list_multimodal_hn_share
+  kind: categorical
+  source: i2i_list_multimodal_hn_share
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+- name: i2i_list_swingv3gmv_hn_share
+  kind: categorical
+  source: i2i_list_swingv3gmv_hn_share
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: i2i_hit_site_q2i_idx_hn
+  kind: categorical
+  source: i2i_hit_site_q2i_idx_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: only_semi_swingi2i_cut60_hn_share
+  kind: categorical
+  source: only_semi_swingi2i_cut60_hn_share
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+- name: semi_swingi2i_cut30_hn_share
+  kind: categorical
+  source: semi_swingi2i_cut30_hn_share
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+- name: offline_outside_goods_id_list_hn_share
+  kind: categorical
+  source: offline_outside_goods_id_list_hn_share
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 16777216
+    padding_id: 0
+- name: site_q2i_good_list_hn_share
+  kind: categorical
+  source: site_q2i_good_list_hn_share
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+- name: multimodal_i2i_hit_cart_size_hn
+  kind: categorical
+  source: multimodal_i2i_hit_cart_size_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: multimodal_i2i_hit_clk_size_hn
+  kind: categorical
+  source: multimodal_i2i_hit_clk_size_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: main_goods_ids_hn_share
+  kind: categorical
+  source: main_goods_ids_hn_share
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 16777216
+    padding_id: 0
+- name: adj_cartcvr_hn
+  kind: categorical
+  source: adj_cartcvr_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: adj_ctr_hn
+  kind: categorical
+  source: adj_ctr_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: adj_cvr_hn
+  kind: categorical
+  source: adj_cvr_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: buy_long_spec_vids_hn
+  kind: categorical
+  source: buy_long_spec_vids_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 8388608
+    padding_id: 0
+- name: cart_long_spec_vids_hn
+  kind: categorical
+  source: cart_long_spec_vids_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 8388608
+    padding_id: 0
+- name: create_time_hn
+  kind: categorical
+  source: create_time_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: mall_id_hn
+  kind: categorical
+  source: mall_id_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 4194304
+    padding_id: 0
+- name: sellr_type_hn
+  kind: categorical
+  source: sellr_type_hn
+  embedding_scope: feature
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+- name: opt_id_hn
+  kind: categorical
+  source: opt_id_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+- name: site_x_asian_code_hn
+  kind: categorical
+  source: site_x_asian_code_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+- name: f_goods_view_times_tg_l1_hn
+  kind: categorical
+  source: f_goods_view_times_tg_l1_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: target_gs_last_cart_tg_hn
+  kind: categorical
+  source: target_gs_last_cart_tg_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+- name: impr_3h_tg_hn
+  kind: categorical
+  source: impr_3h_tg_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+- name: impr_all_tg_hn
+  kind: categorical
+  source: impr_all_tg_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+- name: impr_clk_6h_cnt_hn
+  kind: categorical
+  source: impr_clk_6h_cnt_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: clk_long_goods_abs_timegap_1d_hn
+  kind: categorical
+  source: clk_long_goods_abs_timegap_1d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: impr_long_goods_abs_timegap_1d_hn
+  kind: categorical
+  source: impr_long_goods_abs_timegap_1d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: mid_goods_prc_list_dis
+  kind: categorical
+  source: mid_goods_prc_list_dis
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: mid_cmprc_diff_list_dis
+  kind: categorical
+  source: mid_cmprc_diff_list_dis
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: rel_score_hn
+  kind: categorical
+  source: rel_score_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: rel_level_hn
+  kind: categorical
+  source: rel_level_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: q_hit_good_correct_unigram_hn
+  kind: categorical
+  source: q_hit_good_correct_unigram_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: q2c_cart_15d_hit_val_hn
+  kind: categorical
+  source: q2c_cart_15d_hit_val_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: tit_in_top_query_cnt_hn
+  kind: categorical
+  source: tit_in_top_query_cnt_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: goods_query_emb32v3_cos_hn
+  kind: categorical
+  source: goods_query_emb32v3_cos_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+- name: query_cat_hn
+  kind: categorical
+  source: query_cat_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 262144
+    padding_id: 0
+- name: query_pay_cnt_15d_hn
+  kind: categorical
+  source: query_pay_cnt_15d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: clk_hit_i2i_idx_hn
+  kind: categorical
+  source: clk_hit_i2i_idx_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: cart_hit_i2i_idx_hn
+  kind: categorical
+  source: cart_hit_i2i_idx_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: cart_long_hit_samestyle_i2i_idx_hn
+  kind: categorical
+  source: cart_long_hit_samestyle_i2i_idx_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: ups_clkv2_i2i_goods_ids_hit_size
+  kind: categorical
+  source: ups_clkv2_i2i_goods_ids_hit_size
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: ups_clkv2_i2i_goods_ids_hit_all_size
+  kind: categorical
+  source: ups_clkv2_i2i_goods_ids_hit_all_size
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: us_ctr_price_dis50_hn
+  kind: categorical
+  source: us_ctr_price_dis50_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: impr_cat_clk_goods_ids_cnt_1d_hn
+  kind: categorical
+  source: impr_cat_clk_goods_ids_cnt_1d_hn
+  embedding_scope: feature
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: ad_id_bin_hn
+  kind: categorical
+  source: ad_id_bin_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 16777216
+    padding_id: 0
+- name: campaign_id_hn
+  kind: categorical
+  source: campaign_id_hn
+  embedding_scope: feature
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 4194304
+    padding_id: 0
+- name: idx_goods_creative_id_hn
+  kind: categorical
+  source: idx_goods_creative_id_hn
+  embedding_scope: feature
+  embedding_dim: 48
+  encoding:
+    type: pre_hashed
+    num_buckets: 16777216
+    padding_id: 0
+- name: scenario_important_currency_hn
+  kind: categorical
+  source: currency_hn
+  embedding_scope: scenario
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 128
+    padding_id: 0
+- name: scenario_important_hash_language_site_hn
+  kind: categorical
+  source: hash_language_site_hn
+  embedding_scope: scenario
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: scenario_important_language_hn
+  kind: categorical
+  source: language_hn
+  embedding_scope: scenario
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 512
+    padding_id: 0
+- name: scenario_important_page_elsn_hn
+  kind: categorical
+  source: page_elsn_hn
+  embedding_scope: scenario
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: scenario_important_page_sn_hn
+  kind: categorical
+  source: page_sn_hn
+  embedding_scope: scenario
+  embedding_dim: 24
+  encoding:
+    type: pre_hashed
+    num_buckets: 8192
+    padding_id: 0
+- name: scenario_prior_scene_id_hn
+  kind: categorical
+  source: scene_id_hn
+  embedding_scope: scenario
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 1024
+    padding_id: 0
+- name: task_important_currency_hn
+  kind: categorical
+  source: currency_hn
+  embedding_scope: task
+  embedding_dim: 8
+  encoding:
+    type: pre_hashed
+    num_buckets: 128
+    padding_id: 0
+- name: task_important_hash_language_site_hn
+  kind: categorical
+  source: hash_language_site_hn
+  embedding_scope: task
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 4096
+    padding_id: 0
+- name: task_important_language_hn
+  kind: categorical
+  source: language_hn
+  embedding_scope: task
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 512
+    padding_id: 0
+sequences:
+- name: impr
+  embedding_scope: feature
+  max_length: 1024
+  truncation: head
+  sequence_order: newest_to_oldest
+  encoder: longer
+  time_delta_field: time_delta_log1p_seconds
+  fields:
+  - name: time_delta_log1p_seconds
+    kind: dense
+    source: impr_x_time_delta_log1p_seconds
+    dimension: 1
+  - name: cat1_id_hn
+    kind: categorical
+    source: impr_x_cat1_id_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 256
+      padding_id: 0
+      share_with: cat1_id_hn
+      share_embedding: true
+  - name: cat2_id_hn
+    kind: categorical
+    source: impr_x_cat2_id_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: cat2_id_hn
+      share_embedding: true
+  - name: cat3_id_hn
+    kind: categorical
+    source: impr_x_cat3_id_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 32768
+      padding_id: 0
+      share_with: cat3_id_hn
+      share_embedding: true
+  - name: cat4_id_hn
+    kind: categorical
+    source: impr_x_cat4_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 131072
+      padding_id: 0
+      share_with: cat4_id_hn
+      share_embedding: true
+  - name: cat_id_hn
+    kind: categorical
+    source: impr_x_cat_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+      share_with: cat_id_hn
+      share_embedding: true
+  - name: goods_id_hn
+    kind: categorical
+    source: impr_x_goods_id_hn
+    embedding_dim: 64
+    encoding:
+      type: pre_hashed
+      num_buckets: 134217728
+      padding_id: 0
+      share_with: goods_id_hn
+      share_embedding: true
+  - name: mall_id_hn
+    kind: categorical
+    source: impr_x_mall_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 4194304
+      padding_id: 0
+      share_with: mall_id_hn
+      share_embedding: true
+  - name: page_sn_hn
+    kind: categorical
+    source: impr_x_page_sn_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 8192
+      padding_id: 0
+      share_with: page_sn_hn
+      share_embedding: true
+  - name: sales_hn
+    kind: categorical
+    source: impr_x_sales_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: sales_hn
+      share_embedding: true
+  - name: price_hn
+    kind: categorical
+    source: impr_x_price_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: price_hn
+      share_embedding: true
+  - name: timegap_hn
+    kind: categorical
+    source: impr_x_timegap_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+  target_inputs: []
+  rankmixer_summary_tokens: 1
+  longer_query_tokens: 32
+  longer_self_layers: 1
+  longer_token_merge: 1
+  longer_inner_layers: 0
+  longer_output: summary
+  longer_user_global_inputs: []
+  longer_user_global_tokens: 0
+  longer_cls_tokens: 1
+  longer_candidate_global_tokens: 0
+- name: clk_long
+  embedding_scope: feature
+  max_length: 2048
+  truncation: head
+  sequence_order: newest_to_oldest
+  encoder: longer
+  time_delta_field: time_delta_log1p_seconds
+  fields:
+  - name: time_delta_log1p_seconds
+    kind: dense
+    source: clk_long_x_time_delta_log1p_seconds
+    dimension: 1
+  - name: cat1_id_hn
+    kind: categorical
+    source: clk_long_x_cat1_id_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 256
+      padding_id: 0
+      share_with: cat1_id_hn
+      share_embedding: true
+  - name: cat2_id_hn
+    kind: categorical
+    source: clk_long_x_cat2_id_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: cat2_id_hn
+      share_embedding: true
+  - name: cat3_id_hn
+    kind: categorical
+    source: clk_long_x_cat3_id_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 32768
+      padding_id: 0
+      share_with: cat3_id_hn
+      share_embedding: true
+  - name: cat4_id_hn
+    kind: categorical
+    source: clk_long_x_cat4_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 131072
+      padding_id: 0
+      share_with: cat4_id_hn
+      share_embedding: true
+  - name: cat_id_hn
+    kind: categorical
+    source: clk_long_x_cat_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+      share_with: cat_id_hn
+      share_embedding: true
+  - name: goods_id_hn
+    kind: categorical
+    source: clk_long_x_goods_id_hn
+    embedding_dim: 64
+    encoding:
+      type: pre_hashed
+      num_buckets: 134217728
+      padding_id: 0
+      share_with: goods_id_hn
+      share_embedding: true
+  - name: mall_id_hn
+    kind: categorical
+    source: clk_long_x_mall_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 4194304
+      padding_id: 0
+      share_with: mall_id_hn
+      share_embedding: true
+  - name: page_sn_hn
+    kind: categorical
+    source: clk_long_x_page_sn_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 8192
+      padding_id: 0
+      share_with: page_sn_hn
+      share_embedding: true
+  - name: sales_hn
+    kind: categorical
+    source: clk_long_x_sales_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: sales_hn
+      share_embedding: true
+  - name: price_hn
+    kind: categorical
+    source: clk_long_x_price_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: price_hn
+      share_embedding: true
+  - name: timegap_hn
+    kind: categorical
+    source: clk_long_x_timegap_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: impr.timegap_hn
+      share_embedding: true
+  target_inputs: []
+  rankmixer_summary_tokens: 1
+  longer_query_tokens: 32
+  longer_self_layers: 1
+  longer_token_merge: 1
+  longer_inner_layers: 0
+  longer_output: summary
+  longer_user_global_inputs: []
+  longer_user_global_tokens: 0
+  longer_cls_tokens: 1
+  longer_candidate_global_tokens: 0
+- name: view_long
+  embedding_scope: feature
+  max_length: 2048
+  truncation: head
+  sequence_order: newest_to_oldest
+  encoder: longer
+  time_delta_field: time_delta_log1p_seconds
+  fields:
+  - name: time_delta_log1p_seconds
+    kind: dense
+    source: view_long_x_time_delta_log1p_seconds
+    dimension: 1
+  - name: cat1_id_hn
+    kind: categorical
+    source: view_long_x_cat1_id_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 256
+      padding_id: 0
+      share_with: cat1_id_hn
+      share_embedding: true
+  - name: cat2_id_hn
+    kind: categorical
+    source: view_long_x_cat2_id_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: cat2_id_hn
+      share_embedding: true
+  - name: cat3_id_hn
+    kind: categorical
+    source: view_long_x_cat3_id_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 32768
+      padding_id: 0
+      share_with: cat3_id_hn
+      share_embedding: true
+  - name: cat4_id_hn
+    kind: categorical
+    source: view_long_x_cat4_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 131072
+      padding_id: 0
+      share_with: cat4_id_hn
+      share_embedding: true
+  - name: cat_id_hn
+    kind: categorical
+    source: view_long_x_cat_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+      share_with: cat_id_hn
+      share_embedding: true
+  - name: goods_id_hn
+    kind: categorical
+    source: view_long_x_goods_id_hn
+    embedding_dim: 64
+    encoding:
+      type: pre_hashed
+      num_buckets: 134217728
+      padding_id: 0
+      share_with: goods_id_hn
+      share_embedding: true
+  - name: mall_id_hn
+    kind: categorical
+    source: view_long_x_mall_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 4194304
+      padding_id: 0
+      share_with: mall_id_hn
+      share_embedding: true
+  - name: page_sn_hn
+    kind: categorical
+    source: view_long_x_page_sn_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 8192
+      padding_id: 0
+      share_with: page_sn_hn
+      share_embedding: true
+  - name: sales_hn
+    kind: categorical
+    source: view_long_x_sales_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: sales_hn
+      share_embedding: true
+  - name: price_hn
+    kind: categorical
+    source: view_long_x_price_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: price_hn
+      share_embedding: true
+  - name: timegap_hn
+    kind: categorical
+    source: view_long_x_timegap_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: impr.timegap_hn
+      share_embedding: true
+  - name: clk_bottom_img_hn
+    kind: categorical
+    source: view_long_x_clk_bottom_img_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: clk_cancel_wish_hn
+    kind: categorical
+    source: view_long_x_clk_cancel_wish_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: clk_carousel_hn
+    kind: categorical
+    source: view_long_x_clk_carousel_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: clk_evaluate_hn
+    kind: categorical
+    source: view_long_x_clk_evaluate_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: clk_more_hn
+    kind: categorical
+    source: view_long_x_clk_more_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: clk_svid_hn
+    kind: categorical
+    source: view_long_x_clk_svid_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: clk_wish_hn
+    kind: categorical
+    source: view_long_x_clk_wish_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: fvid_cv_hn
+    kind: categorical
+    source: view_long_x_fvid_cv_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: fvid_ratio_hn
+    kind: categorical
+    source: view_long_x_fvid_ratio_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: vid_hn
+    kind: categorical
+    source: view_long_x_vid_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+  - name: share_hn
+    kind: categorical
+    source: view_long_x_share_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+  - name: slide_bottom_detail_hn
+    kind: categorical
+    source: view_long_x_slide_bottom_detail_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: slide_bottom_img_hn
+    kind: categorical
+    source: view_long_x_slide_bottom_img_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: slide_carousel_hn
+    kind: categorical
+    source: view_long_x_slide_carousel_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: slide_carousel_cnt_hn
+    kind: categorical
+    source: view_long_x_slide_carousel_cnt_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: stay_time_hn
+    kind: categorical
+    source: view_long_x_stay_time_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+  - name: switch_sku_hn
+    kind: categorical
+    source: view_long_x_switch_sku_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: switch_sku_cnt_hn
+    kind: categorical
+    source: view_long_x_switch_sku_cnt_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  target_inputs: []
+  rankmixer_summary_tokens: 1
+  longer_query_tokens: 32
+  longer_self_layers: 1
+  longer_token_merge: 1
+  longer_inner_layers: 0
+  longer_output: summary
+  longer_user_global_inputs: []
+  longer_user_global_tokens: 0
+  longer_cls_tokens: 1
+  longer_candidate_global_tokens: 0
+- name: cart_long
+  embedding_scope: feature
+  max_length: 512
+  truncation: head
+  sequence_order: newest_to_oldest
+  encoder: longer
+  time_delta_field: time_delta_log1p_seconds
+  fields:
+  - name: time_delta_log1p_seconds
+    kind: dense
+    source: cart_long_x_time_delta_log1p_seconds
+    dimension: 1
+  - name: cat1_id_hn
+    kind: categorical
+    source: cart_long_x_cat1_id_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 256
+      padding_id: 0
+      share_with: cat1_id_hn
+      share_embedding: true
+  - name: cat2_id_hn
+    kind: categorical
+    source: cart_long_x_cat2_id_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: cat2_id_hn
+      share_embedding: true
+  - name: cat3_id_hn
+    kind: categorical
+    source: cart_long_x_cat3_id_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 32768
+      padding_id: 0
+      share_with: cat3_id_hn
+      share_embedding: true
+  - name: cat4_id_hn
+    kind: categorical
+    source: cart_long_x_cat4_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 131072
+      padding_id: 0
+      share_with: cat4_id_hn
+      share_embedding: true
+  - name: cat_id_hn
+    kind: categorical
+    source: cart_long_x_cat_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+      share_with: cat_id_hn
+      share_embedding: true
+  - name: goods_id_hn
+    kind: categorical
+    source: cart_long_x_goods_id_hn
+    embedding_dim: 64
+    encoding:
+      type: pre_hashed
+      num_buckets: 134217728
+      padding_id: 0
+      share_with: goods_id_hn
+      share_embedding: true
+  - name: mall_id_hn
+    kind: categorical
+    source: cart_long_x_mall_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 4194304
+      padding_id: 0
+      share_with: mall_id_hn
+      share_embedding: true
+  - name: price_hn
+    kind: categorical
+    source: cart_long_x_price_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: price_hn
+      share_embedding: true
+  - name: timegap_hn
+    kind: categorical
+    source: cart_long_x_timegap_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: impr.timegap_hn
+      share_embedding: true
+  - name: spec_hn
+    kind: categorical
+    source: cart_long_x_spec_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+  - name: sku_ids_hn
+    kind: categorical
+    source: cart_long_x_sku_ids_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+  target_inputs: []
+  rankmixer_summary_tokens: 1
+  longer_query_tokens: 32
+  longer_self_layers: 1
+  longer_token_merge: 1
+  longer_inner_layers: 0
+  longer_output: summary
+  longer_user_global_inputs: []
+  longer_user_global_tokens: 0
+  longer_cls_tokens: 1
+  longer_candidate_global_tokens: 0
+- name: buy_long
+  embedding_scope: feature
+  max_length: 256
+  truncation: head
+  sequence_order: newest_to_oldest
+  encoder: longer
+  time_delta_field: time_delta_log1p_seconds
+  fields:
+  - name: time_delta_log1p_seconds
+    kind: dense
+    source: buy_long_x_time_delta_log1p_seconds
+    dimension: 1
+  - name: cat1_id_hn
+    kind: categorical
+    source: buy_long_x_cat1_id_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 256
+      padding_id: 0
+      share_with: cat1_id_hn
+      share_embedding: true
+  - name: cat2_id_hn
+    kind: categorical
+    source: buy_long_x_cat2_id_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: cat2_id_hn
+      share_embedding: true
+  - name: cat3_id_hn
+    kind: categorical
+    source: buy_long_x_cat3_id_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 32768
+      padding_id: 0
+      share_with: cat3_id_hn
+      share_embedding: true
+  - name: cat4_id_hn
+    kind: categorical
+    source: buy_long_x_cat4_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 131072
+      padding_id: 0
+      share_with: cat4_id_hn
+      share_embedding: true
+  - name: cat_id_hn
+    kind: categorical
+    source: buy_long_x_cat_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+      share_with: cat_id_hn
+      share_embedding: true
+  - name: goods_id_hn
+    kind: categorical
+    source: buy_long_x_goods_id_hn
+    embedding_dim: 64
+    encoding:
+      type: pre_hashed
+      num_buckets: 134217728
+      padding_id: 0
+      share_with: goods_id_hn
+      share_embedding: true
+  - name: mall_id_hn
+    kind: categorical
+    source: buy_long_x_mall_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 4194304
+      padding_id: 0
+      share_with: mall_id_hn
+      share_embedding: true
+  - name: sales_hn
+    kind: categorical
+    source: buy_long_x_sales_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: sales_hn
+      share_embedding: true
+  - name: price_hn
+    kind: categorical
+    source: buy_long_x_price_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: price_hn
+      share_embedding: true
+  - name: timegap_hn
+    kind: categorical
+    source: buy_long_x_timegap_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: impr.timegap_hn
+      share_embedding: true
+  - name: spec_hn
+    kind: categorical
+    source: buy_long_x_spec_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+      share_with: cart_long.spec_hn
+      share_embedding: true
+  - name: sku_ids_hn
+    kind: categorical
+    source: buy_long_x_sku_ids_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+      share_with: cart_long.sku_ids_hn
+      share_embedding: true
+  target_inputs: []
+  rankmixer_summary_tokens: 1
+  longer_query_tokens: 32
+  longer_self_layers: 1
+  longer_token_merge: 1
+  longer_inner_layers: 0
+  longer_output: summary
+  longer_user_global_inputs: []
+  longer_user_global_tokens: 0
+  longer_cls_tokens: 1
+  longer_candidate_global_tokens: 0
+- name: semi_clk
+  embedding_scope: feature
+  max_length: 128
+  truncation: head
+  sequence_order: newest_to_oldest
+  encoder: longer
+  time_delta_field: time_delta_log1p_seconds
+  fields:
+  - name: time_delta_log1p_seconds
+    kind: dense
+    source: semi_clk_x_time_delta_log1p_seconds
+    dimension: 1
+  - name: cat_id_hn
+    kind: categorical
+    source: semi_clk_x_cat_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+      share_with: cat_id_hn
+      share_embedding: true
+  - name: goods_id_hn
+    kind: categorical
+    source: semi_clk_x_goods_id_hn
+    embedding_dim: 64
+    encoding:
+      type: pre_hashed
+      num_buckets: 134217728
+      padding_id: 0
+      share_with: goods_id_hn
+      share_embedding: true
+  - name: mall_id_hn
+    kind: categorical
+    source: semi_clk_x_mall_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 4194304
+      padding_id: 0
+      share_with: mall_id_hn
+      share_embedding: true
+  - name: page_sn_hn
+    kind: categorical
+    source: semi_clk_x_page_sn_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 8192
+      padding_id: 0
+      share_with: page_sn_hn
+      share_embedding: true
+  - name: timegap_hn
+    kind: categorical
+    source: semi_clk_x_timegap_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: impr.timegap_hn
+      share_embedding: true
+  target_inputs: []
+  rankmixer_summary_tokens: 1
+  longer_query_tokens: 32
+  longer_self_layers: 1
+  longer_token_merge: 1
+  longer_inner_layers: 0
+  longer_output: summary
+  longer_user_global_inputs: []
+  longer_user_global_tokens: 0
+  longer_cls_tokens: 1
+  longer_candidate_global_tokens: 0
+- name: srch_q2i
+  embedding_scope: feature
+  max_length: 100
+  truncation: head
+  sequence_order: newest_to_oldest
+  encoder: longer
+  time_delta_field: time_delta_log1p_seconds
+  fields:
+  - name: time_delta_log1p_seconds
+    kind: dense
+    source: srch_q2i_x_time_delta_log1p_seconds
+    dimension: 1
+  - name: cat1_id_hn
+    kind: categorical
+    source: srch_q2i_x_cat1_id_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 256
+      padding_id: 0
+      share_with: cat1_id_hn
+      share_embedding: true
+  - name: cat2_id_hn
+    kind: categorical
+    source: srch_q2i_x_cat2_id_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: cat2_id_hn
+      share_embedding: true
+  - name: cat3_id_hn
+    kind: categorical
+    source: srch_q2i_x_cat3_id_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 32768
+      padding_id: 0
+      share_with: cat3_id_hn
+      share_embedding: true
+  - name: cat4_id_hn
+    kind: categorical
+    source: srch_q2i_x_cat4_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 131072
+      padding_id: 0
+      share_with: cat4_id_hn
+      share_embedding: true
+  - name: cat_id_hn
+    kind: categorical
+    source: srch_q2i_x_cat_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+      share_with: cat_id_hn
+      share_embedding: true
+  - name: goods_id_hn
+    kind: categorical
+    source: srch_q2i_x_goods_id_hn
+    embedding_dim: 64
+    encoding:
+      type: pre_hashed
+      num_buckets: 134217728
+      padding_id: 0
+      share_with: goods_id_hn
+      share_embedding: true
+  - name: mall_id_hn
+    kind: categorical
+    source: srch_q2i_x_mall_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 4194304
+      padding_id: 0
+      share_with: mall_id_hn
+      share_embedding: true
+  - name: timegap_hn
+    kind: categorical
+    source: srch_q2i_x_timegap_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: impr.timegap_hn
+      share_embedding: true
+  target_inputs: []
+  rankmixer_summary_tokens: 1
+  longer_query_tokens: 32
+  longer_self_layers: 1
+  longer_token_merge: 1
+  longer_inner_layers: 0
+  longer_output: summary
+  longer_user_global_inputs: []
+  longer_user_global_tokens: 0
+  longer_cls_tokens: 1
+  longer_candidate_global_tokens: 0
+- name: ups_clk_sku
+  embedding_scope: feature
+  max_length: 200
+  truncation: head
+  sequence_order: newest_to_oldest
+  encoder: longer
+  time_delta_field: time_delta_log1p_seconds
+  fields:
+  - name: time_delta_log1p_seconds
+    kind: dense
+    source: ups_clk_sku_x_time_delta_log1p_seconds
+    dimension: 1
+  - name: cat1_id_hn
+    kind: categorical
+    source: ups_clk_sku_x_cat1_id_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 256
+      padding_id: 0
+      share_with: cat1_id_hn
+      share_embedding: true
+  - name: cat2_id_hn
+    kind: categorical
+    source: ups_clk_sku_x_cat2_id_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: cat2_id_hn
+      share_embedding: true
+  - name: cat3_id_hn
+    kind: categorical
+    source: ups_clk_sku_x_cat3_id_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 32768
+      padding_id: 0
+      share_with: cat3_id_hn
+      share_embedding: true
+  - name: cat4_id_hn
+    kind: categorical
+    source: ups_clk_sku_x_cat4_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 131072
+      padding_id: 0
+      share_with: cat4_id_hn
+      share_embedding: true
+  - name: cat_id_hn
+    kind: categorical
+    source: ups_clk_sku_x_cat_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+      share_with: cat_id_hn
+      share_embedding: true
+  - name: goods_id_hn
+    kind: categorical
+    source: ups_clk_sku_x_goods_id_hn
+    embedding_dim: 64
+    encoding:
+      type: pre_hashed
+      num_buckets: 134217728
+      padding_id: 0
+      share_with: goods_id_hn
+      share_embedding: true
+  - name: mall_id_hn
+    kind: categorical
+    source: ups_clk_sku_x_mall_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 4194304
+      padding_id: 0
+      share_with: mall_id_hn
+      share_embedding: true
+  - name: timegap_hn
+    kind: categorical
+    source: ups_clk_sku_x_timegap_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: impr.timegap_hn
+      share_embedding: true
+  - name: spec_hn
+    kind: categorical
+    source: ups_clk_sku_x_spec_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+      share_with: cart_long.spec_hn
+      share_embedding: true
+  target_inputs: []
+  rankmixer_summary_tokens: 1
+  longer_query_tokens: 32
+  longer_self_layers: 1
+  longer_token_merge: 1
+  longer_inner_layers: 0
+  longer_output: summary
+  longer_user_global_inputs: []
+  longer_user_global_tokens: 0
+  longer_cls_tokens: 1
+  longer_candidate_global_tokens: 0
+- name: flatten_query_hash
+  embedding_scope: feature
+  max_length: 512
+  truncation: head
+  sequence_order: newest_to_oldest
+  encoder: longer
+  time_delta_field: time_delta_log1p_seconds
+  fields:
+  - name: time_delta_log1p_seconds
+    kind: dense
+    source: flatten_query_hash_x_time_delta_log1p_seconds
+    dimension: 1
+  - name: flat_q_hash_hn
+    kind: categorical
+    source: flatten_query_hash_x_flat_q_hash_hn
+    embedding_dim: 48
+    encoding:
+      type: pre_hashed
+      num_buckets: 33554432
+      padding_id: 0
+  - name: timegap_hn
+    kind: categorical
+    source: flatten_query_hash_x_timegap_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+      share_with: impr.timegap_hn
+      share_embedding: true
+  target_inputs: []
+  rankmixer_summary_tokens: 1
+  longer_query_tokens: 32
+  longer_self_layers: 1
+  longer_token_merge: 1
+  longer_inner_layers: 0
+  longer_output: summary
+  longer_user_global_inputs: []
+  longer_user_global_tokens: 0
+  longer_cls_tokens: 1
+  longer_candidate_global_tokens: 0
+- name: task_fst_cart_prior
+  embedding_scope: task
+  max_length: 512
+  truncation: head
+  sequence_order: newest_to_oldest
+  encoder: mean_pool
+  time_delta_field: time_delta_log1p_seconds
+  fields:
+  - name: time_delta_log1p_seconds
+    kind: dense
+    source: cart_long_x_time_delta_log1p_seconds
+    dimension: 1
+  - name: cat1_id_hn
+    kind: categorical
+    source: cart_long_x_cat1_id_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 256
+      padding_id: 0
+  - name: cat2_id_hn
+    kind: categorical
+    source: cart_long_x_cat2_id_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+  - name: cat3_id_hn
+    kind: categorical
+    source: cart_long_x_cat3_id_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 32768
+      padding_id: 0
+  - name: cat4_id_hn
+    kind: categorical
+    source: cart_long_x_cat4_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 131072
+      padding_id: 0
+  - name: cat_id_hn
+    kind: categorical
+    source: cart_long_x_cat_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+  - name: goods_id_hn
+    kind: categorical
+    source: cart_long_x_goods_id_hn
+    embedding_dim: 48
+    encoding:
+      type: pre_hashed
+      num_buckets: 33554432
+      padding_id: 0
+  - name: mall_id_hn
+    kind: categorical
+    source: cart_long_x_mall_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 4194304
+      padding_id: 0
+  - name: price_hn
+    kind: categorical
+    source: cart_long_x_price_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+  - name: timegap_hn
+    kind: categorical
+    source: cart_long_x_timegap_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: spec_hn
+    kind: categorical
+    source: cart_long_x_spec_hn
+    embedding_dim: 48
+    encoding:
+      type: pre_hashed
+      num_buckets: 8388608
+      padding_id: 0
+  - name: sku_ids_hn
+    kind: categorical
+    source: cart_long_x_sku_ids_hn
+    embedding_dim: 48
+    encoding:
+      type: pre_hashed
+      num_buckets: 16777216
+      padding_id: 0
+- name: task_upid_pay_prior
+  embedding_scope: task
+  max_length: 256
+  truncation: head
+  sequence_order: newest_to_oldest
+  encoder: mean_pool
+  time_delta_field: time_delta_log1p_seconds
+  fields:
+  - name: time_delta_log1p_seconds
+    kind: dense
+    source: buy_long_x_time_delta_log1p_seconds
+    dimension: 1
+  - name: cat1_id_hn
+    kind: categorical
+    source: buy_long_x_cat1_id_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 256
+      padding_id: 0
+  - name: cat2_id_hn
+    kind: categorical
+    source: buy_long_x_cat2_id_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+  - name: cat3_id_hn
+    kind: categorical
+    source: buy_long_x_cat3_id_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 32768
+      padding_id: 0
+  - name: cat4_id_hn
+    kind: categorical
+    source: buy_long_x_cat4_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 131072
+      padding_id: 0
+  - name: cat_id_hn
+    kind: categorical
+    source: buy_long_x_cat_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+  - name: goods_id_hn
+    kind: categorical
+    source: buy_long_x_goods_id_hn
+    embedding_dim: 48
+    encoding:
+      type: pre_hashed
+      num_buckets: 16777216
+      padding_id: 0
+  - name: mall_id_hn
+    kind: categorical
+    source: buy_long_x_mall_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 4194304
+      padding_id: 0
+  - name: sales_hn
+    kind: categorical
+    source: buy_long_x_sales_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+  - name: price_hn
+    kind: categorical
+    source: buy_long_x_price_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+  - name: timegap_hn
+    kind: categorical
+    source: buy_long_x_timegap_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: spec_hn
+    kind: categorical
+    source: buy_long_x_spec_hn
+    embedding_dim: 48
+    encoding:
+      type: pre_hashed
+      num_buckets: 8388608
+      padding_id: 0
+  - name: sku_ids_hn
+    kind: categorical
+    source: buy_long_x_sku_ids_hn
+    embedding_dim: 48
+    encoding:
+      type: pre_hashed
+      num_buckets: 8388608
+      padding_id: 0
+- name: task_cateid_filter_prior
+  embedding_scope: task
+  max_length: 256
+  truncation: head
+  sequence_order: newest_to_oldest
+  encoder: mean_pool
+  time_delta_field: time_delta_log1p_seconds
+  fields:
+  - name: time_delta_log1p_seconds
+    kind: dense
+    source: buy_long_x_time_delta_log1p_seconds
+    dimension: 1
+  - name: cat1_id_hn
+    kind: categorical
+    source: buy_long_x_cat1_id_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 256
+      padding_id: 0
+  - name: cat2_id_hn
+    kind: categorical
+    source: buy_long_x_cat2_id_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+  - name: cat3_id_hn
+    kind: categorical
+    source: buy_long_x_cat3_id_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 32768
+      padding_id: 0
+  - name: cat4_id_hn
+    kind: categorical
+    source: buy_long_x_cat4_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 131072
+      padding_id: 0
+  - name: cat_id_hn
+    kind: categorical
+    source: buy_long_x_cat_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 262144
+      padding_id: 0
+  - name: goods_id_hn
+    kind: categorical
+    source: buy_long_x_goods_id_hn
+    embedding_dim: 48
+    encoding:
+      type: pre_hashed
+      num_buckets: 16777216
+      padding_id: 0
+  - name: mall_id_hn
+    kind: categorical
+    source: buy_long_x_mall_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 4194304
+      padding_id: 0
+  - name: sales_hn
+    kind: categorical
+    source: buy_long_x_sales_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+  - name: price_hn
+    kind: categorical
+    source: buy_long_x_price_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 4096
+      padding_id: 0
+  - name: timegap_hn
+    kind: categorical
+    source: buy_long_x_timegap_hn
+    embedding_dim: 8
+    encoding:
+      type: pre_hashed
+      num_buckets: 64
+      padding_id: 0
+  - name: spec_hn
+    kind: categorical
+    source: buy_long_x_spec_hn
+    embedding_dim: 48
+    encoding:
+      type: pre_hashed
+      num_buckets: 8388608
+      padding_id: 0
+  - name: sku_ids_hn
+    kind: categorical
+    source: buy_long_x_sku_ids_hn
+    embedding_dim: 48
+    encoding:
+      type: pre_hashed
+      num_buckets: 8388608
+      padding_id: 0
+scenarios:
+  names:
+  - __auto__
+  source: scene_id
+  auto_discover: true
+  max_discovered: 64
+  discovery_cache_path: artifacts/scenarios/cvr_allscene.json
+tokenization:
+  feature_tokenizer: rankmixer
+  num_feature_tokens: 32
+  feature_token_inputs:
+  - currency_hn
+  - hash_language_site_hn
+  - language_hn
+  - page_elsn_hn
+  - page_sn_hn
+  - plat_hn
+  - region_hn
+  - scene_id_hn
+  - site_id_hn
+  - timezone_hn
+  - origin_query_hash_hn
+  - query_arr_hn
+  - query_hash_hn
+  - query_terms_hash_hn
+  - query_tfidf_term_hash_list_hn
+  - query_extend_translation_hash_hn
+  - search_method_hn
+  - sess_q2q_hash_list_hn
+  - recall_merge_cate_levels_hn
+  - recall_merge_cate1_ids_hn
+  - recall_merge_cate_ids_hn
+  - scene_clk_cnt_15d_hit_hn
+  - scene_impr_cnt_15d_hn
+  - scene_impr_cnt_15d_hit_hn
+  - uid_or_bg_hn
+  - u_fst_ordr_cnt_mix_d_hn
+  - clk_cnt_1d_hn
+  - clk_3d_cnt_hn
+  - clk_1d_cat_cnt_hn
+  - cart_cnt_1d_hn
+  - cart_cnt_3d_hn
+  - clk_7d_page_sns_hn
+  - clk_7d_page_elsns_hn
+  - cart_7d_cat1_ids_hn
+  - flip_mall_ids_hn
+  - list_clk_cat1_ids_hn
+  - list_clk_cat_ids_hn
+  - ups_in_cart_2h_sku_cur_prices_hn
+  - ups_in_cart_goods_hn_share
+  - ups_incart_cat1_id_nc_hn
+  - ups_in_cart_tg_hn
+  - ups_query_term_hash_v2_hn
+  - ups_query_tg_hn
+  - ups_search_method_hash_hn
+  - view_30m_cat1_ids_hn
+  - view_7d_page_sns_hn
+  - view_7d_page_elsns_hn
+  - cat_id_hn
+  - cat1_id_hn
+  - cat2_id_hn
+  - cat3_id_hn
+  - cat4_id_hn
+  - goods_id_hn
+  - goods_name_bigram_hn
+  - goods_ner_infos_hn
+  - goods_scene_clk_cnt_15d_hn
+  - goods_title_tfidf_term_hash_list_hn
+  - goods_avlb_sku_num_dis_hn
+  - goods_onsale_sku_num_dis_hn
+  - goods_cluster_id_1w_hn
+  - rev_ratings_cnt_crs_pos_hn
+  - g_sku_spec_hn
+  - g_sku_spec_hash_hn
+  - g_sku_spec_unit_list_hn
+  - g_prpty_val_id_list_hn
+  - sku_id_hn
+  - sku_price_v2_hn
+  - sku_sales_hn
+  - sku_spec_hash_hn
+  - sku_spec_hn
+  - sku_spec_vids_hn
+  - sku_cart_cnt_7d_hn
+  - sku_ordr_cnt_1m_hn
+  - sku_price_dis_hn
+  - sku_sales_dis_hn
+  - price_hn
+  - price_bef_coupon_hn
+  - price_after_promotion_hn
+  - price_after_promotion_div_hn
+  - mkt_prc_hn
+  - show_price_hn
+  - is_promotion_hn
+  - promotion_discount_hn
+  - auto_price_p05_dis
+  - auto_price_p10_dis_hn
+  - ori_price_hn_share
+  - sales_hn
+  - auto_sales_p10_dis
+  - c_adj_cart_cvr_15d_hn
+  - c_adj_ctr_15d_hn
+  - c_adj_ordr_cvr_15d_hn
+  - c_cart_cnt_15d_hn
+  - c_clk_cnt_15d_hn
+  - c_impr_cnt_15d_hn
+  - c_ordr_cnt_15d_hn
+  - c_simi_adj_cart_cvr_15d_hn
+  - c_simi_adj_ctr_15d_hn
+  - c_simi_cart_cnt_15d_hn
+  - c_simi_clk_cnt_15d_hn
+  - c_simi_impr_cnt_15d_hn
+  - idx_c_adj_cart_cvr_15d_hn
+  - idx_c_adj_ctr_15d_hn
+  - idx_c_adj_ordr_cvr_15d_hn
+  - idx_c_cart_cnt_15d_hn
+  - idx_c_clk_cnt_15d_hn
+  - idx_c_impr_cnt_15d_hn
+  - idx_c_ordr_cnt_15d_hn
+  - idx_c_simi_adj_cart_cvr_15d_hn
+  - idx_c_simi_adj_ctr_15d_hn
+  - idx_c_simi_cart_cnt_15d_hn
+  - idx_c_simi_clk_cnt_15d_hn
+  - idx_c_simi_impr_cnt_15d_hn
+  - scene_adj_cartcvr_15d_hn
+  - scene_adj_ctr_15d_hn
+  - scene_adj_cvr_15d_hn
+  - scene_cart_cnt_15d_hn
+  - nfk_sales_14d_hn
+  - nfk_price_14d_hn
+  - nfk_gmv_14d_hn
+  - i2i2cat2_swing_hn
+  - i2i_coclk_hn_share
+  - i2i_list_amazoni2ifullgmv_hn_share
+  - i2i_list_multimodal_hn_share
+  - i2i_list_swingv3gmv_hn_share
+  - i2i_hit_site_q2i_idx_hn
+  - only_semi_swingi2i_cut60_hn_share
+  - semi_swingi2i_cut30_hn_share
+  - offline_outside_goods_id_list_hn_share
+  - site_q2i_good_list_hn_share
+  - multimodal_i2i_hit_cart_size_hn
+  - multimodal_i2i_hit_clk_size_hn
+  - main_goods_ids_hn_share
+  - adj_cartcvr_hn
+  - adj_ctr_hn
+  - adj_cvr_hn
+  - buy_long_spec_vids_hn
+  - cart_long_spec_vids_hn
+  - create_time_hn
+  - mall_id_hn
+  - sellr_type_hn
+  - opt_id_hn
+  - site_x_asian_code_hn
+  - f_goods_view_times_tg_l1_hn
+  - target_gs_last_cart_tg_hn
+  - impr_3h_tg_hn
+  - impr_all_tg_hn
+  - impr_clk_6h_cnt_hn
+  - clk_long_goods_abs_timegap_1d_hn
+  - impr_long_goods_abs_timegap_1d_hn
+  - mid_goods_prc_list_dis
+  - mid_cmprc_diff_list_dis
+  - rel_score_hn
+  - rel_level_hn
+  - q_hit_good_correct_unigram_hn
+  - q2c_cart_15d_hit_val_hn
+  - tit_in_top_query_cnt_hn
+  - goods_query_emb32v3_cos_hn
+  - query_cat_hn
+  - query_pay_cnt_15d_hn
+  - clk_hit_i2i_idx_hn
+  - cart_hit_i2i_idx_hn
+  - cart_long_hit_samestyle_i2i_idx_hn
+  - ups_clkv2_i2i_goods_ids_hit_size
+  - ups_clkv2_i2i_goods_ids_hit_all_size
+  - us_ctr_price_dis50_hn
+  - impr_cat_clk_goods_ids_cnt_1d_hn
+  - ad_id_bin_hn
+  - campaign_id_hn
+  - idx_goods_creative_id_hn
+  - impr
+  - clk_long
+  - view_long
+  - cart_long
+  - buy_long
+  - semi_clk
+  - srch_q2i
+  - ups_clk_sku
+  - flatten_query_hash
+  task_tokens:
+  - name: fst_cart
+    important_inputs: &id001
+    - task_important_currency_hn
+    - task_important_hash_language_site_hn
+    - task_important_language_hn
+    prior_inputs:
+    - task_fst_cart_prior
+  - name: upid_pay
+    important_inputs: *id001
+    prior_inputs:
+    - task_upid_pay_prior
+  - name: cateid_filter
+    important_inputs: *id001
+    prior_inputs:
+    - task_cateid_filter_prior
+  scenario_tokens:
+  - name: __auto__
+    important_inputs: &id002
+    - scenario_important_currency_hn
+    - scenario_important_hash_language_site_hn
+    - scenario_important_language_hn
+    - scenario_important_page_elsn_hn
+    - scenario_important_page_sn_hn
+    prior_inputs:
+    - scenario_prior_scene_id_hn
+    - impr
+    - clk_long
+    - view_long
+  - name: global
+    important_inputs: *id002
+    prior_inputs:
+    - impr
+    - clk_long
+    - view_long
+vocab_strategy:
+  defaults:
+    fit_split: train
+    oov_id: 0
+    padding_id: 0
+    unseen_policy: oov
+    artifact_dir: artifacts/vocab
+  features: {}
+model:
+  name: mdl_rankmixer
+  embedding_dim: 32
+  token_dim: 768
+  num_layers: 2
+  num_heads: 12
+  hidden_dim: 1536
+  init_std: 0.02
+  ffn_activation: gelu
+  task_head_hidden_dim: 1536
+  task_head_dropout: 0.0
+  task_head_activation: gelu
+  rankmixer_ffn_type: dense
+  sequence_fusion: intent_ordered
+  use_task_tokens: true
+  use_scenario_tokens: true
+  use_global_scenario_token: true
+  use_task_feature_interaction: true
+  use_scenario_feature_interaction: true
+  mdl_feature_interaction: direct_ffn
+  use_request_cache: true
+training:
+  batch_size: 16
+  embedding_distribution: sharded
+  dense_distribution: ddp
+  embedding_sharding:
+    strategy: auto
+    local_dedup: true
+    table_wise_max_rows: 65536
+  ddp:
+    static_graph: true
+    find_unused_parameters: false
+    gradient_as_bucket_view: true
+    bucket_cap_mb: 50
+    audit_steps: 10
+    validated_no_unused_parameters: true
+    validated_static_graph: true
+  lr_dense: 0.001
+  lr_sparse: 0.001
+  lr_schedule: constant
+  lr_warmup_steps: 500
+  lr_decay_steps: null
+  lr_min_ratio: 0.0
+  dense_optimizer: rmsprop
+  fused_dense_optimizer: true
+  rmsprop_alpha: 0.99999
+  rmsprop_momentum: 0.0
+  sparse_optimizer: adagrad
+  adagrad_initial_accumulator_value: 0.1
+  adagrad_eps: 1.0e-10
+  embedding_sparse_gradients: true
+  sparse_update_mode: ddp_synced_adagrad
+  sparse_parameter_server_adapter: null
+  dense_clip_norm: 1.0
+  sparse_clip_norm: 1.0
+  loss_reduction: sum
+  checkpoint_path: artifacts/checkpoints/mdl_rankmixer.pt
+  embedding_weight_dtype: bf16
+  embedding_collect_stats: false
+  embedding_validate_indices: false
+  log_every_steps: 100

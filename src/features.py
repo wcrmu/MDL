@@ -20,6 +20,7 @@ from .config import (
     ResolvedEncoding,
     ResolvedHashEncoding,
     ResolvedIdentityEncoding,
+    ResolvedPreHashedEncoding,
     ResolvedSharedVocabEncoding,
     ResolvedVocabEncoding,
     VocabStrategy,
@@ -230,7 +231,11 @@ def _encoding_payload(encoding: ResolvedEncoding, source: str) -> dict[str, Any]
         "min_count": encoding.min_count if isinstance(encoding, ResolvedVocabEncoding) else None,
         "max_size": encoding.max_size if isinstance(encoding, ResolvedVocabEncoding) else None,
         "artifact": encoding.artifact if isinstance(encoding, ResolvedVocabEncoding) else None,
-        "num_buckets": encoding.num_buckets if isinstance(encoding, ResolvedHashEncoding) else None,
+        "num_buckets": (
+            encoding.num_buckets
+            if isinstance(encoding, (ResolvedHashEncoding, ResolvedPreHashedEncoding))
+            else None
+        ),
         "salt": encoding.salt if isinstance(encoding, ResolvedHashEncoding) else None,
         "identity_num_buckets": (
             encoding.num_buckets if isinstance(encoding, ResolvedIdentityEncoding) else None
@@ -245,7 +250,11 @@ def _encoding_payload(encoding: ResolvedEncoding, source: str) -> dict[str, Any]
             encoding.share_with
             if isinstance(
                 encoding,
-                (ResolvedIdentityEncoding, ResolvedSharedVocabEncoding),
+                (
+                    ResolvedIdentityEncoding,
+                    ResolvedPreHashedEncoding,
+                    ResolvedSharedVocabEncoding,
+                ),
             )
             else None
         ),
@@ -317,6 +326,25 @@ def stable_hash_buckets(values: Iterable[Any], num_buckets: int, salt: str | Non
     return [stable_hash_bucket(value, num_buckets, salt) for value in values]
 
 
+def pre_hashed_bucket(value: Any, num_buckets: int) -> int:
+    """Map one signed int64 hash by its unchanged uint64 low bits.
+
+    The power-of-two requirement makes signed and unsigned modulo identical
+    without ``abs`` and avoids the ``INT64_MIN`` overflow corner case.  Zero is
+    an upstream-contract violation; true null is handled separately as padding.
+    """
+
+    if num_buckets <= 0 or num_buckets & (num_buckets - 1):
+        raise ValueError("pre_hashed num_buckets must be a positive power of two")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"pre_hashed value must be an int64, got {type(value).__name__}")
+    if value < -(1 << 63) or value > (1 << 63) - 1:
+        raise ValueError(f"pre_hashed value {value!r} is outside signed int64 range")
+    if value == 0:
+        raise ValueError("pre_hashed non-null value must not be zero")
+    return (value & (num_buckets - 1)) + 1
+
+
 def _unseen_value_error(feature_name: str, value: Any) -> ValueError:
     return ValueError(f"unseen categorical value {value!r} for {feature_name!r}")
 
@@ -341,6 +369,8 @@ def encode_categorical_value(
         return 0
     if encoding.encoding == "hash":
         return stable_hash_bucket(value, encoding.num_buckets, encoding.salt)
+    if encoding.encoding == "pre_hashed":
+        return pre_hashed_bucket(value, encoding.num_buckets)
     if encoding.encoding == "identity":
         encoded = int(value)
         if encoded < 0 or encoded >= encoding.num_buckets:
@@ -396,6 +426,8 @@ def vocab_artifacts(strategy_or_config: VocabStrategy | AppConfig) -> list[Vocab
             if isinstance(encoding, ResolvedVocabEncoding):
                 size_hint = encoding.max_size
             elif isinstance(encoding, ResolvedHashEncoding):
+                size_hint = encoding.num_buckets
+            elif isinstance(encoding, ResolvedPreHashedEncoding):
                 size_hint = encoding.num_buckets
             elif isinstance(encoding, ResolvedIdentityEncoding):
                 size_hint = encoding.num_buckets

@@ -95,6 +95,7 @@ ModelName = Literal[
 EncodingType = Literal[
     "vocab",  # Fit or load an explicit categorical value-to-ID vocabulary.
     "hash",  # Map categorical values deterministically into fixed hash buckets.
+    "pre_hashed",  # Bucket an upstream int64 bit pattern without hashing it again.
     "identity",  # Consume bounded, already encoded integer IDs without fitting a vocab.
     "shared_vocab",  # Reuse the vocabulary mapping named by share_with.
 ]
@@ -116,6 +117,14 @@ SequenceOrderType = Literal[
     "oldest_to_newest",  # Source events are already in canonical chronological order.
     "newest_to_oldest",  # Reverse each valid event span into chronological order.
 ]
+CategoricalPoolingType = Literal[
+    "none",  # One categorical value per flattened training row.
+    "mean",  # A ragged bag of categorical values pooled after embedding lookup.
+]
+PoolingNullPolicy = Literal[
+    "exclude",  # Inner null/padding elements do not contribute to the denominator.
+    "include_as_padding",  # Preserve aligned slots; padding contributes a zero vector.
+]
 
 # Sequence encoder choices; individual values target different model paths.
 SequenceEncoderType = Literal[
@@ -123,6 +132,10 @@ SequenceEncoderType = Literal[
     "attention_pool",  # Produce a learned attention-pooled sequence summary.
     "mean_pool",  # Produce a masked mean-pooled sequence summary.
     "longer",  # Use LONGER sequence encoding; required by model.name=longer.
+]
+LongerOutputType = Literal[
+    "full",  # Expose global and recent-query states (paper/reference behavior).
+    "summary",  # Expose only fixed global/CLS states to downstream tokenization.
 ]
 
 # Architecture choices shared by all model families.
@@ -187,6 +200,32 @@ def _validate_identity_bounds(
         raise ValueError(f"{path}.out_of_range must be error or padding")
 
 
+def _validate_pre_hashed(
+    *,
+    num_buckets: int | None,
+    padding_id: int,
+    salt: str | None,
+    max_id: int | None,
+    share_with: str | None,
+    share_embedding: bool,
+    path: str,
+) -> None:
+    if num_buckets is None or num_buckets <= 0:
+        raise ValueError(f"{path}.num_buckets must be positive for pre_hashed encoding")
+    if num_buckets & (num_buckets - 1):
+        raise ValueError(
+            f"{path}.num_buckets must be a power of two for unsigned int64 bit masking"
+        )
+    if padding_id != 0:
+        raise ValueError(f"{path}.padding_id must be 0")
+    if salt is not None:
+        raise ValueError(f"{path}.salt is not allowed for pre_hashed encoding")
+    if max_id is not None:
+        raise ValueError(f"{path}.max_id is not allowed for pre_hashed encoding")
+    if share_embedding and not share_with:
+        raise ValueError(f"{path}.share_with is required when share_embedding=true")
+
+
 # Raw YAML schema. These dataclasses mirror configs/default.yaml field names.
 @dataclass(frozen=True)
 class CategoricalEncodingConfig:
@@ -243,7 +282,7 @@ class CategoricalEncodingConfig:
         return cls(**values)
 
     def validate(self, path: str) -> None:
-        if self.encoding not in {"vocab", "hash", "identity", "shared_vocab"}:
+        if self.encoding not in {"vocab", "hash", "pre_hashed", "identity", "shared_vocab"}:
             raise ValueError(f"{path}.type is invalid")
         if self.encoding == "vocab":
             if not self.artifact:
@@ -255,6 +294,16 @@ class CategoricalEncodingConfig:
         if self.encoding == "hash":
             if self.num_buckets is None or self.num_buckets <= 0:
                 raise ValueError(f"{path}.num_buckets must be positive for hash encoding")
+        if self.encoding == "pre_hashed":
+            _validate_pre_hashed(
+                num_buckets=self.num_buckets,
+                padding_id=self.padding_id,
+                salt=self.salt,
+                max_id=self.max_id,
+                share_with=self.share_with,
+                share_embedding=self.share_embedding,
+                path=path,
+            )
         if self.encoding == "identity":
             _validate_identity_bounds(
                 num_buckets=self.num_buckets,
@@ -281,6 +330,11 @@ class ParquetAdapterConfig(_DeeplyImmutableConfig):
 
     callable: str
     input_columns: tuple[str, ...] | None = None
+    # Columns used only by some raw layouts handled by an auto-detecting
+    # adapter. They are projected when present in the split schema and omitted
+    # otherwise. This keeps agg/req auto detection compatible with column
+    # pruning instead of forcing every split to read all Parquet columns.
+    optional_input_columns: tuple[str, ...] = ()
     options: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -294,9 +348,15 @@ class ParquetAdapterConfig(_DeeplyImmutableConfig):
             if isinstance(input_columns, str):
                 raise ValueError("data split adapter.input_columns must be a list of column names")
             input_columns = tuple(input_columns)
+        optional_input_columns = payload.get("optional_input_columns", ())
+        if isinstance(optional_input_columns, str):
+            raise ValueError(
+                "data split adapter.optional_input_columns must be a list of column names"
+            )
         return cls(
             callable=payload.get("callable", ""),
             input_columns=input_columns,
+            optional_input_columns=tuple(optional_input_columns),
             options=dict(payload.get("options", {})),
         )
 
@@ -315,6 +375,29 @@ class ParquetAdapterConfig(_DeeplyImmutableConfig):
         if self.input_columns is not None:
             if not all(isinstance(column, str) and column for column in self.input_columns):
                 raise ValueError(f"{path}.input_columns must contain non-empty column names")
+            if len(set(self.input_columns)) != len(self.input_columns):
+                raise ValueError(f"{path}.input_columns must not contain duplicates")
+        if not all(
+            isinstance(column, str) and column
+            for column in self.optional_input_columns
+        ):
+            raise ValueError(
+                f"{path}.optional_input_columns must contain non-empty column names"
+            )
+        if len(set(self.optional_input_columns)) != len(self.optional_input_columns):
+            raise ValueError(
+                f"{path}.optional_input_columns must not contain duplicates"
+            )
+        if self.input_columns is None and self.optional_input_columns:
+            raise ValueError(
+                f"{path}.optional_input_columns requires input_columns"
+            )
+        overlap = set(self.input_columns or ()) & set(self.optional_input_columns)
+        if overlap:
+            raise ValueError(
+                f"{path}.input_columns and optional_input_columns must be disjoint: "
+                + ", ".join(sorted(overlap))
+            )
         if not isinstance(self.options, Mapping):
             raise ValueError(f"{path}.options must be an object")
         try:
@@ -377,12 +460,31 @@ class ReaderConfig(_DeeplyImmutableConfig):
     max_prefetch_bytes: int = 512 * 1024 * 1024
     # DataLoader pinning is only useful when batches are later moved to CUDA.
     pin_memory: bool = False
+    # Pack same-dtype tensor leaves into a few pinned buffers before H2D. This
+    # replaces hundreds of tiny DMA operations for wide recommendation batches.
+    coalesce_pinned_tensors: bool = False
+    # Number of already-copied CUDA batches kept ahead of the training loop.
+    # Zero preserves the synchronous transfer path.
+    device_prefetch_batches: int = 0
+    # Repeated candidates from one request can share Context and UPS tensors.
+    # The adapter remains responsible for declaring context feature membership.
+    deduplicate_request_features: bool = False
+    # Strictly reject non-null zero before pre-hashed low-bit bucketing. Secure
+    # production profiles may disable this after establishing the invariant.
+    validate_prehashed_nonzero: bool = True
     # DDP can shard by files, row groups, or record batches depending on data layout.
     shard_unit: Literal["file", "row_group", "record_batch"] = "row_group"
     # Optional Arrow scanner batch size. Training batch size is independent.
     scanner_batch_rows: int | None = None
+    # Eagerly opening every Parquet footer is expensive on large remote file
+    # sets and is repeated by every DDP rank. Sample mode validates evenly
+    # spaced files up front; Arrow still validates files as they are consumed.
+    eager_schema_validation: Literal["all", "sample"] = "all"
+    schema_validation_samples: int = 64
     # Optional vectorized length buckets. Null max_length is the final catch-all.
     length_buckets: tuple[LengthBucketConfig, ...] = ()
+    # max is backward compatible; sum tracks total work across heterogeneous UPS.
+    length_bucket_metric: Literal["max", "sum"] = "max"
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> "ReaderConfig":
@@ -414,10 +516,26 @@ class ReaderConfig(_DeeplyImmutableConfig):
             raise ValueError("reader.prefetch_batches must be non-negative")
         if self.max_prefetch_bytes <= 0:
             raise ValueError("reader.max_prefetch_bytes must be positive")
+        for field_name in (
+            "pin_memory",
+            "coalesce_pinned_tensors",
+            "deduplicate_request_features",
+            "validate_prehashed_nonzero",
+        ):
+            if type(getattr(self, field_name)) is not bool:
+                raise ValueError(f"reader.{field_name} must be a boolean")
+        if self.device_prefetch_batches < 0:
+            raise ValueError("reader.device_prefetch_batches must be non-negative")
         if self.shard_unit not in {"file", "row_group", "record_batch"}:
             raise ValueError("reader.shard_unit must be file, row_group, or record_batch")
+        if self.length_bucket_metric not in {"max", "sum"}:
+            raise ValueError("reader.length_bucket_metric must be max or sum")
         if self.scanner_batch_rows is not None and self.scanner_batch_rows <= 0:
             raise ValueError("reader.scanner_batch_rows must be positive")
+        if self.eager_schema_validation not in {"all", "sample"}:
+            raise ValueError("reader.eager_schema_validation must be all or sample")
+        if self.schema_validation_samples <= 0:
+            raise ValueError("reader.schema_validation_samples must be positive")
         previous = 0
         saw_catch_all = False
         for index, bucket in enumerate(self.length_buckets):
@@ -549,6 +667,32 @@ class ParquetSplitConfig(_DeeplyImmutableConfig):
         if not self.inputs:
             raise ValueError(f"data.{name}.inputs must contain at least one path, glob, or directory")
         self.reader.validate()
+        if self.reader.device_prefetch_batches > 0 and not self.reader.pin_memory:
+            raise ValueError(
+                f"data.{name}.reader.device_prefetch_batches requires pin_memory=true"
+            )
+        if self.reader.coalesce_pinned_tensors and not self.reader.pin_memory:
+            raise ValueError(
+                f"data.{name}.reader.coalesce_pinned_tensors requires pin_memory=true"
+            )
+        if self.reader.deduplicate_request_features:
+            if self.request_id is None:
+                raise ValueError(
+                    f"data.{name}.reader.deduplicate_request_features requires request_id"
+                )
+            context_features = (
+                None if self.adapter is None else self.adapter.options.get("context_features")
+            )
+            if (
+                self.format != "adapter_parquet"
+                or isinstance(context_features, (str, bytes))
+                or not isinstance(context_features, Sequence)
+                or not context_features
+            ):
+                raise ValueError(
+                    f"data.{name}.reader.deduplicate_request_features requires an "
+                    "adapter with non-empty options.context_features"
+                )
         if name == "train" and not self.labels:
             raise ValueError("data.train.labels must declare at least one task label")
         if self.label_masks:
@@ -616,7 +760,10 @@ class FeatureConfig:
     embedding_dim: int | None = None
     # Optional inline categorical encoding. Mutually exclusive with vocab_strategy.features[name].
     encoding: CategoricalEncodingConfig | None = None
-    # Legacy scalar-sequence fields remain rejected; keep these only for YAML compatibility.
+    # A categorical bag remains one model input but pools a ragged list after
+    # embedding lookup. max_length/truncation define its deterministic window.
+    pooling: CategoricalPoolingType = "none"
+    pooling_null_policy: PoolingNullPolicy = "exclude"
     max_length: int | None = None
     truncation: Literal["head", "tail"] = "tail"
 
@@ -656,6 +803,23 @@ class FeatureConfig:
             raise ValueError(f"feature {self.name!r} max_length must be positive")
         if self.truncation not in {"head", "tail"}:
             raise ValueError(f"feature {self.name!r} truncation must be head or tail")
+        if self.pooling not in {"none", "mean"}:
+            raise ValueError(f"feature {self.name!r} pooling must be none or mean")
+        if self.pooling_null_policy not in {"exclude", "include_as_padding"}:
+            raise ValueError(
+                f"feature {self.name!r} pooling_null_policy must be exclude or include_as_padding"
+            )
+        if self.kind != "categorical" and self.pooling != "none":
+            raise ValueError(f"feature {self.name!r} pooling is only supported for categorical features")
+        if self.pooling == "none" and self.pooling_null_policy != "exclude":
+            raise ValueError(
+                f"feature {self.name!r} pooling_null_policy requires pooling=mean"
+            )
+        if self.pooling == "none" and self.max_length is not None:
+            raise ValueError(
+                f"feature {self.name!r} max_length requires categorical pooling=mean; "
+                "use top-level sequences for temporal inputs"
+            )
 
 
 @dataclass(frozen=True)
@@ -753,6 +917,9 @@ class SequenceConfig(_DeeplyImmutableConfig):
     longer_self_layers: int = 1
     longer_token_merge: int = 1
     longer_inner_layers: int = 0
+    # Keep LONGER internals intact while allowing production RankMixer configs
+    # to expose only fixed history summaries rather than recent-query states.
+    longer_output: LongerOutputType = "full"
     # Cacheable user/CLS globals are kept separate from candidate globals so
     # candidate information cannot leak into reusable sequence-side states.
     longer_user_global_inputs: tuple[str, ...] = ()
@@ -791,6 +958,7 @@ class SequenceConfig(_DeeplyImmutableConfig):
             longer_self_layers=payload.get("longer_self_layers", 1),
             longer_token_merge=payload.get("longer_token_merge", 1),
             longer_inner_layers=payload.get("longer_inner_layers", 0),
+            longer_output=payload.get("longer_output", "full"),
             longer_user_global_inputs=tuple(
                 payload.get("longer_user_global_inputs", [])
             ),
@@ -842,6 +1010,12 @@ class SequenceConfig(_DeeplyImmutableConfig):
             raise ValueError(f"sequence {self.name!r} longer_token_merge must be positive")
         if self.longer_inner_layers < 0:
             raise ValueError(f"sequence {self.name!r} longer_inner_layers must be non-negative")
+        if self.longer_output not in {"full", "summary"}:
+            raise ValueError(f"sequence {self.name!r} longer_output must be full or summary")
+        if self.encoder != "longer" and self.longer_output != "full":
+            raise ValueError(
+                f"sequence {self.name!r} longer_output=summary requires encoder=longer"
+            )
         if self.longer_user_global_tokens < 0:
             raise ValueError(f"sequence {self.name!r} longer_user_global_tokens must be non-negative")
         if self.longer_cls_tokens < 0:
@@ -933,6 +1107,17 @@ class ScenarioConfig(_DeeplyImmutableConfig):
     names: tuple[str, ...] = ("default",)
     # Optional parquet column carrying scenario id or scenario mask information.
     source: str | None = None
+    # Discover the finite raw integer scenario set from the training Parquet
+    # before model construction. ``names`` then contains one validation-only
+    # placeholder and is replaced by the stable, sorted discovered values.
+    auto_discover: bool = False
+    # Guard against accidentally constructing an unbounded number of
+    # scenario-specific MDL token networks from a malformed source column.
+    max_discovered: int = 64
+    # Optional local cache for the sorted discovered IDs. The cache is keyed by
+    # input paths and source column so immutable date/hour partitions can be
+    # reused across repeated experiments without rescanning Parquet.
+    discovery_cache_path: str | None = None
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> "ScenarioConfig":
@@ -957,6 +1142,24 @@ class ScenarioConfig(_DeeplyImmutableConfig):
         if self.source is not None:
             if not isinstance(self.source, str) or not self.source:
                 raise ValueError("scenarios.source must be null or a non-empty column name")
+        if type(self.auto_discover) is not bool:
+            raise ValueError("scenarios.auto_discover must be a boolean")
+        if type(self.max_discovered) is not int or self.max_discovered <= 0:
+            raise ValueError("scenarios.max_discovered must be a positive integer")
+        if self.discovery_cache_path is not None and (
+            not isinstance(self.discovery_cache_path, str)
+            or not self.discovery_cache_path
+        ):
+            raise ValueError(
+                "scenarios.discovery_cache_path must be null or a non-empty path"
+            )
+        if self.auto_discover:
+            if self.source is None:
+                raise ValueError("scenarios.source is required when auto_discover=true")
+            if self.names != ("__auto__",):
+                raise ValueError(
+                    "scenarios.names must be [__auto__] when auto_discover=true"
+                )
         if len(self.names) > 1 and self.source is None:
             raise ValueError("scenarios.source is required when multiple scenarios are configured")
 
@@ -1243,7 +1446,8 @@ class VocabFeatureStrategy:
     when fitting or reading the categorical values.
     """
 
-    # vocab uses fitted artifacts, hash uses stable buckets, identity trusts ids.
+    # vocab fits artifacts, hash hashes raw values, pre_hashed masks upstream
+    # int64 bit patterns, and identity trusts bounded IDs.
     encoding: EncodingType
     # Physical column used to fit/load this categorical input.
     source: str
@@ -1251,7 +1455,7 @@ class VocabFeatureStrategy:
     min_count: int | None = None
     max_size: int | None = None
     artifact: str | None = None
-    # Hash bucket count and salt. Only used when encoding == "hash".
+    # Bucket count for hash/pre_hashed; salt is only valid for raw hash.
     num_buckets: int | None = None
     salt: str | None = None
     # Maximum accepted id. Only used when encoding == "identity".
@@ -1267,7 +1471,7 @@ class VocabFeatureStrategy:
         return cls(**payload)
 
     def validate(self, feature_name: str) -> None:
-        if self.encoding not in {"vocab", "hash", "identity", "shared_vocab"}:
+        if self.encoding not in {"vocab", "hash", "pre_hashed", "identity", "shared_vocab"}:
             raise ValueError(f"vocab_strategy.features.{feature_name}.encoding is invalid")
         if not self.source:
             raise ValueError(f"vocab_strategy.features.{feature_name}.source is required")
@@ -1281,6 +1485,16 @@ class VocabFeatureStrategy:
         if self.encoding == "hash":
             if self.num_buckets is None or self.num_buckets <= 0:
                 raise ValueError(f"hash feature {feature_name!r} requires positive num_buckets")
+        if self.encoding == "pre_hashed":
+            _validate_pre_hashed(
+                num_buckets=self.num_buckets,
+                padding_id=self.padding_id,
+                salt=self.salt,
+                max_id=self.max_id,
+                share_with=self.share_with,
+                share_embedding=self.share_embedding,
+                path=f"vocab_strategy.features.{feature_name}",
+            )
         if self.encoding == "identity":
             _validate_identity_bounds(
                 num_buckets=self.num_buckets,
@@ -1345,6 +1559,12 @@ class RuntimeConfig:
     # OneTrans can avoid a dynamic slice when the reader guarantees that no
     # prefix column is padding for every row in the batch.
     require_compact_sequence_batches: bool = False
+    # Trimming a batch-global masked prefix requires reading a CUDA scalar on
+    # the host. Flash attention can safely retain masked slots and avoid it.
+    trim_all_invalid_sequence_prefix: bool = True
+    # Scenario IDs are normally checked again on the accelerator. Production
+    # readers that already map and validate them can skip those reductions.
+    validate_scenario_ids: bool = True
     # TensorFloat-32 accelerates FP32 matrix multiplications on supported GPUs.
     allow_tf32: bool = True
     # none avoids recompute; selective checkpoints large blocks; full also
@@ -1387,6 +1607,8 @@ class RuntimeConfig:
             "compile",
             "allow_tf32",
             "require_compact_sequence_batches",
+            "trim_all_invalid_sequence_prefix",
+            "validate_scenario_ids",
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise ValueError(f"runtime.{field_name} must be a boolean")
@@ -1701,6 +1923,15 @@ class TrainingConfig:
     # Both built-in embedding distributions use sparse gradients. Replicated
     # exchanges touched rows; sharded routes IDs/gradients only to row owners.
     embedding_sparse_gradients: bool = True
+    # BF16 embedding weights halve lookup bandwidth and communication on A100;
+    # Adagrad accumulators remain FP32 in the built-in sharded optimizer.
+    embedding_weight_dtype: Literal["fp32", "bf16"] = "fp32"
+    # Communication statistics are diagnostic-only. Grouped sharded lookups
+    # otherwise need device-to-host count reductions for every table.
+    embedding_collect_stats: bool = True
+    # Sharded lookups can assert every encoded ID and owner assignment on the
+    # GPU. Disable only when IDs come from the validated project encoder.
+    embedding_validate_indices: bool = True
     # Compatibility selector for the replicated path or an out-of-scope
     # external adapter. embedding_distribution selects built-in owner sharding.
     sparse_update_mode: Literal["ddp_synced_adagrad", "external_parameter_server"] = "ddp_synced_adagrad"
@@ -1711,6 +1942,9 @@ class TrainingConfig:
     # MDL Eq. (1) uses a literal sum. mean_per_task is an explicit engineering
     # alternative for datasets that need task-balanced normalization.
     loss_reduction: LossReductionType = "sum"
+    # Logging a CUDA scalar synchronizes the device. Large production runs
+    # should log periodically rather than draining the GPU pipeline every step.
+    log_every_steps: int = 1
     # Default checkpoint path used by train/predict when CLI does not override it.
     checkpoint_path: str | None = None
 
@@ -1793,6 +2027,19 @@ class TrainingConfig:
             raise ValueError("training.sparse_clip_norm must be positive")
         if self.loss_reduction not in {"sum", "mean_per_task"}:
             raise ValueError("training.loss_reduction must be sum or mean_per_task")
+        if self.embedding_weight_dtype not in {"fp32", "bf16"}:
+            raise ValueError("training.embedding_weight_dtype must be fp32 or bf16")
+        if type(self.embedding_collect_stats) is not bool:
+            raise ValueError("training.embedding_collect_stats must be a boolean")
+        if type(self.embedding_validate_indices) is not bool:
+            raise ValueError("training.embedding_validate_indices must be a boolean")
+        if self.embedding_weight_dtype == "bf16" and self.embedding_distribution != "sharded":
+            raise ValueError(
+                "training.embedding_weight_dtype=bf16 currently requires "
+                "embedding_distribution=sharded so Adagrad state remains FP32"
+            )
+        if type(self.log_every_steps) is not int or self.log_every_steps <= 0:
+            raise ValueError("training.log_every_steps must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -2094,6 +2341,21 @@ class ResolvedHashEncoding:
 
 
 @dataclass(frozen=True)
+class ResolvedPreHashedEncoding:
+    """Upstream int64 hashes bucketed by their unchanged uint64 low bits.
+
+    ``num_buckets`` counts usable non-padding buckets.  Model tables therefore
+    contain ``num_buckets + 1`` rows and reserve row zero for true null/padding.
+    """
+
+    encoding: Literal["pre_hashed"] = "pre_hashed"
+    num_buckets: int = 0
+    padding_id: int = 0
+    share_with: str | None = None
+    share_embedding: bool = False
+
+
+@dataclass(frozen=True)
 class ResolvedIdentityEncoding:
     encoding: Literal["identity"] = "identity"
     num_buckets: int = 0
@@ -2119,6 +2381,7 @@ class ResolvedSharedVocabEncoding:
 ResolvedEncoding = (
     ResolvedVocabEncoding
     | ResolvedHashEncoding
+    | ResolvedPreHashedEncoding
     | ResolvedIdentityEncoding
     | ResolvedSharedVocabEncoding
 )
@@ -2253,6 +2516,23 @@ def _resolved_encoding_from_config(
         return ResolvedHashEncoding(
             num_buckets=encoding.num_buckets,
             salt=encoding.salt,
+        )
+    if encoding.encoding == "pre_hashed":
+        _validate_pre_hashed(
+            num_buckets=encoding.num_buckets,
+            padding_id=encoding.padding_id,
+            salt=encoding.salt,
+            max_id=encoding.max_id,
+            share_with=encoding.share_with,
+            share_embedding=encoding.share_embedding,
+            path=path,
+        )
+        assert encoding.num_buckets is not None
+        return ResolvedPreHashedEncoding(
+            num_buckets=encoding.num_buckets,
+            padding_id=encoding.padding_id,
+            share_with=encoding.share_with,
+            share_embedding=encoding.share_embedding,
         )
     if encoding.encoding == "identity":
         _validate_identity_bounds(
@@ -2396,28 +2676,31 @@ def resolve_encoding_strategies(config: AppConfig) -> tuple[ResolvedCategoricalI
 
     for item in inputs:
         encoding = item.encoding
-        if not isinstance(encoding, ResolvedIdentityEncoding):
+        if not isinstance(
+            encoding,
+            (ResolvedIdentityEncoding, ResolvedPreHashedEncoding),
+        ):
             continue
         if not encoding.share_embedding:
             continue
         if encoding.share_with not in by_name:
             raise ValueError(
-                f"identity feature {item.name!r} references unknown embedding base "
+                f"{encoding.encoding} feature {item.name!r} references unknown embedding base "
                 f"{encoding.share_with!r}"
             )
         if encoding.share_with == item.name:
             raise ValueError(
-                f"identity feature {item.name!r} cannot share embedding with itself"
+                f"{encoding.encoding} feature {item.name!r} cannot share embedding with itself"
             )
         base_input = resolve_categorical_base_input(by_name, encoding.share_with)
-        if not isinstance(base_input.encoding, ResolvedIdentityEncoding):
+        if type(base_input.encoding) is not type(encoding):
             raise ValueError(
-                f"identity feature {item.name!r} can share an embedding only with "
-                "an identity-encoded feature"
+                f"{encoding.encoding} feature {item.name!r} can share an embedding only with "
+                f"a {encoding.encoding}-encoded feature"
             )
         if base_input.encoding.num_buckets != encoding.num_buckets:
             raise ValueError(
-                f"identity feature {item.name!r} num_buckets={encoding.num_buckets} "
+                f"{encoding.encoding} feature {item.name!r} num_buckets={encoding.num_buckets} "
                 f"does not match embedding base {encoding.share_with!r} "
                 f"num_buckets={base_input.encoding.num_buckets}"
             )
@@ -2670,9 +2953,12 @@ def resolve_encoded_input_dims(
     for sequence in config.sequences:
         if sequence.encoder == "longer":
             merged_dim = config.model.token_dim * sequence.longer_token_merge
-            dims[sequence.name] = (
-                sequence.rankmixer_summary_tokens + sequence.longer_query_tokens
-            ) * merged_dim
+            if sequence.longer_output == "summary":
+                dims[sequence.name] = sequence.rankmixer_summary_tokens * merged_dim
+            else:
+                dims[sequence.name] = (
+                    sequence.rankmixer_summary_tokens + sequence.longer_query_tokens
+                ) * merged_dim
         else:
             dims[sequence.name] = config.model.token_dim * sequence.rankmixer_summary_tokens
     return dims

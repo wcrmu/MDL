@@ -8,8 +8,10 @@ import unittest
 from src.config import (
     ModelConfig,
     ResolvedIdentityEncoding,
+    ResolvedPreHashedEncoding,
     RuntimeConfig,
     ScenarioConfig,
+    TokenGroupConfig,
     load_app_config,
     resolve_categorical_base_input,
     validate_app_config,
@@ -45,12 +47,21 @@ class ModelConfigOverlayTest(unittest.TestCase):
         experimental = load_app_config(root / "configs" / "mdl_onetrans.yaml")
         self.assertTrue(experimental.model.experimental_model_acknowledged)
         self.assertEqual(experimental.model.first_domain_sequence_layer, 0)
-        self.assertEqual(experimental.sequences[0].encoder, "raw")
+
+        production = load_app_config(
+            root / "configs" / "mdl_onetrans_a100_8x80g.yaml"
+        )
+        self.assertTrue(production.model.experimental_model_acknowledged)
+        self.assertEqual(production.model.first_domain_sequence_layer, 4)
+        self.assertTrue(
+            all(sequence.encoder == "raw" for sequence in production.sequences)
+        )
+        history_names = {sequence.name for sequence in production.sequences}
         for token in [
-            *experimental.tokenization.scenario_tokens,
-            *experimental.tokenization.task_tokens,
+            *production.tokenization.scenario_tokens,
+            *production.tokenization.task_tokens,
         ]:
-            self.assertNotIn("hist", token.resolved_inputs())
+            self.assertFalse(history_names & set(token.resolved_inputs()))
 
         rankmixer = load_app_config(root / "configs" / "rankmixer_paper.yaml")
         self.assertEqual(rankmixer.model.token_dim, 768)
@@ -230,6 +241,14 @@ class ModelConfigOverlayTest(unittest.TestCase):
                 r"scenarios\.names must be a list",
             ),
             (
+                ScenarioConfig(
+                    names=("default",),
+                    source="scenario_id",
+                    auto_discover=True,
+                ),
+                r"scenarios\.names must be \[__auto__\]",
+            ),
+            (
                 RuntimeConfig(compile="false"),
                 r"runtime\.compile must be a boolean",
             ),
@@ -284,6 +303,52 @@ class ModelConfigOverlayTest(unittest.TestCase):
         stress = load_app_config(root / "configs" / "longer_5000_perf.yaml")
         self.assertEqual(stress.sequences[0].max_length, 5000)
 
+    def test_pre_hashed_strategy_resolves_and_validates_shared_bucket(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            overlay = Path(directory) / "pre_hashed.yaml"
+            overlay.write_text(
+                "\n".join(
+                    [
+                        f"extends: {root / 'configs' / 'default.yaml'}",
+                        "vocab_strategy:",
+                        "  features:",
+                        "    shop_id:",
+                        "      encoding: pre_hashed",
+                        "      source: shop_id",
+                        "      num_buckets: 1024",
+                        "      salt: null",
+                        "    hist.shop_id:",
+                        "      encoding: pre_hashed",
+                        "      source: hist_shop_id",
+                        "      num_buckets: 1024",
+                        "      salt: null",
+                        "      share_with: shop_id",
+                        "      share_embedding: true",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = load_app_config(overlay)
+
+            root_input = config.resolved.categorical_input_by_name["shop_id"]
+            alias_input = config.resolved.categorical_input_by_name["hist.shop_id"]
+            self.assertIsInstance(root_input.encoding, ResolvedPreHashedEncoding)
+            self.assertIsInstance(alias_input.encoding, ResolvedPreHashedEncoding)
+            self.assertEqual(alias_input.encoding.share_with, "shop_id")
+            self.assertTrue(alias_input.encoding.share_embedding)
+            fitted_names = {entry.feature_name for entry in plan_vocab_fit(config).entries}
+            self.assertNotIn("shop_id", fitted_names)
+            self.assertNotIn("hist.shop_id", fitted_names)
+
+            mismatched = overlay.read_text(encoding="utf-8").replace(
+                "      num_buckets: 1024\n      salt: null\n      share_with: shop_id",
+                "      num_buckets: 2048\n      salt: null\n      share_with: shop_id",
+            )
+            overlay.write_text(mismatched, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "does not match embedding base"):
+                load_app_config(overlay)
+
     def test_gpu_performance_profiles_keep_validated_occupancy_settings(self) -> None:
         root = Path(__file__).resolve().parents[1]
         mdl = load_app_config(root / "configs" / "mdl_perf.yaml")
@@ -323,7 +388,10 @@ class ModelConfigOverlayTest(unittest.TestCase):
         config = load_app_config(root / "configs" / "onetrans.yaml")
         invalid = replace(
             config,
-            sequences=[replace(config.sequences[0], encoder="mean_pool")],
+            sequences=[
+                replace(config.sequences[0], encoder="mean_pool"),
+                *config.sequences[1:],
+            ],
         )
 
         with self.assertRaisesRegex(ValueError, "requires encoder=raw"):
@@ -334,7 +402,10 @@ class ModelConfigOverlayTest(unittest.TestCase):
         config = load_app_config(root / "configs" / "onetrans.yaml")
         invalid = replace(
             config,
-            model=replace(config.model, max_position_embeddings=103),
+            model=replace(
+                config.model,
+                max_position_embeddings=config.model.max_position_embeddings - 1,
+            ),
         )
 
         with self.assertRaisesRegex(ValueError, r"\[S; NS\] token maximum"):
@@ -348,11 +419,7 @@ class ModelConfigOverlayTest(unittest.TestCase):
             name="hidden_seq",
             embedding_scope="scenario",
         )
-        bad_ns_token = replace(
-            config.tokenization.ns_tokens[0],
-            name="bad_ns",
-            inputs=["hidden_seq"],
-        )
+        bad_ns_token = TokenGroupConfig(name="bad_ns", inputs=["hidden_seq"])
         invalid = replace(
             config,
             sequences=[*config.sequences, hidden_sequence],
@@ -374,7 +441,7 @@ class ModelConfigOverlayTest(unittest.TestCase):
             embedding_scope="task",
         )
 
-        for invalid_input in ("user_id", "hidden_seq"):
+        for invalid_input in (config.features[0].name, "hidden_seq"):
             with self.subTest(invalid_input=invalid_input):
                 bad_sequence_token = replace(
                     config.tokenization.sequence_tokens[0],
@@ -402,7 +469,10 @@ class ModelConfigOverlayTest(unittest.TestCase):
         config = load_app_config(root / "configs" / "onetrans.yaml")
         invalid = replace(
             config,
-            sequences=[replace(config.sequences[0], max_length=None)],
+            sequences=[
+                replace(config.sequences[0], max_length=None),
+                *config.sequences[1:],
+            ],
             model=replace(config.model, max_position_embeddings=None),
         )
 
@@ -434,8 +504,11 @@ class ModelConfigOverlayTest(unittest.TestCase):
     def test_mdl_onetrans_rejects_s_sequence_domain_priors(self) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(root / "configs" / "mdl_onetrans.yaml")
+        history_name = config.sequences[0].name
         scenario_tokens = list(config.tokenization.scenario_tokens)
-        scenario_tokens[0] = replace(scenario_tokens[0], prior_inputs=["hist"])
+        scenario_tokens[0] = replace(
+            scenario_tokens[0], prior_inputs=[history_name]
+        )
         invalid = replace(
             config,
             tokenization=replace(

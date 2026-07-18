@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import dataclass
+import inspect
 import math
+from typing import Any
 
 import torch
 from torch import Tensor, nn
@@ -12,6 +15,16 @@ try:
 except ImportError:  # pragma: no cover - compatibility with older PyTorch builds.
     SDPBackend = None
     sdpa_kernel = None
+
+try:
+    from torch.nn.attention.varlen import varlen_attn
+except ImportError:  # pragma: no cover - older PyTorch compatibility.
+    varlen_attn = None
+
+_VARLEN_ATTN_USES_WINDOW_SIZE = (
+    varlen_attn is not None
+    and "window_size" in inspect.signature(varlen_attn).parameters
+)
 
 from .mlp import PerTokenFFN
 
@@ -24,6 +37,158 @@ def _sdpa_context(attention_backend: str):
             raise RuntimeError("runtime.attention_backend='flash' requires torch.nn.attention.sdpa_kernel")
         return sdpa_kernel([SDPBackend.FLASH_ATTENTION])
     raise ValueError("attention_backend must be auto, sdpa, or flash")
+
+
+def _call_varlen_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    cu_query: Tensor,
+    cu_key: Tensor,
+    max_query_length: int,
+    max_key_length: int,
+    *,
+    causal: bool,
+) -> Tensor:
+    """Call the PyTorch 2.10 or 2.12 varlen Flash API."""
+
+    if varlen_attn is None:
+        raise RuntimeError("torch.nn.attention.varlen is unavailable")
+    if _VARLEN_ATTN_USES_WINDOW_SIZE:
+        output = varlen_attn(
+            query,
+            key,
+            value,
+            cu_query,
+            cu_key,
+            max_query_length,
+            max_key_length,
+            window_size=(-1, 0) if causal else (-1, -1),
+        )
+    else:
+        output = varlen_attn(
+            query,
+            key,
+            value,
+            cu_query,
+            cu_key,
+            max_query_length,
+            max_key_length,
+            is_causal=causal,
+        )
+    if not isinstance(output, Tensor):
+        raise RuntimeError("varlen attention unexpectedly returned auxiliary outputs")
+    return output
+
+
+class _PermutationGather(torch.autograd.Function):
+    """Gather by a permutation and invert it without atomic scatter-add."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        values: Tensor,
+        indices: Tensor,
+        inverse_indices: Tensor,
+    ) -> Tensor:
+        ctx.save_for_backward(inverse_indices)
+        return values.index_select(0, indices)
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        output_gradient: Tensor,
+    ) -> tuple[Tensor, None, None]:
+        (inverse_indices,) = ctx.saved_tensors
+        return output_gradient.index_select(0, inverse_indices), None, None
+
+
+@dataclass(frozen=True)
+class _VarlenPacking:
+    """Fixed-capacity row-major packing metadata for one validity mask."""
+
+    packed_source_indices: Tensor
+    source_to_packed_indices: Tensor
+    flat_mask: Tensor
+    packed_mask: Tensor
+    lengths: Tensor
+    cumulative_lengths: Tensor
+    batch_size: int
+    padded_length: int
+
+    @classmethod
+    def from_mask(cls, mask: Tensor) -> "_VarlenPacking":
+        if mask.ndim != 2:
+            raise ValueError("varlen packing mask must have shape [batch, length]")
+        mask = mask.to(dtype=torch.bool)
+        flat_mask = mask.reshape(-1)
+        lengths = mask.sum(dim=1, dtype=torch.int32)
+        source_positions = torch.arange(
+            flat_mask.numel(),
+            dtype=torch.long,
+            device=mask.device,
+        )
+        valid_prefix = flat_mask.long().cumsum(0)
+        if flat_mask.numel():
+            total_valid = valid_prefix[-1]
+            source_to_packed = torch.where(
+                flat_mask,
+                valid_prefix - 1,
+                total_valid + source_positions - valid_prefix,
+            )
+            packed_source = torch.empty_like(source_positions).scatter(
+                0,
+                source_to_packed,
+                source_positions,
+            )
+        else:
+            source_to_packed = source_positions
+            packed_source = source_positions
+        return cls(
+            packed_source_indices=packed_source,
+            source_to_packed_indices=source_to_packed,
+            flat_mask=flat_mask,
+            packed_mask=flat_mask.index_select(0, packed_source),
+            lengths=lengths,
+            cumulative_lengths=F.pad(
+                lengths.cumsum(0, dtype=torch.int32),
+                (1, 0),
+            ),
+            batch_size=mask.size(0),
+            padded_length=mask.size(1),
+        )
+
+    def pack(self, values: Tensor) -> Tensor:
+        if values.shape[:2] != (self.batch_size, self.padded_length):
+            raise ValueError(
+                "packed values must match the packing mask batch and length"
+            )
+        packed = _PermutationGather.apply(
+            values.flatten(0, 1),
+            self.packed_source_indices,
+            self.source_to_packed_indices,
+        )
+        mask_shape = (self.packed_mask.numel(),) + (1,) * (values.ndim - 2)
+        return packed * self.packed_mask.view(mask_shape).to(packed.dtype)
+
+    def unpack(self, packed: Tensor, reference: Tensor) -> Tensor:
+        if reference.shape[:2] != (self.batch_size, self.padded_length):
+            raise ValueError(
+                "unpack reference must match the packing mask batch and length"
+            )
+        expected_capacity = self.batch_size * self.padded_length
+        if packed.size(0) != expected_capacity:
+            raise ValueError(
+                "fixed-capacity varlen output must match the padded token capacity"
+            )
+        output = _PermutationGather.apply(
+            packed,
+            self.source_to_packed_indices,
+            self.packed_source_indices,
+        )
+        mask_shape = (expected_capacity,) + (1,) * (reference.ndim - 2)
+        output = output * self.flat_mask.view(mask_shape).to(output.dtype)
+        return output.view_as(reference)
 
 
 class RankMixerTokenMixing(nn.Module):
@@ -235,6 +400,48 @@ class VariableLengthDomainAttention(nn.Module):
             self.head_dim,
         ).transpose(1, 2)
 
+    def _flash_varlen_attention(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        key_valid_mask: Tensor,
+    ) -> Tensor:
+        if varlen_attn is None:
+            raise RuntimeError(
+                "runtime.attention_backend='flash' requires torch.nn.attention.varlen"
+            )
+        if query.device.type != "cuda":
+            raise RuntimeError("Flash varlen attention requires CUDA tensors")
+        if query.dtype not in {torch.float16, torch.bfloat16}:
+            raise RuntimeError("Flash varlen attention requires FP16 or BF16 tensors")
+
+        query_tokens = query.transpose(1, 2).contiguous()
+        key_tokens = key.transpose(1, 2)
+        value_tokens = value.transpose(1, 2)
+        if query_tokens.numel() == 0:
+            return torch.zeros_like(query)
+
+        key_packing = _VarlenPacking.from_mask(key_valid_mask)
+        batch_size, query_length = query_tokens.shape[:2]
+        cumulative_query_lengths = torch.arange(
+            batch_size + 1,
+            dtype=torch.int32,
+            device=query.device,
+        ) * query_length
+        with torch.profiler.record_function("mdl::flash_varlen_domain_sequence"):
+            packed_output = _call_varlen_attention(
+                query_tokens.view(-1, self.num_heads, self.head_dim),
+                key_packing.pack(key_tokens).contiguous(),
+                key_packing.pack(value_tokens).contiguous(),
+                cumulative_query_lengths,
+                key_packing.cumulative_lengths,
+                query_length,
+                key_valid_mask.size(1),
+                causal=False,
+            )
+        return packed_output.view_as(query_tokens).transpose(1, 2)
+
     def forward(
         self,
         domain_tokens: Tensor,
@@ -272,16 +479,23 @@ class VariableLengthDomainAttention(nn.Module):
         normalized_memory = self.memory_norm(memory)
         key = self._split_heads(self.key_projection(normalized_memory))
         value = self._split_heads(self.value_projection(normalized_memory))
-        allowed = safe_mask[:, None, None, :]
-
-        with _sdpa_context(self.attention_backend):
-            attended = F.scaled_dot_product_attention(
+        if self.attention_backend == "flash":
+            attended = self._flash_varlen_attention(
                 query,
                 key,
                 value,
-                attn_mask=allowed,
-                dropout_p=0.0,
+                safe_mask,
             )
+        else:
+            allowed = safe_mask[:, None, None, :]
+            with _sdpa_context(self.attention_backend):
+                attended = F.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=allowed,
+                    dropout_p=0.0,
+                )
 
         attended = attended.transpose(1, 2).contiguous().view(
             domain_tokens.size(0),

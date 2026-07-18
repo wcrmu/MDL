@@ -457,6 +457,40 @@ class LongerSequenceEncoderAlignmentTest(unittest.TestCase):
         self.assertIsNotNone(user_global.grad)
         self.assertIsNotNone(candidate_global.grad)
 
+    def test_summary_only_exposes_one_history_conditioned_global_token(self) -> None:
+        torch.manual_seed(47)
+        encoder = LongerSequenceEncoder(
+            token_dim=4,
+            num_heads=2,
+            hidden_dim=8,
+            query_token_count=2,
+            self_layers=1,
+            summary_tokens=1,
+            token_merge=1,
+            inner_layers=0,
+            user_global_tokens=1,
+            summary_only=True,
+        )
+        tokens = torch.randn(2, 5, 4, requires_grad=True)
+        mask = torch.tensor(
+            [[True, True, True, True, True], [False, False, True, True, True]]
+        )
+        cls = torch.randn(2, 1, 4, requires_grad=True)
+        no_candidate_globals = torch.zeros(2, 0, 4)
+
+        output = encoder(
+            tokens,
+            mask,
+            no_candidate_globals,
+            user_global_tokens=cls,
+        )
+
+        self.assertEqual(tuple(output.shape), (2, 4))
+        self.assertEqual(encoder.output_dim, 4)
+        output.square().mean().backward()
+        self.assertTrue(torch.isfinite(tokens.grad).all())
+        self.assertTrue(torch.isfinite(cls.grad).all())
+
 
 class LongerInputGenerationAlignmentTest(unittest.TestCase):
     def _sequence(self, order: str) -> SequenceConfig:

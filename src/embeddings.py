@@ -281,8 +281,9 @@ class _ShardedEmbeddingLookup(torch.autograd.Function):
         shard_spec: EmbeddingShardSpec,
         local_dedup: bool,
         process_group: torch_dist.ProcessGroup | None,
-        stats_sink: _EmbeddingStatsSink,
+        stats_sink: _EmbeddingStatsSink | None,
         table_name: str,
+        validate_indices: bool,
     ) -> Tensor:
         if indices.dtype != torch.long:
             raise TypeError("sharded embedding indices must be torch.long")
@@ -293,16 +294,17 @@ class _ShardedEmbeddingLookup(torch.autograd.Function):
                 f"process group world_size={world_size}"
             )
         flat = indices.reshape(-1)
-        invalid = (flat < 0) | (flat >= num_embeddings)
-        if _invalid_any(
-            invalid,
-            f"embedding {table_name!r} received an out-of-range ID",
-        ):
-            examples = flat[invalid][:5].detach().cpu().tolist()
-            raise IndexError(
-                f"embedding {table_name!r} received IDs outside [0, {num_embeddings}): "
-                f"{examples}"
-            )
+        if validate_indices:
+            invalid = (flat < 0) | (flat >= num_embeddings)
+            if _invalid_any(
+                invalid,
+                f"embedding {table_name!r} received an out-of-range ID",
+            ):
+                examples = flat[invalid][:5].detach().cpu().tolist()
+                raise IndexError(
+                    f"embedding {table_name!r} received IDs outside [0, {num_embeddings}): "
+                    f"{examples}"
+                )
         active_mask = flat != padding_idx
         active_positions = torch.nonzero(active_mask, as_tuple=False).flatten()
         active_ids = flat.index_select(0, active_positions)
@@ -335,7 +337,7 @@ class _ShardedEmbeddingLookup(torch.autograd.Function):
                 sorted_ids, send_splits, recv_splits, process_group
             )
             received_local_rows = shard_spec.local_row_ids(received_ids)
-            if received_ids.numel():
+            if validate_indices and received_ids.numel():
                 expected_owner = shard_spec.owner(received_ids)
                 if _invalid_any(
                     expected_owner != rank,
@@ -384,26 +386,27 @@ class _ShardedEmbeddingLookup(torch.autograd.Function):
 
         id_bytes = indices.element_size()
         value_bytes = local_weight.element_size() * local_weight.size(1)
-        stats_sink.record_forward(
-            EmbeddingCommunicationStats(
-                table_name=table_name,
-                raw_ids=flat.numel(),
-                active_ids=active_ids.numel(),
-                local_unique_ids=requester_ids.numel(),
-                owner_unique_ids=owner_unique_rows.numel(),
-                sent_ids=sorted_ids.numel(),
-                received_ids=received_ids.numel(),
-                forward_sent_bytes=(
-                    sorted_ids.numel() * id_bytes
-                    + received_values.size(0) * value_bytes
-                ),
-                forward_received_bytes=(
-                    received_ids.numel() * id_bytes
-                    + returned_values.size(0) * value_bytes
-                ),
-                forward_collective_enqueue_seconds=communication_seconds,
+        if stats_sink is not None:
+            stats_sink.record_forward(
+                EmbeddingCommunicationStats(
+                    table_name=table_name,
+                    raw_ids=flat.numel(),
+                    active_ids=active_ids.numel(),
+                    local_unique_ids=requester_ids.numel(),
+                    owner_unique_ids=owner_unique_rows.numel(),
+                    sent_ids=sorted_ids.numel(),
+                    received_ids=received_ids.numel(),
+                    forward_sent_bytes=(
+                        sorted_ids.numel() * id_bytes
+                        + received_values.size(0) * value_bytes
+                    ),
+                    forward_received_bytes=(
+                        received_ids.numel() * id_bytes
+                        + returned_values.size(0) * value_bytes
+                    ),
+                    forward_collective_enqueue_seconds=communication_seconds,
+                )
             )
-        )
         return output.view(*indices.shape, local_weight.size(1))
 
     @staticmethod
@@ -449,13 +452,15 @@ class _ShardedEmbeddingLookup(torch.autograd.Function):
             is_coalesced=True,
         )
         value_bytes = grad_output.element_size() * embedding_dim
-        ctx.stats_sink.record_backward(
-            sent_bytes=sorted_grad.size(0) * value_bytes,
-            received_bytes=received_grad.size(0) * value_bytes,
-            enqueue_seconds=communication_seconds,
-        )
+        if ctx.stats_sink is not None:
+            ctx.stats_sink.record_backward(
+                sent_bytes=sorted_grad.size(0) * value_bytes,
+                received_bytes=received_grad.size(0) * value_bytes,
+                enqueue_seconds=communication_seconds,
+            )
         return (
             local_weight_grad,
+            None,
             None,
             None,
             None,
@@ -482,6 +487,8 @@ class ShardedEmbedding(nn.Module):
         init_std: float = 0.02,
         process_group: torch_dist.ProcessGroup | None = None,
         dtype: torch.dtype | None = None,
+        collect_stats: bool = True,
+        validate_indices: bool = True,
     ) -> None:
         super().__init__()
         if num_embeddings <= 0 or embedding_dim <= 0:
@@ -500,6 +507,8 @@ class ShardedEmbedding(nn.Module):
         self.local_dedup = local_dedup
         self.init_std = init_std
         self.process_group = process_group
+        self.collect_stats = collect_stats
+        self.validate_indices = validate_indices
         self.rank = rank
         self.world_size = world_size
         local_rows = shard_spec.local_rows(num_embeddings, rank)
@@ -542,8 +551,9 @@ class ShardedEmbedding(nn.Module):
             self.shard_spec,
             self.local_dedup,
             self.process_group,
-            self._stats_sink,
+            self._stats_sink if self.collect_stats else None,
             self.table_name,
+            self.validate_indices,
         )
 
     @torch.no_grad()
@@ -571,7 +581,8 @@ class ShardedEmbedding(nn.Module):
         return (
             f"num_embeddings={self.num_embeddings}, embedding_dim={self.embedding_dim}, "
             f"local_rows={self.weight.size(0)}, strategy={self.shard_spec.strategy}, "
-            f"rank={self.rank}/{self.world_size}, padding_idx={self.padding_idx}"
+            f"rank={self.rank}/{self.world_size}, padding_idx={self.padding_idx}, "
+            f"validate_indices={self.validate_indices}"
         )
 
 
@@ -583,6 +594,8 @@ class _GroupedLookupMetadata:
     table_offsets: tuple[int, ...]
     local_dedup: bool
     process_group: torch_dist.ProcessGroup | None
+    collect_stats: bool
+    validate_indices: bool
 
 
 def _table_indices_for_keys(keys: Tensor, table_offsets: tuple[int, ...]) -> Tensor:
@@ -635,16 +648,17 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             module = modules[table_index]
             request = packed_indices.narrow(0, request_offset, request_numel)
             request_offset += request_numel
-            invalid = (request < 0) | (request >= module.num_embeddings)
-            if _invalid_any(
-                invalid,
-                f"embedding {module.table_name!r} received an out-of-range ID",
-            ):
-                examples = request[invalid][:5].detach().cpu().tolist()
-                raise IndexError(
-                    f"embedding {module.table_name!r} received IDs outside "
-                    f"[0, {module.num_embeddings}): {examples}"
-                )
+            if metadata.validate_indices:
+                invalid = (request < 0) | (request >= module.num_embeddings)
+                if _invalid_any(
+                    invalid,
+                    f"embedding {module.table_name!r} received an out-of-range ID",
+                ):
+                    examples = request[invalid][:5].detach().cpu().tolist()
+                    raise IndexError(
+                        f"embedding {module.table_name!r} received IDs outside "
+                        f"[0, {module.num_embeddings}): {examples}"
+                    )
             active_mask = request != module.padding_idx
             positions = torch.nonzero(active_mask, as_tuple=False).flatten()
             active_ids = request.index_select(0, positions)
@@ -708,12 +722,13 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
                     continue
                 global_ids = owner_unique_keys.index_select(0, selected)
                 global_ids = global_ids - metadata.table_offsets[table_index]
-                expected_owner = module.shard_spec.owner(global_ids)
-                if _invalid_any(
-                    expected_owner != rank,
-                    "received embedding IDs owned by another rank",
-                ):
-                    raise RuntimeError("received embedding IDs owned by another rank")
+                if metadata.validate_indices:
+                    expected_owner = module.shard_spec.owner(global_ids)
+                    if _invalid_any(
+                        expected_owner != rank,
+                        "received embedding IDs owned by another rank",
+                    ):
+                        raise RuntimeError("received embedding IDs owned by another rank")
                 local_rows = module.shard_spec.local_row_ids(global_ids)
                 values = local_weight.index_select(0, local_rows)
                 owner_unique_values.index_copy_(0, selected, values)
@@ -753,47 +768,48 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             owner_inverse,
         )
 
-        requester_table_indices = _table_indices_for_keys(
-            requester_keys, metadata.table_offsets
-        )
-        received_table_indices = _table_indices_for_keys(
-            received_keys, metadata.table_offsets
-        )
-        returned_table_indices = _table_indices_for_keys(
-            sorted_keys, metadata.table_offsets
-        )
-        owner_unique_table_indices = _table_indices_for_keys(
-            owner_unique_keys, metadata.table_offsets
-        )
-        id_bytes = packed_indices.element_size()
-        value_bytes = local_weights[0].element_size() * embedding_dim
-        for table_index, module in enumerate(modules):
-            local_unique = int((requester_table_indices == table_index).sum().item())
-            received = int((received_table_indices == table_index).sum().item())
-            returned = int((returned_table_indices == table_index).sum().item())
-            owner_unique = int(
-                (owner_unique_table_indices == table_index).sum().item()
+        if metadata.collect_stats:
+            requester_table_indices = _table_indices_for_keys(
+                requester_keys, metadata.table_offsets
             )
-            module._stats_sink.record_forward(
-                EmbeddingCommunicationStats(
-                    table_name=module.table_name,
-                    raw_ids=raw_by_table[table_index],
-                    active_ids=active_by_table[table_index],
-                    local_unique_ids=local_unique,
-                    owner_unique_ids=owner_unique,
-                    sent_ids=local_unique,
-                    received_ids=received,
-                    forward_sent_bytes=(local_unique * id_bytes + received * value_bytes),
-                    forward_received_bytes=(
-                        received * id_bytes + returned * value_bytes
-                    ),
-                    # One elapsed interval covers the whole fused collective.
-                    # Attribute it once so summing table stats does not inflate it.
-                    forward_collective_enqueue_seconds=(
-                        communication_seconds if table_index == 0 else 0.0
-                    ),
+            received_table_indices = _table_indices_for_keys(
+                received_keys, metadata.table_offsets
+            )
+            returned_table_indices = _table_indices_for_keys(
+                sorted_keys, metadata.table_offsets
+            )
+            owner_unique_table_indices = _table_indices_for_keys(
+                owner_unique_keys, metadata.table_offsets
+            )
+            id_bytes = packed_indices.element_size()
+            value_bytes = local_weights[0].element_size() * embedding_dim
+            for table_index, module in enumerate(modules):
+                local_unique = int((requester_table_indices == table_index).sum().item())
+                received = int((received_table_indices == table_index).sum().item())
+                returned = int((returned_table_indices == table_index).sum().item())
+                owner_unique = int(
+                    (owner_unique_table_indices == table_index).sum().item()
                 )
-            )
+                module._stats_sink.record_forward(
+                    EmbeddingCommunicationStats(
+                        table_name=module.table_name,
+                        raw_ids=raw_by_table[table_index],
+                        active_ids=active_by_table[table_index],
+                        local_unique_ids=local_unique,
+                        owner_unique_ids=owner_unique,
+                        sent_ids=local_unique,
+                        received_ids=received,
+                        forward_sent_bytes=(local_unique * id_bytes + received * value_bytes),
+                        forward_received_bytes=(
+                            received * id_bytes + returned * value_bytes
+                        ),
+                        # One elapsed interval covers the whole fused collective.
+                        # Attribute it once so summing table stats does not inflate it.
+                        forward_collective_enqueue_seconds=(
+                            communication_seconds if table_index == 0 else 0.0
+                        ),
+                    )
+                )
         return output
 
     @staticmethod
@@ -858,21 +874,22 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
                 )
             )
 
-        sent_table_indices = _table_indices_for_keys(
-            sorted_keys, metadata.table_offsets
-        )
-        value_bytes = grad_output.element_size() * embedding_dim
-        received_table_indices = owner_table_indices.index_select(0, owner_inverse)
-        for table_index, module in enumerate(metadata.modules):
-            sent_count = int((sent_table_indices == table_index).sum().item())
-            received_count = int(
-                (received_table_indices == table_index).sum().item()
+        if metadata.collect_stats:
+            sent_table_indices = _table_indices_for_keys(
+                sorted_keys, metadata.table_offsets
             )
-            module._stats_sink.record_backward(
-                sent_bytes=sent_count * value_bytes,
-                received_bytes=received_count * value_bytes,
-                enqueue_seconds=(communication_seconds if table_index == 0 else 0.0),
-            )
+            value_bytes = grad_output.element_size() * embedding_dim
+            received_table_indices = owner_table_indices.index_select(0, owner_inverse)
+            for table_index, module in enumerate(metadata.modules):
+                sent_count = int((sent_table_indices == table_index).sum().item())
+                received_count = int(
+                    (received_table_indices == table_index).sum().item()
+                )
+                module._stats_sink.record_backward(
+                    sent_bytes=sent_count * value_bytes,
+                    received_bytes=received_count * value_bytes,
+                    enqueue_seconds=(communication_seconds if table_index == 0 else 0.0),
+                )
         return (None, None, *local_weight_grads)
 
 
@@ -902,6 +919,8 @@ def grouped_sharded_embedding_lookup(
             module.embedding_dim,
             module.world_size,
             module.local_dedup,
+            module.collect_stats,
+            module.validate_indices,
             id(module.process_group),
         )
         groups.setdefault(key, []).append(request_index)
@@ -942,6 +961,8 @@ def grouped_sharded_embedding_lookup(
             table_offsets=tuple(table_offsets),
             local_dedup=unique_modules[0].local_dedup,
             process_group=unique_modules[0].process_group,
+            collect_stats=unique_modules[0].collect_stats,
+            validate_indices=unique_modules[0].validate_indices,
         )
         packed_indices = torch.cat(flat_indices)
         packed_output = _GroupedShardedEmbeddingLookup.apply(
@@ -969,4 +990,8 @@ def sharded_embedding_modules(module: nn.Module) -> list[ShardedEmbedding]:
 def consume_sharded_embedding_stats(
     module: nn.Module,
 ) -> list[EmbeddingCommunicationStats]:
-    return [item.consume_communication_stats() for item in sharded_embedding_modules(module)]
+    return [
+        item.consume_communication_stats()
+        for item in sharded_embedding_modules(module)
+        if item.collect_stats
+    ]

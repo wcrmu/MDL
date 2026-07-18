@@ -17,6 +17,7 @@ from src.train import (
     _NamedSparseParameter,
     _ReplicatedSparseGradientSynchronizer,
     _classify_model_parameters,
+    _clip_grad_norm,
     _exclude_sparse_parameters_from_ddp,
     _mark_sparse_invariant_checks_explicitly_disabled,
     _synchronize_sparse_parameter_replicas,
@@ -286,6 +287,33 @@ def _nccl_sparse_worker(rank: int, world_size: int, port: int) -> None:
 
 
 class SparseDDPTest(unittest.TestCase):
+    def test_clip_grad_norm_handles_dense_and_sparse_values_without_branching(self) -> None:
+        _mark_sparse_invariant_checks_explicitly_disabled()
+        dense = nn.Parameter(torch.zeros(2))
+        sparse = nn.Parameter(torch.zeros(2, 1))
+        dense.grad = torch.tensor([3.0, 4.0])
+        sparse.grad = torch.sparse_coo_tensor(
+            torch.tensor([[1]]),
+            torch.tensor([[12.0]]),
+            sparse.shape,
+        )
+
+        norm = _clip_grad_norm([dense, sparse], 6.5)
+
+        torch.testing.assert_close(norm, torch.tensor(13.0))
+        torch.testing.assert_close(
+            dense.grad,
+            torch.tensor([1.5, 2.0]),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(
+            sparse.grad.coalesce().values(),
+            torch.tensor([[6.0]]),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
     def test_parameter_groups_keep_optimizer_and_sparse_sync_roles_separate(self) -> None:
         model = _ToySparseModel()
         groups = _classify_model_parameters(model)

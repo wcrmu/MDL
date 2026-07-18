@@ -18,6 +18,7 @@ from src.benchmark import (
     _nvidia_smi_device_selector,
     _percentile,
     _replace_id_embeddings_with_synthetic,
+    _synthetic_feature_batch,
     _synthetic_vocab_maps,
     _trace,
 )
@@ -39,6 +40,28 @@ class BenchmarkOptionsTest(unittest.TestCase):
         BenchmarkOptions(mode="compute", batch_size=8).validate()
         with self.assertRaisesRegex(ValueError, "compute mode"):
             BenchmarkOptions(mode="data", batch_size=8).validate()
+
+    def test_agg_compute_controls_are_compute_only(self) -> None:
+        BenchmarkOptions(
+            mode="compute",
+            reserve_hbm_gib=24.0,
+            candidates_per_request=4,
+        ).validate()
+        with self.assertRaisesRegex(ValueError, "reserve_hbm_gib"):
+            BenchmarkOptions(mode="data", reserve_hbm_gib=1.0).validate()
+        with self.assertRaisesRegex(ValueError, "candidates_per_request"):
+            BenchmarkOptions(mode="embedding", candidates_per_request=2).validate()
+
+    def test_named_sequence_lengths_require_positive_integers(self) -> None:
+        BenchmarkOptions(
+            mode="compute",
+            sequence_lengths={"hist": 32},
+        ).validate()
+        with self.assertRaisesRegex(ValueError, "sequence_lengths"):
+            BenchmarkOptions(
+                mode="compute",
+                sequence_lengths={"hist": 0},
+            ).validate()
 
 
 class TraceCollectorTest(unittest.TestCase):
@@ -173,6 +196,43 @@ class SyntheticEmbeddingReplacementTest(unittest.TestCase):
         self.assertIs(
             model.encoder_bank.embeddings["item_id"],
             model.encoder_bank.embeddings["hist__item_id"],
+        )
+
+    def test_synthetic_agg_batch_keeps_sequences_at_request_granularity(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "default.yaml")
+
+        batch = _synthetic_feature_batch(
+            config,
+            torch.device("cpu"),
+            batch_size=6,
+            sequence_length=2,
+            seed=7,
+            candidates_per_request=3,
+        )
+
+        sequence = batch.features[config.sequences[0].name]
+        self.assertEqual(sequence["lengths"].tolist(), [2, 2])
+        self.assertEqual(sequence["row_indices"].tolist(), [0, 0, 0, 1, 1, 1])
+        self.assertEqual(batch.scenario_id.numel(), 6)
+
+    def test_synthetic_batch_uses_named_sequence_length(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "default.yaml")
+        sequence_name = config.sequences[0].name
+
+        batch = _synthetic_feature_batch(
+            config,
+            torch.device("cpu"),
+            batch_size=2,
+            sequence_length=None,
+            seed=7,
+            sequence_lengths={sequence_name: 3},
+        )
+
+        self.assertEqual(
+            batch.features[sequence_name]["lengths"].tolist(),
+            [3, 3],
         )
 
 

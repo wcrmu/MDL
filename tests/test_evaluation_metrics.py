@@ -54,6 +54,7 @@ class EvaluationMetricTest(unittest.TestCase):
         accumulator.update(scores[:2], labels[:2])
         accumulator.update(scores[2:], labels[2:])
         self.assertEqual(accumulator.compute(), _binary_auc(scores, labels))
+        self.assertEqual(accumulator.counts(), (4, 2, 2))
 
     def test_disk_group_histogram_aggregates_across_batches(self) -> None:
         accumulator = _DiskBackedGroupAUC(1024)

@@ -12,11 +12,13 @@ from src.config import (
     FeatureConfig,
     ResolvedCategoricalInput,
     ResolvedIdentityEncoding,
+    ResolvedPreHashedEncoding,
     ResolvedSharedVocabEncoding,
     SequenceConfig,
     SequenceFieldConfig,
 )
 from src.dataloader import _tensorize_categorical, _tensorize_multi_field_sequence
+from src.features import pre_hashed_bucket
 
 
 def _identity_input(
@@ -49,6 +51,27 @@ def _config(inputs: list[ResolvedCategoricalInput]) -> SimpleNamespace:
         ),
         vocab_strategy=SimpleNamespace(
             defaults=SimpleNamespace(unseen_policy="error")
+        ),
+    )
+
+
+def _pre_hashed_input(
+    name: str,
+    source: str,
+    *,
+    num_buckets: int = 8,
+    sequence_name: str | None = None,
+    field_name: str | None = None,
+) -> ResolvedCategoricalInput:
+    return ResolvedCategoricalInput(
+        name=name,
+        source=source,
+        location="sequence_field" if sequence_name else "feature",
+        sequence_name=sequence_name,
+        field_name=field_name,
+        encoding=ResolvedPreHashedEncoding(
+            num_buckets=num_buckets,
+            padding_id=0,
         ),
     )
 
@@ -139,6 +162,121 @@ class ScalarDirectIdTest(unittest.TestCase):
             actual = _tensorize_categorical(config, feature, table, {})
 
         torch.testing.assert_close(actual, torch.tensor([0, 7, 15]))
+
+
+class PreHashedIdTest(unittest.TestCase):
+    def test_config_requires_power_of_two_and_rejects_salt(self) -> None:
+        non_power_two = CategoricalEncodingConfig.from_mapping(
+            {"type": "pre_hashed", "num_buckets": 10}
+        )
+        assert non_power_two is not None
+        with self.assertRaisesRegex(ValueError, "power of two"):
+            non_power_two.validate("feature.encoding")
+
+        salted = CategoricalEncodingConfig.from_mapping(
+            {"type": "pre_hashed", "num_buckets": 8, "salt": "double-hash"}
+        )
+        assert salted is not None
+        with self.assertRaisesRegex(ValueError, "salt is not allowed"):
+            salted.validate("feature.encoding")
+
+    def test_python_mapping_preserves_signed_int64_bits(self) -> None:
+        self.assertEqual(pre_hashed_bucket(-1, 8), 8)
+        self.assertEqual(pre_hashed_bucket(-8, 8), 1)
+        self.assertEqual(pre_hashed_bucket(-(1 << 63), 8), 1)
+        self.assertEqual(pre_hashed_bucket((1 << 63) - 1, 8), 8)
+        with self.assertRaisesRegex(ValueError, "must not be zero"):
+            pre_hashed_bucket(0, 8)
+
+    def test_scalar_arrow_path_is_vectorized_and_null_is_padding(self) -> None:
+        categorical = _pre_hashed_input("item_hash", "item_hash")
+        config = _config([categorical])
+        feature = FeatureConfig(
+            name="item_hash", kind="categorical", source="item_hash"
+        )
+        table = pa.table(
+            {
+                "item_hash": pa.array(
+                    [None, -1, -8, -(1 << 63), 1, (1 << 63) - 1],
+                    type=pa.int64(),
+                )
+            }
+        )
+
+        with patch(
+            "src.dataloader.encode_categorical_values",
+            side_effect=AssertionError("pre_hashed path called Python encoder"),
+        ):
+            actual = _tensorize_categorical(config, feature, table, {})
+
+        torch.testing.assert_close(actual, torch.tensor([0, 8, 1, 1, 2, 8]))
+
+    def test_non_null_zero_is_rejected(self) -> None:
+        categorical = _pre_hashed_input("item_hash", "item_hash")
+        config = _config([categorical])
+        feature = FeatureConfig(
+            name="item_hash", kind="categorical", source="item_hash"
+        )
+        table = pa.table({"item_hash": pa.array([1, 0], type=pa.int64())})
+        with self.assertRaisesRegex(ValueError, "non-null zero"):
+            _tensorize_categorical(config, feature, table, {})
+
+    def test_non_null_zero_scan_can_be_explicitly_disabled(self) -> None:
+        categorical = _pre_hashed_input("item_hash", "item_hash")
+        config = _config([categorical])
+        feature = FeatureConfig(
+            name="item_hash", kind="categorical", source="item_hash"
+        )
+        table = pa.table({"item_hash": pa.array([1, 0], type=pa.int64())})
+
+        actual = _tensorize_categorical(
+            config,
+            feature,
+            table,
+            {},
+            validate_prehashed_nonzero=False,
+        )
+
+        torch.testing.assert_close(actual, torch.tensor([2, 1]))
+
+    def test_sequence_uses_vectorized_low_bit_mapping(self) -> None:
+        categorical = _pre_hashed_input(
+            "hist.item_hash",
+            "hist_item_hash",
+            sequence_name="hist",
+            field_name="item_hash",
+        )
+        config = _config([categorical])
+        sequence = SequenceConfig(
+            name="hist",
+            fields=[
+                SequenceFieldConfig(
+                    name="item_hash", kind="categorical", source="hist_item_hash"
+                )
+            ],
+            max_length=2,
+            truncation="head",
+        )
+        table = pa.table(
+            {
+                "hist_item_hash": pa.array(
+                    [[-1, -8, 3], None],
+                    type=pa.list_(pa.int64()),
+                )
+            }
+        )
+
+        with patch(
+            "src.dataloader._sequence_rows",
+            side_effect=AssertionError("pre_hashed sequence used Python rows"),
+        ):
+            actual = _tensorize_multi_field_sequence(config, sequence, table, {})
+
+        torch.testing.assert_close(actual["lengths"], torch.tensor([2, 0]))
+        torch.testing.assert_close(
+            actual["fields"]["item_hash"],
+            torch.tensor([[8, 1], [0, 0]]),
+        )
 
 
 class SequenceDirectIdTest(unittest.TestCase):

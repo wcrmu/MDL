@@ -78,6 +78,7 @@ class ConfigImmutabilityTest(unittest.TestCase):
         adapter = ParquetAdapterConfig(
             callable="examples.parquet_identity_adapter:adapt",
             input_columns=["item_id"],
+            optional_input_columns=["context_indices"],
             options=options,
         )
 
@@ -85,6 +86,7 @@ class ConfigImmutabilityTest(unittest.TestCase):
         options["new"] = True
 
         self.assertEqual(adapter.input_columns, ("item_id",))
+        self.assertEqual(adapter.optional_input_columns, ("context_indices",))
         self.assertEqual(adapter.options["schema"]["columns"], ("item_id",))
         self.assertNotIn("new", adapter.options)
         with self.assertRaises(TypeError):

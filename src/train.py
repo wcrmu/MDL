@@ -6,11 +6,14 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from importlib import import_module
 import inspect
+import logging
 import math
 import os
 from pathlib import Path
+import queue
 import sqlite3
 import tempfile
+import threading
 from time import perf_counter
 from typing import Any, Callable, Iterator
 
@@ -23,10 +26,13 @@ from .config import AppConfig, DDPConfig, ParquetSplitConfig, ReaderConfig
 from .checkpoint import load_model_checkpoint, save_model_checkpoint
 from .dataloader import (
     FeatureBatch,
+    _column_array,
     _require_pyarrow,
+    discover_scenario_values,
     iter_flat_tables,
     move_feature_batch,
     pin_feature_batch,
+    resolve_auto_scenarios,
     table_to_feature_batch,
 )
 from .features import load_vocab_maps
@@ -38,6 +44,11 @@ from .embeddings import (
 from .model import build_model
 from .modules.mlp import SparseMoEPerTokenFFN
 from .optim import ShardedAdagrad
+
+
+logger = logging.getLogger(__name__)
+
+_CONTROL_PROCESS_GROUP: torch_dist.ProcessGroup | None = None
 
 
 @dataclass(frozen=True)
@@ -101,8 +112,8 @@ class PredictResult:
 @dataclass(frozen=True)
 class EvaluateResult:
     rows: int
-    group_metric_name: str
-    metrics: dict[str, dict[str, float | None]]
+    group_metric_name: str | None
+    metrics: dict[str, dict[str, float | int | None]]
     auc_histogram_bins: int = 65536
 
 
@@ -122,6 +133,7 @@ class DistributedContext:
     world_size: int
     device: torch.device
     initialized_here: bool = False
+    control_group: torch_dist.ProcessGroup | None = None
 
 
 @dataclass(frozen=True)
@@ -286,6 +298,7 @@ def _attention_runtime_description(
 
 
 def _setup_distributed(config: AppConfig) -> DistributedContext:
+    global _CONTROL_PROCESS_GROUP
     world_size = _env_int("WORLD_SIZE", 1)
     rank = _env_int("RANK", 0)
     local_rank = _env_int("LOCAL_RANK", 0)
@@ -298,6 +311,19 @@ def _setup_distributed(config: AppConfig) -> DistributedContext:
         torch_dist.init_process_group(backend=backend, init_method="env://")
         initialized_here = True
 
+    control_group: torch_dist.ProcessGroup | None = None
+    if enabled and device.type == "cuda":
+        if _CONTROL_PROCESS_GROUP is None:
+            try:
+                _CONTROL_PROCESS_GROUP = torch_dist.new_group(backend="gloo")
+            except RuntimeError as error:
+                logger.warning(
+                    "Could not create a CPU control process group; active-rank "
+                    "coordination will synchronize CUDA: %s",
+                    error,
+                )
+        control_group = _CONTROL_PROCESS_GROUP
+
     return DistributedContext(
         enabled=enabled,
         rank=rank,
@@ -305,12 +331,56 @@ def _setup_distributed(config: AppConfig) -> DistributedContext:
         world_size=world_size,
         device=device,
         initialized_here=initialized_here,
+        control_group=control_group,
     )
 
 
 def _cleanup_distributed(context: DistributedContext) -> None:
+    global _CONTROL_PROCESS_GROUP
     if context.initialized_here and torch_dist.is_initialized():
+        if _CONTROL_PROCESS_GROUP is not None:
+            torch_dist.destroy_process_group(_CONTROL_PROCESS_GROUP)
+            _CONTROL_PROCESS_GROUP = None
         torch_dist.destroy_process_group()
+
+
+def _resolve_distributed_auto_scenarios(
+    config: AppConfig,
+    context: DistributedContext,
+) -> AppConfig:
+    """Discover on rank 0 and broadcast one stable raw-scene ordering."""
+
+    scenarios = getattr(config, "scenarios", None)
+    if scenarios is None or not getattr(scenarios, "auto_discover", False):
+        return config
+    if not context.enabled:
+        resolved = resolve_auto_scenarios(config)
+        logger.info("Discovered raw scene_id values: %s", resolved.scenarios.names)
+        return resolved
+
+    payload: list[dict[str, Any] | None] = [None]
+    if context.rank == 0:
+        try:
+            payload[0] = {
+                "values": list(discover_scenario_values(config)),
+                "error": None,
+            }
+        except Exception as error:  # Broadcast failure instead of hanging peers.
+            payload[0] = {"values": None, "error": str(error)}
+    torch_dist.broadcast_object_list(payload, src=0)
+    result = payload[0]
+    if not isinstance(result, dict):
+        raise RuntimeError("distributed scenario discovery broadcast an invalid payload")
+    error = result.get("error")
+    if error:
+        raise RuntimeError(f"automatic scenario discovery failed: {error}")
+    values = result.get("values")
+    if not isinstance(values, list):
+        raise RuntimeError("automatic scenario discovery did not broadcast a value list")
+    resolved = resolve_auto_scenarios(config, values)
+    if context.rank == 0:
+        logger.info("Discovered raw scene_id values: %s", resolved.scenarios.names)
+    return resolved
 
 
 def _load_external_train_adapter(dotted_path: str | None) -> ExternalTrainAdapter:
@@ -363,25 +433,41 @@ def _slice_table(table: object, batch_size: int) -> Iterator[object]:
         yield table.slice(offset, batch_size)
 
 
-def _table_effective_sequence_lengths(config: AppConfig, table: object) -> Tensor:
-    """Return a vectorized per-row maximum length over configured sequences."""
+def _table_sequence_lengths(config: AppConfig, sequence: Any, table: object) -> Tensor:
+    pa, pc, _ds, _pq = _require_pyarrow()
+    source = sequence.fields[0].source
+    array = _column_array(table, source)
+    if pa.types.is_dictionary(array.type):
+        dictionary_lengths = pc.list_value_length(array.dictionary)
+        lengths = pc.take(dictionary_lengths, array.indices)
+    else:
+        lengths = pc.list_value_length(array)
+    if lengths.null_count:
+        lengths = pc.fill_null(lengths, 0)
+    values = torch.from_numpy(
+        lengths.to_numpy(zero_copy_only=False).copy()
+    ).to(dtype=torch.long)
+    if sequence.max_length is not None:
+        values.clamp_(max=sequence.max_length)
+    return values
 
-    _pa, pc, _ds, _pq = _require_pyarrow()
+
+def _table_effective_sequence_lengths(
+    config: AppConfig,
+    table: object,
+    metric: str = "max",
+) -> Tensor:
+    """Return the configured per-row sequence-work metric."""
+
     result = torch.zeros(table.num_rows, dtype=torch.long)
     for sequence in config.sequences:
         if not sequence.fields:
             continue
-        source = sequence.fields[0].source
-        array = table[source].combine_chunks()
-        lengths = pc.list_value_length(array)
-        if lengths.null_count:
-            lengths = pc.fill_null(lengths, 0)
-        values = torch.from_numpy(
-            lengths.to_numpy(zero_copy_only=False).copy()
-        ).to(dtype=torch.long)
-        if sequence.max_length is not None:
-            values.clamp_(max=sequence.max_length)
-        result = torch.maximum(result, values)
+        values = _table_sequence_lengths(config, sequence, table)
+        if metric == "sum":
+            result.add_(values)
+        else:
+            result = torch.maximum(result, values)
     return result
 
 
@@ -421,7 +507,11 @@ def _iter_length_bucketed_tables(
         shard_rank=shard_rank,
         shard_world_size=shard_world_size,
     ):
-        lengths = _table_effective_sequence_lengths(config, table)
+        lengths = _table_effective_sequence_lengths(
+            config,
+            table,
+            metric=reader.length_bucket_metric,
+        )
         assignments = torch.bucketize(lengths, boundaries, right=False)
         for bucket_index, bucket in enumerate(buckets):
             selected = torch.nonzero(
@@ -488,12 +578,35 @@ def _estimate_prepared_batch_bytes(config: AppConfig, table: object) -> int:
 
     rows = int(table.num_rows)
     tensor_bytes = 0
+    bag_max_lengths: dict[str, int] = {}
     for feature in config.features:
-        tensor_bytes += rows * feature.dimension * (8 if feature.kind == "categorical" else 4)
+        if feature.kind == "categorical" and feature.pooling == "mean":
+            max_length = bag_max_lengths.get(feature.source)
+            if max_length is None:
+                try:
+                    pa, pc, _ds, _pq = _require_pyarrow()
+                    array = table[feature.source].combine_chunks()
+                    if pa.types.is_dictionary(array.type):
+                        dictionary_lengths = pc.list_value_length(array.dictionary)
+                        lengths = pc.take(dictionary_lengths, array.indices)
+                    else:
+                        lengths = pc.list_value_length(array)
+                    if lengths.null_count:
+                        lengths = pc.fill_null(lengths, 0)
+                    maximum = pc.max(lengths).as_py()
+                    max_length = int(maximum or 0)
+                except (KeyError, TypeError, AttributeError):
+                    max_length = feature.max_length or 1
+                bag_max_lengths[feature.source] = max_length
+            if feature.max_length is not None:
+                max_length = min(max_length, feature.max_length)
+            tensor_bytes += rows * (8 + max_length * 8)
+        else:
+            tensor_bytes += rows * feature.dimension * (8 if feature.kind == "categorical" else 4)
     for sequence in config.sequences:
         if not sequence.fields:
             continue
-        lengths = _table_effective_sequence_lengths(config, table)
+        lengths = _table_sequence_lengths(config, sequence, table)
         padded_length = int(lengths.max().item()) if lengths.numel() else 0
         tensor_bytes += rows * 8
         for field in sequence.fields:
@@ -512,6 +625,7 @@ def _prepare_feature_batch(
     vocab_maps: dict[str, dict[str, int]],
     require_labels: bool,
     pin_memory: bool,
+    coalesce_pinned_tensors: bool,
     include_group_id: bool,
 ) -> FeatureBatch:
     batch = table_to_feature_batch(
@@ -522,7 +636,14 @@ def _prepare_feature_batch(
         include_group_id=include_group_id,
         split=split,
     )
-    return pin_feature_batch(batch) if pin_memory else batch
+    return (
+        pin_feature_batch(
+            batch,
+            coalesce_tensors=coalesce_pinned_tensors,
+        )
+        if pin_memory
+        else batch
+    )
 
 
 def _split_reader(config: AppConfig, split_name: str) -> ReaderConfig:
@@ -547,6 +668,7 @@ def iter_feature_batches(
         raise ValueError(f"split {split_name!r} is not configured")
     reader = _split_reader(config, split_name)
     pin_memory = reader.pin_memory and pin_memory
+    coalesce_pinned_tensors = reader.coalesce_pinned_tensors and pin_memory
     table_iter = _iter_batch_tables(
         config,
         split_name,
@@ -563,6 +685,7 @@ def iter_feature_batches(
                 vocab_maps,
                 require_labels,
                 pin_memory,
+                coalesce_pinned_tensors,
                 include_group_id,
             )
         return
@@ -606,6 +729,7 @@ def iter_feature_batches(
                             vocab_maps,
                             require_labels,
                             pin_memory,
+                            coalesce_pinned_tensors,
                             include_group_id,
                         ),
                         reservation,
@@ -629,6 +753,7 @@ def iter_feature_batches(
                                 vocab_maps,
                                 require_labels,
                                 pin_memory,
+                                coalesce_pinned_tensors,
                                 include_group_id,
                             ),
                             reservation,
@@ -645,6 +770,120 @@ def iter_feature_batches(
                 reservation = actual_bytes
             yield batch
             pending_bytes -= reservation
+
+
+@dataclass(frozen=True)
+class _DevicePrefetchItem:
+    batch: FeatureBatch | None = None
+    ready: torch.cuda.Event | None = None
+    error: BaseException | None = None
+    done: bool = False
+
+
+def _record_feature_batch_stream(
+    batch: FeatureBatch,
+    stream: torch.cuda.Stream,
+) -> None:
+    """Associate prefetched allocations with the consuming CUDA stream."""
+
+    def record(value: Any) -> None:
+        if isinstance(value, Tensor) and value.device.type == "cuda":
+            value.record_stream(stream)
+        elif isinstance(value, dict):
+            for child in value.values():
+                record(child)
+
+    record(batch.features)
+    record(batch.labels)
+    record(batch.label_mask)
+    record(batch.scenario_id)
+    for buffer in batch._packed_buffers:
+        record(buffer)
+
+
+class _DevicePrefetchIterator:
+    """Prepare and copy future batches on a dedicated CUDA stream/thread."""
+
+    def __init__(
+        self,
+        iterator: Iterator[FeatureBatch],
+        device: torch.device,
+        depth: int,
+    ) -> None:
+        if device.type != "cuda" or depth <= 0:
+            raise ValueError("device prefetch requires CUDA and positive depth")
+        self.iterator = iterator
+        self.device = device
+        self.stop_event = threading.Event()
+        self.queue: queue.Queue[_DevicePrefetchItem] = queue.Queue(maxsize=depth)
+        self.thread = threading.Thread(
+            target=self._worker,
+            name="mdl-cuda-prefetch",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def __iter__(self) -> "_DevicePrefetchIterator":
+        return self
+
+    def _put(self, item: _DevicePrefetchItem) -> bool:
+        while not self.stop_event.is_set():
+            try:
+                self.queue.put(item, timeout=0.05)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _worker(self) -> None:
+        try:
+            torch.cuda.set_device(self.device)
+            transfer_stream = torch.cuda.Stream(device=self.device)
+            while not self.stop_event.is_set():
+                try:
+                    host_batch = next(self.iterator)
+                except StopIteration:
+                    self._put(_DevicePrefetchItem(done=True))
+                    return
+                with torch.cuda.stream(transfer_stream):
+                    device_batch = move_feature_batch(
+                        host_batch,
+                        self.device,
+                        non_blocking=True,
+                    )
+                    ready = torch.cuda.Event()
+                    ready.record(transfer_stream)
+                if not self._put(
+                    _DevicePrefetchItem(batch=device_batch, ready=ready)
+                ):
+                    return
+        except BaseException as error:
+            self._put(_DevicePrefetchItem(error=error))
+        finally:
+            close = getattr(self.iterator, "close", None)
+            if callable(close):
+                close()
+
+    def __next__(self) -> FeatureBatch:
+        item = self.queue.get()
+        if item.error is not None:
+            self.close()
+            raise item.error
+        if item.done:
+            self.close()
+            raise StopIteration
+        if item.batch is None or item.ready is None:
+            self.close()
+            raise RuntimeError("invalid CUDA-prefetch queue item")
+        current_stream = torch.cuda.current_stream(self.device)
+        current_stream.wait_event(item.ready)
+        _record_feature_batch_stream(item.batch, current_stream)
+        return item.batch
+
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.thread is not threading.current_thread():
+            self.thread.join(timeout=5.0)
 
 
 def _classify_model_parameters(model: nn.Module) -> _ParameterGroups:
@@ -789,6 +1028,7 @@ def _validate_sharded_embedding_metadata(
             module.shard_spec.cyclic_offset,
             module.shard_spec.table_owner,
             module.shard_spec.world_size,
+            str(module.weight.dtype),
         )
         for module in modules
     )
@@ -1218,6 +1458,9 @@ def _batch_input_token_count(batch: FeatureBatch) -> int:
         if not isinstance(lengths, Tensor):
             continue
         found_sequence = True
+        row_indices = value.get("row_indices")
+        if isinstance(row_indices, Tensor):
+            lengths = lengths.index_select(0, row_indices.to(lengths.device).long())
         total += int(lengths.detach().sum().cpu().item())
     if found_sequence:
         return total
@@ -1242,7 +1485,11 @@ def _batch_padded_token_slots(batch: FeatureBatch) -> int:
             if isinstance(field_value, Tensor) and field_value.dim() >= 2:
                 padded_length = int(field_value.size(1))
                 break
-        total += int(lengths.numel()) * padded_length
+        row_indices = value.get("row_indices")
+        logical_rows = (
+            int(row_indices.numel()) if isinstance(row_indices, Tensor) else int(lengths.numel())
+        )
+        total += logical_rows * padded_length
     if found_sequence:
         return total
     return int(batch.scenario_id.size(0))
@@ -1293,12 +1540,13 @@ def _set_optimizer_lrs(
 def _active_rank_count(context: DistributedContext, rank_active: bool) -> int:
     if not context.enabled:
         return int(rank_active)
-    value = torch.tensor(
-        int(rank_active),
-        dtype=torch.long,
-        device=context.device,
+    device = torch.device("cpu") if context.control_group is not None else context.device
+    value = torch.tensor(int(rank_active), dtype=torch.long, device=device)
+    torch_dist.all_reduce(
+        value,
+        op=torch_dist.ReduceOp.SUM,
+        group=context.control_group,
     )
-    torch_dist.all_reduce(value, op=torch_dist.ReduceOp.SUM)
     return int(value.item())
 
 
@@ -1416,19 +1664,34 @@ def _clip_grad_norm(parameters: list[nn.Parameter], max_norm: float) -> Tensor:
         return torch.tensor(0.0)
 
     first = grads[0]
+    detached = [grad.detach() for grad in grads]
+    foreach_compatible = all(
+        grad.device == first.device and grad.dtype == first.dtype
+        for grad in detached
+    )
+    norms: list[Tensor] | tuple[Tensor, ...]
+    if foreach_compatible and hasattr(torch, "_foreach_norm"):
+        try:
+            norms = torch._foreach_norm(detached, 2.0)
+        except (RuntimeError, TypeError):
+            norms = [torch.linalg.vector_norm(grad, 2.0) for grad in detached]
+    else:
+        norms = [torch.linalg.vector_norm(grad, 2.0) for grad in detached]
     total_norm = torch.linalg.vector_norm(
-        torch.stack([torch.linalg.vector_norm(grad.detach(), 2.0).to(first.device) for grad in grads]),
+        torch.stack([norm.to(first.device) for norm in norms]),
         2.0,
     )
-    clip_coef = max_norm / (total_norm + 1e-6)
-    if clip_coef < 1:
-        for parameter in parameters:
-            if parameter.grad is None:
-                continue
-            if parameter.grad.is_sparse:
-                parameter.grad._values().mul_(clip_coef.to(parameter.grad.device))
-            else:
-                parameter.grad.mul_(clip_coef.to(parameter.grad.device))
+    # Clamping and applying on-device avoids the Python truth-value conversion
+    # that otherwise synchronizes CUDA every training step.
+    clip_coef = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
+    if foreach_compatible and hasattr(torch, "_foreach_mul_"):
+        try:
+            torch._foreach_mul_(grads, clip_coef)
+            return total_norm
+        except (RuntimeError, TypeError):
+            pass
+    for grad in grads:
+        grad.mul_(clip_coef.to(grad.device))
     return total_norm
 
 
@@ -1578,11 +1841,14 @@ def train_mdl(
     step_observer: TrainStepObserver | None = None,
 ) -> TrainResult:
     if config.training.sparse_update_mode == "external_parameter_server":
+        config = resolve_auto_scenarios(config)
         adapter = _load_external_train_adapter(config.training.sparse_parameter_server_adapter)
         return _coerce_train_result(adapter(config=config, max_steps=max_steps))
 
     context = _setup_distributed(config)
+    batch_iterator: Iterator[FeatureBatch] | None = None
     try:
+        config = _resolve_distributed_auto_scenarios(config, context)
         device = context.device
         if device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = config.runtime.allow_tf32
@@ -1685,10 +1951,13 @@ def train_mdl(
         last_loss = 0.0
         last_loss_numerator = 0.0
         last_loss_denominator = 0.0
+        last_loss_tensor: Tensor | None = None
+        last_loss_numerator_tensor: Tensor | None = None
+        last_loss_denominator_tensor: Tensor | None = None
         model.train()
         _sync_device(device)
         start = perf_counter()
-        batch_iterator = iter(
+        host_batch_iterator = iter(
             iter_feature_batches(
                 config,
                 "train",
@@ -1699,6 +1968,21 @@ def train_mdl(
                 pin_memory=non_blocking,
                 include_group_id=False,
             )
+        )
+        device_prefetch_depth = (
+            config.data.train.reader.device_prefetch_batches
+            if device.type == "cuda"
+            else 0
+        )
+        batches_on_device = device_prefetch_depth > 0
+        batch_iterator = (
+            _DevicePrefetchIterator(
+                host_batch_iterator,
+                device,
+                device_prefetch_depth,
+            )
+            if batches_on_device
+            else host_batch_iterator
         )
         last_device_batch: FeatureBatch | None = None
         while max_steps is None or steps < max_steps:
@@ -1727,10 +2011,14 @@ def train_mdl(
             if rank_active:
                 if local_batch is None:
                     raise AssertionError("active rank is missing its training batch")
-                batch = move_feature_batch(
-                    local_batch,
-                    device,
-                    non_blocking=non_blocking,
+                batch = (
+                    local_batch
+                    if batches_on_device
+                    else move_feature_batch(
+                        local_batch,
+                        device,
+                        non_blocking=non_blocking,
+                    )
                 )
                 last_device_batch = batch
             else:
@@ -1815,9 +2103,9 @@ def train_mdl(
             steps += 1
             if rank_active:
                 rows += int(batch.scenario_id.size(0))
-            last_loss = float(loss.detach().cpu().item())
-            last_loss_numerator = float(loss_numerator.detach().cpu().item())
-            last_loss_denominator = float(loss_denominator.detach().cpu().item())
+            last_loss_tensor = loss.detach()
+            last_loss_numerator_tensor = loss_numerator.detach()
+            last_loss_denominator_tensor = loss_denominator.detach()
             if step_observer is not None:
                 step_observer(
                     TrainStepTrace(
@@ -1841,7 +2129,13 @@ def train_mdl(
                         sparse_payload_bytes=sparse_sync_stats.logical_payload_bytes,
                     )
                 )
-            if log_steps and context.rank == 0:
+            should_log = (
+                log_steps
+                and context.rank == 0
+                and steps % config.training.log_every_steps == 0
+            )
+            if should_log:
+                last_loss = float(last_loss_tensor.float().cpu().item())
                 payload_mib = sparse_sync_stats.logical_payload_bytes / (1024 ** 2)
                 valid_tokens = _batch_input_token_count(batch) if rank_active else 0
                 padded_slots = _batch_padded_token_slots(batch) if rank_active else 0
@@ -1862,6 +2156,17 @@ def train_mdl(
         _sync_device(device)
         elapsed = perf_counter() - start
 
+        if last_loss_tensor is not None:
+            last_loss = float(last_loss_tensor.float().cpu().item())
+            assert last_loss_numerator_tensor is not None
+            assert last_loss_denominator_tensor is not None
+            last_loss_numerator = float(
+                last_loss_numerator_tensor.float().cpu().item()
+            )
+            last_loss_denominator = float(
+                last_loss_denominator_tensor.float().cpu().item()
+            )
+
         local_result = TrainResult(steps=steps, rows=rows, last_loss=last_loss, elapsed_seconds=elapsed)
         result = _aggregate_train_result(
             context,
@@ -1881,6 +2186,10 @@ def train_mdl(
             )
         return result
     finally:
+        if batch_iterator is not None:
+            close = getattr(batch_iterator, "close", None)
+            if callable(close):
+                close()
         _cleanup_distributed(context)
 
 
@@ -1981,6 +2290,11 @@ class _StreamingHistogramAUC:
             self.positives * (negatives_below + 0.5 * self.negatives)
         ).sum()
         return float((concordant / (positive_count * negative_count)).item())
+
+    def counts(self) -> tuple[int, int, int]:
+        positives = int(self.positives.sum().item())
+        negatives = int(self.negatives.sum().item())
+        return positives + negatives, positives, negatives
 
 
 class _DiskBackedGroupAUC:
@@ -2137,13 +2451,14 @@ def evaluate_mdl(
     checkpoint_path: str | None = None,
     max_batches: int | None = None,
     allow_random_init: bool = False,
-    group_metric_name: str = "qauc",
+    group_metric_name: str | None = None,
     auc_bins: int = 65536,
 ) -> EvaluateResult:
+    config = resolve_auto_scenarios(config)
     if split_name not in {"train", "test"}:
         raise ValueError("evaluation split must be train or test")
-    if group_metric_name not in {"qauc", "uauc"}:
-        raise ValueError("group_metric_name must be qauc or uauc")
+    if group_metric_name not in {None, "qauc", "uauc"}:
+        raise ValueError("group_metric_name must be null, qauc, or uauc")
     if auc_bins < 2:
         raise ValueError("auc_bins must be at least 2")
     split = config.data.train if split_name == "train" else config.data.test
@@ -2154,7 +2469,7 @@ def evaluate_mdl(
             f"data.{split_name}.labels must declare the training tasks in the same order: "
             + ", ".join(config.task_names)
         )
-    if split.group_id is None:
+    if group_metric_name is not None and split.group_id is None:
         raise ValueError(
             f"data.{split_name}.group_id is required for {group_metric_name.upper()}"
         )
@@ -2171,7 +2486,11 @@ def evaluate_mdl(
         [_StreamingHistogramAUC(auc_bins) for _ in range(scenario_count + 1)]
         for _ in config.task_names
     ]
-    grouped_auc = _DiskBackedGroupAUC(auc_bins)
+    grouped_auc = (
+        _DiskBackedGroupAUC(auc_bins)
+        if group_metric_name is not None
+        else None
+    )
     rows = 0
     non_blocking = _non_blocking_transfer(config, split_name, device)
     try:
@@ -2182,7 +2501,7 @@ def evaluate_mdl(
                 vocab_maps,
                 require_labels=True,
                 pin_memory=non_blocking,
-                include_group_id=True,
+                include_group_id=group_metric_name is not None,
             )
         ):
             if max_batches is not None and batch_index >= max_batches:
@@ -2209,11 +2528,6 @@ def evaluate_mdl(
                 task_scores = probabilities[valid, task_index]
                 task_labels = labels[valid, task_index]
                 task_scenarios = scenario_membership[valid]
-                task_groups = [
-                    group_id
-                    for group_id, keep in zip(batch.group_id, valid.tolist())
-                    if keep
-                ]
                 auc_accumulators[task_index][0].update(
                     task_scores, task_labels
                 )
@@ -2222,27 +2536,55 @@ def evaluate_mdl(
                     auc_accumulators[task_index][scenario + 1].update(
                         task_scores[selected], task_labels[selected]
                     )
-                grouped_auc.add(
-                    task_index,
-                    task_groups,
-                    task_scores,
-                    task_labels,
-                    task_scenarios,
-                )
+                if grouped_auc is not None:
+                    task_groups = [
+                        group_id
+                        for group_id, keep in zip(batch.group_id, valid.tolist())
+                        if keep
+                    ]
+                    grouped_auc.add(
+                        task_index,
+                        task_groups,
+                        task_scores,
+                        task_labels,
+                        task_scenarios,
+                    )
 
-        metrics: dict[str, dict[str, float | None]] = {}
+        metrics: dict[str, dict[str, float | int | None]] = {}
         for task_index, task_name in enumerate(config.task_names):
-            values: dict[str, float | None] = {
-                "auc": auc_accumulators[task_index][0].compute(),
-                group_metric_name: grouped_auc.compute(task_index, -1),
+            overall = auc_accumulators[task_index][0]
+            total, positives, negatives = overall.counts()
+            values: dict[str, float | int | None] = {
+                "auc": overall.compute(),
+                "examples": total,
+                "positives": positives,
+                "negatives": negatives,
             }
-            for scenario in range(scenario_count):
-                values[f"scenario_{scenario}_auc"] = (
-                    auc_accumulators[task_index][scenario + 1].compute()
-                )
-                values[f"scenario_{scenario}_{group_metric_name}"] = (
-                    grouped_auc.compute(task_index, scenario)
-                )
+            if grouped_auc is not None and group_metric_name is not None:
+                values[group_metric_name] = grouped_auc.compute(task_index, -1)
+            for scenario, scenario_name in enumerate(config.scenarios.names):
+                accumulator = auc_accumulators[task_index][scenario + 1]
+                scenario_total, scenario_positives, scenario_negatives = accumulator.counts()
+                prefix = f"scene_{scenario_name}"
+                scenario_auc = accumulator.compute()
+                values[f"{prefix}_auc"] = scenario_auc
+                values[f"{prefix}_examples"] = scenario_total
+                values[f"{prefix}_positives"] = scenario_positives
+                values[f"{prefix}_negatives"] = scenario_negatives
+                if scenario_total > 0 and scenario_auc is None:
+                    logger.warning(
+                        "AUC is undefined for task=%s scene=%s: examples=%d positives=%d negatives=%d",
+                        task_name,
+                        scenario_name,
+                        scenario_total,
+                        scenario_positives,
+                        scenario_negatives,
+                    )
+                if grouped_auc is not None and group_metric_name is not None:
+                    values[f"{prefix}_{group_metric_name}"] = grouped_auc.compute(
+                        task_index,
+                        scenario,
+                    )
             metrics[task_name] = values
         return EvaluateResult(
             rows=rows,
@@ -2251,7 +2593,8 @@ def evaluate_mdl(
             auc_histogram_bins=auc_bins,
         )
     finally:
-        grouped_auc.close()
+        if grouped_auc is not None:
+            grouped_auc.close()
 
 
 @torch.no_grad()
@@ -2262,6 +2605,7 @@ def predict_mdl(
     max_batches: int | None = None,
     allow_random_init: bool = False,
 ) -> PredictResult:
+    config = resolve_auto_scenarios(config)
     pa, _pc, _ds, pq = _require_pyarrow()
     device = _select_device(config)
     vocab_maps = load_vocab_maps(config)

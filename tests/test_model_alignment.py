@@ -31,19 +31,20 @@ from src.model import (
     RankMixerBlock,
     RankMixerModel,
     RankMixerSliceTokenizer,
+    RMSNorm,
     ScenarioTower,
-    _call_varlen_attention,
     _embedding_size,
     _forward_domain_interaction,
     _mdl_logits,
     _scenario_mask_from_ids,
-    _VarlenPacking,
-    varlen_attn,
 )
 from src.modules.attention import (
     DomainFusedModule,
     RankMixerDomainInteraction,
     VariableLengthDomainAttention,
+    _VarlenPacking,
+    _call_varlen_attention,
+    varlen_attn,
 )
 from src.modules.mlp import SparseMoEPerTokenFFN
 from src.train import _loss_terms_from_batch, _step_sparse_moe_controllers
@@ -79,6 +80,26 @@ def _rankmixer_config() -> SimpleNamespace:
 
 
 class RankMixerAlignmentTest(unittest.TestCase):
+    def test_rms_norm_preserves_bf16_residual_dtype(self) -> None:
+        norm = RMSNorm(4)
+        values = torch.tensor(
+            [[1.0, -2.0, 3.0, -4.0]],
+            dtype=torch.bfloat16,
+        )
+
+        output = norm(values)
+
+        self.assertEqual(output.dtype, torch.bfloat16)
+        reference = values.float() * values.float().pow(2).mean(
+            dim=-1, keepdim=True
+        ).add(norm.eps).rsqrt()
+        torch.testing.assert_close(
+            output.float(),
+            reference,
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
     def test_block_keeps_second_residual_and_layer_norm(self) -> None:
         block = RankMixerBlock(_rankmixer_config(), feature_token_count=2)
         with torch.no_grad():
@@ -538,6 +559,7 @@ class MDLAblationAlignmentTest(unittest.TestCase):
                 onetrans_config.model,
                 use_task_tokens=False,
                 use_scenario_tokens=False,
+                use_request_cache=False,
             ),
         )
         with patch(
@@ -568,17 +590,29 @@ class MDLAblationAlignmentTest(unittest.TestCase):
                     self.assertIsNone(block.task_ffn)
                     self.assertIsNone(block.domain_fused)
 
-        for name, model, token_count in (
-            ("mdl_rankmixer", rankmixer_model, 4),
-            ("mdl_onetrans", onetrans_model, 3),
+        for name, model, token_count, token_dim, task_count in (
+            (
+                "mdl_rankmixer",
+                rankmixer_model,
+                4,
+                rankmixer_config.model.token_dim,
+                len(rankmixer_config.task_names),
+            ),
+            (
+                "mdl_onetrans",
+                onetrans_model,
+                3,
+                onetrans_config.model.token_dim,
+                len(onetrans_config.task_names),
+            ),
         ):
             with self.subTest(model_forward=name):
-                tokens = torch.randn(2, token_count, 32, requires_grad=True)
+                tokens = torch.randn(2, token_count, token_dim, requires_grad=True)
                 output = model(
                     {"tokens": tokens},
                     scenario_id=torch.zeros(2, dtype=torch.long),
                 )
-                self.assertEqual(tuple(output["logits"].shape), (2, 1))
+                self.assertEqual(tuple(output["logits"].shape), (2, task_count))
                 output["logits"].sum().backward()
                 self.assertIsNotNone(tokens.grad)
                 self.assertTrue(bool(torch.isfinite(tokens.grad).all()))
@@ -954,8 +988,8 @@ class VarlenAttentionCompatibilityTest(unittest.TestCase):
             return args[0]
 
         inputs = self._inputs()
-        with patch("src.model.varlen_attn", legacy), patch(
-            "src.model._VARLEN_ATTN_USES_WINDOW_SIZE",
+        with patch("src.modules.attention.varlen_attn", legacy), patch(
+            "src.modules.attention._VARLEN_ATTN_USES_WINDOW_SIZE",
             False,
         ):
             output = _call_varlen_attention(
@@ -980,8 +1014,8 @@ class VarlenAttentionCompatibilityTest(unittest.TestCase):
             return args[0]
 
         inputs = self._inputs()
-        with patch("src.model.varlen_attn", modern), patch(
-            "src.model._VARLEN_ATTN_USES_WINDOW_SIZE",
+        with patch("src.modules.attention.varlen_attn", modern), patch(
+            "src.modules.attention._VARLEN_ATTN_USES_WINDOW_SIZE",
             True,
         ):
             output = _call_varlen_attention(
@@ -1056,7 +1090,48 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
 
     def _base_config(self):
         root = Path(__file__).resolve().parents[1]
-        return load_app_config(root / "configs" / "onetrans.yaml")
+        base = load_app_config(root / "configs" / "default.yaml")
+        sequence = replace(
+            base.sequences[0],
+            encoder="raw",
+            rankmixer_summary_tokens=1,
+            target_inputs=[],
+            longer_user_global_inputs=[],
+            longer_user_global_tokens=0,
+            longer_cls_tokens=0,
+            longer_candidate_global_tokens=None,
+            longer_output="full",
+        )
+        return replace(
+            base,
+            sequences=[sequence],
+            tokenization=replace(
+                base.tokenization,
+                feature_tokenizer="auto_split",
+                num_feature_tokens=4,
+                feature_token_inputs=[
+                    "user_id",
+                    "item_id",
+                    "shop_id",
+                    "rankmixer_context_dense",
+                ],
+                feature_tokens=[],
+                sequence_tokens=[TokenGroupConfig(name="hist", inputs=["hist"])],
+                ns_tokens=[],
+            ),
+            model=replace(
+                base.model,
+                name="onetrans",
+                token_dim=32,
+                num_layers=2,
+                num_heads=4,
+                hidden_dim=64,
+                ns_tokenizer="auto_split",
+                num_ns_tokens=4,
+                max_position_embeddings=104,
+                sequence_fusion="intent_ordered",
+            ),
+        )
 
     def test_auto_split_and_sequence_tokenizers_each_use_one_mlp(self) -> None:
         config = self._base_config()
@@ -1320,7 +1395,7 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
 class OneTransRuntimeCorrectnessTest(unittest.TestCase):
     def test_shared_vocab_alias_uses_base_vocab_size_for_independent_table(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "mdl_onetrans.yaml")
+        config = load_app_config(root / "configs" / "default.yaml")
         vocab_maps = {
             "user_id": {"one": 1, "seven": 7},
             # A stale or partial alias map must not size the independent table.
@@ -1350,13 +1425,49 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
         batch_size: int,
     ) -> tuple[MDLOneTransModel, dict[str, object]]:
         root = Path(__file__).resolve().parents[1]
-        base = load_app_config(root / "configs" / "mdl_onetrans.yaml")
-        sequence = replace(base.sequences[0], max_length=6)
+        base = load_app_config(root / "configs" / "default.yaml")
+        sequence = replace(
+            base.sequences[0],
+            max_length=6,
+            encoder="raw",
+            rankmixer_summary_tokens=1,
+            target_inputs=[],
+            longer_user_global_inputs=[],
+            longer_user_global_tokens=0,
+            longer_cls_tokens=0,
+            longer_candidate_global_tokens=None,
+            longer_output="full",
+        )
+        scenario_tokens = [
+            replace(token, prior_inputs=[])
+            for token in base.tokenization.scenario_tokens
+        ]
+        task_tokens = [
+            replace(token, prior_inputs=[])
+            for token in base.tokenization.task_tokens
+        ]
         config = replace(
             base,
             sequences=[sequence],
+            tokenization=replace(
+                base.tokenization,
+                feature_tokenizer="auto_split",
+                num_feature_tokens=4,
+                feature_token_inputs=[
+                    "user_id",
+                    "item_id",
+                    "shop_id",
+                    "rankmixer_context_dense",
+                ],
+                feature_tokens=[],
+                sequence_tokens=[TokenGroupConfig(name="hist", inputs=["hist"])],
+                ns_tokens=[],
+                scenario_tokens=scenario_tokens,
+                task_tokens=task_tokens,
+            ),
             model=replace(
                 base.model,
+                name="mdl_onetrans",
                 embedding_dim=4,
                 token_dim=8,
                 num_layers=3,
@@ -1367,6 +1478,10 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
                 final_s_tokens=2,
                 max_position_embeddings=10,
                 first_domain_sequence_layer=0,
+                ns_tokenizer="auto_split",
+                num_ns_tokens=4,
+                sequence_fusion="intent_ordered",
+                experimental_model_acknowledged=True,
             ),
         )
         model = MDLOneTransModel(
@@ -1414,6 +1529,95 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
         torch.testing.assert_close(actual, expected)
         torch.testing.assert_close(actual[1], torch.zeros_like(actual[1]))
         self.assertTrue(bool(torch.isfinite(actual).all()))
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and varlen_attn is not None,
+        "strict Flash domain-sequence attention test requires CUDA varlen attention",
+    )
+    def test_strict_flash_packs_masked_memory_and_has_finite_gradients(self) -> None:
+        torch.manual_seed(42)
+        device = torch.device("cuda")
+        reference_attention = VariableLengthDomainAttention(
+            32,
+            2,
+            attention_backend="auto",
+        ).eval().to(device=device, dtype=torch.bfloat16)
+        flash_attention = VariableLengthDomainAttention(
+            32,
+            2,
+            attention_backend="flash",
+        ).eval().to(device=device, dtype=torch.bfloat16)
+        flash_attention.load_state_dict(reference_attention.state_dict())
+
+        domain_tokens = torch.randn(
+            3,
+            4,
+            32,
+            device=device,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        sequence_tokens = torch.randn(
+            3,
+            8,
+            32,
+            device=device,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        sequence_mask = torch.tensor(
+            [
+                [False, False, True, True, True, True, True, True],
+                [False, False, False, False, False, False, False, False],
+                [False, True, False, True, False, True, False, True],
+            ],
+            device=device,
+        )
+
+        with torch.no_grad():
+            expected = reference_attention(
+                domain_tokens.detach(),
+                sequence_tokens.detach(),
+                sequence_mask,
+            )
+        with patch(
+            "src.modules.attention._call_varlen_attention",
+            wraps=_call_varlen_attention,
+        ) as flash_call:
+            actual = flash_attention(
+                domain_tokens,
+                sequence_tokens,
+                sequence_mask,
+            )
+        self.assertEqual(flash_call.call_count, 1)
+
+        torch.testing.assert_close(actual, expected, rtol=2.0e-2, atol=2.0e-2)
+        torch.testing.assert_close(actual[1], torch.zeros_like(actual[1]))
+        changed = sequence_tokens.detach().clone()
+        changed[~sequence_mask] = torch.randn_like(changed[~sequence_mask]) * 1.0e4
+        with torch.no_grad():
+            changed_output = flash_attention(
+                domain_tokens.detach(),
+                changed,
+                sequence_mask,
+            )
+        torch.testing.assert_close(changed_output, actual.detach())
+
+        actual.float().square().mean().backward()
+        self.assertIsNotNone(domain_tokens.grad)
+        self.assertIsNotNone(sequence_tokens.grad)
+        assert domain_tokens.grad is not None and sequence_tokens.grad is not None
+        self.assertTrue(bool(torch.isfinite(domain_tokens.grad).all()))
+        self.assertTrue(bool(torch.isfinite(sequence_tokens.grad).all()))
+        self.assertGreater(float(sequence_tokens.grad[sequence_mask].abs().sum()), 0.0)
+        torch.testing.assert_close(
+            sequence_tokens.grad[~sequence_mask],
+            torch.zeros_like(sequence_tokens.grad[~sequence_mask]),
+        )
+        for parameter in flash_attention.parameters():
+            self.assertIsNotNone(parameter.grad)
+            assert parameter.grad is not None
+            self.assertTrue(bool(torch.isfinite(parameter.grad).all()))
 
     def test_attention_accepts_pyramid_sequence_lengths(self) -> None:
         attention = VariableLengthDomainAttention(8, 2).eval()

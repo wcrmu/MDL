@@ -8,15 +8,17 @@ files, streams Arrow batches, encodes configured features, and builds the
 """
 
 from collections import defaultdict
-from collections.abc import Iterable as RuntimeIterable
+from collections.abc import Iterable as RuntimeIterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import fnmatch
 from hashlib import sha256
 from itertools import islice
 import glob
 import importlib
+import json
 import logging
+import math
 from numbers import Integral
 import os
 import queue
@@ -36,10 +38,15 @@ from .config import (
     ParquetSplitConfig,
     ResolvedCategoricalInput,
     ResolvedIdentityEncoding,
+    ResolvedPreHashedEncoding,
     SequenceConfig,
     resolve_categorical_base_input,
 )
-from .features import encode_categorical_sequence_field, encode_categorical_values
+from .features import (
+    encode_categorical_sequence_field,
+    encode_categorical_value,
+    encode_categorical_values,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +59,8 @@ _LOCAL_FILESYSTEM_KEY = "file://"
 _REMOTE_URI_SCHEMES = {"hdfs", "viewfs"}
 _SUPPORTED_URI_SCHEMES = _REMOTE_URI_SCHEMES | {"file"}
 _GLOB_META_CHARS = "*?["
+_AUTO_SCENARIO_NAME = "__auto__"
+_AUTO_SCENARIO_PRIOR_NAME = "scenario_prior_scene_id_hn"
 
 
 @dataclass(frozen=True)
@@ -78,6 +87,15 @@ class ParquetAdapterContext:
     split_name: str
     required_columns: tuple[str, ...]
     options: Mapping[str, Any]
+    # Built-in adapters may cache an immutable execution plan here. Keeping
+    # this private cache on the context avoids reparsing hundreds of configured
+    # column names for every Arrow record batch.
+    _runtime_cache: dict[str, Any] = field(
+        default_factory=dict,
+        compare=False,
+        hash=False,
+        repr=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +446,27 @@ def validate_matching_schemas(paths: Iterable[str | Path | ParquetInputRef]) -> 
     return expected
 
 
+def _eager_schema_validation_refs(
+    refs: list[ParquetInputRef],
+    mode: str,
+    sample_count: int,
+) -> list[ParquetInputRef]:
+    """Choose deterministic, evenly spaced files for startup validation."""
+
+    if mode == "all" or len(refs) <= sample_count:
+        return refs
+    if mode != "sample":
+        raise ValueError(f"unsupported eager schema validation mode {mode!r}")
+    if sample_count == 1:
+        return [refs[0]]
+    last = len(refs) - 1
+    indices = {
+        round(index * last / (sample_count - 1))
+        for index in range(sample_count)
+    }
+    return [refs[index] for index in sorted(indices)]
+
+
 def _configure_pyarrow_threads(pa: Any, num_workers: int) -> None:
     """Align PyArrow CPU/IO threads with ``reader.num_workers`` when set."""
     if num_workers <= 0:
@@ -528,8 +567,19 @@ def _scan_columns_for_split(split: ParquetSplitConfig, flat_columns: list[str]) 
     if split.format == "adapter_parquet":
         if split.adapter is None:
             raise ValueError("adapter_parquet split requires adapter config")
-        return list(split.adapter.input_columns or [])
+        if split.adapter.input_columns is None:
+            return []
+        return [
+            *split.adapter.input_columns,
+            *split.adapter.optional_input_columns,
+        ]
     return flat_columns
+
+
+def _optional_scan_columns_for_split(split: ParquetSplitConfig) -> tuple[str, ...]:
+    if split.format != "adapter_parquet" or split.adapter is None:
+        return ()
+    return split.adapter.optional_input_columns
 
 
 # ---------------------------------------------------------------------------
@@ -809,9 +859,17 @@ class ParquetScanner:
         columns: list[str],
         shard_rank: int = 0,
         shard_world_size: int = 1,
+        optional_columns: Iterable[str] = (),
     ) -> None:
         self.split = split
-        self.columns = columns
+        self.columns = list(columns)
+        self.optional_columns = frozenset(optional_columns)
+        unknown_optional = self.optional_columns - set(self.columns)
+        if unknown_optional:
+            raise ValueError(
+                "optional parquet scan columns must also be present in columns: "
+                + ", ".join(sorted(unknown_optional))
+            )
         self.shard_rank = shard_rank
         self.shard_world_size = shard_world_size
         if not 0 <= shard_rank < shard_world_size:
@@ -828,7 +886,45 @@ class ParquetScanner:
                 "for distributed scanning"
             )
         self.all_paths = discover_parquet_inputs(split.inputs)
-        validate_matching_schemas(self.all_paths)
+        global_schema_refs = _eager_schema_validation_refs(
+            self.all_paths,
+            split.reader.eager_schema_validation,
+            split.reader.schema_validation_samples,
+        )
+        if shard_world_size > 1 and len(global_schema_refs) > 1:
+            # Validate the chosen global set collectively instead of making
+            # every DDP rank reopen the same remote footers. Every rank also
+            # checks the common anchor, so fingerprints remain transitively
+            # comparable across rank-local subsets.
+            anchor = global_schema_refs[0]
+            local_refs = global_schema_refs[shard_rank::shard_world_size]
+            schema_refs = list(
+                dict.fromkeys([anchor, *local_refs])
+            )
+        else:
+            schema_refs = global_schema_refs
+        validate_matching_schemas(schema_refs)
+        if self.columns:
+            # Auto-detecting adapters may support layout-specific raw columns
+            # (the agg indices are absent from req files). Project optional
+            # columns only when the split schema contains them, while still
+            # failing early for a missing mandatory input.
+            schema_names = set(parquet_schema(schema_refs[0]).names)
+            missing = [
+                column
+                for column in self.columns
+                if column not in self.optional_columns and column not in schema_names
+            ]
+            if missing:
+                raise ValueError(
+                    "parquet schema is missing required scan column(s): "
+                    + ", ".join(missing)
+                )
+            self.columns = [
+                column
+                for column in self.columns
+                if column not in self.optional_columns or column in schema_names
+            ]
         pa, _pc, _ds, _pq = _require_pyarrow()
         _configure_pyarrow_threads(pa, split.reader.num_workers)
         # File sharding: each rank scans a disjoint subset of paths.
@@ -1189,11 +1285,17 @@ class ParquetScanner:
         scanner_kwargs: dict[str, Any] = {
             "columns": self._scan_columns(),
             "use_threads": True,
-            # Dataset's internal queues expose no byte accounting. Keep them at
-            # one batch/fragment; the repository-owned queues enforce both the
-            # configured count and byte limits.
-            "batch_readahead": 1,
-            "fragment_readahead": 1,
+            # File-sharded scans rely on Arrow's asynchronous queues. Tie their
+            # depth to the same user-facing prefetch knob; zero still means a
+            # single in-flight unit so synchronous iteration remains valid.
+            "batch_readahead": max(1, self.split.reader.prefetch_batches),
+            "fragment_readahead": max(
+                1,
+                min(
+                    self.split.reader.prefetch_batches,
+                    self.split.reader.num_workers or 4,
+                ),
+            ),
         }
         if self.split.reader.scanner_batch_rows is not None:
             scanner_kwargs["batch_size"] = self.split.reader.scanner_batch_rows
@@ -1278,6 +1380,1064 @@ class _FlatScanCounters:
         )
 
 
+# ---------------------------------------------------------------------------
+# Built-in MDL-RankMixer agg/req adapter
+# ---------------------------------------------------------------------------
+
+# This production layout is intentionally built into the dataloader. Field
+# membership remains config-driven through ParquetAdapterContext.options.
+
+
+def _string_list(options: Mapping[str, Any], key: str) -> tuple[str, ...]:
+    value = options.get(key, ())
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        raise ValueError(f"adapter option {key!r} must be a list of column names")
+    result = tuple(str(item) for item in value)
+    if any(not item for item in result) or len(set(result)) != len(result):
+        raise ValueError(f"adapter option {key!r} must contain unique non-empty names")
+    return result
+
+
+def _mapping(options: Mapping[str, Any], key: str) -> dict[str, str]:
+    value = options.get(key, {})
+    if not isinstance(value, Mapping):
+        raise ValueError(f"adapter option {key!r} must be an object")
+    result = {str(name): str(source) for name, source in value.items()}
+    if any(not name or not source for name, source in result.items()):
+        raise ValueError(f"adapter option {key!r} must contain non-empty names")
+    return result
+
+
+def _request_value_maps(
+    options: Mapping[str, Any],
+    request_columns: set[str],
+) -> dict[str, dict[Any, int]]:
+    raw = options.get("request_value_maps", {})
+    if not isinstance(raw, Mapping):
+        raise ValueError("adapter option 'request_value_maps' must be an object")
+    result: dict[str, dict[Any, int]] = {}
+    for column, raw_mapping in raw.items():
+        column = str(column)
+        if column not in request_columns:
+            raise ValueError(
+                f"request_value_maps contains non-request column {column!r}"
+            )
+        if not isinstance(raw_mapping, Mapping) or not raw_mapping:
+            raise ValueError(
+                f"request_value_maps.{column} must be a non-empty object"
+            )
+        mapping: dict[Any, int] = {}
+        for source, target in raw_mapping.items():
+            if isinstance(target, bool) or not isinstance(target, int) or target < 0:
+                raise ValueError(
+                    f"request_value_maps.{column} targets must be non-negative integers"
+                )
+            mapping[source] = target
+        expected = set(range(len(mapping)))
+        if set(mapping.values()) != expected:
+            raise ValueError(
+                f"request_value_maps.{column} targets must be unique contiguous ids "
+                f"0..{len(mapping) - 1}"
+            )
+        result[column] = mapping
+    return result
+
+
+def _map_request_value(value: Any, *, column: str, mapping: Mapping[Any, int]) -> int:
+    try:
+        if value in mapping:
+            return mapping[value]
+    except TypeError:
+        pass
+    rendered = str(value)
+    if rendered in mapping:
+        return mapping[rendered]
+    raise ValueError(
+        f"request-level column {column!r} contains unmapped value {value!r}"
+    )
+
+
+def _as_list(value: Any, *, column: str, row_index: int) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    raise ValueError(
+        f"column {column!r} must be list-valued at raw row {row_index}, "
+        f"got {type(value).__name__}"
+    )
+
+
+def _request_index(value: Any, *, column: str, row_index: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"column {column!r} contains invalid request index {value!r} "
+            f"at raw row {row_index}"
+        )
+    return value
+
+
+def _scalarize(value: Any, *, column: str, raw_row: int, logical_row: int) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        return value
+    if len(value) != 1:
+        raise ValueError(
+            f"single-valued feature {column!r} has inner length {len(value)} "
+            f"at raw row {raw_row}, logical row {logical_row}"
+        )
+    return value[0]
+
+
+def _bag_value(value: Any, *, column: str, raw_row: int, logical_row: int) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(
+            f"multivalue feature {column!r} must be list-valued at raw row "
+            f"{raw_row}, logical row {logical_row}"
+        )
+    if not value:
+        raise ValueError(
+            f"multivalue feature {column!r} contains an empty array at raw row "
+            f"{raw_row}, logical row {logical_row}; missing values must be null"
+        )
+    return value
+
+
+def _candidate_count_req(
+    row: Mapping[str, Any],
+    item_features: Sequence[str],
+    label_columns: Sequence[str],
+    raw_row: int,
+) -> int:
+    observed: dict[str, int] = {}
+    for column in [*item_features, *label_columns]:
+        if column not in row or row[column] is None:
+            continue
+        observed[column] = len(_as_list(row[column], column=column, row_index=raw_row))
+    if not observed:
+        raise ValueError(
+            f"cannot infer candidate count for req raw row {raw_row}; "
+            "no item or label arrays are present"
+        )
+    counts = set(observed.values())
+    if len(counts) != 1:
+        raise ValueError(
+            f"req raw row {raw_row} has inconsistent candidate counts: {observed}"
+        )
+    return next(iter(counts))
+
+
+def _request_positions(
+    context_indices: Sequence[Any],
+    *,
+    raw_row: int,
+) -> dict[int, int]:
+    positions: dict[int, int] = {}
+    for position, raw_request in enumerate(context_indices):
+        request = _request_index(
+            raw_request,
+            column="context_indices",
+            row_index=raw_row,
+        )
+        if request in positions:
+            raise ValueError(
+                f"context_indices contains duplicate request {request} at raw row {raw_row}"
+            )
+        positions[request] = position
+    return positions
+
+
+def _request_level_value(
+    value: Any,
+    *,
+    request_position: int,
+    request_count: int,
+    column: str,
+    raw_row: int,
+    agg: bool,
+) -> Any:
+    if value is None or not isinstance(value, (list, tuple)):
+        return value
+    if not agg:
+        if len(value) != 1:
+            raise ValueError(
+                f"req request-level column {column!r} must be scalar or length one "
+                f"at raw row {raw_row}, got length {len(value)}"
+            )
+        return value[0]
+    if len(value) == request_count:
+        return value[request_position]
+    if len(value) == 1:
+        return value[0]
+    raise ValueError(
+        f"agg request-level column {column!r} has length {len(value)}, expected "
+        f"1 or {request_count} at raw row {raw_row}"
+    )
+
+
+def _req_context_value(
+    value: Any,
+    *,
+    has_request_axis: bool,
+    multivalue: bool,
+    column: str,
+    raw_row: int,
+) -> Any:
+    """Normalize the two observed req encodings of request-level features.
+
+    Most req fields remove the train request axis and arrive as ``list<int64>``.
+    A small set of multivalue User fields remains ``list<list<int64>>``; it can
+    be either one request containing a bag or a bag of singleton encoded values.
+    """
+
+    if not has_request_axis:
+        return value
+    if value is None:
+        return None
+    outer = _as_list(value, column=column, row_index=raw_row)
+    if not outer:
+        raise ValueError(
+            f"req context column {column!r} contains an empty outer list at raw row "
+            f"{raw_row}; production missing values must be null"
+        )
+    if not multivalue:
+        if len(outer) != 1:
+            raise ValueError(
+                f"req scalar context column {column!r} has nested outer length "
+                f"{len(outer)} at raw row {raw_row}; expected 1"
+            )
+        return outer[0]
+    if len(outer) == 1:
+        return outer[0]
+    if all(
+        item is None or (isinstance(item, (list, tuple)) and len(item) == 1)
+        for item in outer
+    ):
+        return [None if item is None else item[0] for item in outer]
+    raise ValueError(
+        f"req multivalue context column {column!r} has unsupported nested layout "
+        f"at raw row {raw_row}; expected one request bag or singleton token lists"
+    )
+
+
+def _sequence_membership_positions(
+    memberships: Sequence[Any],
+    *,
+    known_requests: set[int],
+    index_column: str,
+    raw_row: int,
+) -> dict[int, list[int]]:
+    """Validate one UPS membership vector and index it once per raw row."""
+
+    selected: dict[int, list[int]] = {request: [] for request in known_requests}
+    for token_position, raw_membership in enumerate(memberships):
+        members = (
+            list(raw_membership)
+            if isinstance(raw_membership, (list, tuple))
+            else [raw_membership]
+        )
+        if not members:
+            raise ValueError(
+                f"UPS indices column {index_column!r} has an empty membership "
+                f"at raw row {raw_row}, token {token_position}"
+            )
+        normalized = [
+            _request_index(value, column=index_column, row_index=raw_row)
+            for value in members
+        ]
+        if len(normalized) != len(set(normalized)):
+            raise ValueError(
+                f"UPS indices column {index_column!r} repeats a request at raw row "
+                f"{raw_row}, token {token_position}"
+            )
+        unknown = sorted(set(normalized) - known_requests)
+        if unknown:
+            raise ValueError(
+                f"UPS indices column {index_column!r} references requests without "
+                f"context at raw row {raw_row}, token {token_position}: {unknown}"
+            )
+        for request in normalized:
+            selected[request].append(token_position)
+    return selected
+
+
+def _select_sequence(
+    values: Any,
+    selected_positions: Sequence[int] | None,
+    *,
+    expected_length: int | None,
+    column: str,
+    raw_row: int,
+    validated_flat: bool = False,
+) -> list[Any]:
+    items = _as_list(values, column=column, row_index=raw_row)
+    if values is not None and not items:
+        raise ValueError(
+            f"UPS column {column!r} contains an empty sequence at raw row {raw_row}; "
+            "empty sequences must be null"
+        )
+    if selected_positions is not None:
+        if expected_length is None:
+            raise RuntimeError("selected UPS positions require an expected raw length")
+        if len(items) != expected_length:
+            raise ValueError(
+                f"UPS column {column!r} length {len(items)} does not match its indices "
+                f"length {expected_length} at raw row {raw_row}"
+            )
+        items = [items[position] for position in selected_positions]
+
+    if validated_flat:
+        return items
+
+    normalized: list[Any] = []
+    for token_position, item in enumerate(items):
+        if isinstance(item, (list, tuple)):
+            if len(item) != 1:
+                raise ValueError(
+                    f"UPS column {column!r} token {token_position} has inner length "
+                    f"{len(item)} at raw row {raw_row}; expected exactly 1"
+                )
+            item = item[0]
+        if item is None:
+            raise ValueError(
+                f"UPS column {column!r} token {token_position} is null at raw row "
+                f"{raw_row}; only the complete sequence may be null"
+            )
+        normalized.append(item)
+    return normalized
+
+
+def _flatten_singleton_ups_array(pa: Any, pc: Any, array: Any) -> tuple[Any, bool]:
+    """Collapse list<list<int64>> singleton tokens before Python conversion.
+
+    fgout stores every S-token property as an inner singleton list. Flattening
+    that level with Arrow avoids allocating millions of one-element Python
+    lists in ``to_pydict``. Invalid/null token payloads deliberately fall back
+    to the validated Python path so error semantics are unchanged.
+    """
+
+    if not (pa.types.is_list(array.type) or pa.types.is_large_list(array.type)):
+        return array, False
+    child = array.values
+    if pa.types.is_list(child.type) or pa.types.is_large_list(child.type):
+        lengths = pc.list_value_length(child)
+        if lengths.null_count:
+            return array, False
+        invalid = pc.any(pc.not_equal(lengths, 1)).as_py()
+        if invalid:
+            return array, False
+        flattened = pc.list_flatten(child)
+        if flattened.null_count:
+            return array, False
+        offsets = array.offsets
+        base = int(offsets[0].as_py())
+        stop = int(offsets[-1].as_py())
+        normalized_offsets = pc.subtract(offsets, base)
+        flattened = flattened.slice(base, stop - base)
+        mask = array.is_null() if array.null_count else None
+        if pa.types.is_large_list(array.type):
+            rebuilt = pa.LargeListArray.from_arrays(
+                normalized_offsets,
+                flattened,
+                mask=mask,
+            )
+        else:
+            rebuilt = pa.ListArray.from_arrays(
+                normalized_offsets,
+                flattened,
+                mask=mask,
+            )
+        return rebuilt, True
+    if child.null_count:
+        return array, False
+    return array, True
+
+
+def _adapter_table_to_python(
+    table: Any,
+    raw_sequence_columns: frozenset[str],
+) -> tuple[dict[str, list[Any]], frozenset[str]]:
+    """Convert a raw table while flattening valid singleton S-token columns."""
+
+    pa, pc, _ds, _pq = _require_pyarrow()
+    raw: dict[str, list[Any]] = {}
+    flattened: set[str] = set()
+    for name in table.column_names:
+        column = table[name]
+        array = column.combine_chunks()
+        if name in raw_sequence_columns:
+            array, validated_flat = _flatten_singleton_ups_array(pa, pc, array)
+            if validated_flat:
+                flattened.add(name)
+        raw[name] = array.to_pylist()
+    return raw, frozenset(flattened)
+
+
+def _time_deltas(
+    event_times: Sequence[Any],
+    request_time: Any,
+    *,
+    sequence: str,
+    raw_row: int,
+    transform: str,
+) -> list[float]:
+    if event_times and (
+        isinstance(request_time, bool) or not isinstance(request_time, int)
+    ):
+        raise ValueError(
+            f"request time is required to derive {sequence!r} time deltas at raw row {raw_row}"
+        )
+    if len(event_times) >= 64:
+        # Long histories dominate adapter CPU. NumPy performs validation,
+        # subtraction, and log1p in native loops instead of one Python/math
+        # call per event.
+        try:
+            import numpy as np
+        except ImportError:
+            pass
+        else:
+            values = np.asarray(event_times)
+            if values.dtype.kind not in {"i", "u"}:
+                raise ValueError(
+                    f"sequence {sequence!r} has non-integer event time at raw row {raw_row}"
+                )
+            increasing = values[1:] > values[:-1]
+            if bool(np.any(increasing)):
+                position = int(np.flatnonzero(increasing)[0]) + 1
+                raise ValueError(
+                    f"sequence {sequence!r} event times must be newest-to-oldest at "
+                    f"raw row {raw_row}; position {position - 1} is "
+                    f"{int(values[position - 1])}, position {position} is "
+                    f"{int(values[position])}"
+                )
+            deltas = int(request_time) - values
+            if bool(np.any(deltas < 0)):
+                position = int(np.flatnonzero(deltas < 0)[0])
+                raise ValueError(
+                    f"sequence {sequence!r} event time is later than request time "
+                    f"at raw row {raw_row}, position {position}: "
+                    f"delta_ms={int(deltas[position])}"
+                )
+            if transform == "raw_ms":
+                transformed = deltas.astype(np.float64)
+            elif transform == "seconds":
+                transformed = deltas.astype(np.float64) / 1000.0
+            elif transform == "log1p_seconds":
+                transformed = np.log1p(deltas.astype(np.float64) / 1000.0)
+            else:
+                raise RuntimeError(f"unsupported time delta transform {transform!r}")
+            return transformed.tolist()
+    result: list[float] = []
+    previous_time: int | None = None
+    for position, event_time in enumerate(event_times):
+        if isinstance(event_time, bool) or not isinstance(event_time, int):
+            raise ValueError(
+                f"sequence {sequence!r} has invalid event time {event_time!r} "
+                f"at raw row {raw_row}, position {position}"
+            )
+        if previous_time is not None and event_time > previous_time:
+            raise ValueError(
+                f"sequence {sequence!r} event times must be newest-to-oldest at "
+                f"raw row {raw_row}; position {position - 1} is {previous_time}, "
+                f"position {position} is {event_time}"
+            )
+        previous_time = event_time
+        delta = int(request_time) - event_time
+        if delta < 0:
+            raise ValueError(
+                f"sequence {sequence!r} event time is later than request time "
+                f"at raw row {raw_row}, position {position}: delta_ms={delta}"
+            )
+        if transform == "raw_ms":
+            transformed = float(delta)
+        elif transform == "seconds":
+            transformed = float(delta) / 1000.0
+        elif transform == "log1p_seconds":
+            transformed = math.log1p(float(delta) / 1000.0)
+        else:  # Validated once in adapt().
+            raise RuntimeError(f"unsupported time delta transform {transform!r}")
+        result.append(transformed)
+    return result
+
+
+def _output_array(
+    pa: Any,
+    column: str,
+    values: list[Any],
+    *,
+    scalar_features: set[str],
+    bag_features: set[str],
+    sequence_columns: set[str],
+    time_delta_columns: set[str],
+    label_columns: set[str],
+    integer_request_columns: set[str],
+    dictionary_encode: bool = False,
+) -> Any:
+    if dictionary_encode:
+        if column in time_delta_columns:
+            value_type = pa.list_(pa.float32())
+        else:
+            value_type = pa.list_(pa.int64())
+        dictionary_values: list[Any] = []
+        dictionary_index_by_identity: dict[int, int] = {}
+        indices: list[int | None] = []
+        for value in values:
+            if value is None:
+                indices.append(None)
+                continue
+            identity = id(value)
+            dictionary_index = dictionary_index_by_identity.get(identity)
+            if dictionary_index is None:
+                dictionary_index = len(dictionary_values)
+                dictionary_index_by_identity[identity] = dictionary_index
+                dictionary_values.append(value)
+            indices.append(dictionary_index)
+        dictionary = pa.array(dictionary_values, type=value_type)
+        return pa.DictionaryArray.from_arrays(
+            pa.array(indices, type=pa.int32()),
+            dictionary,
+        )
+    if column in time_delta_columns:
+        return pa.array(values, type=pa.list_(pa.float32()))
+    if column in bag_features or column in sequence_columns:
+        return pa.array(values, type=pa.list_(pa.int64()))
+    if column in scalar_features or column in label_columns or column in integer_request_columns:
+        return pa.array(values, type=pa.int64())
+    return pa.array(values)
+
+
+@dataclass(frozen=True)
+class _MdlRankMixerAdapterPlan:
+    context_features: tuple[str, ...]
+    item_features: tuple[str, ...]
+    bag_features: frozenset[str]
+    ups_types: tuple[str, ...]
+    request_columns: tuple[str, ...]
+    request_maps: Mapping[str, Mapping[Any, int]]
+    integer_request_columns: frozenset[str]
+    labels: Mapping[str, str]
+    time_delta_outputs: Mapping[str, str]
+    time_delta_transform: str
+    compact_request_lists: bool
+    request_time_column: str
+    aligned_groups: tuple[tuple[str, ...], ...]
+    required: tuple[str, ...]
+    required_set: frozenset[str]
+    context_set: frozenset[str]
+    item_set: frozenset[str]
+    scalar_features: frozenset[str]
+    label_columns: frozenset[str]
+    sequence_columns_by_type: Mapping[str, tuple[str, ...]]
+    sequence_columns: frozenset[str]
+    time_delta_columns: frozenset[str]
+    label_output_columns: tuple[str, ...]
+    sequence_output_columns: tuple[str, ...]
+    item_output_columns: tuple[str, ...]
+    request_output_columns: tuple[str, ...]
+    compact_list_columns: frozenset[str]
+    raw_sequence_columns: frozenset[str]
+
+
+def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
+    options = context.options
+    context_features = _string_list(options, "context_features")
+    item_features = _string_list(options, "item_features")
+    bag_features = frozenset(_string_list(options, "multivalue_features"))
+    ups_types = _string_list(options, "ups_types")
+    request_columns = _string_list(options, "request_columns")
+    request_maps = _request_value_maps(options, set(request_columns))
+    integer_request_columns = frozenset(
+        _string_list(options, "integer_request_columns")
+    )
+    labels = _mapping(options, "labels")
+    time_delta_outputs = _mapping(options, "time_delta_outputs")
+    time_delta_transform = str(options.get("time_delta_transform", "raw_ms"))
+    compact_request_lists = options.get("compact_request_lists", False)
+    if type(compact_request_lists) is not bool:
+        raise ValueError("adapter option 'compact_request_lists' must be a boolean")
+    if time_delta_transform not in {"raw_ms", "seconds", "log1p_seconds"}:
+        raise ValueError(
+            "adapter option 'time_delta_transform' must be raw_ms, seconds, "
+            "or log1p_seconds"
+        )
+    request_time_column = str(options.get("request_time_column", "impr_time"))
+    aligned_groups_raw = options.get("aligned_multivalue_groups", ())
+    if isinstance(aligned_groups_raw, (str, bytes)) or not isinstance(
+        aligned_groups_raw, Sequence
+    ):
+        raise ValueError("adapter option 'aligned_multivalue_groups' must be a list of lists")
+    aligned_groups = tuple(
+        tuple(str(item) for item in group) for group in aligned_groups_raw
+    )
+
+    context_set = frozenset(context_features)
+    item_set = frozenset(item_features)
+    if context_set & item_set:
+        raise ValueError("context_features and item_features must be disjoint")
+    if not bag_features <= context_set | item_set:
+        unknown = sorted(bag_features - context_set - item_set)
+        raise ValueError("multivalue_features contains unknown fields: " + ", ".join(unknown))
+    for group in aligned_groups:
+        if not group or not set(group) <= bag_features:
+            raise ValueError(
+                "every aligned_multivalue_groups entry must contain configured multivalue fields"
+            )
+    if set(time_delta_outputs) - set(ups_types):
+        raise ValueError("time_delta_outputs contains an unknown UPS type")
+
+    required = tuple(context.required_columns)
+    required_set = frozenset(required)
+    scalar_features = frozenset((context_set | item_set) - bag_features)
+    label_columns = frozenset(labels.values())
+    sequence_columns_by_type = {
+        ups: tuple(
+            column
+            for column in required
+            if column.startswith(f"{ups}_x_")
+            and column != time_delta_outputs.get(ups)
+        )
+        for ups in ups_types
+    }
+    sequence_columns = frozenset(
+        column
+        for columns in sequence_columns_by_type.values()
+        for column in columns
+    )
+    time_delta_columns = frozenset(time_delta_outputs.values())
+    label_output_columns = tuple(
+        column for column in required if column in label_columns
+    )
+    sequence_output_columns = tuple(
+        column
+        for column in required
+        if column not in label_columns
+        and (column in sequence_columns or column in time_delta_columns)
+    )
+    item_output_columns = tuple(
+        column
+        for column in required
+        if column not in label_columns
+        and column not in sequence_columns
+        and column not in time_delta_columns
+        and column in item_set
+    )
+    request_output_columns = tuple(
+        column
+        for column in required
+        if column not in label_columns
+        and column not in sequence_columns
+        and column not in time_delta_columns
+        and column not in item_set
+        and (column in context_set or column in request_columns)
+    )
+    classified_output_columns = {
+        *label_output_columns,
+        *sequence_output_columns,
+        *item_output_columns,
+        *request_output_columns,
+    }
+    unknown_required = sorted(required_set - classified_output_columns)
+    if unknown_required:
+        raise ValueError(
+            "adapter options do not define required output columns: "
+            + ", ".join(unknown_required)
+        )
+    compact_list_columns = frozenset(
+        (bag_features & context_set) | sequence_columns | time_delta_columns
+    )
+    raw_sequence_columns = frozenset(
+        {
+            *sequence_columns,
+            *(f"{ups}_x_time" for ups in ups_types if ups in time_delta_outputs),
+        }
+    )
+    return _MdlRankMixerAdapterPlan(
+        context_features=context_features,
+        item_features=item_features,
+        bag_features=bag_features,
+        ups_types=ups_types,
+        request_columns=request_columns,
+        request_maps=request_maps,
+        integer_request_columns=integer_request_columns,
+        labels=labels,
+        time_delta_outputs=time_delta_outputs,
+        time_delta_transform=time_delta_transform,
+        compact_request_lists=compact_request_lists,
+        request_time_column=request_time_column,
+        aligned_groups=aligned_groups,
+        required=required,
+        required_set=required_set,
+        context_set=context_set,
+        item_set=item_set,
+        scalar_features=scalar_features,
+        label_columns=label_columns,
+        sequence_columns_by_type=sequence_columns_by_type,
+        sequence_columns=sequence_columns,
+        time_delta_columns=time_delta_columns,
+        label_output_columns=label_output_columns,
+        sequence_output_columns=sequence_output_columns,
+        item_output_columns=item_output_columns,
+        request_output_columns=request_output_columns,
+        compact_list_columns=compact_list_columns,
+        raw_sequence_columns=raw_sequence_columns,
+    )
+
+
+def _mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
+    # Only the repository-owned immutable context has stable options. External
+    # tests/adapters may pass mutable SimpleNamespace objects, which are rebuilt
+    # so mutations remain observable.
+    if isinstance(context, ParquetAdapterContext):
+        cached = context._runtime_cache.get("mdl_rankmixer_plan")
+        if isinstance(cached, _MdlRankMixerAdapterPlan):
+            return cached
+        plan = _build_mdl_rankmixer_adapter_plan(context)
+        context._runtime_cache["mdl_rankmixer_plan"] = plan
+        return plan
+    return _build_mdl_rankmixer_adapter_plan(context)
+
+
+def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
+    """Convert one raw Arrow table from agg or req layout to per-item rows."""
+
+    pa, _pc, _ds, _pq = _require_pyarrow()
+    plan = _mdl_rankmixer_adapter_plan(context)
+    context_features = plan.context_features
+    item_features = plan.item_features
+    bag_features = plan.bag_features
+    ups_types = plan.ups_types
+    request_columns = plan.request_columns
+    request_maps = plan.request_maps
+    integer_request_columns = plan.integer_request_columns
+    labels = plan.labels
+    time_delta_outputs = plan.time_delta_outputs
+    time_delta_transform = plan.time_delta_transform
+    compact_request_lists = plan.compact_request_lists
+    request_time_column = plan.request_time_column
+    aligned_groups = plan.aligned_groups
+    context_set = plan.context_set
+    item_set = plan.item_set
+    required = plan.required
+    required_set = plan.required_set
+    scalar_features = plan.scalar_features
+    label_columns = plan.label_columns
+    sequence_columns_by_type = plan.sequence_columns_by_type
+    sequence_columns = plan.sequence_columns
+    time_delta_columns = plan.time_delta_columns
+    label_output_columns = plan.label_output_columns
+    sequence_output_columns = plan.sequence_output_columns
+    item_output_columns = plan.item_output_columns
+    request_output_columns = plan.request_output_columns
+    compact_list_columns = plan.compact_list_columns
+    output: dict[str, list[Any]] = {column: [] for column in required}
+    raw, validated_flat_sequence_columns = _adapter_table_to_python(
+        table,
+        plan.raw_sequence_columns,
+    )
+
+    has_context_indices = "context_indices" in raw
+    has_target_indices = "target_indices" in raw
+    if has_context_indices != has_target_indices:
+        raise ValueError(
+            "agg/req detection requires both context_indices and target_indices or neither"
+        )
+    is_agg = has_context_indices
+    nested_req_context = {
+        field.name
+        for field in table.schema
+        if field.name in context_set
+        and (pa.types.is_list(field.type) or pa.types.is_large_list(field.type))
+        and (
+            pa.types.is_list(field.type.value_type)
+            or pa.types.is_large_list(field.type.value_type)
+        )
+    }
+
+    for raw_row in range(table.num_rows):
+        row = {column: values[raw_row] for column, values in raw.items()}
+        if is_agg:
+            context_indices = _as_list(
+                row["context_indices"], column="context_indices", row_index=raw_row
+            )
+            target_indices = _as_list(
+                row["target_indices"], column="target_indices", row_index=raw_row
+            )
+            positions = _request_positions(context_indices, raw_row=raw_row)
+            candidate_requests = [
+                _request_index(value, column="target_indices", row_index=raw_row)
+                for value in target_indices
+            ]
+        else:
+            positions = {0: 0}
+            candidate_count = _candidate_count_req(
+                row,
+                item_features,
+                tuple(labels.values()),
+                raw_row,
+            )
+            candidate_requests = [0] * candidate_count
+
+        candidate_count = len(candidate_requests)
+        item_arrays: dict[str, list[Any]] = {}
+        for column in item_features:
+            if column not in row:
+                raise ValueError(f"missing item column {column!r}")
+            outer = _as_list(row[column], column=column, row_index=raw_row)
+            if len(outer) != candidate_count:
+                raise ValueError(
+                    f"item column {column!r} length {len(outer)} != candidate count "
+                    f"{candidate_count} at raw row {raw_row}"
+                )
+            item_arrays[column] = outer
+
+        label_arrays: dict[str, list[Any]] = {}
+        for task, column in labels.items():
+            if column not in required_set:
+                continue
+            if column not in row:
+                raise ValueError(f"missing label column {column!r} for task {task!r}")
+            values = _as_list(row[column], column=column, row_index=raw_row)
+            if len(values) != candidate_count:
+                raise ValueError(
+                    f"label {column!r} length {len(values)} != candidate count "
+                    f"{candidate_count} at raw row {raw_row}"
+                )
+            label_arrays[column] = values
+
+        context_arrays: dict[str, Any] = {}
+        request_count = len(positions)
+        for column in context_features:
+            if column not in row:
+                raise ValueError(f"missing context column {column!r}")
+            if is_agg:
+                outer = _as_list(row[column], column=column, row_index=raw_row)
+                if len(outer) != request_count:
+                    raise ValueError(
+                        f"context column {column!r} length {len(outer)} != "
+                        f"context_indices length {request_count} at raw row {raw_row}"
+                    )
+                context_arrays[column] = outer
+            else:
+                context_arrays[column] = row[column]
+
+        membership_positions: dict[str, dict[int, list[int]]] = {}
+        membership_lengths: dict[str, int] = {}
+        if is_agg:
+            known_requests = set(positions)
+            for ups in ups_types:
+                index_column = f"{ups}_x_indices"
+                if index_column not in row:
+                    raise ValueError(f"missing UPS indices column {index_column!r}")
+                memberships = _as_list(
+                    row[index_column], column=index_column, row_index=raw_row
+                )
+                if row[index_column] is not None and not memberships:
+                    raise ValueError(
+                        f"UPS indices column {index_column!r} contains an empty array "
+                        f"at raw row {raw_row}; an empty sequence must use null"
+                    )
+                membership_lengths[ups] = len(memberships)
+                membership_positions[ups] = _sequence_membership_positions(
+                    memberships,
+                    known_requests=known_requests,
+                    index_column=index_column,
+                    raw_row=raw_row,
+                )
+
+        unique_candidate_requests = tuple(dict.fromkeys(candidate_requests))
+        for request_index in unique_candidate_requests:
+            if request_index not in positions:
+                raise ValueError(
+                    f"target request {request_index} has no context at raw row {raw_row}"
+                )
+
+        # Normalize request payloads once, then append whole output columns.
+        # The previous candidate-major loop revisited ~169 dictionaries for
+        # every item even though Context/UPS are shared by request.
+        request_cache: dict[int, dict[str, Any]] = {}
+        sequence_cache: dict[int, dict[str, list[Any]]] = {}
+        for request_index in unique_candidate_requests:
+            request_position = positions[request_index]
+            cached: dict[str, Any] = {}
+            for column in context_features:
+                if is_agg:
+                    value = context_arrays[column][request_position]
+                else:
+                    value = _req_context_value(
+                        context_arrays[column],
+                        has_request_axis=column in nested_req_context,
+                        multivalue=column in bag_features,
+                        column=column,
+                        raw_row=raw_row,
+                    )
+                cached[column] = (
+                    _bag_value(
+                        value,
+                        column=column,
+                        raw_row=raw_row,
+                        logical_row=request_index,
+                    )
+                    if column in bag_features
+                    else _scalarize(
+                        value,
+                        column=column,
+                        raw_row=raw_row,
+                        logical_row=request_index,
+                    )
+                )
+            for column in request_columns:
+                if column not in row:
+                    raise ValueError(f"missing request-level column {column!r}")
+                value = _request_level_value(
+                    row[column],
+                    request_position=request_position,
+                    request_count=request_count,
+                    column=column,
+                    raw_row=raw_row,
+                    agg=is_agg,
+                )
+                if column in request_maps:
+                    value = _map_request_value(
+                        value,
+                        column=column,
+                        mapping=request_maps[column],
+                    )
+                cached[column] = value
+            request_cache[request_index] = cached
+
+            cached_sequences: dict[str, list[Any]] = {}
+            request_time = _request_level_value(
+                row.get(request_time_column),
+                request_position=request_position,
+                request_count=request_count,
+                column=request_time_column,
+                raw_row=raw_row,
+                agg=is_agg,
+            )
+            for ups in ups_types:
+                selected_positions = (
+                    membership_positions[ups][request_index] if is_agg else None
+                )
+                expected_length = membership_lengths.get(ups)
+                for column in sequence_columns_by_type[ups]:
+                    if column not in row:
+                        raise ValueError(f"missing UPS column {column!r}")
+                    cached_sequences[column] = _select_sequence(
+                        row[column],
+                        selected_positions,
+                        expected_length=expected_length,
+                        column=column,
+                        raw_row=raw_row,
+                        validated_flat=column in validated_flat_sequence_columns,
+                    )
+                if ups in time_delta_outputs:
+                    raw_time_column = f"{ups}_x_time"
+                    if raw_time_column not in row:
+                        raise ValueError(f"missing UPS time column {raw_time_column!r}")
+                    event_times = _select_sequence(
+                        row[raw_time_column],
+                        selected_positions,
+                        expected_length=expected_length,
+                        column=raw_time_column,
+                        raw_row=raw_row,
+                        validated_flat=(
+                            raw_time_column in validated_flat_sequence_columns
+                        ),
+                    )
+                    cached_sequences[time_delta_outputs[ups]] = _time_deltas(
+                        event_times,
+                        request_time,
+                        sequence=ups,
+                        raw_row=raw_row,
+                        transform=time_delta_transform,
+                    )
+            sequence_cache[request_index] = cached_sequences
+
+        normalized_items: dict[str, list[Any]] = {}
+        for column in item_features:
+            normalized: list[Any] = []
+            for candidate_index, value in enumerate(item_arrays[column]):
+                normalized.append(
+                    _bag_value(
+                        value,
+                        column=column,
+                        raw_row=raw_row,
+                        logical_row=candidate_index,
+                    )
+                    if column in bag_features
+                    else _scalarize(
+                        value,
+                        column=column,
+                        raw_row=raw_row,
+                        logical_row=candidate_index,
+                    )
+                )
+            normalized_items[column] = normalized
+
+        for group in aligned_groups:
+            for candidate_index in range(candidate_count):
+                lengths = {
+                    column: len(normalized_items[column][candidate_index])
+                    for column in group
+                    if isinstance(
+                        normalized_items[column][candidate_index],
+                        (list, tuple),
+                    )
+                }
+                if len(lengths) != len(group) or len(set(lengths.values())) != 1:
+                    raise ValueError(
+                        f"aligned multivalue group mismatch at raw row {raw_row}, "
+                        f"candidate {candidate_index}: {lengths}"
+                    )
+
+        for task, column in labels.items():
+            if column not in required_set:
+                continue
+            values = label_arrays[column]
+            for candidate_index, value in enumerate(values):
+                if isinstance(value, bool) or not isinstance(value, int) or value not in {0, 1}:
+                    raise ValueError(
+                        f"label {column!r} must be 0 or 1 at raw row {raw_row}, "
+                        f"candidate {candidate_index}; got {value!r}"
+                    )
+
+        for column in request_output_columns:
+            output[column].extend(
+                request_cache[request_index][column]
+                for request_index in candidate_requests
+            )
+        for column in item_output_columns:
+            output[column].extend(normalized_items[column])
+        for column in sequence_output_columns:
+            output[column].extend(
+                sequence_cache[request_index][column]
+                for request_index in candidate_requests
+            )
+        for column in label_output_columns:
+            output[column].extend(label_arrays[column])
+
+    arrays = {
+        column: _output_array(
+            pa,
+            column,
+            values,
+            scalar_features=scalar_features,
+            bag_features=bag_features,
+            sequence_columns=sequence_columns,
+            time_delta_columns=time_delta_columns,
+            label_columns=label_columns,
+            integer_request_columns=integer_request_columns,
+            dictionary_encode=(
+                compact_request_lists and column in compact_list_columns
+            ),
+        )
+        for column, values in output.items()
+    }
+    return pa.table(arrays)
+
 def _split_for_name(config: AppConfig, split_name: str) -> ParquetSplitConfig:
     split = config.data.train if split_name == "train" else config.data.test
     if split is None:
@@ -1339,6 +2499,8 @@ def _normalize_adapter_result(result: Any, adapter_name: str, split_name: str) -
 
 
 def _is_arrow_list_type(pa: Any, arrow_type: Any) -> bool:
+    while pa.types.is_dictionary(arrow_type):
+        arrow_type = arrow_type.value_type
     return (
         pa.types.is_list(arrow_type)
         or pa.types.is_large_list(arrow_type)
@@ -1359,8 +2521,10 @@ def _table_list_columns(table: Any) -> set[str]:
 
 
 def _validate_sequence_contract(config: AppConfig, table: Any, split_name: str) -> None:
-    pa, _pc, _ds, _pq = _require_pyarrow()
+    pa, pc, _ds, _pq = _require_pyarrow()
     for sequence in config.sequences:
+        reference_lengths: Any | None = None
+        reference_field: str | None = None
         for field in sequence.fields:
             arrow_type = table.schema.field(field.source).type
             if not _is_arrow_list_type(pa, arrow_type):
@@ -1368,25 +2532,27 @@ def _validate_sequence_contract(config: AppConfig, table: Any, split_name: str) 
                     f"adapter output for split {split_name!r} column {field.source!r} "
                     f"must be a list column because it backs sequence {sequence.name!r}."
                 )
-        if len(sequence.fields) <= 1:
-            continue
-        values_by_field = {field.name: _column_values(table, field.source) for field in sequence.fields}
-        row_count = table.num_rows
-        for row_index in range(row_count):
-            expected_length: int | None = None
-            expected_field: str | None = None
-            for field in sequence.fields:
-                items = _coerce_sequence_items(values_by_field[field.name][row_index])
-                if expected_length is None:
-                    expected_length = len(items)
-                    expected_field = field.name
-                    continue
-                if len(items) != expected_length:
-                    raise ValueError(
-                        f"adapter output for split {split_name!r} sequence {sequence.name!r} "
-                        f"has misaligned row {row_index}: field {field.name!r} length "
-                        f"{len(items)} != field {expected_field!r} length {expected_length}."
-                    )
+            array = _column_array(table, field.source)
+            if pa.types.is_dictionary(array.type):
+                dictionary_lengths = pc.list_value_length(array.dictionary)
+                lengths = pc.take(dictionary_lengths, array.indices)
+            else:
+                lengths = pc.list_value_length(array)
+            if lengths.null_count:
+                lengths = pc.fill_null(lengths, 0)
+            if reference_lengths is None:
+                reference_lengths = lengths
+                reference_field = field.name
+                continue
+            mismatch = pc.not_equal(reference_lengths, lengths)
+            if pc.any(mismatch).as_py():
+                row_index = int(pc.index(mismatch, True).as_py())
+                raise ValueError(
+                    f"adapter output for split {split_name!r} sequence {sequence.name!r} "
+                    f"has misaligned row {row_index}: field {field.name!r} length "
+                    f"{lengths[row_index].as_py()} != field {reference_field!r} length "
+                    f"{reference_lengths[row_index].as_py()}."
+                )
 
 
 def _validate_flat_table_contract(
@@ -1409,8 +2575,18 @@ def _validate_flat_table_contract(
         for feature in config.features
         if feature.kind == "dense" and feature.dimension > 1
     }
+    categorical_bag_columns = {
+        feature.source
+        for feature in config.features
+        if feature.kind == "categorical" and feature.pooling == "mean"
+    }
     scenario_columns = {config.scenarios.source} if config.scenarios.source else set()
-    allowed_list_columns = sequence_columns | dense_vector_columns | scenario_columns
+    allowed_list_columns = (
+        sequence_columns
+        | dense_vector_columns
+        | categorical_bag_columns
+        | scenario_columns
+    )
     unexpected_list_columns = sorted(
         column
         for column in _table_list_columns(table)
@@ -1420,8 +2596,8 @@ def _validate_flat_table_contract(
         raise ValueError(
             f"adapter output for split {split_name!r} has list-valued non-sequence column(s): "
             + ", ".join(unexpected_list_columns)
-            + ". Only configured sequence fields, dense features with dimension > 1, "
-            "and scenario masks may use list-valued cells."
+            + ". Only configured sequence fields, categorical features with pooling=mean, "
+            "dense features with dimension > 1, and scenario masks may use list-valued cells."
         )
 
     _validate_sequence_contract(config, table, split_name)
@@ -1484,6 +2660,7 @@ def iter_flat_tables(
         _scan_columns_for_split(split, required_columns),
         shard_rank=shard_rank,
         shard_world_size=shard_world_size,
+        optional_columns=_optional_scan_columns_for_split(split),
     )
     adapter_name, adapter = _load_parquet_adapter(split)
     context = _adapter_context(split_name, split, required_columns)
@@ -1507,7 +2684,11 @@ def scan_flat_table_stats(
     """Scan through the unified flat-table path and return raw/flat counters."""
     split = _split_for_name(config, split_name)
     required_columns = required_columns_for_split(config, split)
-    scanner = ParquetScanner(split, _scan_columns_for_split(split, required_columns))
+    scanner = ParquetScanner(
+        split,
+        _scan_columns_for_split(split, required_columns),
+        optional_columns=_optional_scan_columns_for_split(split),
+    )
     counters = _FlatScanCounters(files=len(scanner.paths))
     adapter_name, adapter = _load_parquet_adapter(split)
     context = _adapter_context(split_name, split, required_columns)
@@ -1545,6 +2726,9 @@ class FeatureBatch:
     label_mask: Tensor | None
     scenario_id: Tensor
     group_id: list[str]
+    # Optional same-dtype base buffers. Tensor leaves are views into these
+    # buffers so one H2D copy per dtype replaces hundreds of small copies.
+    _packed_buffers: tuple[Tensor, ...] = field(default_factory=tuple, repr=False)
 
 
 # --- Column accessors ---
@@ -1561,7 +2745,31 @@ def _column_array(table: Any, column: str) -> Any:
     """Return a contiguous Arrow array while preserving a useful missing-column error."""
     if column not in table.column_names:
         raise ValueError(f"missing required batch column {column!r}")
-    return table[column].combine_chunks()
+    pa, pc, _ds, _pq = _require_pyarrow()
+    chunked = table[column]
+    if not chunked.num_chunks:
+        return chunked.combine_chunks()
+    if chunked.num_chunks == 1:
+        return chunked.chunk(0)
+    if not all(
+        pa.types.is_dictionary(chunk.type)
+        for chunk in chunked.chunks
+    ):
+        return chunked.combine_chunks()
+    dictionaries: list[Any] = []
+    shifted_indices: list[Any] = []
+    offset = 0
+    for chunk in chunked.chunks:
+        dictionaries.append(chunk.dictionary)
+        indices = chunk.indices
+        if offset:
+            indices = pc.add(indices, pa.scalar(offset, type=indices.type))
+        shifted_indices.append(indices)
+        offset += len(chunk.dictionary)
+    return pa.DictionaryArray.from_arrays(
+        pa.concat_arrays(shifted_indices),
+        pa.concat_arrays(dictionaries),
+    )
 
 
 def _numeric_column_tensor(table: Any, column: str, dtype: torch.dtype) -> Tensor:
@@ -1651,6 +2859,52 @@ def _identity_column_tensor(
     )
 
 
+def _pre_hashed_array_tensor(
+    array: Any,
+    categorical_input: ResolvedCategoricalInput,
+    *,
+    validate_nonzero: bool = True,
+) -> Tensor:
+    """Vectorize unsigned-low-bit bucketing while preserving null as zero."""
+
+    encoding = categorical_input.encoding
+    if not isinstance(encoding, ResolvedPreHashedEncoding):
+        raise TypeError("_pre_hashed_array_tensor requires pre_hashed encoding")
+    pa, pc, _ds, _pq = _require_pyarrow()
+    if not pa.types.is_int64(array.type):
+        raise TypeError(
+            f"pre_hashed input {categorical_input.name!r} must be an Arrow int64 column, "
+            f"got {array.type}"
+        )
+    if validate_nonzero:
+        zero_mask = pc.equal(array, 0)
+        has_zero = pc.any(zero_mask).as_py()
+        if has_zero:
+            raise ValueError(
+                f"pre_hashed input {categorical_input.name!r} contains non-null zero values"
+            )
+    encoded = pc.add(
+        pc.bit_wise_and(array, encoding.num_buckets - 1),
+        1,
+    )
+    if encoded.null_count:
+        encoded = pc.fill_null(encoded, encoding.padding_id)
+    return _numpy_backed_tensor(encoded, torch.long)
+
+
+def _pre_hashed_column_tensor(
+    table: Any,
+    categorical_input: ResolvedCategoricalInput,
+    *,
+    validate_nonzero: bool = True,
+) -> Tensor:
+    return _pre_hashed_array_tensor(
+        _column_array(table, categorical_input.source),
+        categorical_input,
+        validate_nonzero=validate_nonzero,
+    )
+
+
 # --- Categorical encoding ---
 
 
@@ -1681,6 +2935,8 @@ def _tensorize_categorical(
     feature: FeatureConfig,
     table: Any,
     vocab_maps: dict[str, dict[str, int]],
+    *,
+    validate_prehashed_nonzero: bool = True,
 ) -> Tensor:
     """Build a rank-one integer tensor for a configured categorical feature."""
     categorical_input = _effective_categorical_input(
@@ -1689,6 +2945,12 @@ def _tensorize_categorical(
     )
     if isinstance(categorical_input.encoding, ResolvedIdentityEncoding):
         return _identity_column_tensor(table, categorical_input)
+    if isinstance(categorical_input.encoding, ResolvedPreHashedEncoding):
+        return _pre_hashed_column_tensor(
+            table,
+            categorical_input,
+            validate_nonzero=validate_prehashed_nonzero,
+        )
     unseen_policy = config.vocab_strategy.defaults.unseen_policy
     encoded = encode_categorical_values(
         _column_values(table, categorical_input.source),
@@ -1697,6 +2959,70 @@ def _tensorize_categorical(
         unseen_policy,
     )
     return torch.tensor(encoded, dtype=torch.long)
+
+
+def _tensorize_categorical_bag(
+    config: AppConfig,
+    feature: FeatureConfig,
+    table: Any,
+    vocab_maps: dict[str, dict[str, int]],
+    *,
+    validate_prehashed_nonzero: bool = True,
+) -> dict[str, Tensor]:
+    """Encode one list-valued categorical feature and right-pad its bag."""
+
+    if feature.pooling != "mean":
+        raise TypeError("_tensorize_categorical_bag requires pooling=mean")
+    categorical_input = _effective_categorical_input(
+        config,
+        config.resolved.categorical_input_by_name[feature.name],
+    )
+    array = _normalized_list_array(table, feature.source)
+    offsets = _list_offsets_tensor(array)
+    base = int(offsets[0].item()) if offsets.numel() else 0
+    normalized_offsets = offsets - base
+    raw_lengths = normalized_offsets[1:] - normalized_offsets[:-1]
+    lengths = raw_lengths
+    if feature.max_length is not None:
+        lengths = torch.clamp(raw_lengths, max=feature.max_length)
+    if feature.truncation == "tail":
+        starts = normalized_offsets[1:] - lengths
+    else:
+        starts = normalized_offsets[:-1]
+    max_length = int(lengths.max().item()) if lengths.numel() else 0
+    total_values = int(offsets[-1].item()) - base if offsets.numel() else 0
+    flat = array.values.slice(base, total_values)
+    if isinstance(categorical_input.encoding, ResolvedIdentityEncoding):
+        encoded = _identity_array_tensor(flat, categorical_input)
+    elif isinstance(categorical_input.encoding, ResolvedPreHashedEncoding):
+        encoded = _pre_hashed_array_tensor(
+            flat,
+            categorical_input,
+            validate_nonzero=validate_prehashed_nonzero,
+        )
+    else:
+        unseen_policy = config.vocab_strategy.defaults.unseen_policy
+        vocab_map = vocab_maps.get(categorical_input.name)
+        encoded = torch.tensor(
+            [
+                encode_categorical_value(
+                    value,
+                    categorical_input,
+                    vocab_map,
+                    unseen_policy,
+                )
+                for value in flat.to_pylist()
+            ],
+            dtype=torch.long,
+        )
+    values = _gather_padded_sequence(
+        encoded,
+        starts,
+        lengths,
+        max_length,
+        0,
+    )
+    return {"values": values, "lengths": lengths}
 
 
 # --- Dense features ---
@@ -1766,7 +3092,7 @@ def _direct_sequence_supported(config: AppConfig, sequence: SequenceConfig) -> b
                     field.qualified_name(sequence.name)
                 ],
             ).encoding,
-            ResolvedIdentityEncoding,
+            (ResolvedIdentityEncoding, ResolvedPreHashedEncoding),
         )
         for field in sequence.fields
     )
@@ -1775,6 +3101,10 @@ def _direct_sequence_supported(config: AppConfig, sequence: SequenceConfig) -> b
 def _normalized_list_array(table: Any, column: str) -> Any:
     pa, pc, _ds, _pq = _require_pyarrow()
     array = _column_array(table, column)
+    if pa.types.is_dictionary(array.type):
+        # Arrow 14 cannot dictionary_decode list-valued dictionaries, while
+        # take(dictionary, indices) has the required list kernel.
+        array = pc.take(array.dictionary, array.indices)
     if not (pa.types.is_list(array.type) or pa.types.is_large_list(array.type)):
         raise TypeError(
             f"direct sequence input {column!r} must be an Arrow list column, got {array.type}"
@@ -1857,6 +3187,8 @@ def _tensorize_direct_sequence(
     config: AppConfig,
     sequence: SequenceConfig,
     table: Any,
+    *,
+    validate_prehashed_nonzero: bool = True,
 ) -> dict[str, Any]:
     """Vectorize an identity-ID sequence from Arrow offsets and flat values."""
 
@@ -1906,7 +3238,16 @@ def _tensorize_direct_sequence(
                 config,
                 config.resolved.categorical_input_by_name[qualified],
             )
-            values = _identity_array_tensor(flat, categorical_input)
+            if isinstance(categorical_input.encoding, ResolvedIdentityEncoding):
+                values = _identity_array_tensor(flat, categorical_input)
+            elif isinstance(categorical_input.encoding, ResolvedPreHashedEncoding):
+                values = _pre_hashed_array_tensor(
+                    flat,
+                    categorical_input,
+                    validate_nonzero=validate_prehashed_nonzero,
+                )
+            else:  # Guarded by _direct_sequence_supported.
+                raise TypeError("unsupported direct categorical sequence encoding")
             padding_value: int | float = categorical_input.encoding.padding_id
         else:
             values = _direct_dense_values(flat, field.dimension, field.name)
@@ -1977,10 +3318,17 @@ def _tensorize_multi_field_sequence(
     sequence: SequenceConfig,
     table: Any,
     vocab_maps: dict[str, dict[str, int]],
+    *,
+    validate_prehashed_nonzero: bool = True,
 ) -> dict[str, Any]:
     """Encode and right-pad one configured sequence to the batch maximum length."""
     if _direct_sequence_supported(config, sequence):
-        return _tensorize_direct_sequence(config, sequence, table)
+        return _tensorize_direct_sequence(
+            config,
+            sequence,
+            table,
+            validate_prehashed_nonzero=validate_prehashed_nonzero,
+        )
     rows_by_field, row_lengths = _sequence_rows(table, sequence)
 
     lengths = torch.tensor(row_lengths, dtype=torch.long)
@@ -2027,6 +3375,258 @@ def _tensorize_multi_field_sequence(
 # --- Scenario and evaluation metadata ---
 
 
+def _scenario_discovery_signature(
+    config: AppConfig,
+    split_name: str,
+) -> str:
+    split = _split_for_name(config, split_name)
+    payload = {
+        "version": 1,
+        "source": config.scenarios.source,
+        "split_format": split.format,
+        "inputs": list(split.inputs),
+    }
+    return sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _load_scenario_discovery_cache(
+    config: AppConfig,
+    split_name: str,
+) -> tuple[int, ...] | None:
+    raw_path = config.scenarios.discovery_cache_path
+    if raw_path is None:
+        return None
+    path = Path(raw_path)
+    if not path.is_file():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("signature") != _scenario_discovery_signature(config, split_name):
+        return None
+    raw_values = payload.get("values")
+    if not isinstance(raw_values, list) or not raw_values:
+        raise ValueError(f"scenario discovery cache {path} has invalid values")
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in raw_values):
+        raise ValueError(f"scenario discovery cache {path} must contain integer values")
+    values = tuple(sorted(set(raw_values)))
+    if len(values) != len(raw_values):
+        raise ValueError(f"scenario discovery cache {path} contains duplicate values")
+    if len(values) > config.scenarios.max_discovered:
+        raise ValueError(
+            f"scenario discovery cache {path} exceeds max_discovered="
+            f"{config.scenarios.max_discovered}"
+        )
+    return values
+
+
+def _write_scenario_discovery_cache(
+    config: AppConfig,
+    split_name: str,
+    values: tuple[int, ...],
+) -> None:
+    raw_path = config.scenarios.discovery_cache_path
+    if raw_path is None:
+        return
+    path = Path(raw_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = {
+        "signature": _scenario_discovery_signature(config, split_name),
+        "values": list(values),
+    }
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def discover_scenario_values(
+    config: AppConfig,
+    *,
+    split_name: str = "train",
+) -> tuple[int, ...]:
+    """Discover the complete finite raw integer scenario set from Parquet.
+
+    This intentionally scans only the configured raw scenario column and runs
+    before row sharding.  The caller is responsible for executing it on rank 0
+    and broadcasting the result in distributed jobs.
+    """
+
+    scenario = config.scenarios
+    if not scenario.auto_discover:
+        raise ValueError("scenario discovery requires scenarios.auto_discover=true")
+    if scenario.source is None:
+        raise ValueError("scenario discovery requires scenarios.source")
+    cached = _load_scenario_discovery_cache(config, split_name)
+    if cached is not None:
+        return cached
+    split = _split_for_name(config, split_name)
+    scanner = ParquetScanner(split, [scenario.source])
+    values: set[int] = set()
+
+    def observe(value: Any, *, raw_row: int) -> None:
+        if value is None:
+            raise ValueError(
+                f"scenario source {scenario.source!r} contains null at raw row {raw_row}"
+            )
+        if isinstance(value, (list, tuple)):
+            if not value:
+                raise ValueError(
+                    f"scenario source {scenario.source!r} contains an empty list "
+                    f"at raw row {raw_row}"
+                )
+            for item in value:
+                observe(item, raw_row=raw_row)
+            return
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError(
+                f"scenario source {scenario.source!r} must contain integer ids; "
+                f"got {value!r} at raw row {raw_row}"
+            )
+        values.add(int(value))
+        if len(values) > scenario.max_discovered:
+            raise ValueError(
+                f"scenario discovery found more than {scenario.max_discovered} values; "
+                "increase scenarios.max_discovered only after checking the source column"
+            )
+
+    raw_row_offset = 0
+    for table in scanner.iter_tables():
+        if scenario.source not in table.column_names:
+            raise ValueError(
+                f"scenario discovery is missing source column {scenario.source!r}"
+            )
+        for row_index, value in enumerate(_column_values(table, scenario.source)):
+            observe(value, raw_row=raw_row_offset + row_index)
+        raw_row_offset += table.num_rows
+    if not values:
+        raise ValueError(
+            f"scenario discovery found no values in source column {scenario.source!r}"
+        )
+    result = tuple(sorted(values))
+    _write_scenario_discovery_cache(config, split_name, result)
+    return result
+
+
+def resolve_auto_scenarios(
+    config: AppConfig,
+    discovered_values: Sequence[int] | None = None,
+) -> AppConfig:
+    """Return a validated immutable config with auto scenarios resolved."""
+
+    scenario = config.scenarios
+    if not scenario.auto_discover:
+        return config
+    values = (
+        discover_scenario_values(config)
+        if discovered_values is None
+        else tuple(discovered_values)
+    )
+    if not values:
+        raise ValueError("auto scenario resolution requires at least one value")
+    if any(isinstance(value, bool) or not isinstance(value, Integral) for value in values):
+        raise ValueError("auto scenario values must be integers")
+    ordered = tuple(sorted({int(value) for value in values}))
+    if len(ordered) != len(values):
+        raise ValueError("auto scenario values must be unique")
+    if len(ordered) > scenario.max_discovered:
+        raise ValueError(
+            f"auto scenario values exceed scenarios.max_discovered={scenario.max_discovered}"
+        )
+    # Pure RankMixer/OneTrans use raw scenes only for batch routing and
+    # per-scene evaluation; they do not instantiate MDL domain tokens or
+    # scenario-scoped embedding tables.  Resolving their scenario names is
+    # therefore only a metadata operation.
+    if config.model.name not in {"mdl_rankmixer", "mdl_onetrans"}:
+        resolved = replace(
+            config,
+            scenarios=replace(
+                scenario,
+                names=tuple(str(value) for value in ordered),
+                auto_discover=False,
+            ),
+        )
+        resolved.validate()
+        return resolved
+
+    template_features = [
+        feature
+        for feature in config.features
+        if feature.name == _AUTO_SCENARIO_PRIOR_NAME
+    ]
+    if len(template_features) != 1:
+        raise ValueError(
+            "auto scenario resolution requires exactly one scenario prior template "
+            f"feature named {_AUTO_SCENARIO_PRIOR_NAME!r}"
+        )
+    template_feature = template_features[0]
+    template_tokens = [
+        token
+        for token in config.tokenization.scenario_tokens
+        if token.name == _AUTO_SCENARIO_NAME
+    ]
+    if len(template_tokens) != 1:
+        raise ValueError(
+            "auto scenario resolution requires exactly one scenario token template "
+            f"named {_AUTO_SCENARIO_NAME!r}"
+        )
+    template_token = template_tokens[0]
+    if _AUTO_SCENARIO_PRIOR_NAME not in template_token.prior_inputs:
+        raise ValueError(
+            "auto scenario token template must reference the scenario prior template "
+            "in prior_inputs"
+        )
+
+    def feature_name(value: int) -> str:
+        slug = f"neg_{abs(value)}" if value < 0 else str(value)
+        return f"scenario_{slug}_prior_scene_id_hn"
+
+    expanded_features: list[Any] = []
+    for feature in config.features:
+        if feature.name != _AUTO_SCENARIO_PRIOR_NAME:
+            expanded_features.append(feature)
+            continue
+        expanded_features.extend(
+            replace(template_feature, name=feature_name(value))
+            for value in ordered
+        )
+    expanded_tokens = [
+        replace(
+            template_token,
+            name=str(value),
+            prior_inputs=tuple(
+                feature_name(value)
+                if input_name == _AUTO_SCENARIO_PRIOR_NAME
+                else input_name
+                for input_name in template_token.prior_inputs
+            ),
+        )
+        for value in ordered
+    ]
+    expanded_tokens.extend(
+        token
+        for token in config.tokenization.scenario_tokens
+        if token.name != _AUTO_SCENARIO_NAME
+    )
+    resolved = replace(
+        config,
+        features=tuple(expanded_features),
+        scenarios=replace(
+            scenario,
+            names=tuple(str(value) for value in ordered),
+            auto_discover=False,
+        ),
+        tokenization=replace(
+            config.tokenization,
+            scenario_tokens=tuple(expanded_tokens),
+        ),
+    )
+    resolved.validate()
+    return resolved
+
+
 def _encode_scenario_item(
     value: Any,
     scenario_to_id: dict[str, int],
@@ -2044,6 +3644,9 @@ def _encode_scenario_item(
     if isinstance(value, bool):
         raise ValueError(f"scenario value must be a name or integer id at row {row_index}, got bool")
     if isinstance(value, Integral):
+        raw_name = str(int(value))
+        if raw_name in scenario_to_id:
+            return scenario_to_id[raw_name]
         index = int(value)
         if 0 <= index < scenario_count:
             return index
@@ -2105,6 +3708,49 @@ def _group_ids(split: ParquetSplitConfig, table: Any, batch_size: int) -> list[s
     return ["" if value is None else str(value) for value in _column_values(table, source)]
 
 
+def _request_deduplication_plan(
+    split: ParquetSplitConfig,
+    table: Any,
+) -> tuple[Any, Tensor] | None:
+    """Select one physical row per request and map candidates back to it."""
+
+    if not split.reader.deduplicate_request_features:
+        return None
+    if split.request_id is None:
+        raise ValueError("request feature deduplication requires request_id")
+    request_ids = _column_values(table, split.request_id)
+    unique_positions: list[int] = []
+    candidate_to_request: list[int] = []
+    request_index: dict[Any, int] = {}
+    for row_index, request_id in enumerate(request_ids):
+        if request_id is None:
+            raise ValueError(
+                f"request_id column {split.request_id!r} contains null at row {row_index}"
+            )
+        try:
+            existing = request_index.get(request_id)
+        except TypeError as error:
+            raise ValueError(
+                f"request_id column {split.request_id!r} must contain hashable scalars"
+            ) from error
+        if existing is None:
+            existing = len(unique_positions)
+            request_index[request_id] = existing
+            unique_positions.append(row_index)
+        candidate_to_request.append(existing)
+    if len(unique_positions) == table.num_rows:
+        return None
+    pa, _pc, _ds, _pq = _require_pyarrow()
+    selected = table.take(pa.array(unique_positions, type=pa.int64()))
+    return selected, torch.tensor(candidate_to_request, dtype=torch.long)
+
+
+def _indexed_request_value(value: Any, row_indices: Tensor) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return {**value, "row_indices": row_indices}
+    return {"values": value, "row_indices": row_indices}
+
+
 def table_to_feature_batch(
     config: AppConfig,
     table: Any,
@@ -2122,16 +3768,61 @@ def table_to_feature_batch(
     """
     active_split = config.data.train if split is None else split
     batch_size = table.num_rows
+    deduplication = _request_deduplication_plan(active_split, table)
+    request_table, request_row_indices = (
+        (table, None) if deduplication is None else deduplication
+    )
+    adapter_options = (
+        {} if active_split.adapter is None else active_split.adapter.options
+    )
+    context_sources = {
+        str(source) for source in adapter_options.get("context_features", ())
+    }
+    validate_prehashed_nonzero = active_split.reader.validate_prehashed_nonzero
     features: dict[str, Any] = {}
     for feature in config.features:
+        request_level = (
+            request_row_indices is not None and feature.source in context_sources
+        )
+        source_table = request_table if request_level else table
         if feature.kind == "categorical":
-            features[feature.name] = _tensorize_categorical(config, feature, table, vocab_maps)
+            value = (
+                _tensorize_categorical_bag(
+                    config,
+                    feature,
+                    source_table,
+                    vocab_maps,
+                    validate_prehashed_nonzero=validate_prehashed_nonzero,
+                )
+                if feature.pooling == "mean"
+                else _tensorize_categorical(
+                    config,
+                    feature,
+                    source_table,
+                    vocab_maps,
+                    validate_prehashed_nonzero=validate_prehashed_nonzero,
+                )
+            )
         elif feature.kind == "dense":
-            features[feature.name] = _tensorize_dense_column(feature, table)
+            value = _tensorize_dense_column(feature, source_table)
         else:
             raise ValueError(f"unsupported feature kind {feature.kind!r}")
+        features[feature.name] = (
+            _indexed_request_value(value, request_row_indices)
+            if request_level and request_row_indices is not None
+            else value
+        )
     for sequence in config.sequences:
-        features[sequence.name] = _tensorize_multi_field_sequence(config, sequence, table, vocab_maps)
+        value = _tensorize_multi_field_sequence(
+            config,
+            sequence,
+            request_table if request_row_indices is not None else table,
+            vocab_maps,
+            validate_prehashed_nonzero=validate_prehashed_nonzero,
+        )
+        if request_row_indices is not None:
+            value["row_indices"] = request_row_indices
+        features[sequence.name] = value
 
     # Labels and masks follow config order; missing masks default to all-observed.
     labels = None
@@ -2184,8 +3875,76 @@ def _map_feature_value(value: Any, tensor_fn: Callable[[Tensor], Tensor]) -> Any
     return value
 
 
-def pin_feature_batch(batch: FeatureBatch) -> FeatureBatch:
+def _coalesce_feature_batch(
+    batch: FeatureBatch,
+    *,
+    pin_memory: bool,
+) -> FeatureBatch:
+    """Copy every tensor leaf into one contiguous base buffer per dtype."""
+
+    leaves: list[Tensor] = []
+    seen_leaves: set[int] = set()
+
+    def collect(value: Any) -> Any:
+        if isinstance(value, Tensor):
+            if value.device.type != "cpu":
+                raise ValueError("feature-batch coalescing requires CPU tensors")
+            tensor_id = id(value)
+            if tensor_id not in seen_leaves:
+                leaves.append(value)
+                seen_leaves.add(tensor_id)
+        return value
+
+    for value in batch.features.values():
+        _map_feature_value(value, collect)
+    for value in (batch.labels, batch.label_mask, batch.scenario_id):
+        if isinstance(value, Tensor):
+            collect(value)
+
+    by_dtype: dict[torch.dtype, list[Tensor]] = defaultdict(list)
+    for tensor in leaves:
+        by_dtype[tensor.dtype].append(tensor)
+
+    replacements: dict[int, Tensor] = {}
+    buffers: list[Tensor] = []
+    for dtype, tensors in by_dtype.items():
+        total = sum(tensor.numel() for tensor in tensors)
+        buffer = torch.empty(total, dtype=dtype, pin_memory=pin_memory)
+        buffers.append(buffer)
+        offset = 0
+        for tensor in tensors:
+            count = tensor.numel()
+            target = buffer.narrow(0, offset, count)
+            target.copy_(tensor.reshape(-1))
+            replacements[id(tensor)] = target.view(tensor.shape)
+            offset += count
+
+    def replace_tensor(tensor: Tensor) -> Tensor:
+        return replacements[id(tensor)]
+
+    return FeatureBatch(
+        features={
+            key: _map_feature_value(value, replace_tensor)
+            for key, value in batch.features.items()
+        },
+        labels=None if batch.labels is None else replace_tensor(batch.labels),
+        label_mask=(
+            None if batch.label_mask is None else replace_tensor(batch.label_mask)
+        ),
+        scenario_id=replace_tensor(batch.scenario_id),
+        group_id=batch.group_id,
+        _packed_buffers=tuple(buffers),
+    )
+
+
+def pin_feature_batch(
+    batch: FeatureBatch,
+    *,
+    coalesce_tensors: bool = False,
+) -> FeatureBatch:
     """Pin CPU tensors so CUDA transfers can use the non-blocking path."""
+    if coalesce_tensors:
+        return _coalesce_feature_batch(batch, pin_memory=True)
     return FeatureBatch(
         features={
             key: _map_feature_value(value, lambda tensor: tensor.pin_memory())
@@ -2204,6 +3963,34 @@ def move_feature_batch(
     non_blocking: bool = False,
 ) -> FeatureBatch:
     """Move every tensor leaf while leaving string evaluation metadata on CPU."""
+    if batch._packed_buffers:
+        moved_buffers = tuple(
+            buffer.to(device, non_blocking=non_blocking)
+            for buffer in batch._packed_buffers
+        )
+        moved_by_dtype = {buffer.dtype: buffer for buffer in moved_buffers}
+
+        def move_view(tensor: Tensor) -> Tensor:
+            base = moved_by_dtype[tensor.dtype]
+            return base.as_strided(
+                tensor.size(),
+                tensor.stride(),
+                tensor.storage_offset(),
+            )
+
+        return FeatureBatch(
+            features={
+                key: _map_feature_value(value, move_view)
+                for key, value in batch.features.items()
+            },
+            labels=None if batch.labels is None else move_view(batch.labels),
+            label_mask=(
+                None if batch.label_mask is None else move_view(batch.label_mask)
+            ),
+            scenario_id=move_view(batch.scenario_id),
+            group_id=batch.group_id,
+            _packed_buffers=moved_buffers,
+        )
     return FeatureBatch(
         features={
             key: _map_feature_value(

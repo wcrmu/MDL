@@ -37,6 +37,33 @@ def _load_config(args: argparse.Namespace):
     return load_app_config(args.config)
 
 
+def _parse_named_positive_ints(raw: str) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, separator, value_text = item.partition("=")
+        if not separator or not name.strip():
+            raise argparse.ArgumentTypeError(
+                "expected comma-separated name=positive_integer entries"
+            )
+        try:
+            value = int(value_text)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                f"invalid integer for {name.strip()!r}: {value_text!r}"
+            ) from error
+        if value <= 0:
+            raise argparse.ArgumentTypeError(
+                f"length for {name.strip()!r} must be positive"
+            )
+        result[name.strip()] = value
+    if not result:
+        raise argparse.ArgumentTypeError("at least one named length is required")
+    return result
+
+
 def _cmd_validate_config(args: argparse.Namespace) -> int:
     config = _load_config(args)
     print(f"config: OK ({args.config})")
@@ -165,10 +192,13 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
             seed=args.seed,
             batch_size=args.batch_size,
             sequence_length=args.sequence_length,
+            sequence_lengths=args.sequence_lengths,
             embedding_lookups_per_table=args.embedding_lookups_per_table,
             id_distribution=args.id_distribution,
             zipf_exponent=args.zipf_exponent,
             peak_tflops=args.peak_tflops,
+            reserve_hbm_gib=args.reserve_hbm_gib,
+            candidates_per_request=args.candidates_per_request,
         ),
     )
     if is_main_process():
@@ -200,17 +230,19 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
         checkpoint_path=args.checkpoint_path,
         max_batches=args.max_batches,
         allow_random_init=args.allow_random_init,
-        group_metric_name=args.group_metric_name,
+        group_metric_name=(
+            None if args.group_metric_name == "none" else args.group_metric_name
+        ),
         auc_bins=args.auc_bins,
     )
     print(
         f"evaluate_result rows={result.rows} "
-        f"group_metric={result.group_metric_name} "
+        f"group_metric={result.group_metric_name or 'none'} "
         f"auc_histogram_bins={result.auc_histogram_bins}"
     )
     for task_name, metrics in result.metrics.items():
         formatted = " ".join(
-            f"{name}={'NA' if value is None else f'{value:.8f}'}"
+            f"{name}={('NA' if value is None else str(value) if isinstance(value, int) else f'{value:.8f}')}"
             for name, value in metrics.items()
         )
         print(f"evaluate_task task={task_name} {formatted}")
@@ -263,12 +295,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="per-rank synthetic batch size for compute-only benchmarking",
     )
     benchmark.add_argument("--sequence-length", type=int, default=None)
+    benchmark.add_argument(
+        "--sequence-lengths",
+        type=_parse_named_positive_ints,
+        default={},
+        help="compute-only per-sequence lengths, e.g. impr=256,clk_long=512",
+    )
     benchmark.add_argument("--embedding-lookups-per-table", type=int, default=65536)
     benchmark.add_argument(
         "--id-distribution", choices=["uniform", "zipf"], default="uniform"
     )
     benchmark.add_argument("--zipf-exponent", type=float, default=1.2)
     benchmark.add_argument("--peak-tflops", type=float, default=None)
+    benchmark.add_argument(
+        "--reserve-hbm-gib",
+        type=float,
+        default=0.0,
+        help="compute-only HBM reservation for embedding weights and optimizer state",
+    )
+    benchmark.add_argument(
+        "--candidates-per-request",
+        type=int,
+        default=1,
+        help="compute-only agg simulation: candidates sharing one request",
+    )
     benchmark.add_argument("--output", default=None)
     benchmark.add_argument("--distributed", choices=["none", "ddp"], default=None)
     benchmark.add_argument("--nproc-per-node", type=int, default=None)
@@ -291,7 +341,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--max-batches", type=int, default=None)
     evaluate.add_argument("--allow-random-init", action="store_true")
     evaluate.add_argument(
-        "--group-metric-name", choices=["qauc", "uauc"], default="qauc"
+        "--group-metric-name", choices=["none", "qauc", "uauc"], default="none"
     )
     evaluate.add_argument("--auc-bins", type=int, default=65536)
     evaluate.set_defaults(func=_cmd_evaluate)
