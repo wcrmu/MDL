@@ -1162,7 +1162,7 @@ class ScenarioConfig(_DeeplyImmutableConfig):
     auto_discover: bool = False
     # Guard against accidentally constructing an unbounded number of
     # scenario-specific MDL token networks from a malformed source column.
-    max_discovered: int = 64
+    max_discovered: int = 256
     # Optional local cache for the sorted discovered IDs. The cache is keyed by
     # input paths and source column so immutable date/hour partitions can be
     # reused across repeated experiments without rescanning Parquet.

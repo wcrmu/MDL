@@ -1897,7 +1897,7 @@ def build_config(
             "source": "scene_id",
             "source_encoding": "raw",
             "auto_discover": True,
-            "max_discovered": 64,
+            "max_discovered": 256,
         }
         if mdl_family:
             if auto_scenario_prior_name is None:  # Defensive type narrowing.

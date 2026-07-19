@@ -4594,7 +4594,7 @@ scenarios:
   source: scene_id
   source_encoding: raw
   auto_discover: true
-  max_discovered: 64
+  max_discovered: 256
   discovery_cache_path: artifacts/scenarios/cvr_allscene.json
 tokenization:
   feature_tokenizer: rankmixer
