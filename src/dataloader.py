@@ -87,6 +87,9 @@ class ParquetAdapterContext:
     split_name: str
     required_columns: tuple[str, ...]
     options: Mapping[str, Any]
+    # Trusted production inputs validate one raw/flat sample, then avoid
+    # diagnostic per-row/per-token checks on complete batches.
+    trusted_input: bool = False
     # Built-in adapters may cache an immutable execution plan here. Keeping
     # this private cache on the context avoids reparsing hundreds of configured
     # column names for every Arrow record batch.
@@ -1419,6 +1422,26 @@ def _mapping(options: Mapping[str, Any], key: str) -> dict[str, str]:
     return result
 
 
+def _positive_int_mapping(options: Mapping[str, Any], key: str) -> dict[str, int]:
+    value = options.get(key, {})
+    if not isinstance(value, Mapping):
+        raise ValueError(f"adapter option {key!r} must be an object")
+    result: dict[str, int] = {}
+    for raw_name, raw_limit in value.items():
+        name = str(raw_name)
+        if (
+            not name
+            or isinstance(raw_limit, bool)
+            or not isinstance(raw_limit, int)
+            or raw_limit <= 0
+        ):
+            raise ValueError(
+                f"adapter option {key!r} must map non-empty names to positive integers"
+            )
+        result[name] = raw_limit
+    return result
+
+
 def _column_aliases(options: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
     raw = options.get("column_aliases", {})
     if not isinstance(raw, Mapping):
@@ -1551,7 +1574,18 @@ def _request_value_maps(
     return result
 
 
-def _map_request_value(value: Any, *, column: str, mapping: Mapping[Any, int]) -> int:
+def _map_request_value(
+    value: Any,
+    *,
+    column: str,
+    mapping: Mapping[Any, int],
+    validate_contract: bool = True,
+) -> int:
+    if not validate_contract:
+        try:
+            return mapping[value]
+        except (KeyError, TypeError):
+            return mapping[str(value)]
     try:
         if value in mapping:
             return mapping[value]
@@ -1565,9 +1599,17 @@ def _map_request_value(value: Any, *, column: str, mapping: Mapping[Any, int]) -
     )
 
 
-def _as_list(value: Any, *, column: str, row_index: int) -> list[Any]:
+def _as_list(
+    value: Any,
+    *,
+    column: str,
+    row_index: int,
+    validate_contract: bool = True,
+) -> list[Any]:
     if value is None:
         return []
+    if not validate_contract:
+        return value
     if isinstance(value, (list, tuple)):
         return list(value)
     raise ValueError(
@@ -1576,8 +1618,16 @@ def _as_list(value: Any, *, column: str, row_index: int) -> list[Any]:
     )
 
 
-def _request_index(value: Any, *, column: str, row_index: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+def _request_index(
+    value: Any,
+    *,
+    column: str,
+    row_index: int,
+    validate_contract: bool = True,
+) -> int:
+    if validate_contract and (
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+    ):
         raise ValueError(
             f"column {column!r} contains invalid request index {value!r} "
             f"at raw row {row_index}"
@@ -1585,12 +1635,19 @@ def _request_index(value: Any, *, column: str, row_index: int) -> int:
     return value
 
 
-def _scalarize(value: Any, *, column: str, raw_row: int, logical_row: int) -> Any:
+def _scalarize(
+    value: Any,
+    *,
+    column: str,
+    raw_row: int,
+    logical_row: int,
+    validate_contract: bool = True,
+) -> Any:
     if value is None:
         return None
     if not isinstance(value, (list, tuple)):
         return value
-    if len(value) != 1:
+    if validate_contract and len(value) != 1:
         raise ValueError(
             f"single-valued feature {column!r} has inner length {len(value)} "
             f"at raw row {raw_row}, logical row {logical_row}"
@@ -1598,9 +1655,18 @@ def _scalarize(value: Any, *, column: str, raw_row: int, logical_row: int) -> An
     return value[0]
 
 
-def _bag_value(value: Any, *, column: str, raw_row: int, logical_row: int) -> Any:
+def _bag_value(
+    value: Any,
+    *,
+    column: str,
+    raw_row: int,
+    logical_row: int,
+    validate_contract: bool = True,
+) -> Any:
     if value is None:
         return None
+    if not validate_contract:
+        return value
     if not isinstance(value, (list, tuple)):
         raise ValueError(
             f"multivalue feature {column!r} must be list-valued at raw row "
@@ -1619,12 +1685,31 @@ def _candidate_count_req(
     item_features: Sequence[str],
     label_columns: Sequence[str],
     raw_row: int,
+    *,
+    validate_contract: bool = True,
 ) -> int:
+    if not validate_contract:
+        for column in [*item_features, *label_columns]:
+            if column in row and row[column] is not None:
+                return len(
+                    _as_list(
+                        row[column],
+                        column=column,
+                        row_index=raw_row,
+                        validate_contract=False,
+                    )
+                )
+        raise ValueError(
+            f"cannot infer candidate count for req raw row {raw_row}; "
+            "no item or label arrays are present"
+        )
     observed: dict[str, int] = {}
     for column in [*item_features, *label_columns]:
         if column not in row or row[column] is None:
             continue
-        observed[column] = len(_as_list(row[column], column=column, row_index=raw_row))
+        observed[column] = len(
+            _as_list(row[column], column=column, row_index=raw_row)
+        )
     if not observed:
         raise ValueError(
             f"cannot infer candidate count for req raw row {raw_row}; "
@@ -1642,6 +1727,7 @@ def _request_positions(
     context_indices: Sequence[Any],
     *,
     raw_row: int,
+    validate_contract: bool = True,
 ) -> dict[int, int]:
     positions: dict[int, int] = {}
     for position, raw_request in enumerate(context_indices):
@@ -1649,8 +1735,9 @@ def _request_positions(
             raw_request,
             column="context_indices",
             row_index=raw_row,
+            validate_contract=validate_contract,
         )
-        if request in positions:
+        if validate_contract and request in positions:
             raise ValueError(
                 f"context_indices contains duplicate request {request} at raw row {raw_row}"
             )
@@ -1666,24 +1753,25 @@ def _request_level_value(
     column: str,
     raw_row: int,
     agg: bool,
+    validate_contract: bool = True,
 ) -> Any:
     if value is None or not isinstance(value, (list, tuple)):
         return value
     if not agg:
-        if len(value) != 1:
+        if validate_contract and len(value) != 1:
             raise ValueError(
                 f"req request-level column {column!r} must be scalar or length one "
                 f"at raw row {raw_row}, got length {len(value)}"
             )
         return value[0]
-    if len(value) == request_count:
-        return value[request_position]
     if len(value) == 1:
         return value[0]
-    raise ValueError(
-        f"agg request-level column {column!r} has length {len(value)}, expected "
-        f"1 or {request_count} at raw row {raw_row}"
-    )
+    if validate_contract and len(value) != request_count:
+        raise ValueError(
+            f"agg request-level column {column!r} has length {len(value)}, expected "
+            f"1 or {request_count} at raw row {raw_row}"
+        )
+    return value[request_position]
 
 
 def _req_context_value(
@@ -1693,6 +1781,7 @@ def _req_context_value(
     multivalue: bool,
     column: str,
     raw_row: int,
+    validate_contract: bool = True,
 ) -> Any:
     """Normalize the two observed req encodings of request-level features.
 
@@ -1705,14 +1794,19 @@ def _req_context_value(
         return value
     if value is None:
         return None
-    outer = _as_list(value, column=column, row_index=raw_row)
-    if not outer:
+    outer = _as_list(
+        value,
+        column=column,
+        row_index=raw_row,
+        validate_contract=validate_contract,
+    )
+    if validate_contract and not outer:
         raise ValueError(
             f"req context column {column!r} contains an empty outer list at raw row "
             f"{raw_row}; production missing values must be null"
         )
     if not multivalue:
-        if len(outer) != 1:
+        if validate_contract and len(outer) != 1:
             raise ValueError(
                 f"req scalar context column {column!r} has nested outer length "
                 f"{len(outer)} at raw row {raw_row}; expected 1"
@@ -1720,7 +1814,7 @@ def _req_context_value(
         return outer[0]
     if len(outer) == 1:
         return outer[0]
-    if all(
+    if not validate_contract or all(
         item is None or (isinstance(item, (list, tuple)) and len(item) == 1)
         for item in outer
     ):
@@ -1737,6 +1831,7 @@ def _sequence_membership_positions(
     known_requests: set[int],
     index_column: str,
     raw_row: int,
+    validate_contract: bool = True,
 ) -> dict[int, list[int]]:
     """Validate one UPS membership vector and index it once per raw row."""
 
@@ -1747,26 +1842,32 @@ def _sequence_membership_positions(
             if isinstance(raw_membership, (list, tuple))
             else [raw_membership]
         )
-        if not members:
+        if validate_contract and not members:
             raise ValueError(
                 f"UPS indices column {index_column!r} has an empty membership "
                 f"at raw row {raw_row}, token {token_position}"
             )
         normalized = [
-            _request_index(value, column=index_column, row_index=raw_row)
+            _request_index(
+                value,
+                column=index_column,
+                row_index=raw_row,
+                validate_contract=validate_contract,
+            )
             for value in members
         ]
-        if len(normalized) != len(set(normalized)):
+        if validate_contract and len(normalized) != len(set(normalized)):
             raise ValueError(
                 f"UPS indices column {index_column!r} repeats a request at raw row "
                 f"{raw_row}, token {token_position}"
             )
-        unknown = sorted(set(normalized) - known_requests)
-        if unknown:
-            raise ValueError(
-                f"UPS indices column {index_column!r} references requests without "
-                f"context at raw row {raw_row}, token {token_position}: {unknown}"
-            )
+        if validate_contract:
+            unknown = sorted(set(normalized) - known_requests)
+            if unknown:
+                raise ValueError(
+                    f"UPS indices column {index_column!r} references requests without "
+                    f"context at raw row {raw_row}, token {token_position}: {unknown}"
+                )
         for request in normalized:
             selected[request].append(token_position)
     return selected
@@ -1780,9 +1881,16 @@ def _select_sequence(
     column: str,
     raw_row: int,
     validated_flat: bool = False,
+    max_length: int | None = None,
+    validate_contract: bool = True,
 ) -> list[Any]:
-    items = _as_list(values, column=column, row_index=raw_row)
-    if values is not None and not items:
+    items = _as_list(
+        values,
+        column=column,
+        row_index=raw_row,
+        validate_contract=validate_contract,
+    )
+    if validate_contract and values is not None and not items:
         raise ValueError(
             f"UPS column {column!r} contains an empty sequence at raw row {raw_row}; "
             "empty sequences must be null"
@@ -1790,15 +1898,25 @@ def _select_sequence(
     if selected_positions is not None:
         if expected_length is None:
             raise RuntimeError("selected UPS positions require an expected raw length")
-        if len(items) != expected_length:
+        if validate_contract and len(items) != expected_length:
             raise ValueError(
                 f"UPS column {column!r} length {len(items)} does not match its indices "
                 f"length {expected_length} at raw row {raw_row}"
             )
+        if max_length is not None:
+            selected_positions = selected_positions[:max_length]
         items = [items[position] for position in selected_positions]
+    elif max_length is not None:
+        items = items[:max_length]
 
     if validated_flat:
         return items
+
+    if not validate_contract:
+        return [
+            item[0] if isinstance(item, (list, tuple)) else item
+            for item in items
+        ]
 
     normalized: list[Any] = []
     for token_position, item in enumerate(items):
@@ -1818,7 +1936,13 @@ def _select_sequence(
     return normalized
 
 
-def _flatten_singleton_ups_array(pa: Any, pc: Any, array: Any) -> tuple[Any, bool]:
+def _flatten_singleton_ups_array(
+    pa: Any,
+    pc: Any,
+    array: Any,
+    *,
+    validate_contract: bool = True,
+) -> tuple[Any, bool]:
     """Collapse list<list<int64>> singleton tokens before Python conversion.
 
     fgout stores every S-token property as an inner singleton list. Flattening
@@ -1831,14 +1955,15 @@ def _flatten_singleton_ups_array(pa: Any, pc: Any, array: Any) -> tuple[Any, boo
         return array, False
     child = array.values
     if pa.types.is_list(child.type) or pa.types.is_large_list(child.type):
-        lengths = pc.list_value_length(child)
-        if lengths.null_count:
-            return array, False
-        invalid = pc.any(pc.not_equal(lengths, 1)).as_py()
-        if invalid:
-            return array, False
+        if validate_contract:
+            lengths = pc.list_value_length(child)
+            if lengths.null_count:
+                return array, False
+            invalid = pc.any(pc.not_equal(lengths, 1)).as_py()
+            if invalid:
+                return array, False
         flattened = pc.list_flatten(child)
-        if flattened.null_count:
+        if validate_contract and flattened.null_count:
             return array, False
         offsets = array.offsets
         base = int(offsets[0].as_py())
@@ -1859,14 +1984,62 @@ def _flatten_singleton_ups_array(pa: Any, pc: Any, array: Any) -> tuple[Any, boo
                 mask=mask,
             )
         return rebuilt, True
-    if child.null_count:
+    if validate_contract and child.null_count:
         return array, False
     return array, True
+
+
+def _arrow_array_to_pylist(pa: Any, array: Any) -> list[Any]:
+    """Materialize an Arrow array as Python objects.
+
+    For the common ``list<primitive>`` columns in the aggregated format
+    (flattened UPS histories, bag features, candidate list metadata) Arrow's
+    generic ``to_pylist`` allocates one intermediate object per element and is
+    the dominant adapter cost. When the array is a flat list of a numeric
+    primitive with no inner nulls, we slice a single NumPy view per row
+    instead, which is ~15x faster and produces byte-identical Python objects
+    (``numpy.int64.tolist()``/``float.tolist()`` yield the same ``int``/``float``
+    that ``to_pylist`` would). Every case that does not meet these exact
+    conditions falls back to ``to_pylist`` so semantics never change.
+    """
+
+    if array.offset != 0:
+        return array.to_pylist()
+    if not (pa.types.is_list(array.type) or pa.types.is_large_list(array.type)):
+        return array.to_pylist()
+    child = array.values
+    child_type = child.type
+    if not (
+        pa.types.is_integer(child_type)
+        or pa.types.is_floating(child_type)
+    ):
+        return array.to_pylist()
+    if child.null_count:
+        return array.to_pylist()
+    try:
+        offsets = array.offsets.to_numpy()
+        values = child.to_numpy(zero_copy_only=False)
+    except (TypeError, ValueError, NotImplementedError):
+        return array.to_pylist()
+    if array.null_count:
+        is_null = array.is_null().to_numpy(zero_copy_only=False)
+        return [
+            None
+            if is_null[index]
+            else values[offsets[index] : offsets[index + 1]].tolist()
+            for index in range(len(array))
+        ]
+    return [
+        values[offsets[index] : offsets[index + 1]].tolist()
+        for index in range(len(array))
+    ]
 
 
 def _adapter_table_to_python(
     table: Any,
     raw_sequence_columns: frozenset[str],
+    *,
+    validate_contract: bool = True,
 ) -> tuple[dict[str, list[Any]], frozenset[str]]:
     """Convert a raw table while flattening valid singleton S-token columns."""
 
@@ -1877,10 +2050,15 @@ def _adapter_table_to_python(
         column = table[name]
         array = column.combine_chunks()
         if name in raw_sequence_columns:
-            array, validated_flat = _flatten_singleton_ups_array(pa, pc, array)
+            array, validated_flat = _flatten_singleton_ups_array(
+                pa,
+                pc,
+                array,
+                validate_contract=validate_contract,
+            )
             if validated_flat:
                 flattened.add(name)
-        raw[name] = array.to_pylist()
+        raw[name] = _arrow_array_to_pylist(pa, array)
     return raw, frozenset(flattened)
 
 
@@ -1891,7 +2069,32 @@ def _time_deltas(
     sequence: str,
     raw_row: int,
     transform: str,
+    validate_contract: bool = True,
 ) -> list[float]:
+    if not validate_contract:
+        try:
+            import numpy as np
+        except ImportError:
+            deltas = [int(request_time) - int(event_time) for event_time in event_times]
+            if transform == "raw_ms":
+                return [float(delta) for delta in deltas]
+            if transform == "seconds":
+                return [float(delta) / 1000.0 for delta in deltas]
+            if transform == "log1p_seconds":
+                return [math.log1p(float(delta) / 1000.0) for delta in deltas]
+            raise RuntimeError(f"unsupported time delta transform {transform!r}")
+        values = np.asarray(event_times, dtype=np.int64)
+        deltas = int(request_time) - values
+        if transform == "raw_ms":
+            transformed = deltas.astype(np.float64)
+        elif transform == "seconds":
+            transformed = deltas.astype(np.float64) / 1000.0
+        elif transform == "log1p_seconds":
+            transformed = np.log1p(deltas.astype(np.float64) / 1000.0)
+        else:
+            raise RuntimeError(f"unsupported time delta transform {transform!r}")
+        return transformed.tolist()
+
     if event_times and (
         isinstance(request_time, bool) or not isinstance(request_time, int)
     ):
@@ -2055,6 +2258,7 @@ class _MdlRankMixerAdapterPlan:
     column_aliases: Mapping[str, tuple[str, ...]]
     time_delta_outputs: Mapping[str, str]
     time_delta_transform: str
+    sequence_max_lengths: Mapping[str, int]
     compact_request_lists: bool
     request_time_column: str
     aligned_groups: tuple[tuple[str, ...], ...]
@@ -2118,6 +2322,7 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     column_aliases = _column_aliases(options)
     time_delta_outputs = _mapping(options, "time_delta_outputs")
     time_delta_transform = str(options.get("time_delta_transform", "raw_ms"))
+    sequence_max_lengths = _positive_int_mapping(options, "sequence_max_lengths")
     compact_request_lists = options.get("compact_request_lists", False)
     if type(compact_request_lists) is not bool:
         raise ValueError("adapter option 'compact_request_lists' must be a boolean")
@@ -2163,6 +2368,12 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
             )
     if set(time_delta_outputs) - set(ups_types):
         raise ValueError("time_delta_outputs contains an unknown UPS type")
+    unknown_sequence_limits = sorted(set(sequence_max_lengths) - set(ups_types))
+    if unknown_sequence_limits:
+        raise ValueError(
+            "sequence_max_lengths contains an unknown UPS type: "
+            + ", ".join(unknown_sequence_limits)
+        )
 
     required = tuple(context.required_columns)
     required_set = frozenset(required)
@@ -2298,6 +2509,7 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         column_aliases=column_aliases,
         time_delta_outputs=time_delta_outputs,
         time_delta_transform=time_delta_transform,
+        sequence_max_lengths=sequence_max_lengths,
         compact_request_lists=compact_request_lists,
         request_time_column=request_time_column,
         aligned_groups=aligned_groups,
@@ -2357,6 +2569,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
     column_aliases = plan.column_aliases
     time_delta_outputs = plan.time_delta_outputs
     time_delta_transform = plan.time_delta_transform
+    sequence_max_lengths = plan.sequence_max_lengths
     compact_request_lists = plan.compact_request_lists
     request_time_column = plan.request_time_column
     aligned_groups = plan.aligned_groups
@@ -2376,10 +2589,41 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
     item_output_columns = plan.item_output_columns
     request_output_columns = plan.request_output_columns
     compact_list_columns = plan.compact_list_columns
+    runtime_cache = getattr(context, "_runtime_cache", None)
+    trusted_input = bool(getattr(context, "trusted_input", False))
+    raw_sample_already_validated = (
+        isinstance(runtime_cache, dict)
+        and runtime_cache.get("mdl_rankmixer_raw_sample_validated", False)
+    )
+    if trusted_input and table.num_rows > 0 and not raw_sample_already_validated:
+        sample_context = ParquetAdapterContext(
+            split_name=str(getattr(context, "split_name", "unknown")),
+            required_columns=tuple(context.required_columns),
+            options=context.options,
+            trusted_input=False,
+            _runtime_cache={"mdl_rankmixer_plan": plan},
+        )
+        # Validate only one physical Parquet row. The full table is converted
+        # below with diagnostics disabled.
+        adapt_mdl_rankmixer_parquet(table.slice(0, 1), context=sample_context)
+        if isinstance(runtime_cache, dict):
+            runtime_cache["mdl_rankmixer_raw_sample_validated"] = True
+    first_batch_already_adapted = (
+        isinstance(runtime_cache, dict)
+        and runtime_cache.get("mdl_rankmixer_first_batch_adapted", False)
+    )
+    complete_label_contract = not label_masks and not any(
+        label_missing_values.values()
+    )
+    validate_adapter_contract = not trusted_input and (
+        not first_batch_already_adapted or not complete_label_contract
+    )
+    validate_row_contract = not trusted_input
     output: dict[str, list[Any]] = {column: [] for column in required}
     raw, validated_flat_sequence_columns = _adapter_table_to_python(
         table,
         plan.raw_sequence_columns,
+        validate_contract=validate_adapter_contract,
     )
     candidate_metadata_types: dict[str, Any] = {}
     schema_names = set(table.schema.names)
@@ -2399,7 +2643,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
     for canonical, aliases in column_aliases.items():
         alias_to_canonical.update({alias: canonical for alias in aliases})
         present = [name for name in (canonical, *aliases) if name in raw]
-        if len(present) > 1:
+        if validate_row_contract and len(present) > 1:
             raise ValueError(
                 f"raw schema contains multiple aliases for {canonical!r}: {present}"
             )
@@ -2411,7 +2655,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
 
     has_context_indices = "context_indices" in raw
     has_target_indices = "target_indices" in raw
-    if has_context_indices != has_target_indices:
+    if validate_row_contract and has_context_indices != has_target_indices:
         raise ValueError(
             "agg/req detection requires both context_indices and target_indices or neither"
         )
@@ -2431,14 +2675,29 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
         row = {column: values[raw_row] for column, values in raw.items()}
         if is_agg:
             context_indices = _as_list(
-                row["context_indices"], column="context_indices", row_index=raw_row
+                row["context_indices"],
+                column="context_indices",
+                row_index=raw_row,
+                validate_contract=validate_row_contract,
             )
             target_indices = _as_list(
-                row["target_indices"], column="target_indices", row_index=raw_row
+                row["target_indices"],
+                column="target_indices",
+                row_index=raw_row,
+                validate_contract=validate_row_contract,
             )
-            positions = _request_positions(context_indices, raw_row=raw_row)
+            positions = _request_positions(
+                context_indices,
+                raw_row=raw_row,
+                validate_contract=validate_row_contract,
+            )
             candidate_requests = [
-                _request_index(value, column="target_indices", row_index=raw_row)
+                _request_index(
+                    value,
+                    column="target_indices",
+                    row_index=raw_row,
+                    validate_contract=validate_row_contract,
+                )
                 for value in target_indices
             ]
         else:
@@ -2448,16 +2707,22 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                 item_features,
                 tuple(labels.values()),
                 raw_row,
+                validate_contract=validate_row_contract,
             )
             candidate_requests = [0] * candidate_count
 
         candidate_count = len(candidate_requests)
         item_arrays: dict[str, list[Any]] = {}
         for column in item_features:
-            if column not in row:
+            if validate_row_contract and column not in row:
                 raise ValueError(f"missing item column {column!r}")
-            outer = _as_list(row[column], column=column, row_index=raw_row)
-            if len(outer) != candidate_count:
+            outer = _as_list(
+                row[column],
+                column=column,
+                row_index=raw_row,
+                validate_contract=validate_row_contract,
+            )
+            if validate_adapter_contract and len(outer) != candidate_count:
                 raise ValueError(
                     f"item column {column!r} length {len(outer)} != candidate count "
                     f"{candidate_count} at raw row {raw_row}"
@@ -2469,7 +2734,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             mask_column = label_masks.get(task)
             if column not in required_set and mask_column not in required_set:
                 continue
-            if column not in row:
+            if validate_row_contract and column not in row:
                 raise ValueError(f"missing label column {column!r} for task {task!r}")
             if row[column] is None and _is_missing_label(
                 None,
@@ -2477,8 +2742,13 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             ):
                 values = [None] * candidate_count
             else:
-                values = _as_list(row[column], column=column, row_index=raw_row)
-            if len(values) != candidate_count:
+                values = _as_list(
+                    row[column],
+                    column=column,
+                    row_index=raw_row,
+                    validate_contract=validate_row_contract,
+                )
+            if validate_adapter_contract and len(values) != candidate_count:
                 raise ValueError(
                     f"label {column!r} length {len(values)} != candidate count "
                     f"{candidate_count} at raw row {raw_row}"
@@ -2502,8 +2772,13 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             if column not in row:
                 candidate_metadata[column] = [None] * candidate_count
                 continue
-            values = _as_list(row[column], column=column, row_index=raw_row)
-            if len(values) != candidate_count:
+            values = _as_list(
+                row[column],
+                column=column,
+                row_index=raw_row,
+                validate_contract=validate_row_contract,
+            )
+            if validate_adapter_contract and len(values) != candidate_count:
                 raise ValueError(
                     f"candidate metadata {column!r} length {len(values)} != candidate "
                     f"count {candidate_count} at raw row {raw_row}"
@@ -2514,6 +2789,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                     column=column,
                     raw_row=raw_row,
                     logical_row=candidate_index,
+                    validate_contract=validate_row_contract,
                 )
                 for candidate_index, value in enumerate(values)
             ]
@@ -2521,11 +2797,16 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
         context_arrays: dict[str, Any] = {}
         request_count = len(positions)
         for column in context_features:
-            if column not in row:
+            if validate_row_contract and column not in row:
                 raise ValueError(f"missing context column {column!r}")
             if is_agg:
-                outer = _as_list(row[column], column=column, row_index=raw_row)
-                if len(outer) != request_count:
+                outer = _as_list(
+                    row[column],
+                    column=column,
+                    row_index=raw_row,
+                    validate_contract=validate_row_contract,
+                )
+                if validate_adapter_contract and len(outer) != request_count:
                     raise ValueError(
                         f"context column {column!r} length {len(outer)} != "
                         f"context_indices length {request_count} at raw row {raw_row}"
@@ -2540,12 +2821,19 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             known_requests = set(positions)
             for ups in ups_types:
                 index_column = f"{ups}_x_indices"
-                if index_column not in row:
+                if validate_row_contract and index_column not in row:
                     raise ValueError(f"missing UPS indices column {index_column!r}")
                 memberships = _as_list(
-                    row[index_column], column=index_column, row_index=raw_row
+                    row[index_column],
+                    column=index_column,
+                    row_index=raw_row,
+                    validate_contract=validate_row_contract,
                 )
-                if row[index_column] is not None and not memberships:
+                if (
+                    validate_adapter_contract
+                    and row[index_column] is not None
+                    and not memberships
+                ):
                     raise ValueError(
                         f"UPS indices column {index_column!r} contains an empty array "
                         f"at raw row {raw_row}; an empty sequence must use null"
@@ -2556,14 +2844,16 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                     known_requests=known_requests,
                     index_column=index_column,
                     raw_row=raw_row,
+                    validate_contract=validate_adapter_contract,
                 )
 
         unique_candidate_requests = tuple(dict.fromkeys(candidate_requests))
-        for request_index in unique_candidate_requests:
-            if request_index not in positions:
-                raise ValueError(
-                    f"target request {request_index} has no context at raw row {raw_row}"
-                )
+        if validate_adapter_contract:
+            for request_index in unique_candidate_requests:
+                if request_index not in positions:
+                    raise ValueError(
+                        f"target request {request_index} has no context at raw row {raw_row}"
+                    )
 
         # Normalize request payloads once, then append whole output columns.
         # The previous candidate-major loop revisited ~169 dictionaries for
@@ -2583,6 +2873,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         multivalue=column in bag_features,
                         column=column,
                         raw_row=raw_row,
+                        validate_contract=validate_row_contract,
                     )
                 cached[column] = (
                     _bag_value(
@@ -2590,6 +2881,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         column=column,
                         raw_row=raw_row,
                         logical_row=request_index,
+                        validate_contract=validate_row_contract,
                     )
                     if column in bag_features
                     else _scalarize(
@@ -2597,10 +2889,11 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         column=column,
                         raw_row=raw_row,
                         logical_row=request_index,
+                        validate_contract=validate_row_contract,
                     )
                 )
             for column in request_columns:
-                if column not in row:
+                if validate_row_contract and column not in row:
                     raise ValueError(f"missing request-level column {column!r}")
                 value = _request_level_value(
                     row[column],
@@ -2609,12 +2902,14 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                     column=column,
                     raw_row=raw_row,
                     agg=is_agg,
+                    validate_contract=validate_row_contract,
                 )
                 if column in request_maps:
                     value = _map_request_value(
                         value,
                         column=column,
                         mapping=request_maps[column],
+                        validate_contract=validate_row_contract,
                     )
                 cached[column] = value
             request_cache[request_index] = cached
@@ -2627,6 +2922,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                 column=request_time_column,
                 raw_row=raw_row,
                 agg=is_agg,
+                validate_contract=validate_row_contract,
             )
             for ups in ups_types:
                 selected_positions = (
@@ -2634,7 +2930,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                 )
                 expected_length = membership_lengths.get(ups)
                 for column in sequence_columns_by_type[ups]:
-                    if column not in row:
+                    if validate_row_contract and column not in row:
                         raise ValueError(f"missing UPS column {column!r}")
                     cached_sequences[column] = _select_sequence(
                         row[column],
@@ -2643,10 +2939,12 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         column=column,
                         raw_row=raw_row,
                         validated_flat=column in validated_flat_sequence_columns,
+                        max_length=sequence_max_lengths.get(ups),
+                        validate_contract=validate_adapter_contract,
                     )
                 if ups in time_delta_outputs:
                     raw_time_column = f"{ups}_x_time"
-                    if raw_time_column not in row:
+                    if validate_row_contract and raw_time_column not in row:
                         raise ValueError(f"missing UPS time column {raw_time_column!r}")
                     event_times = _select_sequence(
                         row[raw_time_column],
@@ -2657,6 +2955,8 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         validated_flat=(
                             raw_time_column in validated_flat_sequence_columns
                         ),
+                        max_length=sequence_max_lengths.get(ups),
+                        validate_contract=validate_adapter_contract,
                     )
                     cached_sequences[time_delta_outputs[ups]] = _time_deltas(
                         event_times,
@@ -2664,6 +2964,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         sequence=ups,
                         raw_row=raw_row,
                         transform=time_delta_transform,
+                        validate_contract=validate_adapter_contract,
                     )
             sequence_cache[request_index] = cached_sequences
 
@@ -2677,6 +2978,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         column=column,
                         raw_row=raw_row,
                         logical_row=candidate_index,
+                        validate_contract=validate_row_contract,
                     )
                     if column in bag_features
                     else _scalarize(
@@ -2684,25 +2986,27 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         column=column,
                         raw_row=raw_row,
                         logical_row=candidate_index,
+                        validate_contract=validate_row_contract,
                     )
                 )
             normalized_items[column] = normalized
 
-        for group in aligned_groups:
-            for candidate_index in range(candidate_count):
-                lengths = {
-                    column: len(normalized_items[column][candidate_index])
-                    for column in group
-                    if isinstance(
-                        normalized_items[column][candidate_index],
-                        (list, tuple),
-                    )
-                }
-                if len(lengths) != len(group) or len(set(lengths.values())) != 1:
-                    raise ValueError(
-                        f"aligned multivalue group mismatch at raw row {raw_row}, "
-                        f"candidate {candidate_index}: {lengths}"
-                    )
+        if validate_adapter_contract:
+            for group in aligned_groups:
+                for candidate_index in range(candidate_count):
+                    lengths = {
+                        column: len(normalized_items[column][candidate_index])
+                        for column in group
+                        if isinstance(
+                            normalized_items[column][candidate_index],
+                            (list, tuple),
+                        )
+                    }
+                    if len(lengths) != len(group) or len(set(lengths.values())) != 1:
+                        raise ValueError(
+                            f"aligned multivalue group mismatch at raw row {raw_row}, "
+                            f"candidate {candidate_index}: {lengths}"
+                        )
 
         normalized_labels: dict[str, list[int | None]] = {}
         normalized_label_masks: dict[str, list[int]] = {}
@@ -2711,6 +3015,12 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             if column not in required_set and mask_column not in required_set:
                 continue
             values = label_arrays[column]
+            if mask_column is None and not label_missing_values[task]:
+                # Complete-label production data is checked vectorially on the
+                # first flat batch. Avoid three Python type/finite/binary tests
+                # for every candidate on the training hot path.
+                normalized_labels[column] = values
+                continue
             task_labels: list[int | None] = []
             task_masks: list[int] = []
             for candidate_index, value in enumerate(values):
@@ -2774,7 +3084,10 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                 compact_request_lists and column in compact_list_columns
             ),
         )
-    return pa.table(arrays)
+    result = pa.table(arrays)
+    if isinstance(runtime_cache, dict) and table.num_rows > 0:
+        runtime_cache["mdl_rankmixer_first_batch_adapted"] = True
+    return result
 
 
 def _split_for_name(config: AppConfig, split_name: str) -> ParquetSplitConfig:
@@ -2814,6 +3127,7 @@ def _adapter_context(
         split_name=split_name,
         required_columns=tuple(required_columns),
         options=options,
+        trusted_input=split.reader.trusted_input,
     )
 
 
@@ -2941,6 +3255,33 @@ def _validate_flat_table_contract(
 
     _validate_sequence_contract(config, table, split_name)
 
+    # Complete-label production paths do not allocate masks. Prove the strict
+    # binary/no-null contract once with Arrow kernels, then keep candidate-level
+    # Python checks out of subsequent adapter batches.
+    required_set = set(required_columns)
+    pa, pc, _ds, _pq = _require_pyarrow()
+    for task, column in (() if split.label_masks else split.labels.items()):
+        if column not in required_set:
+            continue
+        array = _column_array(table, column)
+        if not (
+            pa.types.is_integer(array.type)
+            or pa.types.is_floating(array.type)
+        ):
+            raise ValueError(
+                f"adapter output label {column!r} for task {task!r} must be numeric 0/1"
+            )
+        if array.null_count:
+            raise ValueError(
+                f"adapter output label {column!r} for task {task!r} contains null"
+            )
+        if len(array):
+            binary = pc.or_(pc.equal(array, 0), pc.equal(array, 1))
+            if not bool(pc.all(binary).as_py()):
+                raise ValueError(
+                    f"adapter output label {column!r} for task {task!r} must contain only 0/1"
+                )
+
 
 def _iter_adapted_flat_tables(
     config: AppConfig,
@@ -2954,6 +3295,7 @@ def _iter_adapted_flat_tables(
     max_batches: int | None = None,
 ) -> Iterator[Any]:
     raw_batch_index = 0
+    validated_flat_contract = False
     for raw_table in scanner.iter_tables():
         if max_batches is not None and raw_batch_index >= max_batches:
             break
@@ -2965,7 +3307,20 @@ def _iter_adapted_flat_tables(
             result = adapter(raw_table, context=context)
             flat_tables = _normalize_adapter_result(result, adapter_name, split_name)
             for flat_table in flat_tables:
-                _validate_flat_table_contract(config, scanner.split, split_name, flat_table, required_columns)
+                if not validated_flat_contract:
+                    sample_table = (
+                        flat_table.slice(0, 1)
+                        if scanner.split.reader.trusted_input
+                        else flat_table
+                    )
+                    _validate_flat_table_contract(
+                        config,
+                        scanner.split,
+                        split_name,
+                        sample_table,
+                        required_columns,
+                    )
+                    validated_flat_contract = flat_table.num_rows > 0
                 if counters is not None:
                     counters.flat_tables += 1
                     counters.flat_rows += flat_table.num_rows
@@ -3538,6 +3893,7 @@ def _tensorize_direct_sequence(
     table: Any,
     *,
     validate_prehashed_nonzero: bool = True,
+    validate_sequence_alignment: bool = True,
 ) -> dict[str, Any]:
     """Vectorize an identity-ID sequence from Arrow offsets and flat values."""
 
@@ -3549,6 +3905,8 @@ def _tensorize_direct_sequence(
     reference_base = 0
     reference_stop = 0
     for field in sequence.fields:
+        if reference_offsets is not None and not validate_sequence_alignment:
+            continue
         offsets = _list_offsets_tensor(arrays[field.name])
         base = int(offsets[0].item()) if offsets.numel() else 0
         normalized = offsets - base
@@ -3627,6 +3985,8 @@ def _dense_vector(value: Any, dimension: int) -> list[float]:
 def _sequence_rows(
     table: Any,
     sequence: SequenceConfig,
+    *,
+    validate_sequence_alignment: bool = True,
 ) -> tuple[dict[str, list[list[Any]]], list[int]]:
     """Align and truncate every field of a multi-field sequence.
 
@@ -3648,7 +4008,7 @@ def _sequence_rows(
             items = _coerce_sequence_items(values_by_field[field.name][row_index])
             if row_length is None:
                 row_length = len(items)
-            elif len(items) != row_length:
+            elif validate_sequence_alignment and len(items) != row_length:
                 raise ValueError(
                     f"sequence {sequence.name!r} field {field.name!r} has length {len(items)} "
                     f"but expected {row_length} at row {row_index}"
@@ -3669,6 +4029,7 @@ def _tensorize_multi_field_sequence(
     vocab_maps: dict[str, dict[str, int]],
     *,
     validate_prehashed_nonzero: bool = True,
+    validate_sequence_alignment: bool = True,
 ) -> dict[str, Any]:
     """Encode and right-pad one configured sequence to the batch maximum length."""
     if _direct_sequence_supported(config, sequence):
@@ -3677,8 +4038,13 @@ def _tensorize_multi_field_sequence(
             sequence,
             table,
             validate_prehashed_nonzero=validate_prehashed_nonzero,
+            validate_sequence_alignment=validate_sequence_alignment,
         )
-    rows_by_field, row_lengths = _sequence_rows(table, sequence)
+    rows_by_field, row_lengths = _sequence_rows(
+        table,
+        sequence,
+        validate_sequence_alignment=validate_sequence_alignment,
+    )
 
     lengths = torch.tensor(row_lengths, dtype=torch.long)
     max_length = int(lengths.max().item()) if row_lengths else 0
@@ -4023,7 +4389,48 @@ def _encode_scenario_item(
     )
 
 
-def _scenario_tensor(config: AppConfig, table: Any, batch_size: int) -> Tensor:
+def _trusted_scalar_scenario_tensor(config: AppConfig, table: Any) -> Tensor | None:
+    """Map a trusted scalar scenario column with Arrow kernels.
+
+    The mapping itself is required model input work. Trusted profiles avoid a
+    second Python type/null/range validation loop around that mapping.
+    """
+
+    pa, pc, _ds, _pq = _require_pyarrow()
+    array = _column_array(table, config.scenarios.source)
+    if pa.types.is_dictionary(array.type):
+        array = pc.dictionary_decode(array)
+    if _is_arrow_list_type(pa, array.type):
+        return None
+
+    source_encoding = config.scenarios.source_encoding
+    if source_encoding == "index" and pa.types.is_integer(array.type):
+        encoded = pc.cast(array, target_type=pa.int64(), safe=False)
+        return _numpy_backed_tensor(encoded, torch.long)
+    if source_encoding != "raw":
+        return None
+
+    if pa.types.is_integer(array.type):
+        raw_values: list[Any] = [int(name) for name in config.scenarios.names]
+    elif pa.types.is_string(array.type) or pa.types.is_large_string(array.type):
+        raw_values = list(config.scenarios.names)
+    else:
+        return None
+    encoded = pc.index_in(
+        array,
+        value_set=pa.array(raw_values, type=array.type),
+    )
+    encoded = pc.cast(encoded, target_type=pa.int64(), safe=False)
+    return _numpy_backed_tensor(encoded, torch.long)
+
+
+def _scenario_tensor(
+    config: AppConfig,
+    table: Any,
+    batch_size: int,
+    *,
+    trusted_input: bool = False,
+) -> Tensor:
     """Build scenario IDs or a multi-hot scenario mask for each row."""
     scenario_count = len(config.scenarios.names)
     if config.scenarios.source is None:
@@ -4031,6 +4438,11 @@ def _scenario_tensor(config: AppConfig, table: Any, batch_size: int) -> Tensor:
             raise ValueError("scenarios.source is required when multiple scenarios are configured")
         # Single-scenario models default every row to scenario index 0.
         return torch.zeros(batch_size, dtype=torch.long)
+
+    if trusted_input:
+        trusted = _trusted_scalar_scenario_tensor(config, table)
+        if trusted is not None:
+            return trusted
 
     scenario_to_id = {name: index for index, name in enumerate(config.scenarios.names)}
     row_indices: list[list[int]] = []
@@ -4103,22 +4515,32 @@ def _request_deduplication_plan(
     unique_positions: list[int] = []
     candidate_to_request: list[int] = []
     request_index: dict[Any, int] = {}
-    for row_index, request_id in enumerate(request_ids):
-        if request_id is None:
-            raise ValueError(
-                f"request_id column {split.request_id!r} contains null at row {row_index}"
-            )
-        try:
+    trusted_input = split.reader.trusted_input
+    if trusted_input:
+        for row_index, request_id in enumerate(request_ids):
             existing = request_index.get(request_id)
-        except TypeError as error:
-            raise ValueError(
-                f"request_id column {split.request_id!r} must contain hashable scalars"
-            ) from error
-        if existing is None:
-            existing = len(unique_positions)
-            request_index[request_id] = existing
-            unique_positions.append(row_index)
-        candidate_to_request.append(existing)
+            if existing is None:
+                existing = len(unique_positions)
+                request_index[request_id] = existing
+                unique_positions.append(row_index)
+            candidate_to_request.append(existing)
+    else:
+        for row_index, request_id in enumerate(request_ids):
+            if request_id is None:
+                raise ValueError(
+                    f"request_id column {split.request_id!r} contains null at row {row_index}"
+                )
+            try:
+                existing = request_index.get(request_id)
+            except TypeError as error:
+                raise ValueError(
+                    f"request_id column {split.request_id!r} must contain hashable scalars"
+                ) from error
+            if existing is None:
+                existing = len(unique_positions)
+                request_index[request_id] = existing
+                unique_positions.append(row_index)
+            candidate_to_request.append(existing)
     if len(unique_positions) == table.num_rows:
         return None
     pa, _pc, _ds, _pq = _require_pyarrow()
@@ -4160,6 +4582,7 @@ def table_to_feature_batch(
         str(source) for source in adapter_options.get("context_features", ())
     }
     validate_prehashed_nonzero = active_split.reader.validate_prehashed_nonzero
+    validate_sequence_alignment = not active_split.reader.trusted_input
     features: dict[str, Any] = {}
     for feature in config.features:
         request_level = (
@@ -4200,12 +4623,15 @@ def table_to_feature_batch(
             request_table if request_row_indices is not None else table,
             vocab_maps,
             validate_prehashed_nonzero=validate_prehashed_nonzero,
+            validate_sequence_alignment=validate_sequence_alignment,
         )
         if request_row_indices is not None:
             value["row_indices"] = request_row_indices
         features[sequence.name] = value
 
-    # Labels and masks follow config order; missing masks default to all-observed.
+    # Labels and masks follow config order. Complete-label paths keep
+    # ``label_mask=None`` so no [batch, task] all-ones tensor is allocated,
+    # pinned, copied to the device, or multiplied into BCE.
     labels = None
     label_mask = None
     label_columns = active_split.labels
@@ -4228,8 +4654,6 @@ def table_to_feature_batch(
                 ],
                 dim=1,
             )
-        else:
-            label_mask = torch.ones_like(labels)
     elif require_labels:
         raise ValueError("required label columns are missing from batch")
 
@@ -4237,7 +4661,12 @@ def table_to_feature_batch(
         features=features,
         labels=labels,
         label_mask=label_mask,
-        scenario_id=_scenario_tensor(config, table, batch_size),
+        scenario_id=_scenario_tensor(
+            config,
+            table,
+            batch_size,
+            trusted_input=active_split.reader.trusted_input,
+        ),
         group_id=_group_ids(active_split, table, batch_size) if include_group_id else [],
         prediction_keys=_prediction_keys(active_split, table),
     )

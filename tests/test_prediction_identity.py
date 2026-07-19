@@ -37,7 +37,7 @@ class _IdentityScoreModel(nn.Module):
 
 class PredictionIdentityTest(unittest.TestCase):
     def test_unlabeled_req_file_scans_through_the_builtin_adapter(self) -> None:
-        base = load_app_config(ROOT / "configs" / "default.yaml")
+        base = load_app_config(ROOT / "configs" / "reference" / "default.yaml")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "req.parquet"
             pq.write_table(
@@ -154,7 +154,7 @@ class PredictionIdentityTest(unittest.TestCase):
         flat = adapt_mdl_rankmixer_parquet(raw, context=context)
         self.assertEqual(flat["candidate_position"].to_pylist(), [0, 0, 1])
 
-        base = load_app_config(ROOT / "configs" / "default.yaml")
+        base = load_app_config(ROOT / "configs" / "reference" / "default.yaml")
         sequence = replace(
             base.sequences[0],
             max_length=10,

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
+from datetime import datetime, timedelta
 import os
 from pathlib import Path
 import subprocess
 import sys
 
 MAIN_SCRIPT = Path(__file__).resolve()
+DEFAULT_DATA_BASE_DIR = (
+    "hdfs://temu-data-ns/apps/nothive/warehouse/searchrec/"
+    "searchrec_cvr_allscene_agg_fgoutput_hour_dracarys_exp"
+)
 
 
 def _bootstrap_import_path() -> None:
@@ -33,8 +39,169 @@ from src.features import fit_vocabs, plan_vocab_fit, vocab_artifacts, vocab_stra
 from src.train import evaluate_mdl, is_main_process, predict_mdl, train_mdl
 
 
+def _expand_hour_partition(
+    base_dir: str,
+    start_hour: str,
+    end_hour: str,
+) -> tuple[str, ...]:
+    base = base_dir.rstrip("/")
+    if not base:
+        raise ValueError("--data-base-dir must be non-empty when expanding hour windows")
+    try:
+        start = datetime.strptime(start_hour, "%Y-%m-%d-%H")
+        end = datetime.strptime(end_hour, "%Y-%m-%d-%H")
+    except ValueError as error:
+        raise ValueError("hour windows must use YYYY-MM-DD-HH") from error
+    if end <= start:
+        raise ValueError("end hour must be later than start hour")
+    inputs: list[str] = []
+    current = start
+    while current < end:
+        inputs.append(f"{base}/pt={current:%Y-%m-%d}/hr={current:%H}")
+        current += timedelta(hours=1)
+    return tuple(inputs)
+
+
+def _resolve_split_inputs(
+    *,
+    explicit: list[str] | None,
+    start_hour: str | None,
+    end_hour: str | None,
+    base_dir: str,
+    configured: tuple[str, ...],
+) -> tuple[str, ...]:
+    if explicit:
+        return tuple(explicit)
+    if start_hour or end_hour:
+        if not start_hour or not end_hour:
+            raise ValueError("start hour and end hour must be provided together")
+        return _expand_hour_partition(base_dir, start_hour, end_hour)
+    return configured
+
+
+def _apply_data_input_overrides(config, args: argparse.Namespace):
+    """Optionally override empty/fixed split inputs from CLI without editing YAML."""
+    base_dir = getattr(args, "data_base_dir", None) or DEFAULT_DATA_BASE_DIR
+    train_inputs = _resolve_split_inputs(
+        explicit=getattr(args, "train_input", None),
+        start_hour=getattr(args, "train_start_hour", None),
+        end_hour=getattr(args, "train_end_hour", None),
+        base_dir=base_dir,
+        configured=config.data.train.inputs,
+    )
+    test_inputs = config.data.test.inputs if config.data.test is not None else ()
+    if config.data.test is not None or getattr(args, "test_input", None) or getattr(
+        args, "test_start_hour", None
+    ):
+        test_inputs = _resolve_split_inputs(
+            explicit=getattr(args, "test_input", None),
+            start_hour=getattr(args, "test_start_hour", None),
+            end_hour=getattr(args, "test_end_hour", None),
+            base_dir=base_dir,
+            configured=test_inputs,
+        )
+    train = (
+        config.data.train
+        if train_inputs == config.data.train.inputs
+        else replace(config.data.train, inputs=train_inputs)
+    )
+    test = config.data.test
+    if config.data.test is not None and test_inputs != config.data.test.inputs:
+        test = replace(config.data.test, inputs=test_inputs)
+    if train is config.data.train and test is config.data.test:
+        return config
+    return replace(config, data=replace(config.data, train=train, test=test))
+
+
+_TRAINING_OVERRIDE_FIELDS = (
+    "batch_size",
+    "lr_dense",
+    "lr_sparse",
+    "lr_warmup_steps",
+    "lr_decay_steps",
+    "log_every_steps",
+    "dense_clip_norm",
+    "sparse_clip_norm",
+    "checkpoint_path",
+)
+
+
+def _scale_length_buckets(buckets: tuple, old_batch_size: int, new_batch_size: int) -> tuple:
+    """Keep length-bucket ratios when CLI overrides training.batch_size."""
+    if not buckets or old_batch_size <= 0 or old_batch_size == new_batch_size:
+        return buckets
+    scale = new_batch_size / float(old_batch_size)
+    return tuple(
+        replace(bucket, batch_size=max(1, int(round(bucket.batch_size * scale))))
+        for bucket in buckets
+    )
+
+
+def _replace_split_length_buckets(split, buckets: tuple):
+    if split is None or split.reader.length_buckets == buckets:
+        return split
+    return replace(split, reader=replace(split.reader, length_buckets=buckets))
+
+
+def _apply_training_overrides(config, args: argparse.Namespace):
+    """Apply optional CLI training hyperparameter overrides."""
+    updates: dict[str, object] = {}
+    for field_name in _TRAINING_OVERRIDE_FIELDS:
+        value = getattr(args, field_name, None)
+        if value is not None:
+            updates[field_name] = value
+    if not updates:
+        return config
+
+    old_batch_size = config.training.batch_size
+    training = replace(config.training, **updates)
+    training.validate()
+
+    data = config.data
+    if "batch_size" in updates:
+        new_batch_size = training.batch_size
+        train = _replace_split_length_buckets(
+            config.data.train,
+            _scale_length_buckets(
+                config.data.train.reader.length_buckets,
+                old_batch_size,
+                new_batch_size,
+            ),
+        )
+        test = _replace_split_length_buckets(
+            config.data.test,
+            _scale_length_buckets(
+                config.data.test.reader.length_buckets if config.data.test else (),
+                old_batch_size,
+                new_batch_size,
+            ),
+        )
+        if train is not config.data.train or test is not config.data.test:
+            data = replace(config.data, train=train, test=test)
+
+    if training is config.training and data is config.data:
+        return config
+    return replace(config, training=training, data=data)
+
+
 def _load_config(args: argparse.Namespace):
-    return load_app_config(args.config)
+    config = load_app_config(args.config)
+    if any(
+        getattr(args, name, None)
+        for name in (
+            "train_input",
+            "test_input",
+            "train_start_hour",
+            "train_end_hour",
+            "test_start_hour",
+            "test_end_hour",
+            "data_base_dir",
+        )
+    ):
+        config = _apply_data_input_overrides(config, args)
+    if any(getattr(args, name, None) is not None for name in _TRAINING_OVERRIDE_FIELDS):
+        config = _apply_training_overrides(config, args)
+    return config
 
 
 def _parse_named_positive_ints(raw: str) -> dict[str, int]:
@@ -64,11 +231,122 @@ def _parse_named_positive_ints(raw: str) -> dict[str, int]:
     return result
 
 
+def _add_data_input_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--train-input",
+        action="append",
+        default=None,
+        help="override data.train.inputs (repeatable); default leaves YAML empty/unset",
+    )
+    parser.add_argument(
+        "--test-input",
+        action="append",
+        default=None,
+        help="override data.test.inputs (repeatable); default leaves YAML empty/unset",
+    )
+    parser.add_argument(
+        "--data-base-dir",
+        default=None,
+        help="HDFS/local base dir used with --*-start-hour/--*-end-hour",
+    )
+    parser.add_argument(
+        "--train-start-hour",
+        default=None,
+        help="inclusive train hour window start as YYYY-MM-DD-HH",
+    )
+    parser.add_argument(
+        "--train-end-hour",
+        default=None,
+        help="exclusive train hour window end as YYYY-MM-DD-HH",
+    )
+    parser.add_argument(
+        "--test-start-hour",
+        default=None,
+        help="inclusive test hour window start as YYYY-MM-DD-HH",
+    )
+    parser.add_argument(
+        "--test-end-hour",
+        default=None,
+        help="exclusive test hour window end as YYYY-MM-DD-HH",
+    )
+
+
+def _add_training_override_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=(
+            "override training.batch_size (per rank); also scales "
+            "data.*.reader.length_buckets batch sizes proportionally"
+        ),
+    )
+    parser.add_argument(
+        "--lr-dense",
+        type=float,
+        default=None,
+        help="override training.lr_dense",
+    )
+    parser.add_argument(
+        "--lr-sparse",
+        type=float,
+        default=None,
+        help="override training.lr_sparse",
+    )
+    parser.add_argument(
+        "--lr-warmup-steps",
+        type=int,
+        default=None,
+        help="override training.lr_warmup_steps",
+    )
+    parser.add_argument(
+        "--lr-decay-steps",
+        type=int,
+        default=None,
+        help="override training.lr_decay_steps",
+    )
+    parser.add_argument(
+        "--log-every-steps",
+        type=int,
+        default=None,
+        help="override training.log_every_steps",
+    )
+    parser.add_argument(
+        "--dense-clip-norm",
+        type=float,
+        default=None,
+        help="override training.dense_clip_norm",
+    )
+    parser.add_argument(
+        "--sparse-clip-norm",
+        type=float,
+        default=None,
+        help="override training.sparse_clip_norm",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        default=None,
+        help="override training.checkpoint_path",
+    )
+
+
 def _cmd_validate_config(args: argparse.Namespace) -> int:
     config = _load_config(args)
     print(f"config: OK ({args.config})")
     print(f"model: {config.model.name}")
     print(f"features: {len(config.features)}")
+    print(f"train_inputs: {len(config.data.train.inputs)}")
+    if config.data.test is not None:
+        print(f"test_inputs: {len(config.data.test.inputs)}")
+    print(f"batch_size: {config.training.batch_size}")
+    print(f"lr_dense: {config.training.lr_dense}")
+    print(f"lr_sparse: {config.training.lr_sparse}")
+    buckets = config.data.train.reader.length_buckets
+    if buckets:
+        rendered = ",".join(
+            f"{bucket.max_length}:{bucket.batch_size}" for bucket in buckets
+        )
+        print(f"train_length_buckets: {rendered}")
     print(f"vocab_strategy_hash: {vocab_strategy_fingerprint(config)}")
     return 0
 
@@ -78,6 +356,7 @@ def _cmd_profile(args: argparse.Namespace) -> int:
     split = config.data.train if args.split == "train" else config.data.test
     if split is None:
         raise ValueError(f"split {args.split!r} is not configured")
+    split.require_inputs(args.split)
     paths = discover_parquet_inputs(split.inputs)
     fingerprint = validate_matching_schemas(paths)
     columns = required_columns_for_split(config, split)
@@ -103,6 +382,7 @@ def _cmd_profile(args: argparse.Namespace) -> int:
 
 def _cmd_fit_vocab(args: argparse.Namespace) -> int:
     config = _load_config(args)
+    config.data.train.require_inputs("train")
     plan = plan_vocab_fit(config)
     tables = iter_flat_tables(config, "train", extra_columns=plan.columns)
     fitted = fit_vocabs(config, tables, plan)
@@ -138,7 +418,7 @@ def _effective_nproc_per_node(args: argparse.Namespace, config) -> int:
     return max(torch.cuda.device_count(), 1)
 
 
-def _launch_ddp_train(args: argparse.Namespace, config) -> int:
+def _launch_ddp_command(args: argparse.Namespace, config) -> int:
     nproc_per_node = _effective_nproc_per_node(args, config)
     if nproc_per_node <= 0:
         raise ValueError("nproc_per_node must be positive")
@@ -165,7 +445,8 @@ def _launch_ddp_train(args: argparse.Namespace, config) -> int:
 def _cmd_train(args: argparse.Namespace) -> int:
     config = _load_config(args)
     if _effective_distributed_mode(args, config) == "ddp" and not _in_distributed_launcher():
-        return _launch_ddp_train(args, config)
+        return _launch_ddp_command(args, config)
+    config.data.train.require_inputs("train")
     result = train_mdl(config, max_steps=args.max_steps)
     if is_main_process():
         print(
@@ -181,7 +462,9 @@ def _cmd_train(args: argparse.Namespace) -> int:
 def _cmd_benchmark(args: argparse.Namespace) -> int:
     config = _load_config(args)
     if _effective_distributed_mode(args, config) == "ddp" and not _in_distributed_launcher():
-        return _launch_ddp_train(args, config)
+        return _launch_ddp_command(args, config)
+    if args.mode in {"data", "end-to-end"}:
+        config.data.train.require_inputs("train")
     report = run_benchmark(
         config,
         BenchmarkOptions(
@@ -211,6 +494,9 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
 
 def _cmd_predict(args: argparse.Namespace) -> int:
     config = _load_config(args)
+    if config.data.test is None:
+        raise ValueError("data.test is required for predict")
+    config.data.test.require_inputs("test")
     result = predict_mdl(
         config,
         checkpoint_path=args.checkpoint_path,
@@ -224,6 +510,12 @@ def _cmd_predict(args: argparse.Namespace) -> int:
 
 def _cmd_evaluate(args: argparse.Namespace) -> int:
     config = _load_config(args)
+    if _effective_distributed_mode(args, config) == "ddp" and not _in_distributed_launcher():
+        return _launch_ddp_command(args, config)
+    split = config.data.train if args.split == "train" else config.data.test
+    if split is None:
+        raise ValueError(f"split {args.split!r} is not configured")
+    split.require_inputs(args.split)
     result = evaluate_mdl(
         config,
         split_name=args.split,
@@ -235,6 +527,8 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
         ),
         auc_bins=args.auc_bins,
     )
+    if not is_main_process():
+        return 0
     print(
         f"evaluate_result rows={result.rows} "
         f"group_metric={result.group_metric_name or 'none'} "
@@ -249,23 +543,27 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
-
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Parquet-native MDL CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     validate = subparsers.add_parser("validate-config")
     validate.add_argument("--config", required=True)
+    _add_data_input_args(validate)
+    _add_training_override_args(validate)
     validate.set_defaults(func=_cmd_validate_config)
 
     profile = subparsers.add_parser("profile")
     profile.add_argument("--config", required=True)
     profile.add_argument("--split", choices=["train", "test"], default="train")
     profile.add_argument("--max-batches", type=int, default=10)
+    _add_data_input_args(profile)
+    _add_training_override_args(profile)
     profile.set_defaults(func=_cmd_profile)
 
     fit_vocab = subparsers.add_parser("fit-vocab")
     fit_vocab.add_argument("--config", required=True)
+    _add_data_input_args(fit_vocab)
     fit_vocab.set_defaults(func=_cmd_fit_vocab)
 
     train = subparsers.add_parser("train")
@@ -275,6 +573,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--nproc-per-node", type=int, default=None)
     train.add_argument("--master-addr", default=None)
     train.add_argument("--master-port", type=int, default=None)
+    _add_data_input_args(train)
+    _add_training_override_args(train)
     train.set_defaults(func=_cmd_train)
 
     benchmark = subparsers.add_parser("benchmark")
@@ -324,29 +624,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--nproc-per-node", type=int, default=None)
     benchmark.add_argument("--master-addr", default=None)
     benchmark.add_argument("--master-port", type=int, default=None)
+    _add_data_input_args(benchmark)
     benchmark.set_defaults(func=_cmd_benchmark)
 
     predict = subparsers.add_parser("predict")
     predict.add_argument("--config", required=True)
-    predict.add_argument("--checkpoint-path", default=None)
     predict.add_argument("--output-path", default=None)
     predict.add_argument("--max-batches", type=int, default=None)
     predict.add_argument("--allow-random-init", action="store_true")
+    _add_data_input_args(predict)
+    _add_training_override_args(predict)
     predict.set_defaults(func=_cmd_predict)
 
     evaluate = subparsers.add_parser("evaluate")
     evaluate.add_argument("--config", required=True)
     evaluate.add_argument("--split", choices=["train", "test"], default="test")
-    evaluate.add_argument("--checkpoint-path", default=None)
     evaluate.add_argument("--max-batches", type=int, default=None)
     evaluate.add_argument("--allow-random-init", action="store_true")
     evaluate.add_argument(
         "--group-metric-name", choices=["none", "qauc", "uauc"], default="none"
     )
     evaluate.add_argument("--auc-bins", type=int, default=65536)
+    evaluate.add_argument("--distributed", choices=["none", "ddp"], default=None)
+    evaluate.add_argument("--nproc-per-node", type=int, default=None)
+    evaluate.add_argument("--master-addr", default=None)
+    evaluate.add_argument("--master-port", type=int, default=None)
+    _add_data_input_args(evaluate)
+    _add_training_override_args(evaluate)
     evaluate.set_defaults(func=_cmd_evaluate)
 
     return parser
+
 
 def main() -> None:
     args = build_arg_parser().parse_args()

@@ -11,6 +11,7 @@ import torch.distributed as torch_dist
 import torch.multiprocessing as torch_mp
 from torch import nn
 
+from src.config import QuickEvalConfig
 from src.dataloader import FeatureBatch
 from src.train import (
     DistributedContext,
@@ -22,6 +23,7 @@ from src.train import (
     _exclude_sparse_parameters_from_ddp,
     _mark_sparse_invariant_checks_explicitly_disabled,
     _synchronize_sparse_parameter_replicas,
+    evaluate_mdl,
     train_mdl,
 )
 
@@ -177,6 +179,25 @@ class _ToySparseModel(nn.Module):
         return {"logits": self.output(values)}
 
 
+class _RecordingToySparseModel(_ToySparseModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.forward_calls: list[tuple[bool, tuple[int, ...]]] = []
+
+    def forward(
+        self,
+        features: dict[str, torch.Tensor],
+        scenario_id: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        self.forward_calls.append(
+            (
+                self.training,
+                tuple(int(value) for value in features["ids"].tolist()),
+            )
+        )
+        return super().forward(features, scenario_id)
+
+
 def _toy_config() -> SimpleNamespace:
     return SimpleNamespace(
         runtime=SimpleNamespace(device="cpu", precision="fp32", compile=False),
@@ -213,6 +234,74 @@ def _feature_batch(ids: list[int]) -> FeatureBatch:
         label_mask=torch.ones(len(ids), 1, dtype=torch.bool),
         scenario_id=torch.zeros(len(ids), dtype=torch.long),
         group_id=[],
+    )
+
+
+class _ToyEvaluationModel(nn.Module):
+    def forward(
+        self,
+        features: dict[str, torch.Tensor],
+        scenario_id: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        del scenario_id
+        return {"logits": features["logits"]}
+
+
+def _evaluation_batch(logits: list[float], labels: list[float]) -> FeatureBatch:
+    return FeatureBatch(
+        features={"logits": torch.tensor(logits).unsqueeze(1)},
+        labels=torch.tensor(labels).unsqueeze(1),
+        label_mask=None,
+        scenario_id=torch.zeros(len(labels), dtype=torch.long),
+        group_id=[],
+    )
+
+
+def _uneven_evaluation_worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    output_queue: object,
+) -> None:
+    os.environ.update(
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT=str(port),
+        RANK=str(rank),
+        LOCAL_RANK=str(rank),
+        WORLD_SIZE=str(world_size),
+    )
+    split = SimpleNamespace(labels={"task": "label"}, group_id=None)
+    config = SimpleNamespace(
+        runtime=SimpleNamespace(device="cpu", precision="fp32", compile=False),
+        training=SimpleNamespace(checkpoint_path=None),
+        scenarios=SimpleNamespace(names=("default",), auto_discover=False),
+        task_names=["task"],
+        data=SimpleNamespace(train=split, test=split),
+    )
+    batches = (
+        [
+            _evaluation_batch([-2.0], [0.0]),
+            _evaluation_batch([2.0], [1.0]),
+        ]
+        if rank == 0
+        else [_evaluation_batch([1.0], [1.0])]
+    )
+    with (
+        patch("src.train.load_vocab_maps", return_value={}),
+        patch("src.train.build_model", return_value=_ToyEvaluationModel()),
+        patch("src.train.iter_feature_batches", return_value=iter(batches)),
+    ):
+        result = evaluate_mdl(
+            config,
+            allow_random_init=True,
+            auc_bins=128,
+        )
+    output_queue.put(
+        {
+            "rank": rank,
+            "rows": result.rows,
+            "metrics": result.metrics,
+        }
     )
 
 
@@ -320,6 +409,73 @@ def _nccl_sparse_worker(rank: int, world_size: int, port: int) -> None:
 
 
 class SparseDDPTest(unittest.TestCase):
+    def test_quick_eval_trains_the_exact_staged_batches_in_order(self) -> None:
+        config = _toy_config()
+        config.data = SimpleNamespace(train=object(), test=None)
+        config.training.quick_eval = QuickEvalConfig(
+            enabled=True,
+            every_steps=1,
+            max_batches=1,
+            split="train",
+            auc_bins=128,
+        )
+        batches = [
+            _feature_batch([1]),
+            _feature_batch([2]),
+            _feature_batch([3]),
+        ]
+        model = _RecordingToySparseModel()
+
+        with (
+            patch("src.train.load_vocab_maps", return_value={}),
+            patch("src.train.build_model", return_value=model),
+            patch("src.train.iter_feature_batches", return_value=iter(batches)),
+            patch("src.train._non_blocking_transfer", return_value=False),
+            patch("src.train._print_training_quick_eval"),
+        ):
+            result = train_mdl(
+                config,
+                max_steps=3,
+                save_checkpoint=False,
+                log_steps=False,
+            )
+
+        self.assertEqual(result.steps, 3)
+        self.assertEqual(
+            model.forward_calls,
+            [
+                (True, (1,)),
+                (False, (2,)),
+                (True, (2,)),
+                (False, (3,)),
+                (True, (3,)),
+            ],
+        )
+
+    def test_evaluation_replays_exhausted_rank_and_reduces_auc_histograms(self) -> None:
+        context = torch_mp.get_context("spawn")
+        output_queue = context.SimpleQueue()
+        torch_mp.start_processes(
+            _uneven_evaluation_worker,
+            args=(2, _free_port(), output_queue),
+            nprocs=2,
+            join=True,
+            start_method="spawn",
+        )
+        results = sorted(
+            [output_queue.get(), output_queue.get()],
+            key=lambda item: item["rank"],
+        )
+
+        self.assertEqual([item["rows"] for item in results], [3, 3])
+        for item in results:
+            metrics = item["metrics"]["task"]
+            self.assertEqual(metrics["examples"], 3)
+            self.assertEqual(metrics["positives"], 2)
+            self.assertEqual(metrics["negatives"], 1)
+            self.assertEqual(metrics["auc"], 1.0)
+            self.assertEqual(metrics["scene_default_auc"], 1.0)
+
     def test_sharded_sparse_clip_uses_one_global_norm(self) -> None:
         torch_mp.start_processes(
             _global_sparse_clip_worker,

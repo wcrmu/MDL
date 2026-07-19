@@ -255,7 +255,11 @@ class SparseMoEPerTokenFFN(nn.Module):
         activation_layer = _activation_layer(activation)
         self.num_tokens = num_tokens
         self.token_dim = token_dim
+        self.hidden_dim = hidden_dim
         self.num_experts = num_experts
+        self.activation = activation
+        self.dropout = dropout
+        self.output_relu = output_relu
         self.use_dtsi = use_dtsi
         self.dtsi_training_output = dtsi_training_output
         self.inference_threshold = inference_threshold
@@ -304,12 +308,123 @@ class SparseMoEPerTokenFFN(nn.Module):
                 )
         return output
 
-    def forward(self, tokens: Tensor) -> Tensor:
-        if tokens.ndim != 3 or tokens.size(1) != self.num_tokens or tokens.size(2) != self.token_dim:
-            raise ValueError(
-                f"expected tokens with shape [batch, {self.num_tokens}, {self.token_dim}], "
-                f"got {tuple(tokens.shape)}"
-            )
+    def _stacked_expert_weights(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Autograd-connected stacked expert GEMM weights, grouped by (token, expert).
+
+        Group index ``g = token_index * num_experts + expert_index``. ``torch.stack``
+        keeps every stacked slice a live view into the original ``nn.Linear``
+        parameters, so gradients flow back to ``self.experts`` exactly as in the
+        per-expert path and checkpoints keep their historical key layout.
+        """
+
+        input_weight = torch.stack(
+            [expert[0].weight for experts in self.experts for expert in experts],
+            dim=0,
+        )
+        input_bias = torch.stack(
+            [expert[0].bias for experts in self.experts for expert in experts],
+            dim=0,
+        )
+        output_weight = torch.stack(
+            [expert[3].weight for experts in self.experts for expert in experts],
+            dim=0,
+        )
+        output_bias = torch.stack(
+            [expert[3].bias for experts in self.experts for expert in experts],
+            dim=0,
+        )
+        return input_weight, input_bias, output_weight, output_bias
+
+    def _stacked_router_weights(
+        self, routers: nn.ModuleList
+    ) -> tuple[Tensor, Tensor]:
+        weight = torch.stack([router.weight for router in routers], dim=0)
+        bias = torch.stack([router.bias for router in routers], dim=0)
+        return weight, bias
+
+    def _all_expert_outputs(self, tokens: Tensor) -> Tensor:
+        """Evaluate every (token, expert) FFN as two batched GEMMs.
+
+        Returns ``[num_tokens, num_experts, batch, token_dim]`` matching the
+        per-token ``_expert_outputs`` stack, but with two ``bmm`` launches
+        instead of ``2 * num_tokens * num_experts`` small Linear kernels.
+        """
+
+        batch = tokens.size(0)
+        token_count = self.num_tokens
+        expert_count = self.num_experts
+        groups = token_count * expert_count
+        input_weight, input_bias, output_weight, output_bias = (
+            self._stacked_expert_weights()
+        )
+        # [T,B,D] -> replicate each token across its experts -> [T*E, B, D].
+        token_major = tokens.transpose(0, 1)
+        grouped_input = (
+            token_major.unsqueeze(1)
+            .expand(token_count, expert_count, batch, self.token_dim)
+            .reshape(groups, batch, self.token_dim)
+        )
+        hidden = torch.bmm(grouped_input, input_weight.transpose(1, 2))
+        hidden = hidden + input_bias.unsqueeze(1).to(dtype=hidden.dtype)
+        hidden = F.gelu(hidden) if self.activation == "gelu" else F.relu(hidden)
+        hidden = F.dropout(hidden, p=self.dropout, training=self.training)
+        output = torch.bmm(hidden, output_weight.transpose(1, 2))
+        output = output + output_bias.unsqueeze(1).to(dtype=output.dtype)
+        if self.output_relu:
+            output = F.relu(output)
+        return output.view(token_count, expert_count, batch, self.token_dim)
+
+    def _forward_batched(self, tokens: Tensor) -> Tensor:
+        token_major = tokens.transpose(0, 1)  # [T,B,D]
+        sparse_weight, sparse_bias = self._stacked_router_weights(self.sparse_routers)
+        sparse_logits = torch.bmm(
+            token_major, sparse_weight.transpose(1, 2)
+        ) + sparse_bias.unsqueeze(1)
+        sparse_gates = torch.relu(sparse_logits)  # [T,B,E]
+
+        # Per-token mean-then-mean reproduces stack([...per token...]).mean().
+        gate_l1 = sparse_gates.sum(dim=-1).mean(dim=1).mean()
+        active_ratio = (
+            (sparse_gates > 0.0).to(tokens.dtype).mean(dim=(1, 2)).mean().detach()
+        )
+
+        expert_outputs = self._all_expert_outputs(tokens)  # [T,E,B,D]
+        if self.training:
+            sparse_gates_te = sparse_gates.permute(0, 2, 1).unsqueeze(-1)  # [T,E,B,1]
+            sparse_output = (expert_outputs * sparse_gates_te).sum(dim=1)  # [T,B,D]
+            if self.use_dtsi:
+                dense_weight, dense_bias = self._stacked_router_weights(
+                    self.dense_routers
+                )
+                dense_logits = torch.bmm(
+                    token_major, dense_weight.transpose(1, 2)
+                ) + dense_bias.unsqueeze(1)
+                dense_gates = torch.softmax(dense_logits, dim=-1)
+                dense_gates_te = dense_gates.permute(0, 2, 1).unsqueeze(-1)
+                dense_output = (expert_outputs * dense_gates_te).sum(dim=1)
+                if self.dtsi_training_output == "dense_router":
+                    combined = dense_output
+                elif self.dtsi_training_output == "mean":
+                    combined = 0.5 * (dense_output + sparse_output)
+                else:
+                    raise RuntimeError("DTSI training output policy is not configured")
+            else:
+                combined = sparse_output
+        else:
+            # Experts below the inference threshold contribute exactly zero,
+            # so masking the gates is equivalent to skipping their kernels.
+            gate_mask = (sparse_gates > self.inference_threshold).to(sparse_gates.dtype)
+            gated = (sparse_gates * gate_mask).permute(0, 2, 1).unsqueeze(-1)
+            combined = (expert_outputs * gated).sum(dim=1)  # [T,B,D]
+
+        self._last_regularization_loss = (
+            self.regularization_coefficient.detach().clone() * gate_l1
+        )
+        self._last_active_ratio = active_ratio
+        self._coefficient_update_pending = self.training
+        return combined.transpose(0, 1)  # [B,T,D]
+
+    def _forward_looped(self, tokens: Tensor) -> Tensor:
         outputs: list[Tensor] = []
         gate_l1_terms: list[Tensor] = []
         active_ratios: list[Tensor] = []
@@ -346,6 +461,19 @@ class SparseMoEPerTokenFFN(nn.Module):
         self._last_active_ratio = active_ratio
         self._coefficient_update_pending = self.training
         return torch.stack(outputs, dim=1)
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        if tokens.ndim != 3 or tokens.size(1) != self.num_tokens or tokens.size(2) != self.token_dim:
+            raise ValueError(
+                f"expected tokens with shape [batch, {self.num_tokens}, {self.token_dim}], "
+                f"got {tuple(tokens.shape)}"
+            )
+        # CUDA amortizes the per-expert launch overhead as batched GEMMs; the
+        # small host BLAS GEMMs of the looped path parallelize better on CPU
+        # and preserve the exact per-expert dropout RNG stream there.
+        if tokens.device.type == "cuda":
+            return self._forward_batched(tokens)
+        return self._forward_looped(tokens)
 
     def step_regularization_controller(
         self,

@@ -20,6 +20,24 @@ from src.features import load_vocab_maps, plan_vocab_fit
 
 
 class ModelConfigOverlayTest(unittest.TestCase):
+    def test_early_adapter_truncation_must_match_sequence_semantics(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "mdl_rankmixer.yaml")
+        adapter = config.data.train.adapter
+        self.assertIsNotNone(adapter)
+        assert adapter is not None
+        limits = dict(adapter.options["sequence_max_lengths"])
+        limits["impr"] += 1
+        bad_adapter = replace(
+            adapter,
+            options={**adapter.options, "sequence_max_lengths": limits},
+        )
+        bad_train = replace(config.data.train, adapter=bad_adapter)
+        bad_config = replace(config, data=replace(config.data, train=bad_train))
+
+        with self.assertRaisesRegex(ValueError, "must equal sequences.impr.max_length"):
+            bad_config.validate()
+
     def test_all_model_profiles_extend_and_validate(self) -> None:
         root = Path(__file__).resolve().parents[1]
         expected = {
@@ -41,15 +59,17 @@ class ModelConfigOverlayTest(unittest.TestCase):
         }
         for filename, model_name in expected.items():
             with self.subTest(filename=filename):
-                config = load_app_config(root / "configs" / filename)
+                config = load_app_config(root / "configs" / "reference" / filename)
                 self.assertEqual(config.model.name, model_name)
 
-        experimental = load_app_config(root / "configs" / "mdl_onetrans.yaml")
+        experimental = load_app_config(
+            root / "configs" / "reference" / "mdl_onetrans.yaml"
+        )
         self.assertTrue(experimental.model.experimental_model_acknowledged)
         self.assertEqual(experimental.model.first_domain_sequence_layer, 0)
 
         production = load_app_config(
-            root / "configs" / "mdl_onetrans_a100_8x80g.yaml"
+            root / "configs" / "mdl_onetrans.yaml"
         )
         self.assertTrue(production.model.experimental_model_acknowledged)
         self.assertEqual(production.model.first_domain_sequence_layer, 4)
@@ -63,13 +83,17 @@ class ModelConfigOverlayTest(unittest.TestCase):
         ]:
             self.assertFalse(history_names & set(token.resolved_inputs()))
 
-        rankmixer = load_app_config(root / "configs" / "rankmixer_paper.yaml")
+        rankmixer = load_app_config(
+            root / "configs" / "reference" / "rankmixer_paper.yaml"
+        )
         self.assertEqual(rankmixer.model.token_dim, 768)
         self.assertEqual(rankmixer.training.lr_dense, 0.01)
         self.assertEqual(rankmixer.tokenization.feature_tokenizer, "rankmixer")
         self.assertEqual(rankmixer.resolved.encoded_input_dims["hist"], 33_792)
 
-        mdl = load_app_config(root / "configs" / "mdl_rankmixer_paper.yaml")
+        mdl = load_app_config(
+            root / "configs" / "reference" / "mdl_rankmixer_paper.yaml"
+        )
         self.assertEqual(len(mdl.scenarios.names), 3)
         self.assertEqual(len(mdl.task_names), 3)
         self.assertEqual(mdl.model.mdl_feature_interaction, "direct_ffn")
@@ -120,14 +144,18 @@ class ModelConfigOverlayTest(unittest.TestCase):
             self.assertFalse(categorical_input.encoding.share_embedding)
         self.assertEqual(len(domain_prior_sources), len(domain_prior_names))
 
-        onetrans = load_app_config(root / "configs" / "onetrans_paper.yaml")
+        onetrans = load_app_config(
+            root / "configs" / "reference" / "onetrans_paper.yaml"
+        )
         self.assertEqual(onetrans.model.sequence_fusion, "timestamp_aware")
         self.assertEqual(onetrans.model.num_layers, 6)
         self.assertEqual(onetrans.model.token_dim, 256)
         self.assertEqual(onetrans.model.final_s_tokens, 12)
         self.assertEqual(onetrans.sequences[0].encoder, "raw")
 
-        longer = load_app_config(root / "configs" / "longer_paper.yaml")
+        longer = load_app_config(
+            root / "configs" / "reference" / "longer_paper.yaml"
+        )
         self.assertEqual(longer.sequences[0].sequence_order, "newest_to_oldest")
         self.assertEqual(longer.sequences[0].longer_token_merge, 8)
         self.assertEqual(longer.sequences[0].longer_query_tokens, 100)
@@ -208,19 +236,40 @@ class ModelConfigOverlayTest(unittest.TestCase):
                 with self.subTest(name=name):
                     config_path = Path(temporary) / f"invalid_{index}.yaml"
                     config_path.write_text(
-                        f'extends: "{(root / "configs" / "default.yaml").as_posix()}"\n'
+                        f'extends: "{(root / "configs" / "reference" / "default.yaml").as_posix()}"\n'
                         + override,
                         encoding="utf-8",
                     )
                     with self.assertRaisesRegex(ValueError, expected_error):
                         load_app_config(config_path)
 
+    def test_quick_eval_requires_labels_on_the_selected_split(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
+        self.assertTrue(config.training.quick_eval.enabled)
+        self.assertEqual(config.training.quick_eval.split, "train")
+        quick_eval = replace(
+            config.training.quick_eval,
+            enabled=True,
+            split="test",
+        )
+        configured = replace(
+            config,
+            training=replace(config.training, quick_eval=quick_eval),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"data\.test\.labels must declare the training tasks",
+        ):
+            validate_app_config(configured)
+
     def test_strict_type_validation_preserves_documented_compatibility(self) -> None:
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temporary:
             config_path = Path(temporary) / "compatible.yaml"
             config_path.write_text(
-                f'extends: "{(root / "configs" / "default.yaml").as_posix()}"\n'
+                f'extends: "{(root / "configs" / "reference" / "default.yaml").as_posix()}"\n'
                 "runtime:\n"
                 "  activation_checkpoint: false\n"
                 "data:\n"
@@ -284,7 +333,7 @@ class ModelConfigOverlayTest(unittest.TestCase):
             "longer_5000_perf.yaml",
         ):
             with self.subTest(filename=filename):
-                config = load_app_config(root / "configs" / filename)
+                config = load_app_config(root / "configs" / "reference" / filename)
                 self.assertEqual(config.training.embedding_distribution, "sharded")
                 for categorical_input in config.resolved.categorical_inputs:
                     self.assertIsInstance(
@@ -300,7 +349,9 @@ class ModelConfigOverlayTest(unittest.TestCase):
                 self.assertEqual(plan_vocab_fit(config).entries, ())
                 self.assertEqual(load_vocab_maps(config), {})
 
-        stress = load_app_config(root / "configs" / "longer_5000_perf.yaml")
+        stress = load_app_config(
+            root / "configs" / "reference" / "longer_5000_perf.yaml"
+        )
         self.assertEqual(stress.sequences[0].max_length, 5000)
 
     def test_pre_hashed_strategy_resolves_and_validates_shared_bucket(self) -> None:
@@ -310,7 +361,7 @@ class ModelConfigOverlayTest(unittest.TestCase):
             overlay.write_text(
                 "\n".join(
                     [
-                        f"extends: {root / 'configs' / 'default.yaml'}",
+                        f"extends: {root / 'configs' / 'reference' / 'default.yaml'}",
                         "vocab_strategy:",
                         "  features:",
                         "    shop_id:",
@@ -351,10 +402,11 @@ class ModelConfigOverlayTest(unittest.TestCase):
 
     def test_gpu_performance_profiles_keep_validated_occupancy_settings(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        mdl = load_app_config(root / "configs" / "mdl_perf.yaml")
-        onetrans = load_app_config(root / "configs" / "onetrans_perf.yaml")
-        longer = load_app_config(root / "configs" / "longer_perf.yaml")
-        longer_stress = load_app_config(root / "configs" / "longer_5000_perf.yaml")
+        reference = root / "configs" / "reference"
+        mdl = load_app_config(reference / "mdl_perf.yaml")
+        onetrans = load_app_config(reference / "onetrans_perf.yaml")
+        longer = load_app_config(reference / "longer_perf.yaml")
+        longer_stress = load_app_config(reference / "longer_5000_perf.yaml")
 
         self.assertEqual(mdl.training.batch_size, 4096)
         self.assertTrue(mdl.runtime.compile)
@@ -385,7 +437,9 @@ class ModelConfigOverlayTest(unittest.TestCase):
 
     def test_onetrans_rejects_pre_encoded_behavior_sequences(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "onetrans.yaml")
+        config = load_app_config(
+            root / "configs" / "reference" / "onetrans.yaml"
+        )
         invalid = replace(
             config,
             sequences=[
@@ -399,7 +453,9 @@ class ModelConfigOverlayTest(unittest.TestCase):
 
     def test_onetrans_rejects_position_capacity_below_unified_token_count(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "onetrans.yaml")
+        config = load_app_config(
+            root / "configs" / "reference" / "onetrans.yaml"
+        )
         invalid = replace(
             config,
             model=replace(
@@ -413,7 +469,9 @@ class ModelConfigOverlayTest(unittest.TestCase):
 
     def test_onetrans_ns_tokens_reject_sequences_in_inactive_scopes(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "onetrans.yaml")
+        config = load_app_config(
+            root / "configs" / "reference" / "onetrans.yaml"
+        )
         hidden_sequence = replace(
             config.sequences[0],
             name="hidden_seq",
@@ -434,7 +492,9 @@ class ModelConfigOverlayTest(unittest.TestCase):
 
     def test_onetrans_sequence_tokens_only_accept_active_sequences(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "onetrans.yaml")
+        config = load_app_config(
+            root / "configs" / "reference" / "onetrans.yaml"
+        )
         hidden_sequence = replace(
             config.sequences[0],
             name="hidden_seq",
@@ -466,7 +526,9 @@ class ModelConfigOverlayTest(unittest.TestCase):
 
     def test_dynamic_onetrans_length_requires_explicit_position_capacity(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "onetrans.yaml")
+        config = load_app_config(
+            root / "configs" / "reference" / "onetrans.yaml"
+        )
         invalid = replace(
             config,
             sequences=[
@@ -481,7 +543,7 @@ class ModelConfigOverlayTest(unittest.TestCase):
 
     def test_raw_sequence_mode_is_reserved_for_onetrans(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "default.yaml")
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
         invalid = replace(
             config,
             sequences=[
@@ -503,7 +565,9 @@ class ModelConfigOverlayTest(unittest.TestCase):
 
     def test_mdl_onetrans_rejects_s_sequence_domain_priors(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "mdl_onetrans.yaml")
+        config = load_app_config(
+            root / "configs" / "reference" / "mdl_onetrans.yaml"
+        )
         history_name = config.sequences[0].name
         scenario_tokens = list(config.tokenization.scenario_tokens)
         scenario_tokens[0] = replace(
@@ -522,7 +586,9 @@ class ModelConfigOverlayTest(unittest.TestCase):
 
     def test_multi_domain_mdl_rejects_generic_or_reused_priors(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "mdl_rankmixer_paper.yaml")
+        config = load_app_config(
+            root / "configs" / "reference" / "mdl_rankmixer_paper.yaml"
+        )
 
         generic_scenarios = [
             replace(token, prior_inputs=["hist"])
@@ -563,7 +629,9 @@ class ModelConfigOverlayTest(unittest.TestCase):
 
     def test_sparse_dtsi_requires_explicit_unpublished_output_policy(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "rankmixer.yaml")
+        config = load_app_config(
+            root / "configs" / "reference" / "rankmixer.yaml"
+        )
         sparse_model = replace(
             config.model,
             rankmixer_ffn_type="sparse_moe",
@@ -576,7 +644,9 @@ class ModelConfigOverlayTest(unittest.TestCase):
 
     def test_mdl_ablation_switches_are_valid_runtime_paths(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "mdl_rankmixer_paper.yaml")
+        config = load_app_config(
+            root / "configs" / "reference" / "mdl_rankmixer_paper.yaml"
+        )
 
         for switch in (
             "use_task_tokens",

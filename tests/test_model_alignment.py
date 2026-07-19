@@ -278,7 +278,9 @@ class MDLAblationAlignmentTest(unittest.TestCase):
                 self.encoder_bank = Encoder()
 
         root = Path(__file__).resolve().parents[1]
-        rankmixer_config = load_app_config(root / "configs" / "default.yaml")
+        rankmixer_config = load_app_config(
+            root / "configs" / "reference" / "default.yaml"
+        )
         with patch("src.model.FeatureEncoderBank", return_value=Encoder()), patch(
             "src.model._build_rankmixer_feature_projector",
             return_value=nn.Identity(),
@@ -288,7 +290,9 @@ class MDLAblationAlignmentTest(unittest.TestCase):
         ):
             rankmixer_model = MDLRankMixerModel(rankmixer_config, {})
 
-        onetrans_config = load_app_config(root / "configs" / "mdl_onetrans.yaml")
+        onetrans_config = load_app_config(
+            root / "configs" / "reference" / "mdl_onetrans.yaml"
+        )
         with patch(
             "src.model.OneTransBackbone",
             return_value=OneTransBackboneStub(),
@@ -536,7 +540,9 @@ class MDLAblationAlignmentTest(unittest.TestCase):
                 return state
 
         root = Path(__file__).resolve().parents[1]
-        rankmixer_config = load_app_config(root / "configs" / "default.yaml")
+        rankmixer_config = load_app_config(
+            root / "configs" / "reference" / "default.yaml"
+        )
         rankmixer_config = replace(
             rankmixer_config,
             model=replace(
@@ -552,7 +558,9 @@ class MDLAblationAlignmentTest(unittest.TestCase):
             rankmixer_model = MDLRankMixerModel(rankmixer_config, {})
         domain_projector.assert_not_called()
 
-        onetrans_config = load_app_config(root / "configs" / "mdl_onetrans.yaml")
+        onetrans_config = load_app_config(
+            root / "configs" / "reference" / "mdl_onetrans.yaml"
+        )
         onetrans_config = replace(
             onetrans_config,
             model=replace(
@@ -729,6 +737,34 @@ class MDLLossAlignmentTest(unittest.TestCase):
             torch.tensor(0.0),
         )
         torch.testing.assert_close(paper_sum, 3.0 * unit)
+        torch.testing.assert_close(balanced_mean, 2.0 * unit)
+
+    def test_complete_labels_use_implicit_all_observed_weights(self) -> None:
+        logits = torch.zeros(2, 2)
+        batch = FeatureBatch(
+            features={},
+            labels=torch.tensor([[0.0, 1.0], [1.0, 0.0]]),
+            label_mask=None,
+            scenario_id=torch.zeros(2, dtype=torch.long),
+            group_id=[],
+        )
+
+        paper_sum, _numerator, _denominator = _loss_terms_from_batch(
+            {"logits": logits},
+            batch,
+            loss_reduction="sum",
+        )
+        balanced_mean, _numerator, _denominator = _loss_terms_from_batch(
+            {"logits": logits},
+            batch,
+            loss_reduction="mean_per_task",
+        )
+
+        unit = torch.nn.functional.binary_cross_entropy_with_logits(
+            torch.tensor(0.0),
+            torch.tensor(0.0),
+        )
+        torch.testing.assert_close(paper_sum, 4.0 * unit)
         torch.testing.assert_close(balanced_mean, 2.0 * unit)
 
 
@@ -928,7 +964,7 @@ class FeatureEncoderShardedFusionTest(unittest.TestCase):
 
     def test_mdl_fuses_scalar_and_all_sequence_lookups_with_output_parity(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "mdl_perf.yaml")
+        config = load_app_config(root / "configs" / "reference" / "mdl_perf.yaml")
         bank = FeatureEncoderBank(
             config,
             {},
@@ -952,7 +988,9 @@ class FeatureEncoderShardedFusionTest(unittest.TestCase):
 
     def test_onetrans_fuses_ns_and_sequence_lookups(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "onetrans_perf.yaml")
+        config = load_app_config(
+            root / "configs" / "reference" / "onetrans_perf.yaml"
+        )
         bank = FeatureEncoderBank(
             config,
             {},
@@ -1090,7 +1128,7 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
 
     def _base_config(self):
         root = Path(__file__).resolve().parents[1]
-        base = load_app_config(root / "configs" / "default.yaml")
+        base = load_app_config(root / "configs" / "reference" / "default.yaml")
         sequence = replace(
             base.sequences[0],
             encoder="raw",
@@ -1395,7 +1433,7 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
 class OneTransRuntimeCorrectnessTest(unittest.TestCase):
     def test_shared_vocab_alias_uses_base_vocab_size_for_independent_table(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "default.yaml")
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
         vocab_maps = {
             "user_id": {"one": 1, "seven": 7},
             # A stale or partial alias map must not size the independent table.
@@ -1425,7 +1463,7 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
         batch_size: int,
     ) -> tuple[MDLOneTransModel, dict[str, object]]:
         root = Path(__file__).resolve().parents[1]
-        base = load_app_config(root / "configs" / "default.yaml")
+        base = load_app_config(root / "configs" / "reference" / "default.yaml")
         sequence = replace(
             base.sequences[0],
             max_length=6,

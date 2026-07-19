@@ -176,7 +176,7 @@ class SyntheticEmbeddingReplacementTest(unittest.TestCase):
 
     def test_model_build_can_cap_id_tables_before_compute_replacement(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "default.yaml")
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
         model = build_model(
             config,
             _synthetic_vocab_maps(config),
@@ -190,7 +190,9 @@ class SyntheticEmbeddingReplacementTest(unittest.TestCase):
 
     def test_identity_alias_reuses_embedding_without_hiding_its_bound(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "rankmixer_perf.yaml")
+        config = load_app_config(
+            root / "configs" / "reference" / "rankmixer_perf.yaml"
+        )
         model = build_model(config, {}, embedding_size_override=2)
 
         self.assertIs(
@@ -200,7 +202,7 @@ class SyntheticEmbeddingReplacementTest(unittest.TestCase):
 
     def test_synthetic_agg_batch_keeps_sequences_at_request_granularity(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "default.yaml")
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
 
         batch = _synthetic_feature_batch(
             config,
@@ -218,7 +220,7 @@ class SyntheticEmbeddingReplacementTest(unittest.TestCase):
 
     def test_synthetic_batch_uses_named_sequence_length(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "default.yaml")
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
         sequence_name = config.sequences[0].name
 
         batch = _synthetic_feature_batch(

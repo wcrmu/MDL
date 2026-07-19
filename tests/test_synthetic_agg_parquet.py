@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class SyntheticAggParquetTest(unittest.TestCase):
     def test_generated_wide_agg_file_runs_through_production_adapter(self) -> None:
-        config = load_app_config(ROOT / "configs" / "rankmixer_a100_8x80g.yaml")
+        config = load_app_config(ROOT / "configs" / "rankmixer.yaml")
         short_lengths = {name: 2 for name in OBSERVED_MEDIAN_SEQUENCE_LENGTHS}
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory) / "parquet"
@@ -76,7 +76,7 @@ class SyntheticAggParquetTest(unittest.TestCase):
         )
 
     def test_tuner_updates_the_bucket_matching_the_synthetic_workload(self) -> None:
-        path = ROOT / "configs" / "mdl_rankmixer_a100_8x80g.yaml"
+        path = ROOT / "configs" / "mdl_rankmixer.yaml"
         lengths = _default_sequence_lengths(path)
 
         override, bucket = _recommended_yaml_override(path, 40, lengths)

@@ -4,6 +4,7 @@ from dataclasses import replace
 import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import torch
 import yaml
@@ -37,7 +38,7 @@ def _compact_production_config(model_name: str):
     """Keep production wiring while making a CPU forward/backward test cheap."""
 
     config = load_app_config(
-        ROOT / "configs" / f"{model_name}_a100_8x80g.yaml"
+        ROOT / "configs" / f"{model_name}.yaml"
     )
     config = resolve_auto_scenarios(config, [9, 17])
     sequences = tuple(
@@ -52,9 +53,28 @@ def _compact_production_config(model_name: str):
         )
         for sequence in config.sequences
     )
+
+    def compact_split(split):
+        if split is None or split.adapter is None:
+            return split
+        limits = {
+            name: 2
+            for name in split.adapter.options.get("sequence_max_lengths", {})
+        }
+        adapter = replace(
+            split.adapter,
+            options={**split.adapter.options, "sequence_max_lengths": limits},
+        )
+        return replace(split, adapter=adapter)
+
     onetrans = model_name in {"onetrans", "mdl_onetrans"}
     config = replace(
         config,
+        data=replace(
+            config.data,
+            train=compact_split(config.data.train),
+            test=compact_split(config.data.test),
+        ),
         sequences=sequences,
         model=replace(
             config.model,
@@ -297,14 +317,18 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         )
         adapter_payload = payload["data"]["train"]["adapter"]
         self.assertEqual(len(adapter_payload["input_columns"]), 281)
-        self.assertEqual(len(adapter_payload["optional_input_columns"]), 13)
+        self.assertEqual(len(adapter_payload["optional_input_columns"]), 12)
         self.assertEqual(
             len(payload["data"]["test"]["adapter"]["optional_input_columns"]),
-            14,
+            13,
         )
         self.assertIn("impr_x_time", adapter_payload["input_columns"])
         self.assertNotIn("impr_x_indices", adapter_payload["input_columns"])
         self.assertIn("impr_x_indices", adapter_payload["optional_input_columns"])
+        self.assertIn(
+            "f_goods_view_times_tg_l1_hn",
+            adapter_payload["optional_input_columns"],
+        )
         self.assertEqual(adapter_options["request_value_maps"]["scene_id"], {7: 0, 19: 1})
         self.assertEqual(len(adapter_options["context_features"]), 47)
         self.assertEqual(len(adapter_options["item_features"]), 122)
@@ -318,11 +342,14 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         )
         self.assertNotIn("prediction_keys", payload["data"]["train"])
         self.assertEqual(payload["data"]["test"]["prediction_score_suffix"], "_score")
-        self.assertEqual(adapter_options["label_missing_values"], [None])
+        self.assertNotIn("label_missing_values", adapter_options)
+        self.assertNotIn("label_masks", adapter_options)
+        self.assertFalse(payload["data"]["train"].get("label_masks"))
         self.assertEqual(
-            adapter_options["column_aliases"]["f_goods_view_times_tg_l1_hn"],
-            ["f_goods_view_times_tg_11_hn"],
+            adapter_options["sequence_max_lengths"],
+            {sequence["name"]: sequence["max_length"] for sequence in main_sequences},
         )
+        self.assertNotIn("column_aliases", adapter_options)
         self.assertEqual(adapter_options["time_delta_transform"], "log1p_seconds")
 
         main_input_width = sum(
@@ -332,6 +359,17 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         self.assertEqual(main_input_width % 32, 0)
         self.assertEqual(payload["runtime"]["nproc_per_node"], 8)
         self.assertEqual(payload["training"]["embedding_distribution"], "sharded")
+        self.assertEqual(payload["training"]["loss_reduction"], "mean_per_task")
+        self.assertEqual(
+            payload["training"]["quick_eval"],
+            {
+                "enabled": True,
+                "every_steps": 1000,
+                "max_batches": 20,
+                "split": "train",
+                "auc_bins": 4096,
+            },
+        )
         self.assertLessEqual(
             summary["embedding_memory"]["planned_weight_plus_state_gib_per_gpu"],
             40.0,
@@ -354,7 +392,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             config.resolved.categorical_embedding_dims["impr.goods_id_hn"],
         )
 
-    def test_report_derives_task_specific_missing_label_sentinels(self) -> None:
+    def test_report_rejects_incomplete_or_non_binary_labels(self) -> None:
         report = _synthetic_report(self.sample)
         report["contract"]["label_distribution"] = {
             task: {
@@ -368,15 +406,21 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             for task in EXPECTED_LABELS
         }
 
-        payload, _summary = build_config(self.sample, report)
-        missing = payload["data"]["train"]["adapter"]["options"][
-            "label_missing_values"
-        ]
+        with self.assertRaisesRegex(ValueError, "label_distribution.fst_cart.null"):
+            build_config(self.sample, report)
 
-        self.assertEqual(missing["fst_cart"], [None])
-        self.assertEqual(missing["upid_pay"], [None, -1])
-        self.assertEqual(missing["cateid_filter"], [None])
-
+        report = _synthetic_report(self.sample)
+        report["contract"]["label_distribution"] = {
+            task: {
+                "total": 10,
+                "null": 0,
+                "minus_one": 0,
+                "zero": 5,
+                "one": 5,
+                "other": 0,
+            }
+            for task in EXPECTED_LABELS
+        }
         report["contract"]["label_distribution"]["fst_cart"]["other"] = 1
         with self.assertRaisesRegex(ValueError, "label_distribution.fst_cart.other"):
             build_config(self.sample, report)
@@ -446,6 +490,17 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             2,
         )
         self.assertEqual(scene_tensor.tolist(), [1, 0])
+        with patch(
+            "src.dataloader._encode_scenario_item",
+            side_effect=AssertionError("trusted scenario path used Python validation"),
+        ):
+            trusted_scene_tensor = _scenario_tensor(
+                resolved,
+                pa.table({"scene_id": [17, 9]}),
+                2,
+                trusted_input=True,
+            )
+        self.assertEqual(trusted_scene_tensor.tolist(), [1, 0])
         self.assertEqual(resolved.scenarios.source_encoding, "raw")
         with self.assertRaisesRegex(ValueError, "unknown raw scenario id 0"):
             _scenario_tensor(
@@ -481,7 +536,9 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 pa.table({"scene_id": pa.array([[17, 9], [17]])}),
                 parquet_path,
             )
-            base = load_app_config(ROOT / "configs" / "default.yaml")
+            base = load_app_config(
+                ROOT / "configs" / "reference" / "default.yaml"
+            )
             config = replace(
                 base,
                 data=replace(
@@ -678,7 +735,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         ):
             with self.subTest(model=model_name):
                 config = load_app_config(
-                    ROOT / "configs" / f"{model_name}_a100_8x80g.yaml"
+                    ROOT / "configs" / f"{model_name}.yaml"
                 )
                 self.assertTrue(config.runtime.compile)
                 self.assertEqual(config.runtime.attention_backend, "flash")
@@ -697,9 +754,16 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertTrue(
                     config.data.train.reader.deduplicate_request_features
                 )
-                self.assertTrue(
+                self.assertFalse(
                     config.data.train.reader.validate_prehashed_nonzero
                 )
+                self.assertTrue(config.data.train.reader.trusted_input)
+                self.assertTrue(config.data.test.reader.trusted_input)
+                self.assertFalse(config.data.train.label_masks)
+                self.assertFalse(config.data.test.label_masks)
+                self.assertEqual(config.training.loss_reduction, "mean_per_task")
+                self.assertTrue(config.training.quick_eval.enabled)
+                self.assertEqual(config.training.quick_eval.split, "train")
                 self.assertEqual(config.data.train.reader.shard_unit, "row_group")
                 self.assertEqual(config.data.train.reader.shuffle_buffer_rows, 8192)
                 self.assertEqual(config.data.train.reader.shuffle_seed, 2025)
@@ -710,6 +774,16 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 )
                 self.assertTrue(
                     config.data.train.adapter.options["compact_request_lists"]
+                )
+                main_sequences = {
+                    sequence.name: sequence.max_length
+                    for sequence in config.sequences
+                    if sequence.name
+                    in config.data.train.adapter.options["ups_types"]
+                }
+                self.assertEqual(
+                    config.data.train.adapter.options["sequence_max_lengths"],
+                    main_sequences,
                 )
                 self.assertTrue(config.data.train.reader.coalesce_pinned_tensors)
                 self.assertEqual(

@@ -119,12 +119,7 @@ EXPECTED_LABELS = {
     "upid_pay": "upid_fst_trgt_noc_clk_pay_24h",
     "cateid_filter": "cateid_is_fst_scene_sp_filter",
 }
-LABEL_MASKS = {
-    task: f"{source}__valid" for task, source in EXPECTED_LABELS.items()
-}
-FIELD_ALIASES = {
-    "f_goods_view_times_tg_l1_hn": ("f_goods_view_times_tg_11_hn",),
-}
+OPTIONAL_FEATURE_COLUMNS = ("f_goods_view_times_tg_l1_hn",)
 TIME_DELTA_FIELD = "time_delta_log1p_seconds"
 AUTO_SCENARIO_NAME = "__auto__"
 ESTIMATED_SEQUENCE_LENGTHS = {
@@ -412,6 +407,14 @@ def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tup
                 errors.append(
                     f"contract.label_distribution.{task}.other must be zero"
                 )
+            if counts.get("null", 0):
+                errors.append(
+                    f"contract.label_distribution.{task}.null must be zero"
+                )
+            if counts.get("minus_one", 0):
+                errors.append(
+                    f"contract.label_distribution.{task}.minus_one must be zero"
+                )
     else:
         # Backward compatibility for format-v4 reports written before detailed
         # null/-1 categories were added. Those reports can prove only that every
@@ -624,16 +627,24 @@ class ReportValues:
 
 
 def _partition_inputs(split: Mapping[str, Any]) -> list[str]:
+    """Resolve split inputs; empty when no paths or hour window is configured."""
     configured = split.get("inputs")
     if isinstance(configured, str) and configured:
         return [configured]
     if isinstance(configured, list) and configured:
         return [str(value) for value in configured]
-    reader = _require_mapping(split.get("reader", {}), "data split reader")
-    partition = _require_mapping(reader.get("partition"), "data split reader.partition")
-    base = str(partition.get("base_dir", "")).rstrip("/")
-    start_raw = str(partition.get("start_hour", ""))
-    end_raw = str(partition.get("end_hour", ""))
+    reader = split.get("reader", {})
+    if not isinstance(reader, Mapping):
+        return []
+    partition = reader.get("partition")
+    if not isinstance(partition, Mapping):
+        return []
+    base = str(partition.get("base_dir", "") or "").rstrip("/")
+    start_raw = str(partition.get("start_hour", "") or "").strip()
+    end_raw = str(partition.get("end_hour", "") or "").strip()
+    # Default leave empty: callers may pass --train-input/--test-input later.
+    if not start_raw and not end_raw:
+        return []
     if not base or not start_raw or not end_raw:
         raise ValueError(
             "sample split needs inputs or reader.partition.{base_dir,start_hour,end_hour}"
@@ -1068,7 +1079,7 @@ def _adapter_options(
     sample_features: Sequence[Mapping[str, Any]],
     bag_fields: set[str],
     scene_ids: Sequence[int] | None,
-    label_missing_values: Mapping[str, Sequence[Any]] | None = None,
+    sequence_max_lengths: Mapping[str, int],
 ) -> dict[str, Any]:
     context = [str(item["source"]) for item in sample_features[:CONTEXT_FEATURE_COUNT]]
     items = [str(item["source"]) for item in sample_features[CONTEXT_FEATURE_COUNT:]]
@@ -1085,20 +1096,9 @@ def _adapter_options(
         "request_columns": ["scene_id", "search_id", "impr_time"],
         "integer_request_columns": ["scene_id", "impr_time"],
         "labels": dict(EXPECTED_LABELS),
-        "label_masks": dict(LABEL_MASKS),
-        # The report may prove task-specific -1 missing encodings. Null remains
-        # accepted for every task because it cannot be a binary target.
-        "label_missing_values": (
-            {task: list(values) for task, values in label_missing_values.items()}
-            if label_missing_values is not None
-            else [None]
-        ),
+        "sequence_max_lengths": dict(sequence_max_lengths),
         "candidate_position_column": "candidate_position",
         "candidate_metadata_columns": ["example_ids"],
-        "column_aliases": {
-            canonical: list(aliases)
-            for canonical, aliases in FIELD_ALIASES.items()
-        },
         "request_time_column": "impr_time",
         "time_delta_outputs": {
             name: f"{name}_x_{TIME_DELTA_FIELD}" for name in EXPECTED_UPS_TYPES
@@ -1112,27 +1112,6 @@ def _adapter_options(
     return options
 
 
-def _profile_label_missing_values(
-    report: Mapping[str, Any],
-) -> dict[str, list[Any]] | None:
-    contract = report.get("contract")
-    if not isinstance(contract, Mapping):
-        return None
-    distributions = contract.get("label_distribution")
-    if not isinstance(distributions, Mapping):
-        return None
-    result: dict[str, list[Any]] = {}
-    for task in EXPECTED_LABELS:
-        counts = distributions.get(task)
-        if not isinstance(counts, Mapping):
-            return None
-        values: list[Any] = [None]
-        if counts.get("minus_one", 0):
-            values.append(-1)
-        result[task] = values
-    return result
-
-
 def _reader_config(*, training: bool) -> dict[str, Any]:
     result = {
         "engine": "pyarrow_dataset",
@@ -1143,7 +1122,8 @@ def _reader_config(*, training: bool) -> dict[str, Any]:
         "scanner_batch_rows": 64,
         "pin_memory": True,
         "shard_unit": "row_group",
-        "validate_prehashed_nonzero": True,
+        "validate_prehashed_nonzero": False,
+        "trusted_input": True,
     }
     if training:
         result.update({"shuffle_buffer_rows": 8192, "shuffle_seed": 2025})
@@ -1157,7 +1137,7 @@ def _split_config(
     *,
     training: bool,
 ) -> dict[str, Any]:
-    alias_targets = set(FIELD_ALIASES)
+    optional_feature_columns = set(OPTIONAL_FEATURE_COLUMNS)
     mandatory_columns = list(
         dict.fromkeys(
             [
@@ -1165,7 +1145,7 @@ def _split_config(
                 *(
                     source
                     for source in adapter_options["item_features"]
-                    if source not in alias_targets
+                    if source not in optional_feature_columns
                 ),
                 *sequence_input_columns,
                 *adapter_options["request_columns"],
@@ -1176,11 +1156,7 @@ def _split_config(
     optional_columns = [
         "context_indices",
         "target_indices",
-        *(
-            name
-            for canonical, aliases in FIELD_ALIASES.items()
-            for name in (canonical, *aliases)
-        ),
+        *OPTIONAL_FEATURE_COLUMNS,
         *(
             f"{ups_type}_x_indices"
             for ups_type in adapter_options["ups_types"]
@@ -1194,7 +1170,6 @@ def _split_config(
         "request_id": "search_id",
         "group_id": "search_id",
         "labels": dict(EXPECTED_LABELS),
-        "label_masks": dict(LABEL_MASKS),
         "reader": _reader_config(training=training),
         "adapter": {
             "callable": "src.dataloader:adapt_mdl_rankmixer_parquet",
@@ -1537,7 +1512,9 @@ def build_config(
 
     data_payload = _require_mapping(sample.get("data"), "sample.data")
     sample_train = _require_mapping(data_payload.get("train"), "sample.data.train")
-    resolved_train_inputs = list(train_inputs) if train_inputs else _partition_inputs(sample_train)
+    resolved_train_inputs = (
+        list(train_inputs) if train_inputs else _partition_inputs(sample_train)
+    )
     sample_test = data_payload.get("test")
     if test_inputs:
         resolved_test_inputs = list(test_inputs)
@@ -1550,7 +1527,10 @@ def build_config(
         raw_features,
         bag_fields,
         None if auto_discover_scenes else scene_ids,
-        _profile_label_missing_values(report),
+        {
+            str(sequence["name"]): int(sequence["max_length"])
+            for sequence in main_sequences
+        },
     )
     derived_time_columns = set(adapter_options["time_delta_outputs"].values())
     sequence_input_columns = list(
@@ -1585,6 +1565,14 @@ def build_config(
     if resolved_test_inputs:
         data["test"] = _split_config(
             resolved_test_inputs,
+            adapter_options,
+            sequence_input_columns,
+            training=False,
+        )
+    elif isinstance(sample_test, Mapping):
+        # Keep a test split shell even when hour windows / inputs are left empty.
+        data["test"] = _split_config(
+            [],
             adapter_options,
             sequence_input_columns,
             training=False,
@@ -1766,7 +1754,14 @@ def build_config(
             "sparse_parameter_server_adapter": None,
             "dense_clip_norm": 1.0,
             "sparse_clip_norm": 1.0,
-            "loss_reduction": "sum",
+            "loss_reduction": "mean_per_task",
+            "quick_eval": {
+                "enabled": True,
+                "every_steps": 1000,
+                "max_batches": 20,
+                "split": "train",
+                "auc_bins": 4096,
+            },
             "checkpoint_path": f"artifacts/checkpoints/{model_name}.pt",
         },
     }

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-CONFIG="${1:-configs/mdl_perf.yaml}"
+CONFIG="${1:-configs/reference/mdl_perf.yaml}"
 OUTPUT_DIR="${2:-artifacts/benchmarks/$(basename "${CONFIG%.yaml}")}"
 GPU_COUNTS="${GPU_COUNTS:-1 2 4 8}"
 MODES="${MODES:-data embedding compute end-to-end}"

@@ -1,0 +1,71 @@
+# LONGER main-method profile. The paper illustrates newest-to-oldest physical
+# order with j>=i masking; the model canonicalizes this to oldest-to-newest and
+# uses the equivalent key_position<=query_position mask internally.
+extends: default.yaml
+
+data:
+  train:
+    reader:
+      scanner_batch_rows: 256
+      max_prefetch_bytes: 536870912
+  test:
+    reader:
+      scanner_batch_rows: 256
+      max_prefetch_bytes: 536870912
+
+sequences:
+  - name: hist
+    embedding_scope: feature
+    max_length: 2000
+    # head keeps the most recent events when the physical source is newest first.
+    truncation: head
+    sequence_order: newest_to_oldest
+    encoder: longer
+    rankmixer_summary_tokens: 3
+    longer_token_merge: 8
+    longer_inner_layers: 1
+    time_delta_field: time_delta
+    target_inputs: [item_id]
+    longer_user_global_inputs: [user_id]
+    longer_user_global_tokens: 1
+    longer_cls_tokens: 1
+    longer_candidate_global_tokens: 1
+    longer_query_tokens: 100
+    # Cross layer + one self layer matches the paper's common two-layer scaling
+    # setup; N is otherwise presented as scalable rather than fixed.
+    longer_self_layers: 1
+    fields:
+      - name: item_id
+        kind: categorical
+        source: hist_item_id
+      - name: shop_id
+        kind: categorical
+        source: hist_shop_id
+      - name: action
+        kind: categorical
+        source: hist_action
+      - name: age
+        kind: dense
+        source: hist_age
+      - name: time_delta
+        kind: dense
+        source: hist_time_delta
+
+model:
+  name: longer
+  token_dim: 32
+  num_layers: 2
+  num_heads: 4       # implementation choice; paper head count is undisclosed
+  hidden_dim: 64     # implementation choice; paper FFN width is undisclosed
+  ffn_activation: gelu  # implementation choice; input/FFN activation is undisclosed
+
+training:
+  # LONGER specifies BCE but does not publish optimizer, LR, or schedule.
+  loss_reduction: sum
+  lr_dense: 0.005
+  dense_optimizer: rmsprop
+  sparse_optimizer: adagrad
+  lr_schedule: constant
+  lr_warmup_steps: 0
+  lr_decay_steps: null
+  lr_min_ratio: 0.0

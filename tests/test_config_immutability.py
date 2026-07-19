@@ -36,7 +36,7 @@ class ConfigImmutabilityTest(unittest.TestCase):
 
     def test_loaded_and_resolved_configs_are_deeply_immutable(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "default.yaml")
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
         resolved = config.resolved
 
         self._assert_no_mutable_containers(config)

@@ -1282,6 +1282,7 @@ def _benchmark_end_to_end(
         save_checkpoint=False,
         log_steps=False,
         step_observer=collector.observe,
+        run_quick_eval=False,
     )
     profiler = _profile_callable(
         lambda: train_mdl(
@@ -1289,6 +1290,7 @@ def _benchmark_end_to_end(
             max_steps=1,
             save_checkpoint=False,
             log_steps=False,
+            run_quick_eval=False,
         ),
         context.device,
         options.profile_steps,

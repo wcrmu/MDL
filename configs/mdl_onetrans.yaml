@@ -18,20 +18,13 @@ runtime:
 data:
   train:
     format: adapter_parquet
-    inputs:
-    - hdfs://temu-data-ns/apps/nothive/warehouse/searchrec/searchrec_cvr_allscene_agg_fgoutput_hour_dracarys_exp/pt=2026-07-10/hr=00
-    - hdfs://temu-data-ns/apps/nothive/warehouse/searchrec/searchrec_cvr_allscene_agg_fgoutput_hour_dracarys_exp/pt=2026-07-10/hr=01
-    - hdfs://temu-data-ns/apps/nothive/warehouse/searchrec/searchrec_cvr_allscene_agg_fgoutput_hour_dracarys_exp/pt=2026-07-10/hr=02
+    inputs: []
     request_id: search_id
     group_id: search_id
     labels:
       fst_cart: label_fst_cart
       upid_pay: upid_fst_trgt_noc_clk_pay_24h
       cateid_filter: cateid_is_fst_scene_sp_filter
-    label_masks:
-      fst_cart: label_fst_cart__valid
-      upid_pay: upid_fst_trgt_noc_clk_pay_24h__valid
-      cateid_filter: cateid_is_fst_scene_sp_filter__valid
     reader:
       engine: pyarrow_dataset
       columns_pruning: true
@@ -46,7 +39,8 @@ data:
       coalesce_pinned_tensors: true
       device_prefetch_batches: 2
       deduplicate_request_features: true
-      validate_prehashed_nonzero: true
+      validate_prehashed_nonzero: false
+      trusted_input: true
       shuffle_buffer_rows: 8192
       shuffle_seed: 2025
       length_bucket_metric: sum
@@ -347,7 +341,6 @@ data:
       - context_indices
       - target_indices
       - f_goods_view_times_tg_l1_hn
-      - f_goods_view_times_tg_11_hn
       - impr_x_indices
       - clk_long_x_indices
       - view_long_x_indices
@@ -611,18 +604,19 @@ data:
           fst_cart: label_fst_cart
           upid_pay: upid_fst_trgt_noc_clk_pay_24h
           cateid_filter: cateid_is_fst_scene_sp_filter
-        label_masks:
-          fst_cart: label_fst_cart__valid
-          upid_pay: upid_fst_trgt_noc_clk_pay_24h__valid
-          cateid_filter: cateid_is_fst_scene_sp_filter__valid
-        label_missing_values:
-        - null
+        sequence_max_lengths:
+          impr: 256
+          clk_long: 512
+          view_long: 512
+          cart_long: 192
+          buy_long: 128
+          semi_clk: 64
+          srch_q2i: 100
+          ups_clk_sku: 128
+          flatten_query_hash: 156
         candidate_position_column: candidate_position
         candidate_metadata_columns:
         - example_ids
-        column_aliases:
-          f_goods_view_times_tg_l1_hn:
-          - f_goods_view_times_tg_11_hn
         request_time_column: impr_time
         time_delta_outputs:
           impr: impr_x_time_delta_log1p_seconds
@@ -642,18 +636,13 @@ data:
     validate_before_train: true
   test:
     format: adapter_parquet
-    inputs:
-    - hdfs://temu-data-ns/apps/nothive/warehouse/searchrec/searchrec_cvr_allscene_agg_fgoutput_hour_dracarys_exp/pt=2026-07-10/hr=04
+    inputs: []
     request_id: search_id
     group_id: search_id
     labels:
       fst_cart: label_fst_cart
       upid_pay: upid_fst_trgt_noc_clk_pay_24h
       cateid_filter: cateid_is_fst_scene_sp_filter
-    label_masks:
-      fst_cart: label_fst_cart__valid
-      upid_pay: upid_fst_trgt_noc_clk_pay_24h__valid
-      cateid_filter: cateid_is_fst_scene_sp_filter__valid
     prediction_keys:
       search_id: search_id
       candidate_position: candidate_position
@@ -674,7 +663,8 @@ data:
       coalesce_pinned_tensors: true
       device_prefetch_batches: 2
       deduplicate_request_features: true
-      validate_prehashed_nonzero: true
+      validate_prehashed_nonzero: false
+      trusted_input: true
       length_bucket_metric: sum
       length_buckets:
       - max_length: 512
@@ -974,7 +964,6 @@ data:
       - target_indices
       - example_ids
       - f_goods_view_times_tg_l1_hn
-      - f_goods_view_times_tg_11_hn
       - impr_x_indices
       - clk_long_x_indices
       - view_long_x_indices
@@ -1238,18 +1227,19 @@ data:
           fst_cart: label_fst_cart
           upid_pay: upid_fst_trgt_noc_clk_pay_24h
           cateid_filter: cateid_is_fst_scene_sp_filter
-        label_masks:
-          fst_cart: label_fst_cart__valid
-          upid_pay: upid_fst_trgt_noc_clk_pay_24h__valid
-          cateid_filter: cateid_is_fst_scene_sp_filter__valid
-        label_missing_values:
-        - null
+        sequence_max_lengths:
+          impr: 256
+          clk_long: 512
+          view_long: 512
+          cart_long: 192
+          buy_long: 128
+          semi_clk: 64
+          srch_q2i: 100
+          ups_clk_sku: 128
+          flatten_query_hash: 156
         candidate_position_column: candidate_position
         candidate_metadata_columns:
         - example_ids
-        column_aliases:
-          f_goods_view_times_tg_l1_hn:
-          - f_goods_view_times_tg_11_hn
         request_time_column: impr_time
         time_delta_outputs:
           impr: impr_x_time_delta_log1p_seconds
@@ -4417,9 +4407,15 @@ training:
   sparse_parameter_server_adapter: null
   dense_clip_norm: 1.0
   sparse_clip_norm: 1.0
-  loss_reduction: sum
+  loss_reduction: mean_per_task
   checkpoint_path: artifacts/checkpoints/mdl_onetrans.pt
   embedding_weight_dtype: bf16
   embedding_collect_stats: false
   embedding_validate_indices: false
   log_every_steps: 100
+  quick_eval:
+    enabled: true
+    every_steps: 1000
+    max_batches: 20
+    split: train
+    auc_bins: 4096

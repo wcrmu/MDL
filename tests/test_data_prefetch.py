@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import threading
 import time
@@ -26,9 +27,12 @@ from src.dataloader import (
     _ByteBudget,
     _coalesce_feature_batch,
     _eager_schema_validation_refs,
+    _iter_adapted_flat_tables,
     _request_deduplication_plan,
     _scan_columns_for_split,
+    _validate_flat_table_contract,
     move_feature_batch,
+    table_to_feature_batch,
 )
 from src.train import (
     _estimate_prepared_batch_bytes,
@@ -41,7 +45,7 @@ from src.train import (
 class LengthBucketTest(unittest.TestCase):
     def test_streaming_shuffle_is_deterministic_and_preserves_exact_coverage(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "default.yaml")
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
         train_split = replace(
             config.data.train,
             reader=replace(
@@ -83,9 +87,62 @@ class LengthBucketTest(unittest.TestCase):
         self.assertNotEqual(first, list(range(10)))
         self.assertNotEqual(first, shuffled(rank=1))
 
+    def test_request_shuffle_keeps_candidates_grouped_and_ordered(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
+        train_split = replace(
+            config.data.train,
+            reader=replace(
+                config.data.train.reader,
+                deduplicate_request_features=True,
+                shuffle_buffer_rows=4,
+                shuffle_seed=23,
+            ),
+        )
+        config = replace(config, data=replace(config.data, train=train_split))
+        tables = [
+            pa.table(
+                {
+                    "request_id": ["a", "b", "a", "b"],
+                    "candidate": [0, 0, 1, 1],
+                    "row_id": [0, 1, 2, 3],
+                }
+            ),
+            pa.table(
+                {
+                    "request_id": ["c", "c", "d"],
+                    "candidate": [0, 1, 0],
+                    "row_id": [4, 5, 6],
+                }
+            ),
+        ]
+
+        def shuffled() -> list[pa.Table]:
+            with patch("src.train.iter_candidate_tables", return_value=iter(tables)):
+                return list(
+                    _iter_shuffled_candidate_tables(config, "train", 0, 1, True)
+                )
+
+        first = shuffled()
+        second = shuffled()
+        self.assertEqual(
+            [table["row_id"].to_pylist() for table in first],
+            [table["row_id"].to_pylist() for table in second],
+        )
+        self.assertEqual(
+            sorted(value for table in first for value in table["row_id"].to_pylist()),
+            list(range(7)),
+        )
+        for table in first:
+            self.assertEqual(len(set(table["request_id"].to_pylist())), 1)
+            self.assertEqual(
+                table["candidate"].to_pylist(),
+                sorted(table["candidate"].to_pylist()),
+            )
+
     def test_rows_are_vectorized_into_configured_length_buckets(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "default.yaml")
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
         buckets = (
             LengthBucketConfig(max_length=128, batch_size=2),
             LengthBucketConfig(max_length=256, batch_size=2),
@@ -127,7 +184,7 @@ class LengthBucketTest(unittest.TestCase):
 
     def test_sum_metric_counts_work_across_sequences(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "default.yaml")
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
         first = config.sequences[0]
         second = replace(first, name="second", fields=first.fields)
         config = replace(config, sequences=(first, second))
@@ -140,8 +197,112 @@ class LengthBucketTest(unittest.TestCase):
         self.assertEqual(maximum.tolist(), [2, 1])
         self.assertEqual(summed.tolist(), [4, 2])
 
+    def test_request_bucket_computes_shared_length_once_and_does_not_split(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
+        buckets = (
+            LengthBucketConfig(max_length=128, batch_size=3),
+            LengthBucketConfig(max_length=None, batch_size=3),
+        )
+        train_split = replace(
+            config.data.train,
+            reader=replace(
+                config.data.train.reader,
+                deduplicate_request_features=True,
+                shuffle_buffer_rows=0,
+                length_buckets=buckets,
+            ),
+        )
+        config = replace(
+            config,
+            data=replace(config.data, train=train_split),
+            sequences=(replace(config.sequences[0], max_length=1000),),
+        )
+        source = config.sequences[0].fields[0].source
+        table = pa.table(
+            {
+                "request_id": ["r0", "r1", "r0", "r1", "r2"],
+                "row_id": [0, 1, 2, 3, 4],
+                source: [
+                    list(range(10)),
+                    list(range(130)),
+                    list(range(10)),
+                    list(range(130)),
+                    list(range(20)),
+                ],
+            }
+        )
+
+        with patch("src.train.iter_candidate_tables", return_value=iter([table])), patch(
+            "src.train._table_effective_sequence_lengths",
+            wraps=_table_effective_sequence_lengths,
+        ) as lengths:
+            batches = list(_iter_batch_tables(config, "train", 0, 1))
+
+        self.assertEqual(
+            [batch["row_id"].to_pylist() for batch in batches],
+            [[0, 2, 4], [1, 3]],
+        )
+        self.assertTrue(lengths.call_args_list)
+        self.assertTrue(
+            all(call.args[1].num_rows == 1 for call in lengths.call_args_list)
+        )
+
 
 class EagerSchemaValidationTest(unittest.TestCase):
+    def test_full_flat_contract_is_validated_only_on_the_first_nonempty_batch(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
+        tables = [pa.table({"value": [1]}), pa.table({"value": [2]})]
+        scanner = SimpleNamespace(
+            split=config.data.train,
+            iter_tables=lambda: iter(tables),
+        )
+        context = SimpleNamespace()
+
+        with patch("src.dataloader._validate_flat_table_contract") as validate:
+            actual = list(
+                _iter_adapted_flat_tables(
+                    config,
+                    "train",
+                    scanner,
+                    "identity",
+                    lambda table, *, context: table,
+                    context,
+                    ["value"],
+                )
+            )
+
+        self.assertEqual([table["value"].to_pylist() for table in actual], [[1], [2]])
+        validate.assert_called_once()
+
+    def test_trusted_input_validates_only_one_flat_row(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
+        split = replace(
+            config.data.train,
+            reader=replace(config.data.train.reader, trusted_input=True),
+        )
+        tables = [pa.table({"value": [1, 2, 3]}), pa.table({"value": [4, 5]})]
+        scanner = SimpleNamespace(split=split, iter_tables=lambda: iter(tables))
+
+        with patch("src.dataloader._validate_flat_table_contract") as validate:
+            actual = list(
+                _iter_adapted_flat_tables(
+                    config,
+                    "train",
+                    scanner,
+                    "identity",
+                    lambda table, *, context: table,
+                    SimpleNamespace(),
+                    ["value"],
+                )
+            )
+
+        self.assertEqual([table.num_rows for table in actual], [3, 2])
+        validate.assert_called_once()
+        self.assertEqual(validate.call_args.args[3].num_rows, 1)
+
     def test_row_group_sharding_covers_rows_exactly_once_across_eight_ranks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             expected = list(range(24))
@@ -260,7 +421,7 @@ class RequestDeduplicationTest(unittest.TestCase):
     def test_stably_selects_one_row_per_request(self) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(
-            root / "configs" / "rankmixer_a100_8x80g.yaml"
+            root / "configs" / "rankmixer.yaml"
         )
         split = replace(
             config.data.train,
@@ -280,6 +441,49 @@ class RequestDeduplicationTest(unittest.TestCase):
 
         self.assertEqual(selected["value"].to_pylist(), [10, 20, 30])
         self.assertEqual(row_indices.tolist(), [0, 0, 1, 0, 2])
+
+
+class CompleteLabelTest(unittest.TestCase):
+    def test_first_batch_contract_rejects_non_binary_complete_labels(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        base = load_app_config(root / "configs" / "reference" / "default.yaml")
+        split = replace(
+            base.data.train,
+            labels={"click": "click"},
+            label_masks={},
+        )
+        config = replace(base, features=(), sequences=())
+
+        with self.assertRaisesRegex(ValueError, "must contain only 0/1"):
+            _validate_flat_table_contract(
+                config,
+                split,
+                "train",
+                pa.table({"click": [0, 2]}),
+                ["click"],
+            )
+
+    def test_complete_labels_do_not_allocate_an_all_ones_mask(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        base = load_app_config(root / "configs" / "reference" / "default.yaml")
+        split = replace(
+            base.data.train,
+            labels={"click": "click"},
+            label_masks={},
+            request_id=None,
+            group_id=None,
+        )
+        config = replace(base, features=(), sequences=())
+
+        batch = table_to_feature_batch(
+            config,
+            pa.table({"click": [0, 1]}),
+            {},
+            split=split,
+        )
+
+        self.assertEqual(batch.labels.tolist(), [[0.0], [1.0]])
+        self.assertIsNone(batch.label_mask)
 
 
 class CoalescedBatchTest(unittest.TestCase):
@@ -316,7 +520,7 @@ class ByteBudgetTest(unittest.TestCase):
     def test_prepared_batch_estimate_supports_dictionary_encoded_list_bags(self) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(
-            root / "configs" / "rankmixer_a100_8x80g.yaml"
+            root / "configs" / "rankmixer.yaml"
         )
         feature = next(
             item

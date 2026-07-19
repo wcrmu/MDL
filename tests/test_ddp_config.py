@@ -8,10 +8,35 @@ import torch
 from torch import nn
 
 from src.config import DDPConfig
+from src.main import _cmd_evaluate, build_arg_parser
 from src.train import DistributedContext, _maybe_compile_model, _prepare_forward_model
 
 
 class DDPConfigTest(unittest.TestCase):
+    def test_evaluate_uses_the_ddp_launcher(self) -> None:
+        args = build_arg_parser().parse_args(
+            [
+                "evaluate",
+                "--config",
+                "production.yaml",
+                "--distributed",
+                "ddp",
+                "--nproc-per-node",
+                "8",
+            ]
+        )
+        config = SimpleNamespace(runtime=SimpleNamespace(distributed="none"))
+        with patch("src.main._load_config", return_value=config), patch(
+            "src.main._in_distributed_launcher", return_value=False
+        ), patch("src.main._launch_ddp_command", return_value=7) as launch, patch(
+            "src.main.evaluate_mdl"
+        ) as evaluate:
+            result = _cmd_evaluate(args)
+
+        self.assertEqual(result, 7)
+        launch.assert_called_once_with(args, config)
+        evaluate.assert_not_called()
+
     def test_safe_default_is_dynamic_with_unused_detection(self) -> None:
         config = DDPConfig()
         config.validate()

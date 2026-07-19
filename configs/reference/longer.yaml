@@ -1,0 +1,5 @@
+# End-to-end LONGER architecture smoke profile over the configured hist sequence.
+extends: default.yaml
+
+model:
+  name: longer

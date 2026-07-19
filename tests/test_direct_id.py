@@ -351,6 +351,48 @@ class SequenceDirectIdTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "offsets"):
             _tensorize_multi_field_sequence(config, sequence, table, {})
 
+    def test_trusted_sequence_skips_repeated_offset_comparison(self) -> None:
+        categorical = _identity_input(
+            "hist.item_id",
+            "hist_item",
+            sequence_name="hist",
+            field_name="item_id",
+        )
+        config = _config([categorical])
+        sequence = SequenceConfig(
+            name="hist",
+            fields=[
+                SequenceFieldConfig(
+                    name="item_id", kind="categorical", source="hist_item"
+                ),
+                SequenceFieldConfig(name="age", kind="dense", source="hist_age"),
+            ],
+        )
+        table = pa.table(
+            {
+                "hist_item": [[1, 2], [3]],
+                "hist_age": [[0.1, 0.2], [0.3]],
+            }
+        )
+
+        with patch(
+            "src.dataloader.torch.equal",
+            side_effect=AssertionError("trusted path compared sequence offsets"),
+        ):
+            actual = _tensorize_multi_field_sequence(
+                config,
+                sequence,
+                table,
+                {},
+                validate_sequence_alignment=False,
+            )
+
+        torch.testing.assert_close(actual["lengths"], torch.tensor([2, 1]))
+        torch.testing.assert_close(
+            actual["fields"]["age"],
+            torch.tensor([[0.1, 0.2], [0.3, 0.0]]),
+        )
+
     def test_shared_sequence_namespace_uses_identity_offsets_path(self) -> None:
         root = _identity_input("item_id", "item", num_buckets=16)
         alias = ResolvedCategoricalInput(

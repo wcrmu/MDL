@@ -238,17 +238,35 @@ def _distributed_rank_world(
     )
 
 
-def _exchange_counts(
-    send_splits: tuple[int, ...],
-    device: torch.device,
+def _exchange_and_host_splits(
+    send_splits_tensor: Tensor,
     process_group: torch_dist.ProcessGroup | None,
-) -> tuple[int, ...]:
-    if len(send_splits) == 1:
-        return send_splits
-    send = torch.tensor(send_splits, dtype=torch.long, device=device)
-    received = torch.empty_like(send)
-    torch_dist.all_to_all_single(received, send, group=process_group)
-    return tuple(int(value) for value in received.cpu().tolist())
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Exchange all-to-all counts and read send+recv splits with ONE host sync.
+
+    ``all_to_all_single`` requires Python ``int`` split sizes and the counts are
+    data dependent (they follow the unique IDs present in the batch), so a
+    single device->host copy per lookup is unavoidable. Previously the forward
+    path synced twice: once to read ``send_splits`` and once to read the
+    exchanged ``recv_splits``. Exchanging on-device and copying both split
+    vectors in a single stacked transfer halves the per-lookup GPU
+    synchronizations while producing identical Python split tuples.
+    """
+
+    world_size = int(send_splits_tensor.numel())
+    if world_size == 1:
+        send = (int(send_splits_tensor[0].item()),)
+        return send, send
+    recv_splits_tensor = torch.empty_like(send_splits_tensor)
+    torch_dist.all_to_all_single(
+        recv_splits_tensor, send_splits_tensor, group=process_group
+    )
+    both = torch.stack((send_splits_tensor, recv_splits_tensor)).to(
+        device="cpu"
+    )
+    send = tuple(int(value) for value in both[0].tolist())
+    recv = tuple(int(value) for value in both[1].tolist())
+    return send, recv
 
 
 def _all_to_all_variable(
@@ -324,14 +342,13 @@ class _ShardedEmbeddingLookup(torch.autograd.Function):
         send_order = torch.argsort(owners, stable=True)
         sorted_ids = requester_ids.index_select(0, send_order)
         send_splits_tensor = torch.bincount(owners, minlength=world_size)
-        send_splits = tuple(int(value) for value in send_splits_tensor.cpu().tolist())
 
         communication_started = perf_counter()
         with torch.profiler.record_function(
             f"sharded_embedding::{table_name}::forward_all_to_all"
         ):
-            recv_splits = _exchange_counts(
-                send_splits, indices.device, process_group
+            send_splits, recv_splits = _exchange_and_host_splits(
+                send_splits_tensor, process_group
             )
             received_ids = _all_to_all_variable(
                 sorted_ids, send_splits, recv_splits, process_group
@@ -691,14 +708,13 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
         send_order = torch.argsort(requester_owners, stable=True)
         sorted_keys = requester_keys.index_select(0, send_order)
         send_splits_tensor = torch.bincount(requester_owners, minlength=world_size)
-        send_splits = tuple(int(value) for value in send_splits_tensor.cpu().tolist())
 
         communication_started = perf_counter()
         with torch.profiler.record_function(
             f"sharded_embedding_group::{embedding_dim}::forward_all_to_all"
         ):
-            recv_splits = _exchange_counts(
-                send_splits, packed_indices.device, metadata.process_group
+            send_splits, recv_splits = _exchange_and_host_splits(
+                send_splits_tensor, metadata.process_group
             )
             received_keys = _all_to_all_variable(
                 sorted_keys, send_splits, recv_splits, metadata.process_group

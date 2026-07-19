@@ -36,9 +36,6 @@ MASK64 = (1 << 64) - 1
 # have to be repeated merely to diagnose that a strict collision target is
 # incompatible with the available embedding-memory budget.
 DEFAULT_BUCKETS = tuple(1 << exponent for exponent in range(10, 37))
-KNOWN_SOURCE_ALIASES = {
-    "f_goods_view_times_tg_l1_hn": ("f_goods_view_times_tg_11_hn",),
-}
 DEFAULT_SKU_FIELDS = (
     "sku_id_hn",
     "sku_price_v2_hn",
@@ -1012,18 +1009,8 @@ def profile_paths(
         schema_names = set(dataset.schema.names)
         canonical_to_physical: dict[str, str] = {}
         for source in set(spec.all_sources) | required_contract_columns:
-            candidates = [
-                name
-                for name in (source, *KNOWN_SOURCE_ALIASES.get(source, ()))
-                if name in schema_names
-            ]
-            if len(candidates) > 1:
-                raise ValueError(
-                    f"input {input_uri!r} contains multiple physical columns for "
-                    f"{source!r}: {candidates}"
-                )
-            if candidates:
-                canonical_to_physical[source] = candidates[0]
+            if source in schema_names:
+                canonical_to_physical[source] = source
         is_agg_schema = {
             "context_indices",
             "target_indices",

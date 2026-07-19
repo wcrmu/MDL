@@ -3,10 +3,12 @@ from __future__ import annotations
 import math
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import pyarrow as pa
 
 from src.dataloader import (
+    _adapter_table_to_python,
     _column_array,
     _normalized_list_array,
     _select_sequence,
@@ -59,6 +61,52 @@ REQUIRED = [
 
 
 class MDLRankMixerParquetAdapterTest(unittest.TestCase):
+    def test_trusted_adapter_validates_one_raw_row_then_uses_fast_path(self) -> None:
+        one_row = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[1, 2]],
+                "item_scalar_hn": [[[201]]],
+                "sku_a_hn": [[[11]]],
+                "sku_b_hn": [[[21]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "scene_id": [7],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": [[0]],
+                "label_b": [[1]],
+                "label_c": [[0]],
+            }
+        )
+        table = pa.concat_tables([one_row, one_row])
+        context = _context(REQUIRED)
+        context.trusted_input = True
+        context._runtime_cache = {}
+
+        with patch(
+            "src.dataloader._adapter_table_to_python",
+            wraps=_adapter_table_to_python,
+        ) as convert:
+            adapt(table, context=context)
+            self.assertEqual(
+                [
+                    (call.args[0].num_rows, call.kwargs["validate_contract"])
+                    for call in convert.call_args_list
+                ],
+                [(1, True), (2, False)],
+            )
+
+            convert.reset_mock()
+            adapt(table, context=context)
+            self.assertEqual(
+                [
+                    (call.args[0].num_rows, call.kwargs["validate_contract"])
+                    for call in convert.call_args_list
+                ],
+                [(2, False)],
+            )
+
     def test_rejects_unknown_membership_and_non_monotonic_event_time(self) -> None:
         with self.assertRaisesRegex(ValueError, "requests without context"):
             _sequence_membership_positions(
@@ -358,6 +406,34 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         for row in transformed:
             self.assertAlmostEqual(row[0], math.log1p(0.1))
             self.assertAlmostEqual(row[1], math.log1p(1.0))
+
+    def test_req_truncates_before_time_delta_and_ignores_discarded_history(self) -> None:
+        table = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[1, 2]],
+                "item_scalar_hn": [[[201]]],
+                "sku_a_hn": [[[11]]],
+                "sku_b_hn": [[[21]]],
+                "impr_x_goods_id_hn": [[-1, -2, -3, -4]],
+                # The discarded suffix violates both temporal contracts. It
+                # must never be inspected or transformed after head truncation.
+                "impr_x_time": [[4900, 4000, 4500, 6000]],
+                "scene_id": [7],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": [[0]],
+                "label_b": [[1]],
+                "label_c": [[0]],
+            }
+        )
+        context = _context(REQUIRED)
+        context.options["sequence_max_lengths"] = {"impr": 2}
+
+        actual = adapt(table, context=context).to_pydict()
+
+        self.assertEqual(actual["impr_x_goods_id_hn"], [[-1, -2]])
+        self.assertEqual(actual["impr_x_time_delta_ms"], [[100.0, 1000.0]])
 
     def test_req_accepts_optional_single_request_axis_on_context(self) -> None:
         table = pa.table(

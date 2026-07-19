@@ -113,9 +113,8 @@ class PreHashedParquetProfileTest(unittest.TestCase):
         self.assertEqual(report["contract"]["req_rows"], 1)
         self.assertEqual(report["contract"]["label_distribution"]["task"]["total"], 0)
 
-    def test_known_field_alias_is_canonicalized_and_ambiguity_is_rejected(self) -> None:
+    def test_configured_field_name_is_profiled_exactly(self) -> None:
         canonical = "f_goods_view_times_tg_l1_hn"
-        alternate = "f_goods_view_times_tg_11_hn"
         spec = ProfileSpec(
             all_sources=(canonical,),
             categorical_sources=(canonical,),
@@ -131,19 +130,19 @@ class PreHashedParquetProfileTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            alias_path = root / "alias.parquet"
+            path = root / "canonical.parquet"
             pq.write_table(
                 pa.table(
                     {
-                        alternate: [[[-7]]],
+                        canonical: [[[-7]]],
                         "scene_id": [3],
                         "impr_time": [5000],
                     }
                 ),
-                alias_path,
+                path,
             )
             report = profile_paths(
-                [str(alias_path)],
+                [str(path)],
                 spec,
                 candidate_buckets=(16,),
                 collision_target=1.0,
@@ -153,35 +152,40 @@ class PreHashedParquetProfileTest(unittest.TestCase):
                 progress=False,
             )
 
-            ambiguous_path = root / "ambiguous.parquet"
+            legacy_typo = canonical.replace("l1", "1" * 2)
+            typo_path = root / "typo.parquet"
             pq.write_table(
                 pa.table(
                     {
-                        canonical: [[[-7]]],
-                        alternate: [[[-8]]],
+                        legacy_typo: [[[-7]]],
                         "scene_id": [3],
                         "impr_time": [5000],
                     }
                 ),
-                ambiguous_path,
+                typo_path,
             )
-            with self.assertRaisesRegex(ValueError, "multiple physical columns"):
-                profile_paths(
-                    [str(ambiguous_path)],
-                    spec,
-                    candidate_buckets=(16,),
-                    collision_target=1.0,
-                    cardinality_headroom=1.0,
-                    sample_size=16,
-                    hll_precision=10,
-                    progress=False,
-                )
+            typo_report = profile_paths(
+                [str(typo_path)],
+                spec,
+                candidate_buckets=(16,),
+                collision_target=1.0,
+                cardinality_headroom=1.0,
+                sample_size=16,
+                hll_precision=10,
+                progress=False,
+            )
 
         self.assertEqual(
-            report["resolved_column_aliases_by_input"][str(alias_path)],
-            {canonical: alternate},
+            report["resolved_column_aliases_by_input"][str(path)],
+            {},
         )
+        self.assertEqual(report["missing_configured_columns_by_input"][str(path)], [])
         self.assertEqual(report["fields"][canonical]["negative_count"], 1)
+        self.assertEqual(
+            typo_report["missing_configured_columns_by_input"][str(typo_path)],
+            [canonical],
+        )
+        self.assertEqual(typo_report["fields"][canonical]["leaf_count"], 0)
 
     def test_nested_null_sign_and_power_of_two_collision_stats(self) -> None:
         profile = FieldProfile(sample_size=32, hll_precision=10)

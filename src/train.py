@@ -22,7 +22,13 @@ import torch.distributed as torch_dist
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel
 
-from .config import AppConfig, DDPConfig, ParquetSplitConfig, ReaderConfig
+from .config import (
+    AppConfig,
+    DDPConfig,
+    ParquetSplitConfig,
+    QuickEvalConfig,
+    ReaderConfig,
+)
 from .checkpoint import load_model_checkpoint, save_model_checkpoint
 from .dataloader import (
     FeatureBatch,
@@ -115,6 +121,13 @@ class EvaluateResult:
     group_metric_name: str | None
     metrics: dict[str, dict[str, float | int | None]]
     auc_histogram_bins: int = 65536
+
+
+@dataclass(frozen=True)
+class QuickEvalResult:
+    rows: int
+    metrics: dict[str, dict[str, float | int | None]]
+    elapsed_seconds: float
 
 
 ExternalTrainAdapter = Callable[..., TrainResult | dict[str, Any]]
@@ -443,6 +456,51 @@ def _shuffle_table(table: object, generator: torch.Generator) -> object:
     return table.take(pa.array(permutation.numpy(), type=pa.int64()))
 
 
+def _request_group_tables(
+    split: ParquetSplitConfig,
+    table: object,
+) -> Iterator[object]:
+    """Yield one table per request while preserving candidate order."""
+
+    if not split.reader.deduplicate_request_features:
+        yield table
+        return
+    if split.request_id is None:
+        raise ValueError("request-grouped batching requires request_id")
+
+    request_ids = _column_array(table, split.request_id).to_pylist()
+    positions_by_request: dict[Any, list[int]] = {}
+    for row_index, request_id in enumerate(request_ids):
+        if request_id is None:
+            raise ValueError(
+                f"request_id column {split.request_id!r} contains null at row {row_index}"
+            )
+        try:
+            positions_by_request.setdefault(request_id, []).append(row_index)
+        except TypeError as error:
+            raise ValueError(
+                f"request_id column {split.request_id!r} must contain hashable scalars"
+            ) from error
+
+    pa, _pc, _ds, _pq = _require_pyarrow()
+    for positions in positions_by_request.values():
+        first = positions[0]
+        if positions == list(range(first, first + len(positions))):
+            yield table.slice(first, len(positions))
+        else:
+            yield table.take(pa.array(positions, type=pa.int64()))
+
+
+def _shuffle_table_groups(
+    tables: list[object],
+    generator: torch.Generator,
+) -> list[object]:
+    if len(tables) <= 1:
+        return tables
+    permutation = torch.randperm(len(tables), generator=generator).tolist()
+    return [tables[index] for index in permutation]
+
+
 def _iter_shuffled_candidate_tables(
     config: AppConfig,
     split_name: str,
@@ -450,41 +508,101 @@ def _iter_shuffled_candidate_tables(
     shard_world_size: int,
     require_labels: bool,
 ) -> Iterator[object]:
-    """Bounded deterministic streaming shuffle with exact row coverage."""
+    """Bounded deterministic shuffle with request groups kept intact."""
 
     reader = _split_reader(config, split_name)
-    source = iter_candidate_tables(
+    split = config.data.train if split_name == "train" else config.data.test
+    if split is None:
+        raise ValueError(f"split {split_name!r} is not configured")
+    candidate_source = iter_candidate_tables(
         config,
         split_name,
         shard_rank=shard_rank,
         shard_world_size=shard_world_size,
         require_labels=require_labels,
     )
+    source = (
+        group
+        for table in candidate_source
+        if table.num_rows
+        for group in _request_group_tables(split, table)
+    )
     if reader.shuffle_buffer_rows == 0:
         yield from source
         return
 
-    pa, _pc, _ds, _pq = _require_pyarrow()
     generator = torch.Generator(device="cpu")
     generator.manual_seed(reader.shuffle_seed + shard_rank)
-    buffered: object | None = None
+    if not reader.deduplicate_request_features:
+        pa, _pc, _ds, _pq = _require_pyarrow()
+        buffered: object | None = None
+        for table in source:
+            combined = (
+                table
+                if buffered is None
+                else pa.concat_tables([buffered, table])
+            )
+            if combined.num_rows <= reader.shuffle_buffer_rows:
+                buffered = combined
+                continue
+            shuffled = _shuffle_table(combined, generator)
+            emitted_rows = shuffled.num_rows - reader.shuffle_buffer_rows
+            yield shuffled.slice(0, emitted_rows)
+            buffered = shuffled.slice(emitted_rows)
+        if buffered is not None and buffered.num_rows:
+            yield _shuffle_table(buffered, generator)
+        return
+
+    buffered_groups: list[object] = []
+    buffered_rows = 0
     for table in source:
-        if table.num_rows == 0:
+        buffered_groups.append(table)
+        buffered_rows += table.num_rows
+        if buffered_rows <= reader.shuffle_buffer_rows:
             continue
-        combined = (
-            table
-            if buffered is None
-            else pa.concat_tables([buffered, table])
-        )
-        if combined.num_rows <= reader.shuffle_buffer_rows:
-            buffered = combined
+        shuffled = _shuffle_table_groups(buffered_groups, generator)
+        emitted: list[object] = []
+        while shuffled and buffered_rows > reader.shuffle_buffer_rows:
+            group = shuffled.pop(0)
+            emitted.append(group)
+            buffered_rows -= group.num_rows
+        yield from emitted
+        buffered_groups = shuffled
+    yield from _shuffle_table_groups(buffered_groups, generator)
+
+
+def _iter_group_preserving_batches(
+    tables: Iterator[object],
+    batch_size: int,
+) -> Iterator[object]:
+    """Pack request groups without splitting unless one group exceeds capacity."""
+
+    pa, _pc, _ds, _pq = _require_pyarrow()
+    buffered: list[object] = []
+    buffered_rows = 0
+    for original in tables:
+        table = original
+        while table.num_rows > batch_size:
+            if buffered_rows:
+                yield pa.concat_tables(buffered)
+                buffered = []
+                buffered_rows = 0
+            yield table.slice(0, batch_size)
+            table = table.slice(batch_size)
+        if not table.num_rows:
             continue
-        shuffled = _shuffle_table(combined, generator)
-        emitted_rows = shuffled.num_rows - reader.shuffle_buffer_rows
-        yield shuffled.slice(0, emitted_rows)
-        buffered = shuffled.slice(emitted_rows)
-    if buffered is not None and buffered.num_rows:
-        yield _shuffle_table(buffered, generator)
+        if buffered_rows and buffered_rows + table.num_rows > batch_size:
+            yield pa.concat_tables(buffered)
+            buffered = []
+            buffered_rows = 0
+        buffered.append(table)
+        buffered_rows += table.num_rows
+        if buffered_rows == batch_size:
+            yield pa.concat_tables(buffered)
+            buffered = []
+            buffered_rows = 0
+    if buffered_rows:
+        yield pa.concat_tables(buffered)
 
 
 def _table_sequence_lengths(config: AppConfig, sequence: Any, table: object) -> Tensor:
@@ -536,15 +654,23 @@ def _iter_length_bucketed_tables(
 
     reader = _split_reader(config, split_name)
     buckets = reader.length_buckets
+    preserve_request_groups = reader.deduplicate_request_features
     if not buckets or not config.sequences:
-        for table in _iter_shuffled_candidate_tables(
+        tables = _iter_shuffled_candidate_tables(
             config,
             split_name,
             shard_rank=shard_rank,
             shard_world_size=shard_world_size,
             require_labels=require_labels,
-        ):
-            yield from _slice_table(table, config.training.batch_size)
+        )
+        if preserve_request_groups:
+            yield from _iter_group_preserving_batches(
+                tables,
+                config.training.batch_size,
+            )
+        else:
+            for table in tables:
+                yield from _slice_table(table, config.training.batch_size)
         return
 
     pa, _pc, _ds, _pq = _require_pyarrow()
@@ -564,6 +690,45 @@ def _iter_length_bucketed_tables(
         shard_world_size=shard_world_size,
         require_labels=require_labels,
     ):
+        if preserve_request_groups:
+            # Context and UPS are identical across one request group. Reading
+            # the first row avoids repeating the same nine sequence lengths for
+            # every candidate.
+            lengths = _table_effective_sequence_lengths(
+                config,
+                table.slice(0, 1),
+                metric=reader.length_bucket_metric,
+            )
+            bucket_index = int(
+                torch.bucketize(lengths, boundaries, right=False).item()
+            )
+            bucket = buckets[bucket_index]
+            remaining = table
+            while remaining.num_rows > bucket.batch_size:
+                if buffered_rows[bucket_index]:
+                    yield pa.concat_tables(buffered[bucket_index])
+                    buffered[bucket_index] = []
+                    buffered_rows[bucket_index] = 0
+                yield remaining.slice(0, bucket.batch_size)
+                remaining = remaining.slice(bucket.batch_size)
+            if not remaining.num_rows:
+                continue
+            if (
+                buffered_rows[bucket_index]
+                and buffered_rows[bucket_index] + remaining.num_rows
+                > bucket.batch_size
+            ):
+                yield pa.concat_tables(buffered[bucket_index])
+                buffered[bucket_index] = []
+                buffered_rows[bucket_index] = 0
+            buffered[bucket_index].append(remaining)
+            buffered_rows[bucket_index] += remaining.num_rows
+            if buffered_rows[bucket_index] == bucket.batch_size:
+                yield pa.concat_tables(buffered[bucket_index])
+                buffered[bucket_index] = []
+                buffered_rows[bucket_index] = 0
+            continue
+
         lengths = _table_effective_sequence_lengths(
             config,
             table,
@@ -834,6 +999,7 @@ def iter_feature_batches(
 
 @dataclass(frozen=True)
 class _DevicePrefetchItem:
+    host_batch: FeatureBatch | None = None
     batch: FeatureBatch | None = None
     ready: torch.cuda.Event | None = None
     error: BaseException | None = None
@@ -914,7 +1080,11 @@ class _DevicePrefetchIterator:
                     ready = torch.cuda.Event()
                     ready.record(transfer_stream)
                 if not self._put(
-                    _DevicePrefetchItem(batch=device_batch, ready=ready)
+                    _DevicePrefetchItem(
+                        host_batch=host_batch,
+                        batch=device_batch,
+                        ready=ready,
+                    )
                 ):
                     return
         except BaseException as error:
@@ -924,7 +1094,7 @@ class _DevicePrefetchIterator:
             if callable(close):
                 close()
 
-    def __next__(self) -> FeatureBatch:
+    def _next_item(self) -> _DevicePrefetchItem:
         item = self.queue.get()
         if item.error is not None:
             self.close()
@@ -938,7 +1108,21 @@ class _DevicePrefetchIterator:
         current_stream = torch.cuda.current_stream(self.device)
         current_stream.wait_event(item.ready)
         _record_feature_batch_stream(item.batch, current_stream)
+        return item
+
+    def __next__(self) -> FeatureBatch:
+        item = self._next_item()
+        assert item.batch is not None
         return item.batch
+
+    def next_with_host(self) -> tuple[FeatureBatch, FeatureBatch]:
+        """Return matching host/device views for pre-update evaluation replay."""
+
+        item = self._next_item()
+        if item.host_batch is None or item.batch is None:
+            self.close()
+            raise RuntimeError("CUDA-prefetch item did not retain its host batch")
+        return item.host_batch, item.batch
 
     def close(self) -> None:
         self.stop_event.set()
@@ -1839,8 +2023,8 @@ def _loss_terms_from_batch(
     rank_active: bool = True,
     active_rank_count: int | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    if batch.labels is None or batch.label_mask is None:
-        raise ValueError("training batch must contain labels and label_mask")
+    if batch.labels is None:
+        raise ValueError("training batch must contain labels")
     logits = output["logits"]
     if logits.shape != batch.labels.shape:
         raise ValueError(
@@ -1851,11 +2035,26 @@ def _loss_terms_from_batch(
         batch.labels,
         reduction="none",
     )
-    weights = batch.label_mask.to(device=logits.device, dtype=element_loss.dtype)
-    if not rank_active:
-        weights = torch.zeros_like(weights)
-    task_numerators = (element_loss * weights).sum(dim=0)
-    task_counts = weights.sum(dim=0)
+    if batch.label_mask is None:
+        task_numerators = element_loss.sum(dim=0)
+        task_counts = element_loss.new_full(
+            (element_loss.size(1),),
+            float(element_loss.size(0)),
+        )
+        if not rank_active:
+            # Preserve the replayed forward graph on an exhausted rank while
+            # contributing no samples to either reduction.
+            task_numerators = task_numerators * 0.0
+            task_counts.zero_()
+    else:
+        weights = batch.label_mask.to(
+            device=logits.device,
+            dtype=element_loss.dtype,
+        )
+        if not rank_active:
+            weights = torch.zeros_like(weights)
+        task_numerators = (element_loss * weights).sum(dim=0)
+        task_counts = weights.sum(dim=0)
 
     distributed = torch_dist.is_available() and torch_dist.is_initialized()
     if loss_reduction == "sum":
@@ -1951,6 +2150,7 @@ def train_mdl(
     save_checkpoint: bool = True,
     log_steps: bool = True,
     step_observer: TrainStepObserver | None = None,
+    run_quick_eval: bool = True,
 ) -> TrainResult:
     if config.training.sparse_update_mode == "external_parameter_server":
         config = resolve_auto_scenarios(config)
@@ -2057,6 +2257,7 @@ def train_mdl(
         lr_decay_steps = _resolve_lr_decay_steps(config, max_steps)
         scaler = _make_grad_scaler(config, device)
         non_blocking = _non_blocking_transfer(config, "train", device)
+        quick_eval = getattr(config.training, "quick_eval", QuickEvalConfig())
 
         steps = 0
         rows = 0
@@ -2096,6 +2297,7 @@ def train_mdl(
             if batches_on_device
             else host_batch_iterator
         )
+        pending_train_batches: deque[FeatureBatch | None] = deque()
         last_device_batch: FeatureBatch | None = None
         while max_steps is None or steps < max_steps:
             tracing = step_observer is not None
@@ -2103,10 +2305,15 @@ def train_mdl(
                 _sync_device(device)
             step_started = perf_counter() if tracing else 0.0
             dataloader_started = step_started
-            try:
-                local_batch = next(batch_iterator)
-            except StopIteration:
-                local_batch = None
+            if pending_train_batches:
+                local_batch = pending_train_batches.popleft()
+                local_batch_on_device = False
+            else:
+                try:
+                    local_batch = next(batch_iterator)
+                except StopIteration:
+                    local_batch = None
+                local_batch_on_device = batches_on_device
             dataloader_wait_seconds = (
                 perf_counter() - dataloader_started if tracing else 0.0
             )
@@ -2125,7 +2332,7 @@ def train_mdl(
                     raise AssertionError("active rank is missing its training batch")
                 batch = (
                     local_batch
-                    if batches_on_device
+                    if local_batch_on_device
                     else move_feature_batch(
                         local_batch,
                         device,
@@ -2266,6 +2473,49 @@ def train_mdl(
                     f"sparse_global_rows={sparse_sync_stats.global_rows} "
                     f"sparse_payload_mib={payload_mib:.2f}"
                 )
+            if (
+                run_quick_eval
+                and quick_eval.enabled
+                and steps % quick_eval.every_steps == 0
+                and (
+                    quick_eval.split != "train"
+                    or not pending_train_batches
+                )
+                and (
+                    quick_eval.split != "train"
+                    or max_steps is None
+                    or steps < max_steps
+                )
+            ):
+                quick_eval_batch_limit = quick_eval.max_batches
+                if quick_eval.split == "train" and max_steps is not None:
+                    quick_eval_batch_limit = min(
+                        quick_eval_batch_limit,
+                        max_steps - steps,
+                    )
+                quick_eval_result, staged_batches = _run_training_quick_eval(
+                    config,
+                    model,
+                    vocab_maps,
+                    context,
+                    quick_eval,
+                    fallback_batch=last_device_batch,
+                    training_batch_iterator=(
+                        batch_iterator if quick_eval.split == "train" else None
+                    ),
+                    training_batches_on_device=batches_on_device,
+                    max_batches=quick_eval_batch_limit,
+                )
+                pending_train_batches.extend(staged_batches)
+                # Evaluation forwards also touch sharded-embedding diagnostics;
+                # keep them out of the following training step's trace/log.
+                consume_sharded_embedding_stats(base_model)
+                if context.rank == 0:
+                    _print_training_quick_eval(
+                        steps,
+                        quick_eval,
+                        quick_eval_result,
+                    )
         audit_report = ddp_auditor.report(context)
         if log_steps and context.rank == 0 and audit_report is not None:
             print(f"DDP graph audit | {audit_report}")
@@ -2371,8 +2621,9 @@ class _StreamingHistogramAUC:
         if bins < 2:
             raise ValueError("AUC histogram requires at least two bins")
         self.bins = bins
-        self.positives = torch.zeros(bins, dtype=torch.float64)
-        self.negatives = torch.zeros(bins, dtype=torch.float64)
+        self.histogram = torch.zeros(2, bins, dtype=torch.float64)
+        self.positives = self.histogram[0]
+        self.negatives = self.histogram[1]
 
     def update(self, scores: Tensor, labels: Tensor) -> None:
         scores = scores.detach().float().flatten().cpu()
@@ -2411,6 +2662,242 @@ class _StreamingHistogramAUC:
         positives = int(self.positives.sum().item())
         negatives = int(self.negatives.sum().item())
         return positives + negatives, positives, negatives
+
+
+def _all_reduce_cpu_sum_(tensor: Tensor, context: DistributedContext) -> None:
+    """Sum a CPU metric tensor even when the data process group is NCCL."""
+
+    if not context.enabled:
+        return
+    if context.control_group is not None or context.device.type == "cpu":
+        torch_dist.all_reduce(
+            tensor,
+            op=torch_dist.ReduceOp.SUM,
+            group=context.control_group,
+        )
+        return
+    device_value = tensor.to(context.device)
+    torch_dist.all_reduce(device_value, op=torch_dist.ReduceOp.SUM)
+    tensor.copy_(device_value.cpu())
+
+
+def _reduce_evaluation_histograms(
+    context: DistributedContext,
+    accumulators: list[list[_StreamingHistogramAUC]],
+    rows: int,
+) -> int:
+    if not context.enabled:
+        return rows
+    for task_accumulators in accumulators:
+        for accumulator in task_accumulators:
+            _all_reduce_cpu_sum_(accumulator.histogram, context)
+    row_count = torch.tensor(rows, dtype=torch.long)
+    _all_reduce_cpu_sum_(row_count, context)
+    return int(row_count.item())
+
+
+def _run_training_quick_eval(
+    config: AppConfig,
+    model: nn.Module,
+    vocab_maps: dict[str, dict[str, int]],
+    context: DistributedContext,
+    quick_eval: QuickEvalConfig,
+    *,
+    fallback_batch: FeatureBatch | None,
+    training_batch_iterator: Iterator[FeatureBatch] | None = None,
+    training_batches_on_device: bool = False,
+    max_batches: int | None = None,
+) -> tuple[QuickEvalResult, tuple[FeatureBatch | None, ...]]:
+    """Evaluate upcoming train batches or a deterministic held-out prefix.
+
+    When ``quick_eval.split`` is ``train``, batches are consumed from the main
+    training iterator and returned untouched so the caller can train those exact
+    batches immediately afterward. No separate training reader is created.
+    """
+
+    split = (
+        config.data.train if quick_eval.split == "train" else config.data.test
+    )
+    if split is None:
+        raise ValueError(
+            f"quick evaluation split {quick_eval.split!r} is not configured"
+        )
+
+    retain_batches = quick_eval.split == "train"
+    if retain_batches and training_batch_iterator is None:
+        raise ValueError(
+            "training quick evaluation requires the main training batch iterator"
+        )
+    batch_limit = quick_eval.max_batches if max_batches is None else max_batches
+    if batch_limit <= 0:
+        raise ValueError("quick-evaluation max_batches must be positive")
+
+    accumulators = [
+        [_StreamingHistogramAUC(quick_eval.auc_bins)]
+        for _ in config.task_names
+    ]
+    rows = 0
+    local_batches = 0
+    batch_iterator: Iterator[FeatureBatch] | None = None
+    owns_batch_iterator = False
+    staged_batches: list[FeatureBatch | None] = []
+    replay_batch = fallback_batch
+    was_training = model.training
+    started = perf_counter()
+    model.eval()
+    try:
+        non_blocking = _non_blocking_transfer(
+            config,
+            quick_eval.split,
+            context.device,
+        )
+        if retain_batches:
+            assert training_batch_iterator is not None
+            batch_iterator = training_batch_iterator
+        else:
+            batch_iterator = iter(
+                iter_feature_batches(
+                    config,
+                    quick_eval.split,
+                    vocab_maps,
+                    require_labels=True,
+                    shard_rank=context.rank,
+                    shard_world_size=context.world_size,
+                    pin_memory=non_blocking,
+                    include_group_id=False,
+                )
+            )
+            owns_batch_iterator = True
+        with torch.no_grad():
+            while True:
+                prefetched_device_batch: FeatureBatch | None = None
+                if local_batches >= batch_limit:
+                    local_batch = None
+                else:
+                    try:
+                        if retain_batches and training_batches_on_device:
+                            if not isinstance(
+                                batch_iterator,
+                                _DevicePrefetchIterator,
+                            ):
+                                raise RuntimeError(
+                                    "device-resident training batches require the "
+                                    "CUDA prefetch iterator"
+                                )
+                            (
+                                local_batch,
+                                prefetched_device_batch,
+                            ) = batch_iterator.next_with_host()
+                        else:
+                            local_batch = next(batch_iterator)
+                        local_batches += 1
+                    except StopIteration:
+                        local_batch = None
+                rank_active = local_batch is not None
+                active_ranks = _active_rank_count(context, rank_active)
+                if active_ranks == 0:
+                    break
+                if retain_batches:
+                    staged_batches.append(local_batch)
+                if rank_active:
+                    if local_batch is None:
+                        raise AssertionError(
+                            "active quick-evaluation rank is missing its batch"
+                        )
+                    batch = (
+                        prefetched_device_batch
+                        if prefetched_device_batch is not None
+                        else move_feature_batch(
+                            local_batch,
+                            context.device,
+                            non_blocking=non_blocking,
+                        )
+                    )
+                    replay_batch = batch
+                else:
+                    if replay_batch is None:
+                        raise RuntimeError(
+                            "quick evaluation requires every rank to have either an "
+                            "evaluation batch or a previous training batch for replay"
+                        )
+                    batch = replay_batch
+
+                with _autocast_context(config, context.device):
+                    logits = model(batch.features, batch.scenario_id)["logits"]
+                if not rank_active:
+                    continue
+                if batch.labels is None:
+                    raise RuntimeError(
+                        "quick-evaluation batch did not contain labels"
+                    )
+                probabilities = torch.sigmoid(logits.float()).cpu()
+                labels = batch.labels.float().cpu()
+                label_mask = (
+                    None
+                    if batch.label_mask is None
+                    else batch.label_mask.bool().cpu()
+                )
+                rows += int(labels.size(0))
+                for task_index in range(len(config.task_names)):
+                    if label_mask is None:
+                        task_scores = probabilities[:, task_index]
+                        task_labels = labels[:, task_index]
+                    else:
+                        valid = label_mask[:, task_index]
+                        task_scores = probabilities[valid, task_index]
+                        task_labels = labels[valid, task_index]
+                    accumulators[task_index][0].update(
+                        task_scores,
+                        task_labels,
+                    )
+
+        rows = _reduce_evaluation_histograms(context, accumulators, rows)
+        metrics: dict[str, dict[str, float | int | None]] = {}
+        for task_index, task_name in enumerate(config.task_names):
+            accumulator = accumulators[task_index][0]
+            examples, positives, negatives = accumulator.counts()
+            metrics[task_name] = {
+                "auc": accumulator.compute(),
+                "examples": examples,
+                "positives": positives,
+                "negatives": negatives,
+            }
+        _sync_device(context.device)
+        return (
+            QuickEvalResult(
+                rows=rows,
+                metrics=metrics,
+                elapsed_seconds=perf_counter() - started,
+            ),
+            tuple(staged_batches),
+        )
+    finally:
+        if owns_batch_iterator and batch_iterator is not None:
+            close = getattr(batch_iterator, "close", None)
+            if callable(close):
+                close()
+        model.train(was_training)
+
+
+def _print_training_quick_eval(
+    step: int,
+    quick_eval: QuickEvalConfig,
+    result: QuickEvalResult,
+) -> None:
+    print(
+        f"Quick eval | step={step} split={quick_eval.split} rows={result.rows} "
+        f"staged_for_training={str(quick_eval.split == 'train').lower()} "
+        f"max_batches_per_rank={quick_eval.max_batches} "
+        f"elapsed_seconds={result.elapsed_seconds:.6f}"
+    )
+    for task_name, metrics in result.metrics.items():
+        auc = metrics["auc"]
+        formatted_auc = "NA" if auc is None else f"{float(auc):.8f}"
+        print(
+            f"Quick eval task | step={step} task={task_name} auc={formatted_auc} "
+            f"examples={metrics['examples']} positives={metrics['positives']} "
+            f"negatives={metrics['negatives']}"
+        )
 
 
 class _DiskBackedGroupAUC:
@@ -2538,9 +3025,12 @@ def _load_inference_model(
     device: torch.device,
     checkpoint_path: str | None,
     allow_random_init: bool,
+    context: DistributedContext | None = None,
 ) -> tuple[nn.Module, dict[str, dict[str, int]]]:
     vocab_maps = load_vocab_maps(config)
     base_model = build_model(config, vocab_maps).to(device)
+    if context is not None:
+        _validate_sharded_embedding_metadata(context, base_model)
     resolved_checkpoint_path = checkpoint_path or config.training.checkpoint_path
     if resolved_checkpoint_path is None and not allow_random_init:
         raise ValueError(
@@ -2570,66 +3060,113 @@ def evaluate_mdl(
     group_metric_name: str | None = None,
     auc_bins: int = 65536,
 ) -> EvaluateResult:
-    config = resolve_auto_scenarios(config)
-    if split_name not in {"train", "test"}:
-        raise ValueError("evaluation split must be train or test")
-    if group_metric_name not in {None, "qauc", "uauc"}:
-        raise ValueError("group_metric_name must be null, qauc, or uauc")
-    if auc_bins < 2:
-        raise ValueError("auc_bins must be at least 2")
-    split = config.data.train if split_name == "train" else config.data.test
-    if split is None:
-        raise ValueError(f"split {split_name!r} is not configured")
-    if list(split.labels) != config.task_names:
-        raise ValueError(
-            f"data.{split_name}.labels must declare the training tasks in the same order: "
-            + ", ".join(config.task_names)
-        )
-    if group_metric_name is not None and split.group_id is None:
-        raise ValueError(
-            f"data.{split_name}.group_id is required for {group_metric_name.upper()}"
-        )
-
-    device = _select_device(config)
-    model, vocab_maps = _load_inference_model(
-        config,
-        device,
-        checkpoint_path,
-        allow_random_init,
-    )
-    scenario_count = len(config.scenarios.names)
-    auc_accumulators = [
-        [_StreamingHistogramAUC(auc_bins) for _ in range(scenario_count + 1)]
-        for _ in config.task_names
-    ]
-    grouped_auc = (
-        _DiskBackedGroupAUC(auc_bins)
-        if group_metric_name is not None
-        else None
-    )
-    rows = 0
-    non_blocking = _non_blocking_transfer(config, split_name, device)
+    context = _setup_distributed(config)
+    batch_iterator: Iterator[FeatureBatch] | None = None
+    grouped_auc: _DiskBackedGroupAUC | None = None
     try:
-        for batch_index, batch in enumerate(
+        config = _resolve_distributed_auto_scenarios(config, context)
+        if split_name not in {"train", "test"}:
+            raise ValueError("evaluation split must be train or test")
+        if group_metric_name not in {None, "qauc", "uauc"}:
+            raise ValueError("group_metric_name must be null, qauc, or uauc")
+        if auc_bins < 2:
+            raise ValueError("auc_bins must be at least 2")
+        if context.enabled and group_metric_name is not None:
+            raise ValueError(
+                "distributed evaluation currently supports overall/per-scene AUC; "
+                "qauc/uauc require single-process evaluation"
+            )
+        split = config.data.train if split_name == "train" else config.data.test
+        if split is None:
+            raise ValueError(f"split {split_name!r} is not configured")
+        if list(split.labels) != config.task_names:
+            raise ValueError(
+                f"data.{split_name}.labels must declare the training tasks in the same order: "
+                + ", ".join(config.task_names)
+            )
+        if group_metric_name is not None and split.group_id is None:
+            raise ValueError(
+                f"data.{split_name}.group_id is required for {group_metric_name.upper()}"
+            )
+
+        device = context.device
+        model, vocab_maps = _load_inference_model(
+            config,
+            device,
+            checkpoint_path,
+            allow_random_init,
+            context=context,
+        )
+        scenario_count = len(config.scenarios.names)
+        auc_accumulators = [
+            [_StreamingHistogramAUC(auc_bins) for _ in range(scenario_count + 1)]
+            for _ in config.task_names
+        ]
+        grouped_auc = (
+            _DiskBackedGroupAUC(auc_bins)
+            if group_metric_name is not None
+            else None
+        )
+        rows = 0
+        non_blocking = _non_blocking_transfer(config, split_name, device)
+        batch_iterator = iter(
             iter_feature_batches(
                 config,
                 split_name,
                 vocab_maps,
                 require_labels=True,
+                shard_rank=context.rank,
+                shard_world_size=context.world_size,
                 pin_memory=non_blocking,
                 include_group_id=group_metric_name is not None,
             )
-        ):
-            if max_batches is not None and batch_index >= max_batches:
+        )
+        local_batches = 0
+        last_device_batch: FeatureBatch | None = None
+        while True:
+            if max_batches is not None and local_batches >= max_batches:
+                local_batch = None
+            else:
+                try:
+                    local_batch = next(batch_iterator)
+                    local_batches += 1
+                except StopIteration:
+                    local_batch = None
+            rank_active = local_batch is not None
+            active_ranks = _active_rank_count(context, rank_active)
+            if active_ranks == 0:
                 break
-            batch = move_feature_batch(batch, device, non_blocking=non_blocking)
+            if last_device_batch is None and active_ranks != context.world_size:
+                raise RuntimeError(
+                    "sharded distributed evaluation requires every rank to provide an "
+                    "initial test batch; reduce world_size or use a finer reader.shard_unit"
+                )
+            if rank_active:
+                if local_batch is None:
+                    raise AssertionError("active evaluation rank is missing its batch")
+                batch = move_feature_batch(
+                    local_batch,
+                    device,
+                    non_blocking=non_blocking,
+                )
+                last_device_batch = batch
+            else:
+                if last_device_batch is None:
+                    raise RuntimeError("inactive evaluation rank has no replay batch")
+                batch = last_device_batch
             with _autocast_context(config, device):
                 logits = model(batch.features, batch.scenario_id)["logits"]
-            if batch.labels is None or batch.label_mask is None:
+            if not rank_active:
+                continue
+            if batch.labels is None:
                 raise RuntimeError("evaluation batch did not contain labels")
             probabilities = torch.sigmoid(logits.float()).cpu()
             labels = batch.labels.float().cpu()
-            label_mask = batch.label_mask.bool().cpu()
+            label_mask = (
+                None
+                if batch.label_mask is None
+                else batch.label_mask.bool().cpu()
+            )
             raw_scenarios = batch.scenario_id.cpu()
             if raw_scenarios.ndim == 1:
                 scenario_membership = torch.nn.functional.one_hot(
@@ -2640,10 +3177,21 @@ def evaluate_mdl(
                 scenario_membership = raw_scenarios.bool()
             rows += int(labels.size(0))
             for task_index in range(len(config.task_names)):
-                valid = label_mask[:, task_index]
-                task_scores = probabilities[valid, task_index]
-                task_labels = labels[valid, task_index]
-                task_scenarios = scenario_membership[valid]
+                if label_mask is None:
+                    task_scores = probabilities[:, task_index]
+                    task_labels = labels[:, task_index]
+                    task_scenarios = scenario_membership
+                    task_groups = batch.group_id
+                else:
+                    valid = label_mask[:, task_index]
+                    task_scores = probabilities[valid, task_index]
+                    task_labels = labels[valid, task_index]
+                    task_scenarios = scenario_membership[valid]
+                    task_groups = [
+                        group_id
+                        for group_id, keep in zip(batch.group_id, valid.tolist())
+                        if keep
+                    ]
                 auc_accumulators[task_index][0].update(
                     task_scores, task_labels
                 )
@@ -2653,11 +3201,6 @@ def evaluate_mdl(
                         task_scores[selected], task_labels[selected]
                     )
                 if grouped_auc is not None:
-                    task_groups = [
-                        group_id
-                        for group_id, keep in zip(batch.group_id, valid.tolist())
-                        if keep
-                    ]
                     grouped_auc.add(
                         task_index,
                         task_groups,
@@ -2666,6 +3209,11 @@ def evaluate_mdl(
                         task_scenarios,
                     )
 
+        rows = _reduce_evaluation_histograms(
+            context,
+            auc_accumulators,
+            rows,
+        )
         metrics: dict[str, dict[str, float | int | None]] = {}
         for task_index, task_name in enumerate(config.task_names):
             overall = auc_accumulators[task_index][0]
@@ -2709,8 +3257,13 @@ def evaluate_mdl(
             auc_histogram_bins=auc_bins,
         )
     finally:
+        if batch_iterator is not None:
+            close = getattr(batch_iterator, "close", None)
+            if callable(close):
+                close()
         if grouped_auc is not None:
             grouped_auc.close()
+        _cleanup_distributed(context)
 
 
 @torch.no_grad()

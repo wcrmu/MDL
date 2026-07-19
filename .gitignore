@@ -6,6 +6,7 @@ __pycache__/
 .coverage
 .mypy_cache/
 .ruff_cache/
+.venv*/
 /paper/
 .PAPER_ALIGNMENT.md
 /PAPER_ALIGNMENT.md

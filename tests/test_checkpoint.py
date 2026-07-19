@@ -79,7 +79,7 @@ def _save_worker(
 class ShardedCheckpointTest(unittest.TestCase):
     def test_checkpoint_reshards_without_full_reconstruction(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config_path = root / "configs" / "default.yaml"
+        config_path = root / "configs" / "reference" / "default.yaml"
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint_path = Path(temporary) / "model.sharded"
             torch_mp.start_processes(

@@ -226,7 +226,7 @@ def _validate_pre_hashed(
         raise ValueError(f"{path}.share_with is required when share_embedding=true")
 
 
-# Raw YAML schema. These dataclasses mirror configs/default.yaml field names.
+# Raw YAML schema. These dataclasses mirror configs/reference/default.yaml field names.
 @dataclass(frozen=True)
 class CategoricalEncodingConfig:
     """Inline categorical encoding config under a logical feature declaration."""
@@ -472,6 +472,11 @@ class ReaderConfig(_DeeplyImmutableConfig):
     # Strictly reject non-null zero before pre-hashed low-bit bucketing. Secure
     # production profiles may disable this after establishing the invariant.
     validate_prehashed_nonzero: bool = True
+    # Trust the upstream row-level contract after one raw row and one flat row
+    # have been sampled. This keeps full-batch diagnostic shape/alignment scans
+    # out of the training hot path while Parquet/Arrow decoding still fails on
+    # unreadable or physically incompatible data.
+    trusted_input: bool = False
     # DDP can shard by files, row groups, or record batches depending on data layout.
     shard_unit: Literal["file", "row_group", "record_batch"] = "row_group"
     # Optional Arrow scanner batch size. Training batch size is independent.
@@ -485,8 +490,9 @@ class ReaderConfig(_DeeplyImmutableConfig):
     length_buckets: tuple[LengthBucketConfig, ...] = ()
     # max is backward compatible; sum tracks total work across heterogeneous UPS.
     length_bucket_metric: Literal["max", "sum"] = "max"
-    # Bounded streaming row shuffle. Zero preserves physical scan order. This is
-    # intended for the training split; evaluation and prediction stay stable.
+    # Bounded streaming shuffle. With request-feature deduplication enabled,
+    # request groups are shuffled atomically and bucketed from one shared
+    # sequence-length calculation. Zero preserves physical request order.
     shuffle_buffer_rows: int = 0
     shuffle_seed: int = 0
 
@@ -525,6 +531,7 @@ class ReaderConfig(_DeeplyImmutableConfig):
             "coalesce_pinned_tensors",
             "deduplicate_request_features",
             "validate_prehashed_nonzero",
+            "trusted_input",
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise ValueError(f"reader.{field_name} must be a boolean")
@@ -680,8 +687,8 @@ class ParquetSplitConfig(_DeeplyImmutableConfig):
                     "raw Parquet Arrow tables to the flat_parquet contract."
                 )
             self.adapter.validate(f"data.{name}.adapter")
-        if not self.inputs:
-            raise ValueError(f"data.{name}.inputs must contain at least one path, glob, or directory")
+        # Empty inputs are allowed in template configs; train/eval paths require
+        # concrete paths via YAML or CLI overrides before reading data.
         self.reader.validate()
         if self.reader.device_prefetch_batches > 0 and not self.reader.pin_memory:
             raise ValueError(
@@ -740,6 +747,13 @@ class ParquetSplitConfig(_DeeplyImmutableConfig):
             )
         if not isinstance(self.prediction_score_suffix, str):
             raise ValueError(f"data.{name}.prediction_score_suffix must be a string")
+
+    def require_inputs(self, name: str) -> None:
+        if not self.inputs:
+            raise ValueError(
+                f"data.{name}.inputs must contain at least one path, glob, or directory; "
+                "pass --train-input/--test-input or set data.*.inputs / reader.partition hours"
+            )
 
 
 @dataclass(frozen=True)
@@ -1930,6 +1944,46 @@ class DDPConfig:
 
 
 @dataclass(frozen=True)
+class QuickEvalConfig:
+    """Small, periodic AUC evaluation performed inside the training loop."""
+
+    enabled: bool = True
+    # Run after every N completed optimizer steps.
+    every_steps: int = 1000
+    # This limit is per rank when distributed training is enabled.
+    max_batches: int = 20
+    # train stages the next batches before their first optimizer update; test
+    # uses a separate deterministic reader and does not feed samples to training.
+    split: Literal["train", "test"] = "train"
+    # Bounded-memory histogram resolution used by the streaming AUC metric.
+    auc_bins: int = 4096
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any] | None) -> "QuickEvalConfig":
+        if payload is None:
+            return cls()
+        return cls(**payload)
+
+    def validate(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ValueError("training.quick_eval.enabled must be a boolean")
+        if type(self.every_steps) is not int or self.every_steps <= 0:
+            raise ValueError(
+                "training.quick_eval.every_steps must be a positive integer"
+            )
+        if type(self.max_batches) is not int or self.max_batches <= 0:
+            raise ValueError(
+                "training.quick_eval.max_batches must be a positive integer"
+            )
+        if self.split not in {"train", "test"}:
+            raise ValueError("training.quick_eval.split must be train or test")
+        if type(self.auc_bins) is not int or self.auc_bins < 2:
+            raise ValueError(
+                "training.quick_eval.auc_bins must be an integer of at least 2"
+            )
+
+
+@dataclass(frozen=True)
 class TrainingConfig:
     """Optimizer, batch, schedule, and checkpoint settings."""
 
@@ -1986,6 +2040,8 @@ class TrainingConfig:
     # Logging a CUDA scalar synchronizes the device. Large production runs
     # should log periodically rather than draining the GPU pipeline every step.
     log_every_steps: int = 1
+    # Periodic pre-update AUC check performed without saving/reloading a checkpoint.
+    quick_eval: QuickEvalConfig = field(default_factory=QuickEvalConfig)
     # Default checkpoint path used by train/predict when CLI does not override it.
     checkpoint_path: str | None = None
 
@@ -1998,6 +2054,9 @@ class TrainingConfig:
             values.get("embedding_sharding")
         )
         values["ddp"] = DDPConfig.from_mapping(values.get("ddp"))
+        values["quick_eval"] = QuickEvalConfig.from_mapping(
+            values.get("quick_eval")
+        )
         return cls(**values)
 
     def validate(self) -> None:
@@ -2042,6 +2101,7 @@ class TrainingConfig:
             raise ValueError("training.dense_distribution must be ddp")
         self.embedding_sharding.validate()
         self.ddp.validate()
+        self.quick_eval.validate()
         if self.embedding_distribution == "sharded" and not self.embedding_sparse_gradients:
             raise ValueError(
                 "training.embedding_sparse_gradients must be true for sharded embeddings"
@@ -3370,6 +3430,22 @@ def validate_app_config(config: AppConfig) -> None:
     config.model.validate()
     config.runtime.validate()
     config.training.validate()
+    if config.training.quick_eval.enabled:
+        quick_eval_split = (
+            config.data.train
+            if config.training.quick_eval.split == "train"
+            else config.data.test
+        )
+        if quick_eval_split is None:
+            raise ValueError(
+                "training.quick_eval.split=test requires data.test to be configured"
+            )
+        if list(quick_eval_split.labels) != config.task_names:
+            raise ValueError(
+                f"data.{config.training.quick_eval.split}.labels must declare the "
+                "training tasks in the same order when training.quick_eval is enabled: "
+                + ", ".join(config.task_names)
+            )
     validate_tokenization_config(
         config.tokenization,
         config.features,
@@ -3384,6 +3460,45 @@ def validate_app_config(config: AppConfig) -> None:
     _validate_mdl_extra_embeddings(config, resolved)
     _validate_mdl_domain_priors(config, resolved)
     sequence_by_name = {sequence.name: sequence for sequence in config.sequences}
+    for split_name, split in (("train", config.data.train), ("test", config.data.test)):
+        if (
+            split is None
+            or split.adapter is None
+            or split.adapter.callable
+            != "src.dataloader:adapt_mdl_rankmixer_parquet"
+        ):
+            continue
+        sequence_limits = split.adapter.options.get("sequence_max_lengths", {})
+        if not isinstance(sequence_limits, Mapping):
+            raise ValueError(
+                f"data.{split_name}.adapter.options.sequence_max_lengths must be an object"
+            )
+        for raw_name, raw_limit in sequence_limits.items():
+            name = str(raw_name)
+            sequence = sequence_by_name.get(name)
+            if sequence is None:
+                raise ValueError(
+                    f"data.{split_name}.adapter.options.sequence_max_lengths references "
+                    f"unknown sequence {name!r}"
+                )
+            if type(raw_limit) is not int or raw_limit <= 0:
+                raise ValueError(
+                    f"data.{split_name}.adapter.options.sequence_max_lengths.{name} "
+                    "must be a positive integer"
+                )
+            if sequence.max_length != raw_limit:
+                raise ValueError(
+                    f"data.{split_name}.adapter.options.sequence_max_lengths.{name} "
+                    f"must equal sequences.{name}.max_length ({sequence.max_length})"
+                )
+            if (
+                sequence.sequence_order != "newest_to_oldest"
+                or sequence.truncation != "head"
+            ):
+                raise ValueError(
+                    f"early adapter truncation for sequence {name!r} requires "
+                    "sequence_order=newest_to_oldest and truncation=head"
+                )
     if config.model.name in {"onetrans", "mdl_onetrans"} and config.model.sequence_fusion == "timestamp_aware":
         for group in resolved.tokenization.sequence_token_groups:
             for input_name in group.input_refs:
