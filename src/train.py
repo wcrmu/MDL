@@ -34,6 +34,7 @@ from .dataloader import (
     FeatureBatch,
     _column_array,
     _require_pyarrow,
+    _safe_table_take,
     discover_scenario_values,
     iter_flat_tables,
     move_feature_batch,
@@ -451,9 +452,8 @@ def _slice_table(table: object, batch_size: int) -> Iterator[object]:
 def _shuffle_table(table: object, generator: torch.Generator) -> object:
     if table.num_rows <= 1:
         return table
-    pa, _pc, _ds, _pq = _require_pyarrow()
     permutation = torch.randperm(table.num_rows, generator=generator)
-    return table.take(pa.array(permutation.numpy(), type=pa.int64()))
+    return _safe_table_take(table, permutation)
 
 
 def _request_group_tables(
@@ -482,13 +482,12 @@ def _request_group_tables(
                 f"request_id column {split.request_id!r} must contain hashable scalars"
             ) from error
 
-    pa, _pc, _ds, _pq = _require_pyarrow()
     for positions in positions_by_request.values():
         first = positions[0]
         if positions == list(range(first, first + len(positions))):
             yield table.slice(first, len(positions))
         else:
-            yield table.take(pa.array(positions, type=pa.int64()))
+            yield _safe_table_take(table, positions)
 
 
 def _shuffle_table_groups(
@@ -741,9 +740,7 @@ def _iter_length_bucketed_tables(
             ).flatten()
             if not selected.numel():
                 continue
-            selected_table = table.take(
-                pa.array(selected.numpy(), type=pa.int64())
-            )
+            selected_table = _safe_table_take(table, selected)
             buffered[bucket_index].append(selected_table)
             buffered_rows[bucket_index] += selected_table.num_rows
             if buffered_rows[bucket_index] < bucket.batch_size:

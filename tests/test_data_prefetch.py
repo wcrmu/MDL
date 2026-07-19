@@ -29,15 +29,18 @@ from src.dataloader import (
     _eager_schema_validation_refs,
     _iter_adapted_flat_tables,
     _request_deduplication_plan,
+    _safe_table_take,
     _scan_columns_for_split,
     _validate_flat_table_contract,
     move_feature_batch,
     table_to_feature_batch,
 )
+from src.features import _flatten_array_values
 from src.train import (
     _estimate_prepared_batch_bytes,
     _iter_batch_tables,
     _iter_shuffled_candidate_tables,
+    _shuffle_table,
     _table_effective_sequence_lengths,
 )
 
@@ -441,6 +444,134 @@ class RequestDeduplicationTest(unittest.TestCase):
 
         self.assertEqual(selected["value"].to_pylist(), [10, 20, 30])
         self.assertEqual(row_indices.tolist(), [0, 0, 1, 0, 2])
+
+    def test_dedup_survives_multi_chunk_dictionary_list_columns(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "rankmixer.yaml")
+        split = replace(
+            config.data.train,
+            reader=replace(
+                config.data.train.reader,
+                deduplicate_request_features=True,
+            ),
+        )
+        table = _multi_chunk_dictionary_list_table(
+            request_ids=["r0", "r0", "r1", "r1"],
+            bags=[[[1, 2], [1, 2]], [[3], [4, 5, 6]]],
+            request_column=split.request_id or "search_id",
+            bag_column="bag",
+        )
+        with self.assertRaises(pa.lib.ArrowNotImplementedError):
+            table.take(pa.array([0, 2], type=pa.int64()))
+
+        selected, row_indices = _request_deduplication_plan(split, table)
+
+        self.assertEqual(selected[split.request_id or "search_id"].to_pylist(), ["r0", "r1"])
+        self.assertEqual(row_indices.tolist(), [0, 0, 1, 1])
+        self.assertEqual(
+            _flatten_array_values(selected["bag"]),
+            [1, 2, 3],
+        )
+
+
+def _dictionary_list_chunk(rows: list[list[int]]) -> pa.DictionaryArray:
+    unique: list[list[int]] = []
+    indices: list[int] = []
+    seen: dict[tuple[int, ...], int] = {}
+    for row in rows:
+        key = tuple(row)
+        if key not in seen:
+            seen[key] = len(unique)
+            unique.append(row)
+        indices.append(seen[key])
+    return pa.DictionaryArray.from_arrays(
+        pa.array(indices, type=pa.int32()),
+        pa.array(unique, type=pa.list_(pa.int64())),
+    )
+
+
+def _multi_chunk_dictionary_list_table(
+    *,
+    request_ids: list[str],
+    bags: list[list[list[int]]],
+    request_column: str,
+    bag_column: str,
+) -> pa.Table:
+    mid = len(request_ids) // 2
+    chunk_a = pa.table(
+        {
+            request_column: request_ids[:mid],
+            bag_column: _dictionary_list_chunk(bags[0]),
+            "label": list(range(mid)),
+        }
+    )
+    chunk_b = pa.table(
+        {
+            request_column: request_ids[mid:],
+            bag_column: _dictionary_list_chunk(bags[1]),
+            "label": list(range(mid, len(request_ids))),
+        }
+    )
+    return pa.concat_tables([chunk_a, chunk_b])
+
+
+class NestedDictionarySafetyTest(unittest.TestCase):
+    def test_safe_table_take_preserves_alignment_under_permutation(self) -> None:
+        table = _multi_chunk_dictionary_list_table(
+            request_ids=["r0", "r0", "r1", "r1"],
+            bags=[[[1, 2], [1, 2]], [[3], [4, 5, 6]]],
+            request_column="search_id",
+            bag_column="bag",
+        )
+        taken = _safe_table_take(table, [3, 0, 2, 1])
+        self.assertEqual(taken["search_id"].to_pylist(), ["r1", "r0", "r1", "r0"])
+        self.assertEqual(taken["label"].to_pylist(), [3, 0, 2, 1])
+        self.assertEqual(taken["bag"].to_pylist(), [[4, 5, 6], [1, 2], [3], [1, 2]])
+
+    def test_safe_table_take_supports_empty_and_repeated_indices(self) -> None:
+        table = _multi_chunk_dictionary_list_table(
+            request_ids=["r0", "r0", "r1", "r1"],
+            bags=[[[1], [1]], [[2, 2], [3]]],
+            request_column="search_id",
+            bag_column="bag",
+        )
+        empty = _safe_table_take(table, [])
+        self.assertEqual(empty.num_rows, 0)
+        self.assertEqual(empty.column_names, table.column_names)
+        repeated = _safe_table_take(table, [1, 1, 0])
+        self.assertEqual(repeated["label"].to_pylist(), [1, 1, 0])
+        self.assertEqual(repeated["bag"].to_pylist(), [[1], [1], [1]])
+
+    def test_shuffle_table_survives_multi_chunk_dictionary_lists(self) -> None:
+        table = _multi_chunk_dictionary_list_table(
+            request_ids=["r0", "r0", "r1", "r1"],
+            bags=[[[1, 2], [1, 2]], [[3], [4, 5, 6]]],
+            request_column="search_id",
+            bag_column="bag",
+        )
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(7)
+        shuffled = _shuffle_table(table, generator)
+        self.assertEqual(shuffled.num_rows, table.num_rows)
+        self.assertCountEqual(shuffled["label"].to_pylist(), [0, 1, 2, 3])
+        self.assertCountEqual(
+            shuffled["bag"].to_pylist(),
+            [[1, 2], [1, 2], [3], [4, 5, 6]],
+        )
+
+    def test_flatten_array_values_survives_multi_chunk_dictionary_lists(self) -> None:
+        table = _multi_chunk_dictionary_list_table(
+            request_ids=["r0", "r0", "r1", "r1"],
+            bags=[[[1, 2], [1, 2]], [[3], [4, 5, 6]]],
+            request_column="search_id",
+            bag_column="bag",
+        )
+        with self.assertRaises(pa.lib.ArrowNotImplementedError):
+            table["bag"].combine_chunks()
+        self.assertEqual(
+            _flatten_array_values(table["bag"]),
+            [1, 2, 1, 2, 3, 4, 5, 6],
+        )
 
 
 class CompleteLabelTest(unittest.TestCase):

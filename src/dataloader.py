@@ -2047,8 +2047,7 @@ def _adapter_table_to_python(
     raw: dict[str, list[Any]] = {}
     flattened: set[str] = set()
     for name in table.column_names:
-        column = table[name]
-        array = column.combine_chunks()
+        array = _column_array(table, name)
         if name in raw_sequence_columns:
             array, validated_flat = _flatten_singleton_ups_array(
                 pa,
@@ -3476,6 +3475,30 @@ def _column_array(table: Any, column: str) -> Any:
     )
 
 
+def _safe_table_take(table: Any, indices: Any) -> Any:
+    """Row-select without Arrow nested-dictionary unification.
+
+    ``Table.take`` fails on multi-chunk ``dictionary<list<...>>`` columns
+    because Arrow cannot unify those dictionaries. Rebuild each column from
+    ``_column_array`` first, then ``pc.take`` on the contiguous array.
+    """
+
+    pa, pc, _ds, _pq = _require_pyarrow()
+    if hasattr(indices, "numpy") and not isinstance(indices, pa.Array):
+        index_array = pa.array(indices.numpy(), type=pa.int64())
+    elif isinstance(indices, pa.Array):
+        index_array = indices.cast(pa.int64()) if indices.type != pa.int64() else indices
+    else:
+        index_array = pa.array(indices, type=pa.int64())
+    if len(index_array) == 0:
+        return table.slice(0, 0)
+    arrays = [
+        pc.take(_column_array(table, column), index_array)
+        for column in table.column_names
+    ]
+    return pa.Table.from_arrays(arrays, schema=table.schema)
+
+
 def _numeric_column_tensor(table: Any, column: str, dtype: torch.dtype) -> Tensor:
     """Convert a scalar numeric Arrow column with a fast NumPy path.
 
@@ -4543,8 +4566,7 @@ def _request_deduplication_plan(
             candidate_to_request.append(existing)
     if len(unique_positions) == table.num_rows:
         return None
-    pa, _pc, _ds, _pq = _require_pyarrow()
-    selected = table.take(pa.array(unique_positions, type=pa.int64()))
+    selected = _safe_table_take(table, unique_positions)
     return selected, torch.tensor(candidate_to_request, dtype=torch.long)
 
 

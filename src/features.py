@@ -74,9 +74,40 @@ def _artifact_path(config: AppConfig, feature_name: str, encoding: ResolvedVocab
     return Path(config.vocab_strategy.defaults.artifact_dir) / encoding.artifact
 
 
+def _contiguous_array(array: Any) -> Any:
+    """Combine chunks without Arrow nested-dictionary unification."""
+
+    pa, pc, _ds, _pq = _require_pyarrow()
+    if not hasattr(array, "num_chunks"):
+        return array
+    if not array.num_chunks:
+        return array.combine_chunks()
+    if array.num_chunks == 1:
+        return array.chunk(0)
+    if not all(pa.types.is_dictionary(chunk.type) for chunk in array.chunks):
+        return array.combine_chunks()
+    dictionaries: list[Any] = []
+    shifted_indices: list[Any] = []
+    offset = 0
+    for chunk in array.chunks:
+        dictionaries.append(chunk.dictionary)
+        indices = chunk.indices
+        if offset:
+            indices = pc.add(indices, pa.scalar(offset, type=indices.type))
+        shifted_indices.append(indices)
+        offset += len(chunk.dictionary)
+    return pa.DictionaryArray.from_arrays(
+        pa.concat_arrays(shifted_indices),
+        pa.concat_arrays(dictionaries),
+    )
+
+
 def _flatten_array_values(array: Any) -> list[Any]:
     pa, pc, _ds, _pq = _require_pyarrow()
-    current = array.combine_chunks() if hasattr(array, "combine_chunks") else array
+    current = _contiguous_array(array)
+    if pa.types.is_dictionary(current.type):
+        # Arrow cannot dictionary_decode list-valued dictionaries; take works.
+        current = pc.take(current.dictionary, current.indices)
     while pa.types.is_list(current.type) or pa.types.is_large_list(current.type):
         current = pc.list_flatten(current)
     return [value.as_py() for value in current if value.as_py() is not None]
