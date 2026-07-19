@@ -482,6 +482,7 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
             peak_tflops=args.peak_tflops,
             reserve_hbm_gib=args.reserve_hbm_gib,
             candidates_per_request=args.candidates_per_request,
+            synthetic_scenario_count=args.synthetic_scenario_count,
         ),
     )
     if is_main_process():
@@ -618,6 +619,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="compute-only agg simulation: candidates sharing one request",
+    )
+    benchmark.add_argument(
+        "--synthetic-scenario-count",
+        type=int,
+        default=32,
+        help=(
+            "number of synthetic scenarios used by compute and embedding "
+            "benchmark modes when scenarios.auto_discover is true"
+        ),
     )
     benchmark.add_argument("--output", default=None)
     benchmark.add_argument("--distributed", choices=["none", "ddp"], default=None)

@@ -228,6 +228,8 @@ def _run_candidate(
                     str(args.candidates_per_request),
                     "--sequence-lengths",
                     _render_named_lengths(args.sequence_lengths),
+                    "--synthetic-scenario-count",
+                    str(args.scenario_count),
                 ]
             )
         environment = os.environ.copy()

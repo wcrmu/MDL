@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import gc
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -25,7 +26,7 @@ import torch.distributed as torch_dist
 from torch import Tensor, nn
 
 from .config import AppConfig, ResolvedVocabEncoding, resolve_categorical_base_input
-from .dataloader import FeatureBatch
+from .dataloader import FeatureBatch, resolve_auto_scenarios
 from .features import load_vocab_maps, vocab_strategy_fingerprint
 from .embeddings import ShardedEmbedding
 from .optim import ShardedAdagrad, ShardedRowWiseAdagrad
@@ -53,6 +54,8 @@ from .train import (
     train_mdl,
 )
 
+logger = logging.getLogger(__name__)
+
 
 BenchmarkMode = Literal["data", "embedding", "compute", "end-to-end"]
 IdDistribution = Literal["uniform", "zipf"]
@@ -79,6 +82,10 @@ class BenchmarkOptions:
     reserve_hbm_gib: float = 0.0
     # Mirror agg data where several candidates share Context and UPS payloads.
     candidates_per_request: int = 1
+    # Compute/embedding modes do not scan Parquet. When auto_discover is on,
+    # expand this many synthetic raw scene ids so MDL scenario-token cost
+    # matches a production-sized routing table instead of a single __auto__.
+    synthetic_scenario_count: int = 32
 
     def validate(self) -> None:
         if self.mode not in {"data", "embedding", "compute", "end-to-end"}:
@@ -120,6 +127,8 @@ class BenchmarkOptions:
             raise ValueError("candidates_per_request must be positive")
         if self.candidates_per_request != 1 and self.mode != "compute":
             raise ValueError("candidates_per_request is supported only in compute mode")
+        if self.synthetic_scenario_count <= 0:
+            raise ValueError("synthetic_scenario_count must be positive")
 
 
 @dataclass(frozen=True)
@@ -1303,6 +1312,32 @@ def _benchmark_end_to_end(
     return collector.finish(context.rank, profiler)
 
 
+def _resolve_benchmark_scenarios(
+    config: AppConfig,
+    context: DistributedContext,
+    options: BenchmarkOptions,
+) -> AppConfig:
+    """Resolve scenarios without forcing Parquet discovery for synthetic modes.
+
+    ``compute`` / ``embedding`` never read training inputs. When auto-discover
+    is enabled they expand a deterministic synthetic scene set so MDL scenario
+    tokens reflect production-scale routing cost. ``data`` / ``end-to-end`` keep
+    the real cache-or-Parquet discovery path.
+    """
+
+    if options.mode in {"compute", "embedding"} and config.scenarios.auto_discover:
+        synthetic_values = tuple(range(options.synthetic_scenario_count))
+        resolved = resolve_auto_scenarios(config, synthetic_values)
+        if context.rank == 0:
+            logger.info(
+                "Using %d synthetic scenarios for %s benchmark",
+                options.synthetic_scenario_count,
+                options.mode,
+            )
+        return resolved
+    return _resolve_distributed_auto_scenarios(config, context)
+
+
 def run_benchmark(config: AppConfig, options: BenchmarkOptions) -> BenchmarkReport:
     """Run one benchmark mode and aggregate a rank-max report."""
 
@@ -1319,7 +1354,7 @@ def run_benchmark(config: AppConfig, options: BenchmarkOptions) -> BenchmarkRepo
         if options.mode in {"compute", "end-to-end"}:
             # Before scenario discovery so strict-flash fails without data scans.
             _attention_runtime_description(config, context.device)
-        config = _resolve_distributed_auto_scenarios(config, context)
+        config = _resolve_benchmark_scenarios(config, context, options)
         torch.manual_seed(options.seed + context.rank)
         if options.mode == "data":
             local = _benchmark_data(config, context, options)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 import unittest
 
@@ -461,6 +462,46 @@ class TunerDefaultsAndPreflightTest(unittest.TestCase):
             ):
                 self.assertEqual(tuner.main(), 0)
             self.assertIsNone(execute.call_args.args[0].peak_tflops)
+
+    def test_compute_only_forwards_synthetic_scenario_count(self) -> None:
+        from scripts import tune_a100_batch_size as tuner
+
+        args = SimpleNamespace(
+            config=ROOT / "configs" / "mdl_rankmixer.yaml",
+            compute_only=True,
+            warmup_steps=0,
+            steps=1,
+            profile_steps=0,
+            nproc_per_node=2,
+            peak_tflops=None,
+            reserve_hbm_gib=32.0,
+            candidates_per_request=4,
+            sequence_lengths={"impr": 8},
+            scenario_count=32,
+            omp_num_threads=4,
+        )
+        with (
+            patch.object(tuner, "_free_port", return_value=29501),
+            patch.object(tuner.subprocess, "run") as run,
+        ):
+            run.return_value = SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="CUDA out of memory",
+            )
+            result = tuner._run_candidate(
+                args,
+                batch_size=8,
+                workspace=ROOT / "artifacts",
+                parquet_dir=None,
+            )
+        self.assertEqual(result["status"], "oom")
+        command = run.call_args.args[0]
+        self.assertIn("--synthetic-scenario-count", command)
+        self.assertEqual(
+            command[command.index("--synthetic-scenario-count") + 1],
+            "32",
+        )
 
 
 if __name__ == "__main__":

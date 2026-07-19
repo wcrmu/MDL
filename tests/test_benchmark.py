@@ -18,6 +18,7 @@ from src.benchmark import (
     _nvidia_smi_device_selector,
     _percentile,
     _replace_id_embeddings_with_synthetic,
+    _resolve_benchmark_scenarios,
     _synthetic_feature_batch,
     _synthetic_vocab_maps,
     _trace,
@@ -62,6 +63,110 @@ class BenchmarkOptionsTest(unittest.TestCase):
                 mode="compute",
                 sequence_lengths={"hist": 0},
             ).validate()
+
+    def test_synthetic_scenario_count_must_be_positive(self) -> None:
+        BenchmarkOptions(mode="compute", synthetic_scenario_count=1).validate()
+        with self.assertRaisesRegex(ValueError, "synthetic_scenario_count"):
+            BenchmarkOptions(mode="compute", synthetic_scenario_count=0).validate()
+
+
+class BenchmarkScenarioResolutionTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.root = Path(__file__).resolve().parents[1]
+        cls.config = load_app_config(cls.root / "configs" / "mdl_rankmixer.yaml")
+
+    def _fake_context(self) -> DistributedContext:
+        return DistributedContext(
+            enabled=False,
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            device=torch.device("cpu"),
+        )
+
+    def test_compute_uses_synthetic_scenarios_without_data_scan(self) -> None:
+        self.assertEqual(self.config.data.train.inputs, ())
+        self.assertTrue(self.config.scenarios.auto_discover)
+        options = BenchmarkOptions(
+            mode="compute",
+            synthetic_scenario_count=4,
+            warmup_steps=0,
+            measured_steps=1,
+            profile_steps=0,
+        )
+        with patch(
+            "src.benchmark._resolve_distributed_auto_scenarios"
+        ) as real_discovery:
+            resolved = _resolve_benchmark_scenarios(
+                self.config,
+                self._fake_context(),
+                options,
+            )
+        real_discovery.assert_not_called()
+        self.assertEqual(resolved.scenarios.names, ("0", "1", "2", "3"))
+        self.assertFalse(resolved.scenarios.auto_discover)
+        self.assertEqual(
+            [token.name for token in resolved.tokenization.scenario_tokens],
+            ["0", "1", "2", "3", "global"],
+        )
+
+    def test_embedding_uses_synthetic_scenarios_without_data_scan(self) -> None:
+        options = BenchmarkOptions(
+            mode="embedding",
+            synthetic_scenario_count=3,
+            warmup_steps=0,
+            measured_steps=1,
+            profile_steps=0,
+        )
+        with patch(
+            "src.benchmark._resolve_distributed_auto_scenarios"
+        ) as real_discovery:
+            resolved = _resolve_benchmark_scenarios(
+                self.config,
+                self._fake_context(),
+                options,
+            )
+        real_discovery.assert_not_called()
+        self.assertEqual(resolved.scenarios.names, ("0", "1", "2"))
+
+    def test_end_to_end_still_uses_real_discovery(self) -> None:
+        options = BenchmarkOptions(
+            mode="end-to-end",
+            warmup_steps=0,
+            measured_steps=1,
+            profile_steps=0,
+        )
+        sentinel = object()
+        with patch(
+            "src.benchmark._resolve_distributed_auto_scenarios",
+            return_value=sentinel,
+        ) as discovery:
+            resolved = _resolve_benchmark_scenarios(
+                self.config,
+                self._fake_context(),
+                options,
+            )
+        discovery.assert_called_once()
+        self.assertIs(resolved, sentinel)
+
+    def test_data_mode_still_uses_real_discovery(self) -> None:
+        options = BenchmarkOptions(
+            mode="data",
+            warmup_steps=0,
+            measured_steps=1,
+            profile_steps=0,
+        )
+        with patch(
+            "src.benchmark._resolve_distributed_auto_scenarios",
+            return_value=self.config,
+        ) as discovery:
+            _resolve_benchmark_scenarios(
+                self.config,
+                self._fake_context(),
+                options,
+            )
+        discovery.assert_called_once()
 
 
 class TraceCollectorTest(unittest.TestCase):
