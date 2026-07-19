@@ -28,7 +28,7 @@ from .config import AppConfig, ResolvedVocabEncoding, resolve_categorical_base_i
 from .dataloader import FeatureBatch
 from .features import load_vocab_maps, vocab_strategy_fingerprint
 from .embeddings import ShardedEmbedding
-from .optim import ShardedAdagrad
+from .optim import ShardedAdagrad, ShardedRowWiseAdagrad
 from .model import build_model
 from .train import (
     DistributedContext,
@@ -991,14 +991,19 @@ def _benchmark_embedding(
     parameters = [parameter for parameter in collection.parameters() if parameter.requires_grad]
     optimizer: torch.optim.Optimizer
     if sharded_mode:
-        optimizer = ShardedAdagrad(
-            parameters,
-            lr=config.training.lr_sparse or config.training.lr_dense,
-            lr_decay=config.training.adagrad_lr_decay,
-            weight_decay=config.training.adagrad_weight_decay,
-            initial_accumulator_value=config.training.adagrad_initial_accumulator_value,
-            eps=config.training.adagrad_eps,
-        )
+        optimizer_kwargs = {
+            "lr": config.training.lr_sparse or config.training.lr_dense,
+            "lr_decay": config.training.adagrad_lr_decay,
+            "weight_decay": config.training.adagrad_weight_decay,
+            "initial_accumulator_value": (
+                config.training.adagrad_initial_accumulator_value
+            ),
+            "eps": config.training.adagrad_eps,
+        }
+        if config.training.sparse_optimizer == "rowwise_adagrad":
+            optimizer = ShardedRowWiseAdagrad(parameters, **optimizer_kwargs)
+        else:
+            optimizer = ShardedAdagrad(parameters, **optimizer_kwargs)
     else:
         optimizer = torch.optim.Adagrad(
             parameters,
@@ -1304,8 +1309,6 @@ def run_benchmark(config: AppConfig, options: BenchmarkOptions) -> BenchmarkRepo
     options.validate()
     context = _setup_distributed(config)
     try:
-        config = _resolve_distributed_auto_scenarios(config, context)
-        torch.manual_seed(options.seed + context.rank)
         if context.device.type == "cuda":
             torch.cuda.manual_seed_all(options.seed + context.rank)
             torch.backends.cuda.matmul.allow_tf32 = config.runtime.allow_tf32
@@ -1314,7 +1317,10 @@ def run_benchmark(config: AppConfig, options: BenchmarkOptions) -> BenchmarkRepo
                 "high" if config.runtime.allow_tf32 else "highest"
             )
         if options.mode in {"compute", "end-to-end"}:
+            # Before scenario discovery so strict-flash fails without data scans.
             _attention_runtime_description(config, context.device)
+        config = _resolve_distributed_auto_scenarios(config, context)
+        torch.manual_seed(options.seed + context.rank)
         if options.mode == "data":
             local = _benchmark_data(config, context, options)
         elif options.mode == "embedding":

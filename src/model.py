@@ -1282,6 +1282,11 @@ class FeatureEncoderBank(nn.Module):
                 table_wise_max_rows=(
                     config.training.embedding_sharding.table_wise_max_rows
                 ),
+                optimizer_state_layout=(
+                    "rowwise"
+                    if config.training.sparse_optimizer == "rowwise_adagrad"
+                    else "full"
+                ),
             )
 
         for feature in config.features:

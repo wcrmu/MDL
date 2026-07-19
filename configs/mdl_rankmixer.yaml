@@ -3,14 +3,15 @@
 runtime:
   device: cuda
   precision: bf16
-  compile: true
+  compile: false
   compile_mode: default
   require_compact_sequence_batches: false
   allow_tf32: true
   activation_checkpoint: none
-  attention_backend: flash
+  # Platform torch builds before 2.10 lack torch.nn.attention.varlen; use SDPA.
+  attention_backend: sdpa
   distributed: ddp
-  nproc_per_node: 8
+  nproc_per_node: 4
   master_addr: 127.0.0.1
   master_port: 29500
   trim_all_invalid_sequence_prefix: false

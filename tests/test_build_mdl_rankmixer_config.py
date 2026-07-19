@@ -250,6 +250,13 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             test_inputs=["/tmp/test"],
         )
 
+        self.assertEqual(payload["runtime"]["nproc_per_node"], 8)
+        self.assertEqual(payload["training"]["sparse_optimizer"], "adagrad")
+        memory = summary["embedding_memory"]
+        self.assertIn("optimizer_state_gib_total", memory)
+        self.assertEqual(memory["optimizer_state_layout"], "full")
+        self.assertEqual(memory["gpu_count"], 8)
+
         self.assertEqual([item["name"] for item in payload["features"][:169]], [
             item["name"] for item in self.sample["features"]
         ])
@@ -391,6 +398,28 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             config.resolved.categorical_embedding_dims["goods_id_hn"],
             config.resolved.categorical_embedding_dims["impr.goods_id_hn"],
         )
+
+    def test_builder_cli_options_mutate_payload_and_memory_summary(self) -> None:
+        report = _synthetic_report(self.sample)
+        payload, summary = build_config(
+            self.sample,
+            report,
+            train_inputs=["/tmp/train"],
+            test_inputs=["/tmp/test"],
+            gpu_count=2,
+            embedding_weight_dtype="bf16",
+            sparse_optimizer="rowwise_adagrad",
+            embedding_budget_gib_per_gpu=80.0,
+        )
+        self.assertEqual(payload["runtime"]["nproc_per_node"], 2)
+        self.assertEqual(payload["training"]["embedding_weight_dtype"], "bf16")
+        self.assertEqual(payload["training"]["sparse_optimizer"], "rowwise_adagrad")
+        memory = summary["embedding_memory"]
+        self.assertEqual(memory["gpu_count"], 2)
+        self.assertEqual(memory["embedding_weight_dtype"], "bf16")
+        self.assertEqual(memory["optimizer_state_layout"], "rowwise")
+        self.assertIn("optimizer_state_gib_total", memory)
+        self.assertNotIn("adagrad_state_gib_total", memory)
 
     def test_report_rejects_incomplete_or_non_binary_labels(self) -> None:
         report = _synthetic_report(self.sample)
@@ -726,19 +755,22 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     actual = model(indexed, scenario_id)["logits"]
                 torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
-    def test_a100_profiles_enable_fast_paths_for_all_models(self) -> None:
-        for model_name in (
-            "rankmixer",
-            "mdl_rankmixer",
-            "onetrans",
-            "mdl_onetrans",
-        ):
+    def test_production_profiles_use_expected_runtime(self) -> None:
+        expected_runtime = {
+            "rankmixer": ("flash", True, 8),
+            "onetrans": ("flash", True, 8),
+            "mdl_onetrans": ("flash", True, 8),
+            # Current platform lacks torch.nn.attention.varlen; use SDPA eager.
+            "mdl_rankmixer": ("sdpa", False, 4),
+        }
+        for model_name, (attention_backend, compile_enabled, nproc) in expected_runtime.items():
             with self.subTest(model=model_name):
                 config = load_app_config(
                     ROOT / "configs" / f"{model_name}.yaml"
                 )
-                self.assertTrue(config.runtime.compile)
-                self.assertEqual(config.runtime.attention_backend, "flash")
+                self.assertEqual(config.runtime.attention_backend, attention_backend)
+                self.assertEqual(config.runtime.compile, compile_enabled)
+                self.assertEqual(config.runtime.nproc_per_node, nproc)
                 self.assertEqual(config.runtime.activation_checkpoint, "none")
                 self.assertFalse(config.runtime.trim_all_invalid_sequence_prefix)
                 self.assertFalse(config.runtime.validate_scenario_ids)

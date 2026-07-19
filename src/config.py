@@ -2002,7 +2002,7 @@ class TrainingConfig:
     fused_dense_optimizer: bool = True
     rmsprop_alpha: float = 0.99999
     rmsprop_momentum: float = 0.0
-    sparse_optimizer: Literal["adagrad"] = "adagrad"
+    sparse_optimizer: Literal["adagrad", "rowwise_adagrad"] = "adagrad"
     adagrad_lr_decay: float = 0.0
     adagrad_weight_decay: float = 0.0
     adagrad_initial_accumulator_value: float = 0.1
@@ -2083,8 +2083,10 @@ class TrainingConfig:
             raise ValueError("training.rmsprop_alpha must be in [0, 1)")
         if self.rmsprop_momentum < 0.0:
             raise ValueError("training.rmsprop_momentum must be non-negative")
-        if self.sparse_optimizer != "adagrad":
-            raise ValueError("training.sparse_optimizer must be adagrad for paper alignment")
+        if self.sparse_optimizer not in {"adagrad", "rowwise_adagrad"}:
+            raise ValueError(
+                "training.sparse_optimizer must be adagrad or rowwise_adagrad"
+            )
         if self.adagrad_lr_decay < 0.0:
             raise ValueError("training.adagrad_lr_decay must be non-negative")
         if self.adagrad_weight_decay < 0.0:
@@ -2093,9 +2095,23 @@ class TrainingConfig:
             raise ValueError("training.adagrad_initial_accumulator_value must be non-negative")
         if self.adagrad_eps <= 0.0:
             raise ValueError("training.adagrad_eps must be positive")
+        if (
+            self.sparse_optimizer == "rowwise_adagrad"
+            and self.adagrad_weight_decay != 0.0
+        ):
+            raise ValueError(
+                "training.rowwise_adagrad requires adagrad_weight_decay == 0"
+            )
         if self.embedding_distribution not in {"replicated", "sharded"}:
             raise ValueError(
                 "training.embedding_distribution must be replicated or sharded"
+            )
+        if (
+            self.sparse_optimizer == "rowwise_adagrad"
+            and self.embedding_distribution != "sharded"
+        ):
+            raise ValueError(
+                "training.rowwise_adagrad requires embedding_distribution=sharded"
             )
         if self.dense_distribution != "ddp":
             raise ValueError("training.dense_distribution must be ddp")

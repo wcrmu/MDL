@@ -29,6 +29,16 @@ _VARLEN_ATTN_USES_WINDOW_SIZE = (
 from .mlp import PerTokenFFN
 
 
+def varlen_attention_available() -> bool:
+    """True iff ``torch.nn.attention.varlen.varlen_attn`` can be imported.
+
+    This only reports Python API availability (PyTorch >= 2.10), not that every
+    GPU/dtype/shape combination will successfully execute the kernel.
+    """
+
+    return varlen_attn is not None
+
+
 def _sdpa_context(attention_backend: str):
     if attention_backend in {"auto", "sdpa"}:
         return nullcontext()

@@ -19,6 +19,31 @@ from torch import Tensor, nn
 
 
 EmbeddingShardStrategy = Literal["row_wise", "table_wise"]
+OptimizerStateLayout = Literal["full", "rowwise"]
+
+
+def embedding_local_bytes(
+    *,
+    rows: int,
+    embedding_dim: int,
+    weight_element_size: int,
+    optimizer_state_layout: OptimizerStateLayout = "full",
+) -> int:
+    """Bytes for local shard weight plus sparse Adagrad state."""
+
+    if rows < 0 or embedding_dim < 0 or weight_element_size <= 0:
+        raise ValueError("rows, embedding_dim, and weight_element_size must be valid")
+    weight_bytes = rows * embedding_dim * weight_element_size
+    if optimizer_state_layout == "full":
+        state_bytes = rows * embedding_dim * 4
+    elif optimizer_state_layout == "rowwise":
+        state_bytes = rows * 4
+    else:
+        raise ValueError(
+            "optimizer_state_layout must be full or rowwise, "
+            f"got {optimizer_state_layout!r}"
+        )
+    return weight_bytes + state_bytes
 
 
 def _invalid_any(invalid: Tensor, message: str) -> bool:
@@ -162,6 +187,7 @@ def plan_embedding_shards(
     world_size: int,
     strategy: Literal["auto", "row_wise", "table_wise"],
     table_wise_max_rows: int,
+    optimizer_state_layout: OptimizerStateLayout = "full",
 ) -> EmbeddingShardingPlan:
     """Build a deterministic memory-aware plan shared by every rank."""
 
@@ -169,6 +195,8 @@ def plan_embedding_shards(
         raise ValueError("world_size must be positive")
     if strategy not in {"auto", "row_wise", "table_wise"}:
         raise ValueError("strategy must be auto, row_wise, or table_wise")
+    if optimizer_state_layout not in {"full", "rowwise"}:
+        raise ValueError("optimizer_state_layout must be full or rowwise")
     specs = sorted(table_specs, key=lambda item: item.name)
     if len({item.name for item in specs}) != len(specs):
         raise ValueError("embedding table names must be unique")
@@ -191,11 +219,13 @@ def plan_embedding_shards(
             cyclic_offset=offset,
         )
         planned[table.name] = shard
-        # Include weight plus an FP32 Adagrad accumulator in the planning load.
         for rank in range(world_size):
             local_rows = shard.local_rows(table.num_embeddings, rank)
-            loads[rank] += local_rows * table.embedding_dim * (
-                table.element_size + 4
+            loads[rank] += embedding_local_bytes(
+                rows=local_rows,
+                embedding_dim=table.embedding_dim,
+                weight_element_size=table.element_size,
+                optimizer_state_layout=optimizer_state_layout,
             )
 
     for table in sorted(table_wise, key=lambda item: (-item.weight_bytes, item.name)):
@@ -206,12 +236,17 @@ def plan_embedding_shards(
             world_size=world_size,
             table_owner=owner,
         )
-        loads[owner] += table.num_embeddings * table.embedding_dim * (
-            table.element_size + 4
+        loads[owner] += embedding_local_bytes(
+            rows=table.num_embeddings,
+            embedding_dim=table.embedding_dim,
+            weight_element_size=table.element_size,
+            optimizer_state_layout=optimizer_state_layout,
         )
 
     payload = {
         "world_size": world_size,
+        "optimizer_state_layout": optimizer_state_layout,
+        "cost_model_version": 2,
         "tables": {
             name: asdict(planned[name])
             for name in sorted(planned)

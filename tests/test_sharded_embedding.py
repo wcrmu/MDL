@@ -13,10 +13,11 @@ from torch import nn
 from src.embeddings import (
     EmbeddingTableSpec,
     ShardedEmbedding,
+    embedding_local_bytes,
     grouped_sharded_embedding_lookup,
     plan_embedding_shards,
 )
-from src.optim import ShardedAdagrad
+from src.optim import ShardedAdagrad, ShardedRowWiseAdagrad
 from src.train import (
     _classify_model_parameters,
     _exclude_sparse_parameters_from_ddp,
@@ -327,6 +328,84 @@ class ShardingPlannerTest(unittest.TestCase):
         self.assertNotEqual(
             first.tables["small_a"].table_owner,
             first.tables["small_b"].table_owner,
+        )
+
+    def test_rowwise_cost_model_matches_embedding_local_bytes(self) -> None:
+        specs = [
+            EmbeddingTableSpec("t0", 1000, 64, element_size=2),
+        ]
+        plan = plan_embedding_shards(
+            specs,
+            world_size=2,
+            strategy="row_wise",
+            table_wise_max_rows=1,
+            optimizer_state_layout="rowwise",
+        )
+        shard = plan.tables["t0"]
+        for rank in range(2):
+            rows = shard.local_rows(1000, rank)
+            self.assertEqual(
+                embedding_local_bytes(
+                    rows=rows,
+                    embedding_dim=64,
+                    weight_element_size=2,
+                    optimizer_state_layout="rowwise",
+                ),
+                rows * (64 * 2 + 4),
+            )
+
+    def test_rowwise_optimizer_matches_full_table_reference_on_owned_rows(self) -> None:
+        torch.manual_seed(0)
+        full = nn.Parameter(torch.randn(8, 4, dtype=torch.float32))
+        shards = [
+            nn.Parameter(full[rank::2].detach().clone())
+            for rank in range(2)
+        ]
+        full_opt = ShardedRowWiseAdagrad(
+            [full], lr=0.1, initial_accumulator_value=0.0, eps=1e-8
+        )
+        shard_opts = [
+            ShardedRowWiseAdagrad(
+                [shard], lr=0.1, initial_accumulator_value=0.0, eps=1e-8
+            )
+            for shard in shards
+        ]
+        # Global sparse rows [0, 3, 5] -> local rows on cyclic owners 0/1/1.
+        full.grad = torch.sparse_coo_tensor(
+            torch.tensor([[0, 3, 5]]),
+            torch.tensor([[1.0, 0.0, -1.0, 0.5], [0.5, 0.5, 0.0, 0.0], [2.0, 0.0, 0.0, 1.0]]),
+            size=full.shape,
+        ).coalesce()
+        full_opt.step()
+
+        shards[0].grad = torch.sparse_coo_tensor(
+            torch.tensor([[0]]),
+            torch.tensor([[1.0, 0.0, -1.0, 0.5]]),
+            size=shards[0].shape,
+        ).coalesce()
+        shards[1].grad = torch.sparse_coo_tensor(
+            torch.tensor([[1, 2]]),
+            torch.tensor([[0.5, 0.5, 0.0, 0.0], [2.0, 0.0, 0.0, 1.0]]),
+            size=shards[1].shape,
+        ).coalesce()
+        for opt in shard_opts:
+            opt.step()
+
+        self.assertTrue(torch.allclose(shards[0], full[0::2], atol=1e-6))
+        self.assertTrue(torch.allclose(shards[1], full[1::2], atol=1e-6))
+        self.assertTrue(
+            torch.allclose(
+                shard_opts[0].state[shards[0]]["sum"],
+                full_opt.state[full]["sum"][0::2],
+                atol=1e-6,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                shard_opts[1].state[shards[1]]["sum"],
+                full_opt.state[full]["sum"][1::2],
+                atol=1e-6,
+            )
         )
 
 

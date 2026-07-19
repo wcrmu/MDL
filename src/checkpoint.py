@@ -15,7 +15,7 @@ from torch import Tensor, nn
 from .config import AppConfig
 from .embeddings import EmbeddingShardSpec, ShardedEmbedding, sharded_embedding_modules
 from .features import vocab_strategy_fingerprint
-from .optim import ShardedAdagrad
+from .optim import ShardedAdagrad, ShardedRowWiseAdagrad
 
 
 SHARDED_CHECKPOINT_FORMAT = "mdl_sharded_embedding_v1"
@@ -85,7 +85,7 @@ def save_model_checkpoint(
     rank: int = 0,
     world_size: int = 1,
     process_group: torch_dist.ProcessGroup | None = None,
-    sharded_optimizer: ShardedAdagrad | None = None,
+    sharded_optimizer: ShardedAdagrad | ShardedRowWiseAdagrad | None = None,
 ) -> None:
     """Save one replicated file or an atomic manifest plus local shard files."""
 
@@ -174,6 +174,9 @@ def save_model_checkpoint(
                     for item in range(world_size)
                 ],
                 "tables": table_metadata,
+                "training_metadata": {
+                    "sparse_optimizer": config.training.sparse_optimizer,
+                },
                 **_checkpoint_metadata(config),
             },
             checkpoint_path / "manifest.json",

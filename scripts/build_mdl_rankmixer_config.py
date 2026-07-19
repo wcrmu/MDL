@@ -38,7 +38,11 @@ from scripts.profile_prehashed_parquet import (  # noqa: E402
     profile_spec_from_mapping,
 )
 from src.config import AppConfig  # noqa: E402
-from src.embeddings import EmbeddingTableSpec, plan_embedding_shards  # noqa: E402
+from src.embeddings import (  # noqa: E402
+    EmbeddingTableSpec,
+    embedding_local_bytes,
+    plan_embedding_shards,
+)
 
 
 CONTEXT_FEATURE_COUNT = 47
@@ -1205,6 +1209,8 @@ def _embedding_memory_summary(
     *,
     gpu_count: int,
     budget_gib_per_gpu: float,
+    embedding_weight_dtype: str = "fp32",
+    sparse_optimizer: str = "adagrad",
 ) -> dict[str, Any]:
     tables: list[tuple[str, int, int]] = []
     for feature in payload["features"]:
@@ -1230,15 +1236,27 @@ def _embedding_memory_summary(
                     int(field["embedding_dim"]),
                 )
             )
-    weight_bytes = sum((bucket + 1) * dimension * 4 for _name, bucket, dimension in tables)
-    adagrad_bytes = weight_bytes
-    ideal_per_gpu = (weight_bytes + adagrad_bytes) / gpu_count
+    weight_element_size = {"fp32": 4, "bf16": 2}[embedding_weight_dtype]
+    optimizer_state_layout = (
+        "rowwise" if sparse_optimizer == "rowwise_adagrad" else "full"
+    )
+    weight_bytes = sum(
+        (bucket + 1) * dimension * weight_element_size
+        for _name, bucket, dimension in tables
+    )
+    if optimizer_state_layout == "full":
+        optimizer_state_bytes = sum(
+            (bucket + 1) * dimension * 4 for _name, bucket, dimension in tables
+        )
+    else:
+        optimizer_state_bytes = sum((bucket + 1) * 4 for _name, bucket, _dimension in tables)
+    ideal_per_gpu = (weight_bytes + optimizer_state_bytes) / gpu_count
     table_specs = [
         EmbeddingTableSpec(
             name=name,
             num_embeddings=bucket + 1,
             embedding_dim=dimension,
-            element_size=4,
+            element_size=weight_element_size,
         )
         for name, bucket, dimension in tables
     ]
@@ -1248,15 +1266,17 @@ def _embedding_memory_summary(
         world_size=gpu_count,
         strategy=sharding["strategy"],
         table_wise_max_rows=int(sharding["table_wise_max_rows"]),
+        optimizer_state_layout=optimizer_state_layout,
     )
     per_gpu_bytes = [0] * gpu_count
     for table in table_specs:
         shard = plan.tables[table.name]
         for rank in range(gpu_count):
-            per_gpu_bytes[rank] += (
-                shard.local_rows(table.num_embeddings, rank)
-                * table.embedding_dim
-                * 8
+            per_gpu_bytes[rank] += embedding_local_bytes(
+                rows=shard.local_rows(table.num_embeddings, rank),
+                embedding_dim=table.embedding_dim,
+                weight_element_size=table.element_size,
+                optimizer_state_layout=optimizer_state_layout,
             )
     planned_per_gpu = max(per_gpu_bytes, default=0)
     gib = 1024**3
@@ -1266,7 +1286,7 @@ def _embedding_memory_summary(
                 "name": name,
                 "num_buckets": bucket,
                 "embedding_dim": dimension,
-                "weight_gib": (bucket + 1) * dimension * 4 / gib,
+                "weight_gib": (bucket + 1) * dimension * weight_element_size / gib,
             }
             for name, bucket, dimension in tables
         ),
@@ -1276,7 +1296,10 @@ def _embedding_memory_summary(
     summary = {
         "unique_tables": len(tables),
         "weight_gib_total": weight_bytes / gib,
-        "adagrad_state_gib_total": adagrad_bytes / gib,
+        "optimizer_state_gib_total": optimizer_state_bytes / gib,
+        "optimizer_state_layout": optimizer_state_layout,
+        "embedding_weight_dtype": embedding_weight_dtype,
+        "gpu_count": gpu_count,
         "ideal_weight_plus_state_gib_per_gpu": ideal_per_gpu / gib,
         "planned_weight_plus_state_gib_per_gpu": planned_per_gpu / gib,
         "planned_weight_plus_state_gib_by_gpu": [
@@ -1310,6 +1333,9 @@ def build_config(
     event_token_budget_per_gpu: int = 262_144,
     batch_size: int | None = None,
     auto_discover_scenes: bool = False,
+    gpu_count: int = 8,
+    embedding_weight_dtype: str = "fp32",
+    sparse_optimizer: str = "adagrad",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if model_name not in SUPPORTED_MODELS:
         raise ValueError(
@@ -1325,6 +1351,12 @@ def build_config(
         raise ValueError("embedding_budget_gib_per_gpu must be positive")
     if event_token_budget_per_gpu <= 0:
         raise ValueError("event_token_budget_per_gpu must be positive")
+    if gpu_count <= 0:
+        raise ValueError("gpu_count must be positive")
+    if embedding_weight_dtype not in {"fp32", "bf16"}:
+        raise ValueError("embedding_weight_dtype must be fp32 or bf16")
+    if sparse_optimizer not in {"adagrad", "rowwise_adagrad"}:
+        raise ValueError("sparse_optimizer must be adagrad or rowwise_adagrad")
 
     raw_features = sample.get("features")
     raw_sequences = sample.get("sequences")
@@ -1698,7 +1730,7 @@ def build_config(
             "activation_checkpoint": "full",
             "attention_backend": "auto",
             "distributed": "ddp",
-            "nproc_per_node": 8,
+            "nproc_per_node": gpu_count,
             "master_addr": "127.0.0.1",
             "master_port": 29500,
         },
@@ -1746,10 +1778,11 @@ def build_config(
             "fused_dense_optimizer": True,
             "rmsprop_alpha": 0.99999,
             "rmsprop_momentum": 0.0,
-            "sparse_optimizer": "adagrad",
+            "sparse_optimizer": sparse_optimizer,
             "adagrad_initial_accumulator_value": 0.1,
             "adagrad_eps": 1.0e-10,
             "embedding_sparse_gradients": True,
+            "embedding_weight_dtype": embedding_weight_dtype,
             "sparse_update_mode": "ddp_synced_adagrad",
             "sparse_parameter_server_adapter": None,
             "dense_clip_norm": 1.0,
@@ -1771,8 +1804,10 @@ def build_config(
     config.validate()
     memory = _embedding_memory_summary(
         payload,
-        gpu_count=8,
+        gpu_count=gpu_count,
         budget_gib_per_gpu=embedding_budget_gib_per_gpu,
+        embedding_weight_dtype=embedding_weight_dtype,
+        sparse_optimizer=sparse_optimizer,
     )
     summary = {
         "model_name": model_name,
@@ -1847,9 +1882,11 @@ def render_config(payload: Mapping[str, Any], summary: Mapping[str, Any]) -> str
         )
     comments.extend(
         [
-            "# Estimated sharded embedding weight+Adagrad state: "
+            "# Estimated sharded embedding weight + optimizer state: "
             f"{memory['planned_weight_plus_state_gib_per_gpu']:.2f} GiB/GPU "
-            f"within a {memory['budget_gib_per_gpu']:.2f} GiB/GPU planning budget.",
+            f"({memory['optimizer_state_layout']}, {memory['embedding_weight_dtype']}, "
+            f"{memory['gpu_count']} GPU) within a {memory['budget_gib_per_gpu']:.2f} "
+            "GiB/GPU planning budget.",
             "# Batch size is a conservative architecture-aware starting point; profile it before a long run.",
             "",
         ]
@@ -1892,6 +1929,17 @@ def main() -> int:
     parser.add_argument("--embedding-budget-gib-per-gpu", type=float, default=40.0)
     parser.add_argument("--event-token-budget-per-gpu", type=int, default=262_144)
     parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--gpu-count", type=int, default=8)
+    parser.add_argument(
+        "--embedding-weight-dtype",
+        choices=("fp32", "bf16"),
+        default="fp32",
+    )
+    parser.add_argument(
+        "--sparse-optimizer",
+        choices=("adagrad", "rowwise_adagrad"),
+        default="adagrad",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     try:
@@ -1923,6 +1971,9 @@ def main() -> int:
             event_token_budget_per_gpu=args.event_token_budget_per_gpu,
             batch_size=args.batch_size,
             auto_discover_scenes=args.estimate_from_names,
+            gpu_count=args.gpu_count,
+            embedding_weight_dtype=args.embedding_weight_dtype,
+            sparse_optimizer=args.sparse_optimizer,
         )
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))

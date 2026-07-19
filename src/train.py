@@ -49,8 +49,9 @@ from .embeddings import (
     sharded_embedding_modules,
 )
 from .model import build_model
+from .modules.attention import varlen_attention_available
 from .modules.mlp import SparseMoEPerTokenFFN
-from .optim import ShardedAdagrad
+from .optim import ShardedAdagrad, ShardedRowWiseAdagrad
 
 
 logger = logging.getLogger(__name__)
@@ -275,6 +276,26 @@ def _select_device(config: AppConfig, local_rank: int | None = None) -> torch.de
     return torch.device(requested)
 
 
+def _varlen_attention_reasons(config: AppConfig) -> tuple[str, ...]:
+    """Human-readable reasons this config needs torch.nn.attention.varlen."""
+
+    reasons: list[str] = []
+    if config.model.name in {"longer", "onetrans", "mdl_onetrans"}:
+        reasons.append(f"model={config.model.name}")
+    longer_sequences = [
+        sequence.name
+        for sequence in config.sequences
+        if sequence.encoder == "longer"
+    ]
+    if longer_sequences:
+        reasons.append("LONGER sequences=" + ",".join(longer_sequences))
+    return tuple(reasons)
+
+
+def _requires_varlen_attention(config: AppConfig) -> bool:
+    return bool(_varlen_attention_reasons(config))
+
+
 def _attention_runtime_description(
     config: AppConfig,
     device: torch.device,
@@ -282,32 +303,47 @@ def _attention_runtime_description(
     # Keep programmatic/minimal configs created before this option compatible;
     # validated YAML always materializes the explicit RuntimeConfig default.
     requested = getattr(config.runtime, "attention_backend", "auto")
+    reasons = _varlen_attention_reasons(config)
+    requires_varlen = bool(reasons)
     if requested == "flash":
         if device.type != "cuda":
             raise RuntimeError(
-                "runtime.attention_backend=flash was requested, but CUDA could not be initialized"
+                "runtime.attention_backend='flash' requires CUDA, but the resolved "
+                f"device is {device}"
             )
-        available = getattr(
-            torch.backends.cuda, "is_flash_attention_available", lambda: False
-        )()
-        if not available:
+        if requires_varlen and not varlen_attention_available():
+            detail = "; ".join(reasons) if reasons else "configured LONGER/OneTrans paths"
             raise RuntimeError(
-                "runtime.attention_backend=flash was requested, but this PyTorch/GPU "
-                "build reports FlashAttention unavailable"
+                "runtime.attention_backend='flash' requires "
+                "torch.nn.attention.varlen.varlen_attn for "
+                f"{detail}, but the API is unavailable in "
+                f"torch={torch.__version__}. Use runtime.attention_backend='sdpa' "
+                "on this platform, or install and validate PyTorch >= 2.10."
             )
-        if config.model.name in {"onetrans", "mdl_onetrans"}:
-            implementation = "varlen_flash_bottom_right_causal"
-        elif config.model.name == "longer":
-            implementation = "varlen_flash_split_global_full_recent_causal"
-        else:
-            implementation = "sdpa_flash_only"
+        ordinary_flash_available = getattr(
+            torch.backends.cuda,
+            "is_flash_attention_available",
+            lambda: False,
+        )()
+        if not ordinary_flash_available:
+            raise RuntimeError(
+                "runtime.attention_backend='flash' was requested, but this "
+                "PyTorch/GPU build reports the ordinary SDPA FlashAttention "
+                "backend unavailable"
+            )
+        implementation = "varlen_flash" if requires_varlen else "padded_sdpa_flash"
         return (
-            f"requested=flash resolved={implementation} strict=true "
-            f"device={device} precision={config.runtime.precision}"
+            f"requested=flash resolved={implementation} "
+            f"requires_varlen={requires_varlen} "
+            f"varlen_api_available={varlen_attention_available()} "
+            f"strict=true device={device} precision={config.runtime.precision}"
         )
     return (
-        f"requested={requested} resolved=runtime_dispatch strict=false "
-        f"device={device} precision={config.runtime.precision}"
+        f"requested={requested} resolved=padded_sdpa "
+        f"kernel_policy=runtime_dispatch "
+        f"requires_varlen={requires_varlen} "
+        f"varlen_api_available={varlen_attention_available()} "
+        f"strict=false device={device} precision={config.runtime.precision}"
     )
 
 
@@ -1837,7 +1873,7 @@ def _log_sparse_replica_memory(
             "Sparse replica | "
             f"name={ref.name} shape={tuple(ref.parameter.shape)} "
             f"weight_mib={weight_bytes / (1024 ** 2):.2f} "
-            f"adagrad_state_mib={state_bytes / (1024 ** 2):.2f}"
+            f"optimizer_state_mib={state_bytes / (1024 ** 2):.2f}"
         )
     per_rank_bytes = total_weight_bytes + total_state_bytes
     print(
@@ -1854,6 +1890,8 @@ def _log_sharded_embedding_memory(
     context: DistributedContext,
     model: nn.Module,
     optimizer: torch.optim.Optimizer | None,
+    *,
+    sparse_optimizer: str = "adagrad",
 ) -> None:
     modules = sharded_embedding_modules(model)
     if not modules:
@@ -1882,6 +1920,16 @@ def _log_sharded_embedding_memory(
         torch_dist.all_gather_object(gathered, local_tables)
     if context.rank != 0:
         return
+    layout = (
+        "rowwise" if sparse_optimizer == "rowwise_adagrad" else "full"
+    )
+    print(
+        "Sharded embedding memory | "
+        f"sparse_optimizer={sparse_optimizer} "
+        f"optimizer_state_layout={layout} "
+        f"embedding_weight_dtype="
+        f"{getattr(model, 'embedding_weight_dtype', torch.float32)}"
+    )
     for rank, rank_tables_raw in enumerate(gathered):
         rank_tables = list(rank_tables_raw or [])
         weight_bytes = sum(int(item["weight_bytes"]) for item in rank_tables)
@@ -1889,8 +1937,9 @@ def _log_sharded_embedding_memory(
         print(
             "Sharded embedding memory | "
             f"rank={rank} tables={len(rank_tables)} "
-            f"weight_mib={weight_bytes / (1024 ** 2):.2f} "
-            f"adagrad_state_mib={state_bytes / (1024 ** 2):.2f}"
+            f"weight_gib={weight_bytes / (1024 ** 3):.5f} "
+            f"optimizer_state_gib={state_bytes / (1024 ** 3):.5f} "
+            f"total_gib={(weight_bytes + state_bytes) / (1024 ** 3):.5f}"
         )
         for item in rank_tables:
             print(
@@ -2175,7 +2224,6 @@ def train_mdl(
     context = _setup_distributed(config)
     batch_iterator: Iterator[FeatureBatch] | None = None
     try:
-        config = _resolve_distributed_auto_scenarios(config, context)
         device = context.device
         if device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = config.runtime.allow_tf32
@@ -2183,9 +2231,11 @@ def train_mdl(
             torch.set_float32_matmul_precision(
                 "high" if config.runtime.allow_tf32 else "highest"
             )
+        # Fail before scenario discovery / Parquet scans when flash lacks varlen.
         attention_runtime = _attention_runtime_description(config, device)
         if log_steps and context.rank == 0:
             print(f"Attention backend | {attention_runtime}")
+        config = _resolve_distributed_auto_scenarios(config, context)
         vocab_maps = load_vocab_maps(config)
         base_model = build_model(config, vocab_maps).to(device)
         _validate_sharded_embedding_metadata(context, base_model)
@@ -2241,14 +2291,25 @@ def train_mdl(
         if sharded_embedding_params:
             _mark_sparse_invariant_checks_explicitly_disabled()
             sparse_lr = config.training.lr_sparse or config.training.lr_dense
-            sharded_embedding_optimizer = ShardedAdagrad(
-                sharded_embedding_params,
-                lr=sparse_lr,
-                lr_decay=config.training.adagrad_lr_decay,
-                weight_decay=config.training.adagrad_weight_decay,
-                initial_accumulator_value=config.training.adagrad_initial_accumulator_value,
-                eps=config.training.adagrad_eps,
-            )
+            optimizer_kwargs = {
+                "lr": sparse_lr,
+                "lr_decay": config.training.adagrad_lr_decay,
+                "weight_decay": config.training.adagrad_weight_decay,
+                "initial_accumulator_value": (
+                    config.training.adagrad_initial_accumulator_value
+                ),
+                "eps": config.training.adagrad_eps,
+            }
+            if config.training.sparse_optimizer == "rowwise_adagrad":
+                sharded_embedding_optimizer = ShardedRowWiseAdagrad(
+                    sharded_embedding_params,
+                    **optimizer_kwargs,
+                )
+            else:
+                sharded_embedding_optimizer = ShardedAdagrad(
+                    sharded_embedding_params,
+                    **optimizer_kwargs,
+                )
             optimizers.append(sharded_embedding_optimizer)
         sparse_synchronizer = _ReplicatedSparseGradientSynchronizer(
             context,
@@ -2264,6 +2325,7 @@ def train_mdl(
                 context,
                 base_model,
                 sharded_embedding_optimizer,
+                sparse_optimizer=config.training.sparse_optimizer,
             )
         optimizer_base_lrs = [
             [float(group["lr"]) for group in optimizer.param_groups]
