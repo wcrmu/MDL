@@ -539,6 +539,46 @@ class ByteBudgetTest(unittest.TestCase):
 
         self.assertGreater(reservation, table.nbytes)
 
+    def test_prepared_batch_estimate_supports_multi_chunk_dictionary_list_bags(
+        self,
+    ) -> None:
+        """concat of compact_request_lists bags must not require dict unify."""
+
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "rankmixer.yaml")
+        feature = next(
+            item
+            for item in config.features
+            if item.kind == "categorical" and item.pooling == "mean"
+        )
+        dictionary_a = pa.array([[1, 2], [3]], type=pa.list_(pa.int64()))
+        dictionary_b = pa.array([[4], [5, 6, 7]], type=pa.list_(pa.int64()))
+        chunk_a = pa.DictionaryArray.from_arrays(
+            pa.array([0, 1], type=pa.int32()),
+            dictionary_a,
+        )
+        chunk_b = pa.DictionaryArray.from_arrays(
+            pa.array([1, 0], type=pa.int32()),
+            dictionary_b,
+        )
+        table = pa.Table.from_arrays(
+            [pa.chunked_array([chunk_a, chunk_b])],
+            names=[feature.source],
+        )
+        config = replace(config, features=(feature,), sequences=())
+
+        with self.assertRaises(pa.lib.ArrowNotImplementedError):
+            table[feature.source].combine_chunks()
+
+        reservation = _estimate_prepared_batch_bytes(config, table)
+
+        self.assertGreater(reservation, table.nbytes)
+        # Conservative path may use full dictionary max (3), not only referenced.
+        self.assertGreaterEqual(
+            reservation,
+            table.nbytes + table.num_rows * (8 + 3 * 8),
+        )
+
     def test_budget_blocks_until_bytes_are_released(self) -> None:
         budget = _ByteBudget(100)
         stop = threading.Event()

@@ -797,6 +797,34 @@ def _feature_batch_tensor_bytes(batch: FeatureBatch) -> int:
     )
 
 
+def _max_bag_length(table: object, source: str) -> int:
+    """Conservative per-column bag length without unifying dictionaries.
+
+    Multi-chunk ``dictionary<list<int64>>`` columns cannot always
+    ``combine_chunks()`` (Arrow lacks nested-dictionary unification). For the
+    prefetch byte budget it is enough to take the max list length per chunk;
+    inspecting a dictionary's full value set may slightly over-estimate when
+    some entries are unreferenced, which matches the conservative reservation.
+    """
+
+    pa, pc, _ds, _pq = _require_pyarrow()
+    chunked = table[source]
+    chunks = getattr(chunked, "chunks", None)
+    if chunks is None:
+        chunks = (chunked,)
+    maximum = 0
+    for chunk in chunks:
+        if pa.types.is_dictionary(chunk.type):
+            lengths = pc.list_value_length(chunk.dictionary)
+        else:
+            lengths = pc.list_value_length(chunk)
+        if lengths.null_count:
+            lengths = pc.fill_null(lengths, 0)
+        chunk_max = pc.max(lengths).as_py()
+        maximum = max(maximum, int(chunk_max or 0))
+    return maximum
+
+
 def _estimate_prepared_batch_bytes(config: AppConfig, table: object) -> int:
     """Conservative Arrow-plus-tensor reservation for the prefetch queue."""
 
@@ -808,17 +836,7 @@ def _estimate_prepared_batch_bytes(config: AppConfig, table: object) -> int:
             max_length = bag_max_lengths.get(feature.source)
             if max_length is None:
                 try:
-                    pa, pc, _ds, _pq = _require_pyarrow()
-                    array = table[feature.source].combine_chunks()
-                    if pa.types.is_dictionary(array.type):
-                        dictionary_lengths = pc.list_value_length(array.dictionary)
-                        lengths = pc.take(dictionary_lengths, array.indices)
-                    else:
-                        lengths = pc.list_value_length(array)
-                    if lengths.null_count:
-                        lengths = pc.fill_null(lengths, 0)
-                    maximum = pc.max(lengths).as_py()
-                    max_length = int(maximum or 0)
+                    max_length = _max_bag_length(table, feature.source)
                 except (KeyError, TypeError, AttributeError):
                     max_length = feature.max_length or 1
                 bag_max_lengths[feature.source] = max_length
