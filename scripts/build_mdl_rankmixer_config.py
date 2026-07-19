@@ -118,6 +118,10 @@ TASK_PRIOR_UPS = {
     "upid_pay": "buy_long",
     "cateid_filter": "buy_long",
 }
+# Alias kept for Phase 2 / docs; both MDL surfaces share this contract.
+MDL_MODELS = frozenset({"mdl_rankmixer", "mdl_onetrans"})
+MDL_TASK_PRIOR_SOURCES = TASK_PRIOR_UPS
+MDL_SCENARIO_SHARED_PRIORS = SCENARIO_SHARED_PRIOR_UPS
 EXPECTED_LABELS = {
     "fst_cart": "label_fst_cart",
     "upid_pay": "upid_fst_trgt_noc_clk_pay_24h",
@@ -166,7 +170,9 @@ PHASE2_TASK_PRIOR_SEQUENCES = (
     "task_upid_pay_prior",
     "task_cateid_filter_prior",
 )
-# Buy-prior dedup excludes timegap (Phase 2 keeps independent prior timegap tables).
+# Buy-prior dedup excludes timegap (Phase 2 keeps independent prior timegap tables)
+# and excludes spec/sku_ids (those already flatten onto cart_long via the dedicated
+# PHASE2_SPEC/SKU alias lists below).
 PHASE2_BUY_PRIOR_SHARE_FIELDS = (
     "cat1_id_hn",
     "cat2_id_hn",
@@ -177,8 +183,6 @@ PHASE2_BUY_PRIOR_SHARE_FIELDS = (
     "mall_id_hn",
     "sales_hn",
     "price_hn",
-    "spec_hn",
-    "sku_ids_hn",
 )
 PHASE2_TASK_PRIOR_BASE_SHARES = {
     "goods_id_hn": "goods_id_hn",
@@ -1388,7 +1392,9 @@ def _share_embedding(
     encoding["num_buckets"] = int(physical["encoding"]["num_buckets"])
     encoding["padding_id"] = int(physical["encoding"]["padding_id"])
     encoding["share_embedding"] = True
-    encoding["share_with"] = base_name
+    # Always point at the physical root so configs never keep multi-hop chains
+    # like cateid.spec → upid.spec → cart_long.spec.
+    encoding["share_with"] = root
 
 
 def _propagate_shared_shapes(payload: Mapping[str, Any]) -> None:
@@ -1403,6 +1409,7 @@ def _propagate_shared_shapes(payload: Mapping[str, Any]) -> None:
         encoding["type"] = physical["encoding"]["type"]
         encoding["num_buckets"] = int(physical["encoding"]["num_buckets"])
         encoding["padding_id"] = int(physical["encoding"]["padding_id"])
+        encoding["share_with"] = root_name
 
 
 def _validate_share_graph(payload: Mapping[str, Any]) -> None:
@@ -1417,6 +1424,11 @@ def _validate_share_graph(payload: Mapping[str, Any]) -> None:
                 f"share_embedding=true requires share_with for categorical input {name!r}"
             )
         root_name = _resolve_share_root(entries, name)
+        if target != root_name:
+            raise ValueError(
+                f"shared alias {name!r} share_with={target!r} must point at the "
+                f"physical root {root_name!r} (multi-hop alias chains are not allowed)"
+            )
         physical = entries[root_name]
         if int(entry["embedding_dim"]) != int(physical["embedding_dim"]):
             raise ValueError(
@@ -1458,10 +1470,14 @@ def _sequence_has_field(payload: Mapping[str, Any], sequence_name: str, field_na
     return False
 
 
-def _apply_phase2_shared(payload: dict[str, Any]) -> None:
-    """Merge duplicate task-prior / important tables onto shared physical bases."""
+def _payload_has_task_priors(payload: Mapping[str, Any]) -> bool:
+    names = {str(sequence["name"]) for sequence in payload["sequences"]}
+    return all(name in names for name in PHASE2_TASK_PRIOR_SEQUENCES)
 
-    # Spec / SKU-list: enlarge the main cart_long bases, then share all aliases.
+
+def _apply_phase2_common(payload: dict[str, Any]) -> None:
+    """Shared Phase 2 table merges that apply to all four production models."""
+
     _set_embedding_shape(
         payload,
         "cart_long.spec_hn",
@@ -1474,12 +1490,28 @@ def _apply_phase2_shared(payload: dict[str, Any]) -> None:
         num_buckets=1 << 24,
         embedding_dim=48,
     )
+    for alias in ("buy_long.spec_hn", "ups_clk_sku.spec_hn"):
+        if _sequence_has_field(payload, alias.split(".", 1)[0], alias.split(".", 1)[1]):
+            _share_embedding(payload, alias, "cart_long.spec_hn")
+    if _sequence_has_field(payload, "buy_long", "sku_ids_hn"):
+        _share_embedding(payload, "buy_long.sku_ids_hn", "cart_long.sku_ids_hn")
+    _propagate_shared_shapes(payload)
+    _validate_share_graph(payload)
+
+
+def _apply_phase2_mdl_priors(payload: dict[str, Any]) -> None:
+    """MDL-only prior alias merges; requires the three task-prior sequences."""
+
+    if not _payload_has_task_priors(payload):
+        raise ValueError(
+            "Phase 2 MDL prior profile requires task_fst_cart_prior, "
+            "task_upid_pay_prior, and task_cateid_filter_prior sequences"
+        )
     for alias in PHASE2_SPEC_SHARE_ALIASES:
         _share_embedding(payload, alias, "cart_long.spec_hn")
     for alias in PHASE2_SKU_LIST_SHARE_ALIASES:
         _share_embedding(payload, alias, "cart_long.sku_ids_hn")
 
-    # Lowest-risk buy-prior dedup, then point entity fields at scalar bases.
     for field_name in PHASE2_BUY_PRIOR_SHARE_FIELDS:
         alias = f"task_cateid_filter_prior.{field_name}"
         base = f"task_upid_pay_prior.{field_name}"
@@ -1498,16 +1530,25 @@ def _apply_phase2_shared(payload: dict[str, Any]) -> None:
     for alias_name, base_name in PHASE2_SCENARIO_PRIOR_SHARES.items():
         try:
             _find_feature(payload, alias_name)
-        except KeyError:
-            continue
+        except KeyError as error:
+            raise ValueError(
+                f"Phase 2 MDL prior profile requires feature {alias_name!r}"
+            ) from error
         _share_embedding(payload, alias_name, base_name)
 
     _propagate_shared_shapes(payload)
     _validate_share_graph(payload)
 
 
-def _apply_phase2_shared_dim(payload: dict[str, Any]) -> None:
-    _apply_phase2_shared(payload)
+def _apply_phase2_shared(payload: dict[str, Any]) -> None:
+    """Merge duplicate tables onto shared physical bases for the payload family."""
+
+    _apply_phase2_common(payload)
+    if _payload_has_task_priors(payload):
+        _apply_phase2_mdl_priors(payload)
+
+
+def _apply_phase2_dim_compression(payload: dict[str, Any]) -> None:
     _set_embedding_shape(payload, "goods_id_hn", embedding_dim=48)
     _set_embedding_shape(payload, "uid_or_bg_hn", embedding_dim=48)
     _set_embedding_shape(payload, "sku_id_hn", embedding_dim=48)
@@ -1520,6 +1561,11 @@ def _apply_phase2_shared_dim(payload: dict[str, Any]) -> None:
     )
     _propagate_shared_shapes(payload)
     _validate_share_graph(payload)
+
+
+def _apply_phase2_shared_dim(payload: dict[str, Any]) -> None:
+    _apply_phase2_shared(payload)
+    _apply_phase2_dim_compression(payload)
 
 
 def _apply_phase2_shared_dim_query_bucket(payload: dict[str, Any]) -> None:
@@ -1814,9 +1860,9 @@ def build_config(
                 length_quantile=length_quantile,
                 max_sequence_length=max_sequence_length,
             )
-            for task, ups in TASK_PRIOR_UPS.items()
+            for task, ups in MDL_TASK_PRIOR_SOURCES.items()
         ]
-        if model_name == "mdl_rankmixer"
+        if mdl_family
         else []
     )
     sequences = [*main_sequences, *task_prior_sequences]
@@ -1845,11 +1891,7 @@ def build_config(
         if mdl_family:
             if auto_scenario_prior_name is None:  # Defensive type narrowing.
                 raise RuntimeError("auto scenario prior was not constructed")
-            scenario_priors = (
-                list(SCENARIO_SHARED_PRIOR_UPS)
-                if model_name == "mdl_rankmixer"
-                else []
-            )
+            scenario_priors = list(MDL_SCENARIO_SHARED_PRIORS)
             scenario_tokens = [
                 {
                     "name": AUTO_SCENARIO_NAME,
@@ -1872,11 +1914,7 @@ def build_config(
             "source_encoding": "index",
         }
         if mdl_family:
-            scenario_priors = (
-                list(SCENARIO_SHARED_PRIOR_UPS)
-                if model_name == "mdl_rankmixer"
-                else []
-            )
+            scenario_priors = list(MDL_SCENARIO_SHARED_PRIORS)
             scenario_tokens = [
                 {
                     "name": str(scene_id),
@@ -1902,11 +1940,7 @@ def build_config(
             {
                 "name": task,
                 "important_inputs": task_important_names,
-                "prior_inputs": (
-                    [f"task_{task}_prior"]
-                    if model_name == "mdl_rankmixer"
-                    else []
-                ),
+                "prior_inputs": [f"task_{task}_prior"],
             }
             for task in EXPECTED_LABELS
         ]
@@ -1927,14 +1961,31 @@ def build_config(
     else:
         resolved_test_inputs = []
 
+    adapter_sequence_limits = {
+        str(sequence["name"]): int(sequence["max_length"])
+        for sequence in main_sequences
+    }
+    for task, ups in MDL_TASK_PRIOR_SOURCES.items():
+        prior_name = f"task_{task}_prior"
+        prior = next(
+            (
+                sequence
+                for sequence in task_prior_sequences
+                if sequence["name"] == prior_name
+            ),
+            None,
+        )
+        if prior is None:
+            continue
+        adapter_sequence_limits[ups] = max(
+            int(adapter_sequence_limits[ups]),
+            int(prior["max_length"]),
+        )
     adapter_options = _adapter_options(
         raw_features,
         bag_fields,
         None if auto_discover_scenes else scene_ids,
-        {
-            str(sequence["name"]): int(sequence["max_length"])
-            for sequence in main_sequences
-        },
+        adapter_sequence_limits,
     )
     derived_time_columns = set(adapter_options["time_delta_outputs"].values())
     sequence_input_columns = list(
@@ -2171,6 +2222,7 @@ def build_config(
                 model_name,
                 embedding_profile,
             ),
+            "save_checkpoint": False,
         },
     }
 

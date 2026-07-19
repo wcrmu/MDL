@@ -2174,7 +2174,7 @@ class SparseMoEAlignmentTest(unittest.TestCase):
 
 
 class MDLOneTransLayerwiseAlignmentTest(unittest.TestCase):
-    def test_backbone_never_builds_a_separate_sequence_summary_encoder(self) -> None:
+    def test_backbone_uses_selective_prior_summaries_not_blanket_encoding(self) -> None:
         encoder_bank = nn.Module()
 
         class Tokenizer(nn.Module):
@@ -2204,8 +2204,9 @@ class MDLOneTransLayerwiseAlignmentTest(unittest.TestCase):
             backbone = OneTransBackbone(config, {})
 
         self.assertIs(backbone.encoder_bank, encoder_bank)
-        self.assertFalse(
-            encoder_constructor.call_args.kwargs["build_sequence_summaries"]
+        self.assertEqual(
+            encoder_constructor.call_args.kwargs["build_sequence_summaries"],
+            set(),
         )
 
     def test_domain_blocks_observe_corresponding_backbone_layer(self) -> None:

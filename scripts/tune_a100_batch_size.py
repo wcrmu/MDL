@@ -34,6 +34,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.config import load_app_config
+from src.train import attention_runtime_description
 from scripts.generate_synthetic_agg_parquet import (
     OBSERVED_MEDIAN_SEQUENCE_LENGTHS,
     SyntheticAggManifest,
@@ -205,8 +206,6 @@ def _run_candidate(
             str(args.steps),
             "--profile-steps",
             str(args.profile_steps),
-            "--peak-tflops",
-            str(args.peak_tflops),
             "--distributed",
             "ddp",
             "--nproc-per-node",
@@ -216,6 +215,8 @@ def _run_candidate(
             "--output",
             str(report_path),
         ]
+        if args.peak_tflops is not None:
+            command.extend(["--peak-tflops", str(args.peak_tflops)])
         if args.compute_only:
             command.extend(
                 [
@@ -560,6 +561,28 @@ def _execute_tuning(
     return 0
 
 
+def _resolve_preflight_device(config) -> "torch.device":
+    """Resolve the device used for tuner-level attention preflight."""
+
+    import torch
+
+    requested = config.runtime.device
+    if requested.startswith("cuda") and torch.cuda.is_available():
+        return torch.device(requested)
+    if requested != "cpu" and not torch.cuda.is_available():
+        return torch.device("cpu")
+    return torch.device(requested)
+
+
+def _run_attention_preflight(config) -> str:
+    """Fail before synthetic data generation when flash capabilities are missing."""
+
+    device = _resolve_preflight_device(config)
+    description = attention_runtime_description(config, device)
+    print(f"Attention backend | {description}", flush=True)
+    return description
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
@@ -568,7 +591,12 @@ def main() -> int:
         type=_candidate_batches,
         default=_candidate_batches("8,12,16,20,24,32,40,48,64,80,96,128"),
     )
-    parser.add_argument("--nproc-per-node", type=int, default=8)
+    parser.add_argument(
+        "--nproc-per-node",
+        type=int,
+        default=None,
+        help="DDP ranks for trials; default reads runtime.nproc_per_node from --config",
+    )
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--profile-steps", type=int, default=0)
@@ -589,8 +617,26 @@ def main() -> int:
             "clamped to each model's configured cap"
         ),
     )
-    parser.add_argument("--peak-tflops", type=float, default=312.0)
-    parser.add_argument("--hbm-limit-gib", type=float, default=76.0)
+    parser.add_argument(
+        "--peak-tflops",
+        type=float,
+        default=None,
+        help=(
+            "optional device peak TFLOPS used only for MFU reporting; omit to "
+            "skip MFU instead of assuming an A100 default"
+        ),
+    )
+    parser.add_argument(
+        "--hbm-limit-gib",
+        "--hbm-safety-limit-gib",
+        type=float,
+        default=76.0,
+        dest="hbm_limit_gib",
+        help=(
+            "per-rank reserved-HBM safety ceiling used when selecting a batch; "
+            "not a fixed A100 attribute (default 76 GiB leaves headroom on 80 GiB GPUs)"
+        ),
+    )
     parser.add_argument("--omp-num-threads", type=int, default=4)
     parser.add_argument("--synthetic-parquet-dir", type=Path, default=None)
     parser.add_argument("--synthetic-files", type=int, default=None)
@@ -630,6 +676,9 @@ def main() -> int:
     if not args.config.is_file():
         parser.error(f"config does not exist: {args.config}")
     base_config = load_app_config(args.config)
+    if args.nproc_per_node is None:
+        args.nproc_per_node = base_config.runtime.nproc_per_node
+    _run_attention_preflight(base_config)
     if args.reader_benchmark_batch_size is None:
         args.reader_benchmark_batch_size = base_config.training.batch_size
     explicit_lengths = args.sequence_lengths
@@ -664,6 +713,8 @@ def main() -> int:
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.peak_tflops is not None and args.peak_tflops <= 0.0:
+        parser.error("--peak-tflops must be positive when set")
     if args.warmup_steps < 0:
         parser.error("--warmup-steps must be non-negative")
     if args.profile_steps < 0:

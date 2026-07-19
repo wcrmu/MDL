@@ -634,15 +634,49 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
 
         mdl_onetrans = payloads["mdl_onetrans"]
         self.assertEqual(len(mdl_onetrans["features"]), 179)
-        self.assertEqual(len(mdl_onetrans["sequences"]), 9)
+        self.assertEqual(len(mdl_onetrans["sequences"]), 12)
         self.assertTrue(mdl_onetrans["model"]["experimental_model_acknowledged"])
         self.assertEqual(mdl_onetrans["model"]["first_domain_sequence_layer"], 4)
-        history_names = set(EXPECTED_UPS_TYPES)
-        for token in [
-            *mdl_onetrans["tokenization"]["scenario_tokens"],
-            *mdl_onetrans["tokenization"]["task_tokens"],
-        ]:
-            self.assertFalse(history_names & set(token.get("prior_inputs", [])))
+        prior_names = {
+            "task_fst_cart_prior",
+            "task_upid_pay_prior",
+            "task_cateid_filter_prior",
+        }
+        self.assertEqual(
+            {sequence["name"] for sequence in mdl_onetrans["sequences"][9:]},
+            prior_names,
+        )
+        self.assertEqual(
+            [token["name"] for token in mdl_onetrans["tokenization"]["sequence_tokens"]],
+            list(EXPECTED_UPS_TYPES),
+        )
+        task_priors = {
+            token["name"]: tuple(token.get("prior_inputs", []))
+            for token in mdl_onetrans["tokenization"]["task_tokens"]
+        }
+        self.assertEqual(
+            task_priors,
+            {
+                "fst_cart": ("task_fst_cart_prior",),
+                "upid_pay": ("task_upid_pay_prior",),
+                "cateid_filter": ("task_cateid_filter_prior",),
+            },
+        )
+        for token in mdl_onetrans["tokenization"]["scenario_tokens"]:
+            self.assertIn("impr", token["prior_inputs"])
+            self.assertIn("clk_long", token["prior_inputs"])
+            self.assertIn("view_long", token["prior_inputs"])
+        adapter_limits = mdl_onetrans["data"]["train"]["adapter"]["options"][
+            "sequence_max_lengths"
+        ]
+        self.assertGreaterEqual(
+            adapter_limits["cart_long"],
+            next(
+                sequence["max_length"]
+                for sequence in mdl_onetrans["sequences"]
+                if sequence["name"] == "task_fst_cart_prior"
+            ),
+        )
 
         self.assertEqual(sum(ONETRANS_SEQUENCE_LENGTH_CAPS.values()), 2048)
 
@@ -763,10 +797,10 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
 
     def test_production_profiles_use_expected_runtime(self) -> None:
         expected_runtime = {
-            "rankmixer": ("flash", True, 8),
-            "onetrans": ("flash", True, 8),
-            "mdl_onetrans": ("flash", True, 8),
-            # Current platform: 2×H100 SDPA eager + Row-Wise Adagrad.
+            # Current platform: 2×H100 SDPA eager + Row-Wise Adagrad + Phase 2.
+            "rankmixer": ("sdpa", False, 2),
+            "onetrans": ("sdpa", False, 2),
+            "mdl_onetrans": ("sdpa", False, 2),
             "mdl_rankmixer": ("sdpa", False, 2),
         }
         for model_name, (attention_backend, compile_enabled, nproc) in expected_runtime.items():
@@ -781,6 +815,11 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertFalse(config.runtime.trim_all_invalid_sequence_prefix)
                 self.assertFalse(config.runtime.validate_scenario_ids)
                 self.assertEqual(config.training.embedding_weight_dtype, "bf16")
+                self.assertEqual(config.training.sparse_optimizer, "rowwise_adagrad")
+                self.assertEqual(
+                    config.training.checkpoint_path,
+                    f"artifacts/checkpoints/{model_name}_2xh100_phase2_shared_dim",
+                )
                 self.assertFalse(config.training.embedding_collect_stats)
                 self.assertFalse(config.training.embedding_validate_indices)
                 self.assertEqual(
@@ -819,10 +858,12 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     if sequence.name
                     in config.data.train.adapter.options["ups_types"]
                 }
-                self.assertEqual(
-                    config.data.train.adapter.options["sequence_max_lengths"],
-                    main_sequences,
-                )
+                adapter_limits = config.data.train.adapter.options[
+                    "sequence_max_lengths"
+                ]
+                self.assertEqual(set(adapter_limits), set(main_sequences))
+                for name, limit in adapter_limits.items():
+                    self.assertGreaterEqual(limit, main_sequences[name])
                 self.assertTrue(config.data.train.reader.coalesce_pinned_tensors)
                 self.assertEqual(
                     config.data.train.reader.device_prefetch_batches,
@@ -837,21 +878,11 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     config.data.train.reader.schema_validation_samples,
                     64,
                 )
-                if model_name == "mdl_rankmixer":
-                    self.assertEqual(
-                        config.training.sparse_optimizer,
-                        "rowwise_adagrad",
-                    )
-                    self.assertEqual(
-                        config.training.checkpoint_path,
-                        "artifacts/checkpoints/mdl_rankmixer_2xh100_phase2_shared_dim",
-                    )
-                    goods = config.resolved.categorical_input_by_name["goods_id_hn"]
-                    self.assertEqual(goods.encoding.num_buckets, 1 << 27)
-                    self.assertEqual(
-                        config.resolved.categorical_embedding_dims["goods_id_hn"],
-                        48,
-                    )
+                self.assertEqual(
+                    config.resolved.categorical_embedding_dims["goods_id_hn"],
+                    48,
+                )
+                if model_name in {"mdl_rankmixer", "mdl_onetrans"}:
                     prior_goods = config.resolved.categorical_input_by_name[
                         "task_upid_pay_prior.goods_id_hn"
                     ]
@@ -863,36 +894,34 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         ],
                         48,
                     )
-                    self.assertEqual(
-                        config.resolved.categorical_embedding_dims["uid_or_bg_hn"],
-                        48,
-                    )
-                    self.assertEqual(
-                        config.resolved.categorical_embedding_dims["sku_id_hn"],
-                        48,
-                    )
-                    self.assertEqual(
-                        config.resolved.categorical_embedding_dims[
-                            "origin_query_hash_hn"
-                        ],
-                        32,
-                    )
-                    self.assertEqual(
-                        config.resolved.categorical_embedding_dims["query_hash_hn"],
-                        32,
-                    )
-                    self.assertEqual(
-                        config.resolved.categorical_embedding_dims[
-                            "flatten_query_hash.flat_q_hash_hn"
-                        ],
-                        32,
-                    )
                     physical = sum(
                         1
                         for item in config.resolved.categorical_input_by_name.values()
                         if not getattr(item.encoding, "share_embedding", False)
                     )
                     self.assertEqual(physical, 202)
+                    if model_name == "mdl_onetrans":
+                        self.assertEqual(len(config.sequences), 12)
+                        self.assertEqual(
+                            {
+                                sequence.name
+                                for sequence in config.sequences
+                                if sequence.name.startswith("task_")
+                            },
+                            {
+                                "task_fst_cart_prior",
+                                "task_upid_pay_prior",
+                                "task_cateid_filter_prior",
+                            },
+                        )
+                        self.assertGreaterEqual(
+                            adapter_limits["cart_long"],
+                            next(
+                                sequence.max_length
+                                for sequence in config.sequences
+                                if sequence.name == "task_fst_cart_prior"
+                            ),
+                        )
 
     def test_bf16_sharded_embeddings_keep_fp32_dense_parameters(self) -> None:
         config = _compact_production_config("rankmixer")
@@ -1048,6 +1077,30 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         self.assertFalse(
                             timegap["encoding"].get("share_embedding", False)
                         )
+                    for alias, root in (
+                        ("buy_long.spec_hn", "cart_long.spec_hn"),
+                        ("ups_clk_sku.spec_hn", "cart_long.spec_hn"),
+                        ("task_fst_cart_prior.spec_hn", "cart_long.spec_hn"),
+                        ("task_upid_pay_prior.spec_hn", "cart_long.spec_hn"),
+                        ("task_cateid_filter_prior.spec_hn", "cart_long.spec_hn"),
+                        ("buy_long.sku_ids_hn", "cart_long.sku_ids_hn"),
+                        ("task_fst_cart_prior.sku_ids_hn", "cart_long.sku_ids_hn"),
+                        ("task_upid_pay_prior.sku_ids_hn", "cart_long.sku_ids_hn"),
+                        ("task_cateid_filter_prior.sku_ids_hn", "cart_long.sku_ids_hn"),
+                    ):
+                        field = _find_sequence_field(payload, alias)
+                        self.assertTrue(field["encoding"]["share_embedding"])
+                        self.assertEqual(field["encoding"]["share_with"], root)
+                    # No multi-hop share_with chains remain after Phase 2.
+                    for name, entry in entries.items():
+                        encoding = entry["encoding"]
+                        if not encoding.get("share_embedding"):
+                            continue
+                        self.assertEqual(
+                            encoding["share_with"],
+                            _resolve_share_root(entries, name),
+                            msg=f"multi-hop share chain for {name}",
+                        )
 
     def test_share_embedding_rejects_cycles(self) -> None:
         report = build_name_estimate_report(self.sample)
@@ -1072,6 +1125,107 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         goods["encoding"]["share_with"] = "impr.goods_id_hn"
         with self.assertRaisesRegex(ValueError, "cycle"):
             apply_embedding_profile(payload, "baseline")
+
+
+    def test_production_mdl_yamls_flatten_spec_sku_aliases(self) -> None:
+        for config_name in ("mdl_rankmixer.yaml", "mdl_onetrans.yaml"):
+            with self.subTest(config=config_name):
+                config = load_app_config(ROOT / "configs" / config_name)
+                for sequence_name in (
+                    "buy_long",
+                    "task_fst_cart_prior",
+                    "task_upid_pay_prior",
+                    "task_cateid_filter_prior",
+                ):
+                    sequence = next(
+                        item for item in config.sequences if item.name == sequence_name
+                    )
+                    for field_name, root in (
+                        ("spec_hn", "cart_long.spec_hn"),
+                        ("sku_ids_hn", "cart_long.sku_ids_hn"),
+                    ):
+                        field = next(
+                            item for item in sequence.fields if item.name == field_name
+                        )
+                        self.assertTrue(field.encoding.share_embedding)
+                        self.assertEqual(field.encoding.share_with, root)
+                ups = next(
+                    item for item in config.sequences if item.name == "ups_clk_sku"
+                )
+                ups_spec = next(item for item in ups.fields if item.name == "spec_hn")
+                self.assertEqual(ups_spec.encoding.share_with, "cart_long.spec_hn")
+
+    def test_mdl_models_share_identical_prior_contract(self) -> None:
+        report = build_name_estimate_report(self.sample)
+        payloads = {}
+        for model_name in ("mdl_rankmixer", "mdl_onetrans"):
+            payloads[model_name], _summary = build_config(
+                self.sample,
+                report,
+                model_name=model_name,
+                train_inputs=["/tmp/train"],
+                test_inputs=["/tmp/test"],
+                auto_discover_scenes=True,
+                gpu_count=2,
+                embedding_weight_dtype="bf16",
+                sparse_optimizer="rowwise_adagrad",
+                embedding_budget_gib_per_gpu=80.0,
+                embedding_profile="shared_dim",
+            )
+        left = payloads["mdl_rankmixer"]
+        right = payloads["mdl_onetrans"]
+        left_priors = [sequence for sequence in left["sequences"] if sequence["name"].startswith("task_")]
+        right_priors = [
+            sequence for sequence in right["sequences"] if sequence["name"].startswith("task_")
+        ]
+        self.assertEqual(
+            [sequence["name"] for sequence in left_priors],
+            [sequence["name"] for sequence in right_priors],
+        )
+        for left_seq, right_seq in zip(left_priors, right_priors):
+            self.assertEqual(left_seq["max_length"], right_seq["max_length"])
+            self.assertEqual(left_seq["encoder"], right_seq["encoder"])
+            self.assertEqual(left_seq["embedding_scope"], right_seq["embedding_scope"])
+            self.assertEqual(
+                [
+                    (
+                        field["name"],
+                        field["kind"],
+                        field["source"],
+                        field.get("embedding_dim"),
+                        field.get("dimension"),
+                        field.get("encoding"),
+                    )
+                    for field in left_seq["fields"]
+                ],
+                [
+                    (
+                        field["name"],
+                        field["kind"],
+                        field["source"],
+                        field.get("embedding_dim"),
+                        field.get("dimension"),
+                        field.get("encoding"),
+                    )
+                    for field in right_seq["fields"]
+                ],
+            )
+        self.assertEqual(
+            left["tokenization"]["task_tokens"],
+            right["tokenization"]["task_tokens"],
+        )
+        self.assertEqual(
+            left["tokenization"]["scenario_tokens"],
+            right["tokenization"]["scenario_tokens"],
+        )
+        self.assertEqual(
+            [token["name"] for token in right["tokenization"]["sequence_tokens"]],
+            list(EXPECTED_UPS_TYPES),
+        )
+        self.assertNotIn(
+            "task_fst_cart_prior",
+            [token["name"] for token in right["tokenization"]["sequence_tokens"]],
+        )
 
 
 if __name__ == "__main__":

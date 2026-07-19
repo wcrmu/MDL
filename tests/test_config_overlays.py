@@ -20,14 +20,14 @@ from src.features import load_vocab_maps, plan_vocab_fit
 
 
 class ModelConfigOverlayTest(unittest.TestCase):
-    def test_early_adapter_truncation_must_match_sequence_semantics(self) -> None:
+    def test_early_adapter_truncation_must_cover_sequence_consumers(self) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(root / "configs" / "mdl_rankmixer.yaml")
         adapter = config.data.train.adapter
         self.assertIsNotNone(adapter)
         assert adapter is not None
         limits = dict(adapter.options["sequence_max_lengths"])
-        limits["impr"] += 1
+        limits["impr"] = config.sequences[0].max_length - 1
         bad_adapter = replace(
             adapter,
             options={**adapter.options, "sequence_max_lengths": limits},
@@ -35,7 +35,7 @@ class ModelConfigOverlayTest(unittest.TestCase):
         bad_train = replace(config.data.train, adapter=bad_adapter)
         bad_config = replace(config, data=replace(config.data, train=bad_train))
 
-        with self.assertRaisesRegex(ValueError, "must equal sequences.impr.max_length"):
+        with self.assertRaisesRegex(ValueError, "must be >= sequences.impr.max_length"):
             bad_config.validate()
 
     def test_all_model_profiles_extend_and_validate(self) -> None:
@@ -73,15 +73,33 @@ class ModelConfigOverlayTest(unittest.TestCase):
         )
         self.assertTrue(production.model.experimental_model_acknowledged)
         self.assertEqual(production.model.first_domain_sequence_layer, 4)
+        s_names = {
+            name
+            for group in production.resolved.tokenization.sequence_token_groups
+            for name in group.input_refs
+        }
+        self.assertEqual(s_names, set(production.data.train.adapter.options["ups_types"]))
         self.assertTrue(
-            all(sequence.encoder == "raw" for sequence in production.sequences)
+            all(
+                sequence.encoder == "raw"
+                for sequence in production.sequences
+                if sequence.name in s_names
+            )
         )
-        history_names = {sequence.name for sequence in production.sequences}
-        for token in [
-            *production.tokenization.scenario_tokens,
-            *production.tokenization.task_tokens,
-        ]:
-            self.assertFalse(history_names & set(token.resolved_inputs()))
+        self.assertTrue(
+            all(
+                sequence.encoder == "mean_pool"
+                for sequence in production.sequences
+                if sequence.name.startswith("task_") and sequence.name.endswith("_prior")
+            )
+        )
+        for token in production.tokenization.task_tokens:
+            self.assertTrue(token.prior_inputs)
+            self.assertTrue(
+                all(name.startswith("task_") for name in token.prior_inputs)
+            )
+        for token in production.tokenization.scenario_tokens:
+            self.assertTrue({"impr", "clk_long", "view_long"} <= set(token.prior_inputs))
 
         rankmixer = load_app_config(
             root / "configs" / "reference" / "rankmixer_paper.yaml"
@@ -563,7 +581,7 @@ class ModelConfigOverlayTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only valid"):
             validate_app_config(invalid)
 
-    def test_mdl_onetrans_rejects_s_sequence_domain_priors(self) -> None:
+    def test_mdl_onetrans_allows_dual_use_s_sequence_scenario_priors(self) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(
             root / "configs" / "reference" / "mdl_onetrans.yaml"
@@ -573,15 +591,29 @@ class ModelConfigOverlayTest(unittest.TestCase):
         scenario_tokens[0] = replace(
             scenario_tokens[0], prior_inputs=[history_name]
         )
-        invalid = replace(
+        dual_use = replace(
             config,
             tokenization=replace(
                 config.tokenization,
                 scenario_tokens=scenario_tokens,
             ),
         )
+        # Same UPS may feed OneTrans S-tokens and a scenario prior summary.
+        validate_app_config(dual_use)
 
-        with self.assertRaisesRegex(ValueError, "exactly once"):
+    def test_mdl_onetrans_rejects_non_raw_s_stream_sequence(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "mdl_onetrans.yaml")
+        sequences = list(config.sequences)
+        s_name = config.tokenization.sequence_tokens[0].inputs[0]
+        sequences = [
+            replace(sequence, encoder="mean_pool")
+            if sequence.name == s_name
+            else sequence
+            for sequence in sequences
+        ]
+        invalid = replace(config, sequences=tuple(sequences))
+        with self.assertRaisesRegex(ValueError, "encoder=raw"):
             validate_app_config(invalid)
 
     def test_multi_domain_mdl_rejects_generic_or_reused_priors(self) -> None:

@@ -1,8 +1,7 @@
-# Standalone 2×H100 production training config (SDPA eager + Row-Wise Adagrad).
-# Phase 2B embedding profile: shared tables + dimension compression.
+# Standalone 2×H100 production training config for mdl_rankmixer.
+# SDPA eager + Row-Wise Adagrad + Phase 2 shared_dim embedding profile.
 # Physical embedding tables: 202; planned static embedding+state: 27.643 GiB/GPU.
-# goods/uid/sku: 64→48; query identity tables: 48→32; buckets unchanged.
-# Phase 2 changes embedding shapes; train from a fresh checkpoint path (no Phase 1 remap).
+# Fresh checkpoint path required (no remap from pre-Phase-2 weights).
 runtime:
   device: cuda
   precision: bf16
@@ -648,12 +647,6 @@ data:
       fst_cart: label_fst_cart
       upid_pay: upid_fst_trgt_noc_clk_pay_24h
       cateid_filter: cateid_is_fst_scene_sp_filter
-    prediction_keys:
-      search_id: search_id
-      candidate_position: candidate_position
-      example_id: example_ids
-      goods_id_hn: goods_id_hn
-    prediction_score_suffix: _score
     reader:
       engine: pyarrow_dataset
       columns_pruning: true
@@ -969,7 +962,6 @@ data:
       optional_input_columns:
       - context_indices
       - target_indices
-      - example_ids
       - f_goods_view_times_tg_l1_hn
       - impr_x_indices
       - clk_long_x_indices
@@ -980,6 +972,7 @@ data:
       - srch_q2i_x_indices
       - ups_clk_sku_x_indices
       - flatten_query_hash_x_indices
+      - example_ids
       options:
         context_features:
         - currency_hn
@@ -1260,6 +1253,12 @@ data:
           flatten_query_hash: flatten_query_hash_x_time_delta_log1p_seconds
         time_delta_transform: log1p_seconds
         compact_request_lists: true
+    prediction_keys:
+      search_id: search_id
+      candidate_position: candidate_position
+      example_id: example_ids
+      goods_id_hn: goods_id_hn
+    prediction_score_suffix: _score
 features:
 - name: currency_hn
   kind: categorical
@@ -4578,7 +4577,7 @@ sequences:
       num_buckets: 8388608
       padding_id: 0
       share_embedding: true
-      share_with: task_upid_pay_prior.spec_hn
+      share_with: cart_long.spec_hn
   - name: sku_ids_hn
     kind: categorical
     source: buy_long_x_sku_ids_hn
@@ -4588,7 +4587,7 @@ sequences:
       num_buckets: 16777216
       padding_id: 0
       share_embedding: true
-      share_with: task_upid_pay_prior.sku_ids_hn
+      share_with: cart_long.sku_ids_hn
 scenarios:
   names:
   - __auto__
@@ -4873,19 +4872,19 @@ training:
   adagrad_initial_accumulator_value: 0.1
   adagrad_eps: 1.0e-10
   embedding_sparse_gradients: true
+  embedding_weight_dtype: bf16
   sparse_update_mode: ddp_synced_adagrad
   sparse_parameter_server_adapter: null
   dense_clip_norm: 1.0
   sparse_clip_norm: 1.0
   loss_reduction: mean_per_task
-  checkpoint_path: artifacts/checkpoints/mdl_rankmixer_2xh100_phase2_shared_dim
-  embedding_weight_dtype: bf16
-  embedding_collect_stats: false
-  embedding_validate_indices: false
-  log_every_steps: 100
   quick_eval:
     enabled: true
     every_steps: 1000
     max_batches: 20
     split: train
     auc_bins: 4096
+  save_checkpoint: false
+  checkpoint_path: artifacts/checkpoints/mdl_rankmixer_2xh100_phase2_shared_dim
+  embedding_collect_stats: false
+  embedding_validate_indices: false

@@ -2044,6 +2044,8 @@ class TrainingConfig:
     quick_eval: QuickEvalConfig = field(default_factory=QuickEvalConfig)
     # Default checkpoint path used by train/predict when CLI does not override it.
     checkpoint_path: str | None = None
+    # When false, train_mdl skips writing checkpoint_path at the end of the run.
+    save_checkpoint: bool = True
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> "TrainingConfig":
@@ -3261,11 +3263,7 @@ def _validate_mdl_domain_priors(config: AppConfig, resolved: ResolvedConfig) -> 
     case while still allowing additional common inputs.
     """
 
-    if config.model.name != "mdl_rankmixer":
-        # MDL-OneTrans is an explicitly experimental composition. Its sequence
-        # context is owned by the OneTrans S stream and reaches domains through
-        # S-to-NS propagation plus optional direct S attention, rather than a
-        # second set of MDL sequence priors.
+    if config.model.name not in {"mdl_rankmixer", "mdl_onetrans"}:
         return
 
     input_scopes = {
@@ -3502,10 +3500,12 @@ def validate_app_config(config: AppConfig) -> None:
                     f"data.{split_name}.adapter.options.sequence_max_lengths.{name} "
                     "must be a positive integer"
                 )
-            if sequence.max_length != raw_limit:
+            if raw_limit < sequence.max_length:
                 raise ValueError(
                     f"data.{split_name}.adapter.options.sequence_max_lengths.{name} "
-                    f"must equal sequences.{name}.max_length ({sequence.max_length})"
+                    f"must be >= sequences.{name}.max_length ({sequence.max_length}); "
+                    "adapter keeps the physical UPS width for all consumers while each "
+                    "sequence may truncate further on its own max_length"
                 )
             if (
                 sequence.sequence_order != "newest_to_oldest"
@@ -3515,6 +3515,23 @@ def validate_app_config(config: AppConfig) -> None:
                     f"early adapter truncation for sequence {name!r} requires "
                     "sequence_order=newest_to_oldest and truncation=head"
                 )
+        # When task/scenario priors reuse a UPS source at a longer cap than the
+        # S/main sequence, adapter must retain the max consumer width.
+        for sequence in config.sequences:
+            for field in sequence.fields:
+                source = str(field.source)
+                if "_x_" not in source or sequence.max_length is None:
+                    continue
+                ups = source.split("_x_", 1)[0]
+                adapter_limit = sequence_limits.get(ups)
+                if adapter_limit is None:
+                    continue
+                if int(adapter_limit) < int(sequence.max_length):
+                    raise ValueError(
+                        f"data.{split_name}.adapter.options.sequence_max_lengths.{ups} "
+                        f"must be >= sequences.{sequence.name}.max_length "
+                        f"({sequence.max_length}) because that sequence consumes {ups}"
+                    )
     if config.model.name in {"onetrans", "mdl_onetrans"} and config.model.sequence_fusion == "timestamp_aware":
         for group in resolved.tokenization.sequence_token_groups:
             for input_name in group.input_refs:
@@ -3525,16 +3542,48 @@ def validate_app_config(config: AppConfig) -> None:
                         "use model.sequence_fusion=intent_ordered when timestamps are unavailable"
                     )
     if config.model.name in {"onetrans", "mdl_onetrans"}:
-        encoded_sequences = [
-            sequence.name for sequence in config.sequences if sequence.encoder != "raw"
+        s_sequence_names = {
+            input_name
+            for group in resolved.tokenization.sequence_token_groups
+            for input_name in group.input_refs
+            if input_name in sequence_by_name
+        }
+        encoded_s_sequences = [
+            name
+            for name in sorted(s_sequence_names)
+            if sequence_by_name[name].encoder != "raw"
         ]
-        if encoded_sequences:
+        if encoded_s_sequences:
             raise ValueError(
-                f"model.name={config.model.name!r} requires encoder=raw for every behavior "
-                "sequence because OneTrans performs event-level sequence modeling itself; "
-                "pre-encoding would recreate an encode-then-interaction path: "
-                + ", ".join(encoded_sequences)
+                f"model.name={config.model.name!r} requires encoder=raw for every "
+                "sequence referenced by tokenization.sequence_tokens because OneTrans "
+                "performs event-level sequence modeling itself; pre-encoding those "
+                "S-stream sequences would recreate an encode-then-interaction path: "
+                + ", ".join(encoded_s_sequences)
             )
+        if config.model.name == "mdl_onetrans":
+            prior_only = [
+                sequence.name
+                for sequence in config.sequences
+                if sequence.name not in s_sequence_names
+            ]
+            for name in prior_only:
+                sequence = sequence_by_name[name]
+                if sequence.encoder == "raw":
+                    raise ValueError(
+                        f"prior-only sequence {name!r} for mdl_onetrans must use a "
+                        "summary encoder such as mean_pool; raw is reserved for "
+                        "OneTrans S-stream sequences"
+                    )
+                if name in {
+                    input_name
+                    for group in resolved.tokenization.sequence_token_groups
+                    for input_name in group.input_refs
+                }:
+                    raise ValueError(
+                        f"prior-only sequence {name!r} must not appear in "
+                        "tokenization.sequence_tokens"
+                    )
     else:
         raw_sequences = [
             sequence.name for sequence in config.sequences if sequence.encoder == "raw"
@@ -3544,32 +3593,6 @@ def validate_app_config(config: AppConfig) -> None:
                 "encoder=raw delegates sequence modeling to OneTrans and is only valid for "
                 "model.name=onetrans or mdl_onetrans: "
                 + ", ".join(raw_sequences)
-            )
-    if config.model.name == "mdl_onetrans":
-        s_sequence_names = {
-            input_name
-            for group in resolved.tokenization.sequence_token_groups
-            for input_name in group.input_refs
-            if input_name in sequence_by_name
-        }
-        duplicated_domain_inputs: list[str] = []
-        for section, tokens in (
-            ("scenario_tokens", resolved.tokenization.scenario_token_specs),
-            ("task_tokens", resolved.tokenization.task_token_specs),
-        ):
-            for token in tokens:
-                duplicated = sorted(set(token.input_refs) & s_sequence_names)
-                if duplicated:
-                    duplicated_domain_inputs.append(
-                        f"{section}.{token.name}=" + ",".join(duplicated)
-                    )
-        if duplicated_domain_inputs:
-            raise ValueError(
-                "model.name='mdl_onetrans' must model each behavior sequence exactly once as "
-                "OneTrans S-tokens; remove those sequences from MDL scenario/task prior_inputs. "
-                "Sequence context reaches MDL through OneTrans-updated NS tokens and the "
-                "configured layers' direct masked S attention: "
-                + "; ".join(duplicated_domain_inputs)
             )
     for sequence in config.sequences:
         if sequence.encoder == "longer" and sequence.max_length is None:

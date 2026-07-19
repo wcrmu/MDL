@@ -36,6 +36,7 @@ from .modules.attention import (
     _call_varlen_attention,
     _sdpa_context,
     masked_scenario_pool,
+    validate_varlen_inputs,
     varlen_attn,
 )
 from .modules.mlp import (
@@ -519,14 +520,13 @@ class LongerSequenceAttentionBlock(nn.Module):
             raise RuntimeError(
                 "runtime.attention_backend='flash' requires torch.nn.attention.varlen"
             )
-        if query.device.type != "cuda":
-            raise RuntimeError("Flash varlen attention requires CUDA tensors")
-        if query.dtype not in {torch.float16, torch.bfloat16}:
-            raise RuntimeError("Flash varlen attention requires FP16 or BF16 tensors")
-        if self.training and self.dropout.p:
-            raise RuntimeError(
-                "Flash varlen attention does not support this block's non-zero dropout"
-            )
+        validate_varlen_inputs(
+            query,
+            key,
+            value,
+            dropout_p=self.dropout.p,
+            training=self.training,
+        )
         query_tokens = query.transpose(1, 2)
         key_tokens = key.transpose(1, 2)
         value_tokens = value.transpose(1, 2)
@@ -1154,13 +1154,21 @@ class FeatureEncoderBank(nn.Module):
         config: AppConfig,
         vocab_maps: dict[str, dict[str, int]],
         embedding_dim: int,
-        build_sequence_summaries: bool = True,
+        build_sequence_summaries: bool | set[str] | frozenset[str] = True,
         included_scalar_feature_names: set[str] | None = None,
         embedding_size_override: int | None = None,
     ) -> None:
         super().__init__()
         self.config = config
-        self.build_sequence_summaries = build_sequence_summaries
+        if isinstance(build_sequence_summaries, bool):
+            self.sequence_summary_names: set[str] | None = (
+                None if build_sequence_summaries else set()
+            )
+        else:
+            self.sequence_summary_names = set(build_sequence_summaries)
+        self.build_sequence_summaries = (
+            self.sequence_summary_names is None or bool(self.sequence_summary_names)
+        )
         self.sequence_token_dim = config.model.token_dim
         self.embedding_size_override = embedding_size_override
         default_scalar_feature_names = {
@@ -1345,7 +1353,11 @@ class FeatureEncoderBank(nn.Module):
             sequence_key = self._module_key(sequence.name)
             self.sequence_field_input_dims[sequence.name] = field_input_dims
             self.sequence_event_input_dims[sequence.name] = step_input_dim
-            if not self.build_sequence_summaries:
+            summarize = (
+                self.sequence_summary_names is None
+                or sequence.name in self.sequence_summary_names
+            )
+            if not summarize:
                 self.output_dims[sequence.name] = self.sequence_token_dim
                 continue
             if sequence.encoder == "longer":
@@ -1820,7 +1832,9 @@ class FeatureEncoderBank(nn.Module):
         if tokens.size(1) == 0 and sequence.encoder != "longer":
             return tokens.new_zeros(tokens.size(0), output_dim)
         mask_float = mask.unsqueeze(-1).to(dtype=tokens.dtype)
-        if sequence.encoder == "mean_pool":
+        # Dual-use OneTrans S sequences (encoder=raw) may still need a compact
+        # mean-pool summary for MDL scenario/task domain tokens.
+        if sequence.encoder in {"mean_pool", "raw"}:
             denominator = mask_float.sum(dim=1).clamp_min(1.0)
             return (tokens * mask_float).sum(dim=1) / denominator
 
@@ -2039,6 +2053,10 @@ class FeatureEncoderBank(nn.Module):
             sequence
             for sequence in self.config.sequences
             if sequence.encoder == "longer"
+            and (
+                self.sequence_summary_names is None
+                or sequence.name in self.sequence_summary_names
+            )
         ]
         user_input_names = {
             name
@@ -2095,7 +2113,11 @@ class FeatureEncoderBank(nn.Module):
             {
                 sequence.name
                 for sequence in self.config.sequences
-                if not (
+                if (
+                    self.sequence_summary_names is None
+                    or sequence.name in self.sequence_summary_names
+                )
+                and not (
                     sequence.encoder == "longer"
                     and request_cache is not None
                     and sequence.name in request_cache
@@ -2116,6 +2138,11 @@ class FeatureEncoderBank(nn.Module):
         if not self.build_sequence_summaries:
             return encoded
         for sequence in self.config.sequences:
+            if (
+                self.sequence_summary_names is not None
+                and sequence.name not in self.sequence_summary_names
+            ):
+                continue
             value = features[sequence.name]
             if not isinstance(value, dict):
                 raise ValueError(f"sequence {sequence.name!r} must be a payload dict")
@@ -2922,10 +2949,13 @@ class MixedCausalAttention(nn.Module):
             raise RuntimeError(
                 "runtime.attention_backend='flash' requires torch.nn.attention.varlen"
             )
-        if query.device.type != "cuda":
-            raise RuntimeError("Flash varlen attention requires CUDA tensors")
-        if query.dtype not in {torch.float16, torch.bfloat16}:
-            raise RuntimeError("Flash varlen attention requires FP16 or BF16 tensors")
+        validate_varlen_inputs(
+            query,
+            key,
+            value,
+            dropout_p=0.0,
+            training=self.training,
+        )
         query_tokens = query.transpose(1, 2)
         key_tokens = key.transpose(1, 2)
         value_tokens = value.transpose(1, 2)
@@ -3240,6 +3270,29 @@ class OneTransBlock(nn.Module):
         return output, valid_mask.index_select(1, query_indices)
 
 
+def _mdl_onetrans_sequence_summary_names(config: AppConfig) -> set[str]:
+    """Sequences that need compact summaries for MDL domain token projectors."""
+
+    sequence_names = {sequence.name for sequence in config.sequences}
+    names: set[str] = set()
+    for token in (
+        *config.tokenization.resolved_scenario_tokens(
+            config.features,
+            config.scenarios.names,
+            config.sequences,
+        ),
+        *config.tokenization.resolved_task_tokens(
+            config.features,
+            config.task_names,
+            config.sequences,
+        ),
+    ):
+        for input_name in token.prior_inputs:
+            if input_name in sequence_names:
+                names.add(input_name)
+    return names
+
+
 class OneTransBackbone(nn.Module):
     def __init__(
         self,
@@ -3252,14 +3305,25 @@ class OneTransBackbone(nn.Module):
         super().__init__()
         self.config = config
         embedding_dim = config.model.embedding_dim if embedding_dim is None else embedding_dim
+        if config.model.name == "mdl_onetrans":
+            if hasattr(config, "tokenization") and hasattr(config, "sequences"):
+                sequence_summaries: bool | set[str] = (
+                    _mdl_onetrans_sequence_summary_names(config)
+                )
+            else:
+                # Lightweight test doubles may omit tokenization; default to no
+                # summaries so S-stream construction remains the only path.
+                sequence_summaries = set()
+        else:
+            # Pure OneTrans keeps event-level S modeling only.
+            sequence_summaries = False
         self.encoder_bank = FeatureEncoderBank(
             config,
             vocab_maps,
             embedding_dim,
-            # OneTrans consumes raw event embeddings as S-tokens. Building a
-            # summary encoder here (especially LONGER for mdl_onetrans) would
-            # model the same history twice and restore encode-then-interaction.
-            build_sequence_summaries=False,
+            # Selective summaries let mdl_onetrans keep raw S-stream events while
+            # still producing mean-pool priors for scenario/task tokens.
+            build_sequence_summaries=sequence_summaries,
             included_scalar_feature_names=included_scalar_feature_names,
             embedding_size_override=embedding_size_override,
         )
@@ -4443,10 +4507,9 @@ class MDLOneTransModel(nn.Module):
                 self.backbone.encoder_bank.included_scalar_feature_names,
                 include_sequences=request_cache is None,
             )
-            encoded = self.backbone.encoder_bank.encode_scalar_features(
-                features,
-                preencoded_inputs=preencoded_inputs,
-            )
+            # Scalars plus selective prior summaries (task priors and dual-use
+            # scenario UPS). S-stream event tokens remain owned by OneTransTokenizer.
+            encoded = self.backbone.encoder_bank(features)
         if request_cache is None and self.config.model.use_request_cache:
             request_cache = (
                 self.backbone.precompute_request_cache(

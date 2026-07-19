@@ -39,6 +39,30 @@ def varlen_attention_available() -> bool:
     return varlen_attn is not None
 
 
+def validate_varlen_inputs(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    *,
+    dropout_p: float,
+    training: bool,
+) -> None:
+    """Reject Varlen Flash execution with unsupported device/dtype/dropout."""
+
+    if query.device.type != "cuda":
+        raise RuntimeError("Flash varlen attention requires CUDA tensors")
+    if key.device != query.device or value.device != query.device:
+        raise RuntimeError("Flash varlen attention requires Q/K/V on the same CUDA device")
+    if query.dtype not in {torch.float16, torch.bfloat16}:
+        raise RuntimeError("Flash varlen attention requires FP16 or BF16 tensors")
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        raise RuntimeError("Flash varlen attention requires matching Q/K/V dtypes")
+    if training and dropout_p != 0.0:
+        raise RuntimeError(
+            "Flash varlen attention does not support non-zero dropout during training"
+        )
+
+
 def _sdpa_context(attention_backend: str):
     if attention_backend in {"auto", "sdpa"}:
         return nullcontext()
@@ -60,7 +84,7 @@ def _call_varlen_attention(
     *,
     causal: bool,
 ) -> Tensor:
-    """Call the PyTorch 2.10 or 2.12 varlen Flash API."""
+    """Call supported PyTorch 2.10+ varlen API variants."""
 
     if varlen_attn is None:
         raise RuntimeError("torch.nn.attention.varlen is unavailable")
@@ -421,10 +445,13 @@ class VariableLengthDomainAttention(nn.Module):
             raise RuntimeError(
                 "runtime.attention_backend='flash' requires torch.nn.attention.varlen"
             )
-        if query.device.type != "cuda":
-            raise RuntimeError("Flash varlen attention requires CUDA tensors")
-        if query.dtype not in {torch.float16, torch.bfloat16}:
-            raise RuntimeError("Flash varlen attention requires FP16 or BF16 tensors")
+        validate_varlen_inputs(
+            query,
+            key,
+            value,
+            dropout_p=0.0,
+            training=self.training,
+        )
 
         query_tokens = query.transpose(1, 2).contiguous()
         key_tokens = key.transpose(1, 2)

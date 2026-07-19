@@ -59,6 +59,129 @@ logger = logging.getLogger(__name__)
 _CONTROL_PROCESS_GROUP: torch_dist.ProcessGroup | None = None
 
 
+def _varlen_attention_reasons(config: AppConfig) -> tuple[str, ...]:
+    """Human-readable reasons this config needs ``torch.nn.attention.varlen``."""
+
+    reasons: list[str] = []
+    if config.model.name in {"longer", "onetrans", "mdl_onetrans"}:
+        reasons.append(f"model={config.model.name}")
+    longer_sequences = [
+        sequence.name
+        for sequence in config.sequences
+        if sequence.encoder == "longer"
+    ]
+    if longer_sequences:
+        reasons.append("LONGER sequences=" + ",".join(longer_sequences))
+    return tuple(reasons)
+
+
+def _requires_varlen_attention(config: AppConfig) -> bool:
+    """True when strict flash would execute the packed Varlen Flash path."""
+
+    return bool(_varlen_attention_reasons(config))
+
+
+def _needs_padded_sdpa_flash(config: AppConfig) -> bool:
+    """True when strict flash would also exercise ordinary padded SDPA Flash.
+
+    LONGER / OneTrans S-streams use Varlen. RankMixer layers and MDL
+    DomainAwareAttention still use padded FlashAttention under the same
+    ``attention_backend='flash'`` setting, so both capabilities can be required
+    at once (they are not mutually exclusive).
+    """
+
+    model = config.model
+    if model.name in {"rankmixer", "mdl_rankmixer"}:
+        return True
+    if getattr(model, "use_task_feature_interaction", False):
+        return True
+    if getattr(model, "use_scenario_feature_interaction", False):
+        return True
+    return False
+
+
+def _ordinary_sdpa_flash_available() -> bool:
+    """True when this PyTorch/GPU build reports padded SDPA Flash available."""
+
+    return bool(
+        getattr(
+            torch.backends.cuda,
+            "is_flash_attention_available",
+            lambda: False,
+        )()
+    )
+
+
+def _attention_runtime_description(
+    config: AppConfig,
+    device: torch.device,
+) -> str:
+    """Validate requested attention backend against local capabilities.
+
+    Entry points must call this after the device is known and before scenario
+    discovery, model construction, or synthetic data generation.
+    """
+
+    requested = getattr(config.runtime, "attention_backend", "auto")
+    reasons = _varlen_attention_reasons(config)
+    needs_varlen = _requires_varlen_attention(config)
+    needs_padded = _needs_padded_sdpa_flash(config)
+    varlen_api = varlen_attention_available()
+    if requested == "flash":
+        if device.type != "cuda":
+            raise RuntimeError(
+                "runtime.attention_backend='flash' requires CUDA, but the resolved "
+                f"device is {device}"
+            )
+        if needs_varlen and not varlen_api:
+            detail = "; ".join(reasons) if reasons else "configured Varlen Flash paths"
+            raise RuntimeError(
+                "runtime.attention_backend='flash' requires "
+                "torch.nn.attention.varlen.varlen_attn for "
+                f"{detail}, but the API is unavailable in "
+                f"torch={torch.__version__}. Use runtime.attention_backend='sdpa' "
+                "on this platform, or install a CUDA-enabled PyTorch build that "
+                "exposes torch.nn.attention.varlen.varlen_attn and validate it on "
+                "the target GPU (PyTorch 2.10+ is normally required)."
+            )
+        if needs_padded and not _ordinary_sdpa_flash_available():
+            raise RuntimeError(
+                "runtime.attention_backend='flash' was requested, but this "
+                "PyTorch/GPU build reports the ordinary SDPA FlashAttention "
+                "backend unavailable"
+            )
+        if needs_varlen and needs_padded:
+            implementation = "varlen_flash+padded_sdpa_flash"
+        elif needs_varlen:
+            implementation = "varlen_flash"
+        else:
+            implementation = "padded_sdpa_flash"
+        return (
+            f"requested=flash resolved={implementation} "
+            f"flash_path_requires_varlen={needs_varlen} "
+            f"flash_path_requires_padded_sdpa={needs_padded} "
+            f"varlen_api_available={varlen_api} "
+            f"strict=true device={device} precision={config.runtime.precision}"
+        )
+    return (
+        f"requested={requested} resolved=padded_sdpa "
+        f"kernel_policy=runtime_dispatch "
+        f"flash_path_requires_varlen={needs_varlen} "
+        f"flash_path_requires_padded_sdpa={needs_padded} "
+        f"varlen_api_available={varlen_api} "
+        f"strict=false device={device} precision={config.runtime.precision}"
+    )
+
+
+# Public aliases for benchmark / tuner / tests.
+attention_runtime_description = _attention_runtime_description
+needs_varlen_flash = _requires_varlen_attention
+needs_padded_sdpa_flash = _needs_padded_sdpa_flash
+ordinary_sdpa_flash_available = _ordinary_sdpa_flash_available
+requires_varlen_attention = _requires_varlen_attention
+varlen_attention_reasons = _varlen_attention_reasons
+
+
 @dataclass(frozen=True)
 class TrainResult:
     steps: int
@@ -274,77 +397,6 @@ def _select_device(config: AppConfig, local_rank: int | None = None) -> torch.de
     if requested != "cpu" and not torch.cuda.is_available():
         return torch.device("cpu")
     return torch.device(requested)
-
-
-def _varlen_attention_reasons(config: AppConfig) -> tuple[str, ...]:
-    """Human-readable reasons this config needs torch.nn.attention.varlen."""
-
-    reasons: list[str] = []
-    if config.model.name in {"longer", "onetrans", "mdl_onetrans"}:
-        reasons.append(f"model={config.model.name}")
-    longer_sequences = [
-        sequence.name
-        for sequence in config.sequences
-        if sequence.encoder == "longer"
-    ]
-    if longer_sequences:
-        reasons.append("LONGER sequences=" + ",".join(longer_sequences))
-    return tuple(reasons)
-
-
-def _requires_varlen_attention(config: AppConfig) -> bool:
-    return bool(_varlen_attention_reasons(config))
-
-
-def _attention_runtime_description(
-    config: AppConfig,
-    device: torch.device,
-) -> str:
-    # Keep programmatic/minimal configs created before this option compatible;
-    # validated YAML always materializes the explicit RuntimeConfig default.
-    requested = getattr(config.runtime, "attention_backend", "auto")
-    reasons = _varlen_attention_reasons(config)
-    requires_varlen = bool(reasons)
-    if requested == "flash":
-        if device.type != "cuda":
-            raise RuntimeError(
-                "runtime.attention_backend='flash' requires CUDA, but the resolved "
-                f"device is {device}"
-            )
-        if requires_varlen and not varlen_attention_available():
-            detail = "; ".join(reasons) if reasons else "configured LONGER/OneTrans paths"
-            raise RuntimeError(
-                "runtime.attention_backend='flash' requires "
-                "torch.nn.attention.varlen.varlen_attn for "
-                f"{detail}, but the API is unavailable in "
-                f"torch={torch.__version__}. Use runtime.attention_backend='sdpa' "
-                "on this platform, or install and validate PyTorch >= 2.10."
-            )
-        ordinary_flash_available = getattr(
-            torch.backends.cuda,
-            "is_flash_attention_available",
-            lambda: False,
-        )()
-        if not ordinary_flash_available:
-            raise RuntimeError(
-                "runtime.attention_backend='flash' was requested, but this "
-                "PyTorch/GPU build reports the ordinary SDPA FlashAttention "
-                "backend unavailable"
-            )
-        implementation = "varlen_flash" if requires_varlen else "padded_sdpa_flash"
-        return (
-            f"requested=flash resolved={implementation} "
-            f"requires_varlen={requires_varlen} "
-            f"varlen_api_available={varlen_attention_available()} "
-            f"strict=true device={device} precision={config.runtime.precision}"
-        )
-    return (
-        f"requested={requested} resolved=padded_sdpa "
-        f"kernel_policy=runtime_dispatch "
-        f"requires_varlen={requires_varlen} "
-        f"varlen_api_available={varlen_attention_available()} "
-        f"strict=false device={device} precision={config.runtime.precision}"
-    )
 
 
 def _setup_distributed(config: AppConfig) -> DistributedContext:
@@ -2618,7 +2670,7 @@ def train_mdl(
             last_loss_denominator,
         )
 
-        if save_checkpoint and config.training.checkpoint_path:
+        if save_checkpoint and config.training.save_checkpoint and config.training.checkpoint_path:
             save_model_checkpoint(
                 config,
                 base_model,
@@ -3141,6 +3193,9 @@ def evaluate_mdl(
     batch_iterator: Iterator[FeatureBatch] | None = None
     grouped_auc: _DiskBackedGroupAUC | None = None
     try:
+        attention_runtime = _attention_runtime_description(config, context.device)
+        if context.rank == 0:
+            print(f"Attention backend | {attention_runtime}")
         config = _resolve_distributed_auto_scenarios(config, context)
         if split_name not in {"train", "test"}:
             raise ValueError("evaluation split must be train or test")
@@ -3351,9 +3406,11 @@ def predict_mdl(
     max_batches: int | None = None,
     allow_random_init: bool = False,
 ) -> PredictResult:
+    device = _select_device(config)
+    attention_runtime = _attention_runtime_description(config, device)
+    print(f"Attention backend | {attention_runtime}")
     config = resolve_auto_scenarios(config)
     pa, _pc, _ds, pq = _require_pyarrow()
-    device = _select_device(config)
     vocab_maps = load_vocab_maps(config)
     base_model = build_model(config, vocab_maps).to(device)
     resolved_checkpoint_path = checkpoint_path or config.training.checkpoint_path

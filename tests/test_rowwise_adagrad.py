@@ -99,6 +99,34 @@ class ShardedRowWiseAdagradTest(unittest.TestCase):
         self.assertTrue(torch.equal(optimizer.state[parameter]["sum"], before_state))
         self.assertEqual(float(optimizer.state[parameter]["step"].item()), 1.0)
 
+    def test_untouched_rows_remain_unchanged_for_bf16_weights(self) -> None:
+        parameter = nn.Parameter(torch.arange(8, dtype=torch.bfloat16).reshape(4, 2))
+        before = parameter.detach().clone()
+        optimizer = ShardedRowWiseAdagrad(
+            [parameter],
+            lr=0.25,
+            initial_accumulator_value=0.0,
+            eps=1.0e-8,
+        )
+        parameter.grad = _coo_grad(
+            [1, 1],
+            [[1.0, -1.0], [1.0, 1.0]],
+            size=parameter.shape,
+            dtype=torch.bfloat16,
+        )
+        optimizer.step()
+        # Coalesced row-1 grad is [2, 0]; rows 0/2/3 must stay put.
+        self.assertTrue(torch.equal(parameter[0], before[0]))
+        self.assertTrue(torch.equal(parameter[2], before[2]))
+        self.assertTrue(torch.equal(parameter[3], before[3]))
+        self.assertFalse(torch.equal(parameter[1], before[1]))
+        state = optimizer.state[parameter]
+        self.assertEqual(tuple(state["sum"].shape), (4,))
+        self.assertEqual(state["sum"].dtype, torch.float32)
+        self.assertEqual(state["step"].device.type, "cpu")
+        self.assertTrue(torch.allclose(state["sum"][1], torch.tensor(2.0)))
+        self.assertTrue(torch.allclose(state["sum"][[0, 2, 3]], torch.zeros(3)))
+
     def test_state_dict_round_trip_keeps_fp32_accumulator(self) -> None:
         parameter = nn.Parameter(torch.zeros(4, 2, dtype=torch.bfloat16))
         optimizer = ShardedRowWiseAdagrad(

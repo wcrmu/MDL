@@ -1,16 +1,18 @@
-# Standalone single-node 8xA100-80G production training config.
-# Bucket sizes and embedding dimensions remain profiling estimates.
+# Standalone 2×H100 production training config for onetrans.
+# SDPA eager + Row-Wise Adagrad + Phase 2 shared_dim embedding profile.
+# Physical embedding tables: 191; planned static embedding+state: 27.642 GiB/GPU.
+# Fresh checkpoint path required (no remap from pre-Phase-2 weights).
 runtime:
   device: cuda
   precision: bf16
-  compile: true
+  compile: false
   compile_mode: default
   require_compact_sequence_batches: false
   allow_tf32: true
   activation_checkpoint: none
-  attention_backend: flash
+  attention_backend: sdpa
   distributed: ddp
-  nproc_per_node: 8
+  nproc_per_node: 2
   master_addr: 127.0.0.1
   master_port: 29500
   trim_all_invalid_sequence_prefix: false
@@ -45,14 +47,16 @@ data:
       shuffle_seed: 2025
       length_bucket_metric: sum
       length_buckets:
-      - max_length: 512
-        batch_size: 128
       - max_length: 1024
-        batch_size: 80
-      - max_length: 1536
-        batch_size: 56
+        batch_size: 72
+      - max_length: 2048
+        batch_size: 48
+      - max_length: 4096
+        batch_size: 32
+      - max_length: 6144
+        batch_size: 22
       - max_length: null
-        batch_size: 40
+        batch_size: 16
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
       input_columns:
@@ -643,12 +647,6 @@ data:
       fst_cart: label_fst_cart
       upid_pay: upid_fst_trgt_noc_clk_pay_24h
       cateid_filter: cateid_is_fst_scene_sp_filter
-    prediction_keys:
-      search_id: search_id
-      candidate_position: candidate_position
-      example_id: example_ids
-      goods_id_hn: goods_id_hn
-    prediction_score_suffix: _score
     reader:
       engine: pyarrow_dataset
       columns_pruning: true
@@ -667,14 +665,16 @@ data:
       trusted_input: true
       length_bucket_metric: sum
       length_buckets:
-      - max_length: 512
-        batch_size: 128
       - max_length: 1024
-        batch_size: 80
-      - max_length: 1536
-        batch_size: 56
+        batch_size: 72
+      - max_length: 2048
+        batch_size: 48
+      - max_length: 4096
+        batch_size: 32
+      - max_length: 6144
+        batch_size: 22
       - max_length: null
-        batch_size: 40
+        batch_size: 16
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
       input_columns:
@@ -962,7 +962,6 @@ data:
       optional_input_columns:
       - context_indices
       - target_indices
-      - example_ids
       - f_goods_view_times_tg_l1_hn
       - impr_x_indices
       - clk_long_x_indices
@@ -973,6 +972,7 @@ data:
       - srch_q2i_x_indices
       - ups_clk_sku_x_indices
       - flatten_query_hash_x_indices
+      - example_ids
       options:
         context_features:
         - currency_hn
@@ -1253,6 +1253,12 @@ data:
           flatten_query_hash: flatten_query_hash_x_time_delta_log1p_seconds
         time_delta_transform: log1p_seconds
         compact_request_lists: true
+    prediction_keys:
+      search_id: search_id
+      candidate_position: candidate_position
+      example_id: example_ids
+      goods_id_hn: goods_id_hn
+    prediction_score_suffix: _score
 features:
 - name: currency_hn
   kind: categorical
@@ -1348,7 +1354,7 @@ features:
   kind: categorical
   source: origin_query_hash_hn
   embedding_scope: feature
-  embedding_dim: 48
+  embedding_dim: 32
   encoding:
     type: pre_hashed
     num_buckets: 33554432
@@ -1374,7 +1380,7 @@ features:
   kind: categorical
   source: query_hash_hn
   embedding_scope: feature
-  embedding_dim: 48
+  embedding_dim: 32
   encoding:
     type: pre_hashed
     num_buckets: 33554432
@@ -1518,7 +1524,7 @@ features:
   kind: categorical
   source: uid_or_bg_hn
   embedding_scope: feature
-  embedding_dim: 64
+  embedding_dim: 48
   encoding:
     type: pre_hashed
     num_buckets: 67108864
@@ -1858,7 +1864,7 @@ features:
   kind: categorical
   source: goods_id_hn
   embedding_scope: feature
-  embedding_dim: 64
+  embedding_dim: 48
   encoding:
     type: pre_hashed
     num_buckets: 134217728
@@ -2007,7 +2013,7 @@ features:
   kind: categorical
   source: sku_id_hn
   embedding_scope: feature
-  embedding_dim: 64
+  embedding_dim: 48
   encoding:
     type: pre_hashed
     num_buckets: 67108864
@@ -3041,7 +3047,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: impr_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -3161,7 +3167,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: clk_long_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -3283,7 +3289,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: view_long_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -3549,7 +3555,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: cart_long_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -3589,18 +3595,18 @@ sequences:
   - name: spec_hn
     kind: categorical
     source: cart_long_x_spec_hn
-    embedding_dim: 32
+    embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 262144
+      num_buckets: 8388608
       padding_id: 0
   - name: sku_ids_hn
     kind: categorical
     source: cart_long_x_sku_ids_hn
-    embedding_dim: 32
+    embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 262144
+      num_buckets: 16777216
       padding_id: 0
 - name: buy_long
   embedding_scope: feature
@@ -3667,7 +3673,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: buy_long_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -3717,20 +3723,20 @@ sequences:
   - name: spec_hn
     kind: categorical
     source: buy_long_x_spec_hn
-    embedding_dim: 32
+    embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 262144
+      num_buckets: 8388608
       padding_id: 0
       share_with: cart_long.spec_hn
       share_embedding: true
   - name: sku_ids_hn
     kind: categorical
     source: buy_long_x_sku_ids_hn
-    embedding_dim: 32
+    embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 262144
+      num_buckets: 16777216
       padding_id: 0
       share_with: cart_long.sku_ids_hn
       share_embedding: true
@@ -3759,7 +3765,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: semi_clk_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -3861,7 +3867,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: srch_q2i_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -3953,7 +3959,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: ups_clk_sku_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -3983,10 +3989,10 @@ sequences:
   - name: spec_hn
     kind: categorical
     source: ups_clk_sku_x_spec_hn
-    embedding_dim: 32
+    embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 262144
+      num_buckets: 8388608
       padding_id: 0
       share_with: cart_long.spec_hn
       share_embedding: true
@@ -4005,7 +4011,7 @@ sequences:
   - name: flat_q_hash_hn
     kind: categorical
     source: flatten_query_hash_x_flat_q_hash_hn
-    embedding_dim: 48
+    embedding_dim: 32
     encoding:
       type: pre_hashed
       num_buckets: 33554432
@@ -4265,7 +4271,7 @@ model:
   mdl_feature_interaction: direct_ffn
   use_request_cache: true
 training:
-  batch_size: 40
+  batch_size: 16
   embedding_distribution: sharded
   dense_distribution: ddp
   embedding_sharding:
@@ -4290,23 +4296,23 @@ training:
   fused_dense_optimizer: true
   rmsprop_alpha: 0.99999
   rmsprop_momentum: 0.0
-  sparse_optimizer: adagrad
+  sparse_optimizer: rowwise_adagrad
   adagrad_initial_accumulator_value: 0.1
   adagrad_eps: 1.0e-10
   embedding_sparse_gradients: true
+  embedding_weight_dtype: bf16
   sparse_update_mode: ddp_synced_adagrad
   sparse_parameter_server_adapter: null
   dense_clip_norm: 1.0
   sparse_clip_norm: 1.0
   loss_reduction: mean_per_task
-  checkpoint_path: artifacts/checkpoints/onetrans.pt
-  embedding_weight_dtype: bf16
-  embedding_collect_stats: false
-  embedding_validate_indices: false
-  log_every_steps: 100
   quick_eval:
     enabled: true
     every_steps: 1000
     max_batches: 20
     split: train
     auc_bins: 4096
+  save_checkpoint: false
+  checkpoint_path: artifacts/checkpoints/onetrans_2xh100_phase2_shared_dim
+  embedding_collect_stats: false
+  embedding_validate_indices: false
