@@ -96,11 +96,10 @@ class AttentionCapabilityHelperTest(unittest.TestCase):
         self.assertTrue(
             any(sequence.encoder == "longer" for sequence in config.sequences)
         )
-        self.assertTrue(
-            config.model.use_task_feature_interaction
-            or config.model.use_scenario_feature_interaction
-            or config.model.name == "mdl_rankmixer"
-        )
+        self.assertTrue(config.model.use_task_tokens)
+        self.assertTrue(config.model.use_task_feature_interaction)
+        self.assertTrue(config.model.use_scenario_tokens)
+        self.assertTrue(config.model.use_scenario_feature_interaction)
         self.assertTrue(needs_varlen_flash(config))
         self.assertTrue(needs_padded_sdpa_flash(config))
 
@@ -135,6 +134,54 @@ class AttentionCapabilityHelperTest(unittest.TestCase):
         self.assertIn("resolved=varlen_flash+padded_sdpa_flash", description)
         self.assertIn("flash_path_requires_varlen=True", description)
         self.assertIn("flash_path_requires_padded_sdpa=True", description)
+
+    def test_padded_flash_capability_matrix(self) -> None:
+        """Padded Flash is only required when MDL DomainAwareAttention is built."""
+
+        cases = (
+            ("rankmixer", True, False, None),
+            ("onetrans", True, False, None),
+            ("mdl_rankmixer", True, True, None),
+            (
+                "mdl_rankmixer",
+                True,
+                False,
+                {
+                    "use_task_feature_interaction": False,
+                    "use_scenario_feature_interaction": False,
+                },
+            ),
+            ("mdl_onetrans", True, True, None),
+        )
+        for model_name, expect_varlen, expect_padded, model_overrides in cases:
+            with self.subTest(model=model_name, overrides=model_overrides):
+                config = load_app_config(ROOT / "configs" / f"{model_name}.yaml")
+                if model_overrides is not None:
+                    config = replace(
+                        config,
+                        model=replace(config.model, **model_overrides),
+                    )
+                self.assertEqual(needs_varlen_flash(config), expect_varlen)
+                self.assertEqual(needs_padded_sdpa_flash(config), expect_padded)
+
+                if expect_varlen and not expect_padded:
+                    flash_config = _flash_config(config)
+                    with (
+                        patch(
+                            "src.train.varlen_attention_available",
+                            return_value=True,
+                        ),
+                        patch(
+                            "src.train._ordinary_sdpa_flash_available",
+                            return_value=False,
+                        ),
+                    ):
+                        description = attention_runtime_description(
+                            flash_config,
+                            torch.device("cuda"),
+                        )
+                    self.assertIn("resolved=varlen_flash ", description)
+                    self.assertIn("flash_path_requires_padded_sdpa=False", description)
 
     def test_validate_varlen_inputs_rejects_unsupported_tensors(self) -> None:
         query = torch.zeros(2, 2, 4, dtype=torch.float32)

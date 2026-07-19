@@ -198,9 +198,23 @@ class _RecordingToySparseModel(_ToySparseModel):
         return super().forward(features, scenario_id)
 
 
+def _toy_model_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        name="rankmixer",
+        sparse_moe_loss_weight=0.0,
+        use_task_feature_interaction=False,
+        use_scenario_feature_interaction=False,
+    )
+
+
 def _toy_config() -> SimpleNamespace:
     return SimpleNamespace(
-        runtime=SimpleNamespace(device="cpu", precision="fp32", compile=False),
+        runtime=SimpleNamespace(
+            device="cpu",
+            precision="fp32",
+            compile=False,
+            attention_backend="sdpa",
+        ),
         training=SimpleNamespace(
             sparse_update_mode="ddp_synced_adagrad",
             sparse_parameter_server_adapter=None,
@@ -221,7 +235,8 @@ def _toy_config() -> SimpleNamespace:
             loss_reduction="sum",
             checkpoint_path=None,
         ),
-        model=SimpleNamespace(sparse_moe_loss_weight=0.0),
+        model=_toy_model_config(),
+        sequences=(),
         task_names=["task"],
     )
 
@@ -272,9 +287,16 @@ def _uneven_evaluation_worker(
     )
     split = SimpleNamespace(labels={"task": "label"}, group_id=None)
     config = SimpleNamespace(
-        runtime=SimpleNamespace(device="cpu", precision="fp32", compile=False),
+        runtime=SimpleNamespace(
+            device="cpu",
+            precision="fp32",
+            compile=False,
+            attention_backend="sdpa",
+        ),
         training=SimpleNamespace(checkpoint_path=None),
         scenarios=SimpleNamespace(names=("default",), auto_discover=False),
+        model=_toy_model_config(),
+        sequences=(),
         task_names=["task"],
         data=SimpleNamespace(train=split, test=split),
     )

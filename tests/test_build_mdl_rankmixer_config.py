@@ -256,12 +256,14 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             test_inputs=["/tmp/test"],
         )
 
-        self.assertEqual(payload["runtime"]["nproc_per_node"], 8)
-        self.assertEqual(payload["training"]["sparse_optimizer"], "adagrad")
+        self.assertEqual(payload["runtime"]["nproc_per_node"], 2)
+        self.assertEqual(payload["training"]["sparse_optimizer"], "rowwise_adagrad")
         memory = summary["embedding_memory"]
         self.assertIn("optimizer_state_gib_total", memory)
-        self.assertEqual(memory["optimizer_state_layout"], "full")
-        self.assertEqual(memory["gpu_count"], 8)
+        self.assertEqual(memory["optimizer_state_layout"], "rowwise")
+        self.assertEqual(memory["gpu_count"], 2)
+        self.assertEqual(memory["embedding_weight_dtype"], "bf16")
+        self.assertEqual(summary["embedding_profile"], "shared_dim")
 
         self.assertEqual([item["name"] for item in payload["features"][:169]], [
             item["name"] for item in self.sample["features"]
@@ -312,8 +314,11 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             for field in task_priors["task_cateid_filter_prior"]["fields"]
             if field["name"] == "goods_id_hn"
         )
-        self.assertNotIn("share_with", upid_goods["encoding"])
-        self.assertNotIn("share_with", cateid_goods["encoding"])
+        self.assertEqual(upid_goods["encoding"]["share_with"], "goods_id_hn")
+        self.assertEqual(cateid_goods["encoding"]["share_with"], "goods_id_hn")
+        self.assertTrue(upid_goods["encoding"]["share_embedding"])
+        self.assertTrue(cateid_goods["encoding"]["share_embedding"])
+        self.assertEqual(by_name["goods_id_hn"]["embedding_dim"], 48)
 
         self.assertEqual(
             payload["scenarios"],
@@ -370,8 +375,11 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             for name in payload["tokenization"]["feature_token_inputs"][:169]
         ) + 9 * 768
         self.assertEqual(main_input_width % 32, 0)
-        self.assertEqual(payload["runtime"]["nproc_per_node"], 8)
+        self.assertEqual(payload["runtime"]["nproc_per_node"], 2)
+        self.assertEqual(payload["runtime"]["attention_backend"], "sdpa")
+        self.assertEqual(payload["runtime"]["activation_checkpoint"], "none")
         self.assertEqual(payload["training"]["embedding_distribution"], "sharded")
+        self.assertEqual(payload["training"]["embedding_weight_dtype"], "bf16")
         self.assertEqual(payload["training"]["loss_reduction"], "mean_per_task")
         self.assertEqual(
             payload["training"]["quick_eval"],
@@ -385,7 +393,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         )
         self.assertLessEqual(
             summary["embedding_memory"]["planned_weight_plus_state_gib_per_gpu"],
-            40.0,
+            80.0,
         )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -556,7 +564,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         self.assertEqual(summary["profile"]["settings"]["mode"], "name_heuristic")
         self.assertLess(
             summary["embedding_memory"]["planned_weight_plus_state_gib_per_gpu"],
-            40.0,
+            80.0,
         )
 
     def test_scene_discovery_cache_avoids_rescanning_immutable_inputs(self) -> None:

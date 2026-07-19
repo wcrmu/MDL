@@ -208,11 +208,8 @@ PHASE2_SKU_LIST_SHARE_ALIASES = (
     "task_upid_pay_prior.sku_ids_hn",
     "task_cateid_filter_prior.sku_ids_hn",
 )
-PHASE2_SCENARIO_PRIOR_SHARES = {
-    # Important task/scenario extras must stay share_embedding=false
-    # (_validate_mdl_extra_embeddings). Only the scene prior scalar may share.
-    "scenario_prior_scene_id_hn": "scene_id_hn",
-}
+# scenario_prior_scene_id_hn (auto) and scenario_<id>_prior_scene_id_hn (fixed)
+# both share onto scene_id_hn via _scenario_prior_scene_aliases().
 
 
 def _semantic_source(source: str) -> tuple[str | None, str]:
@@ -1499,6 +1496,20 @@ def _apply_phase2_common(payload: dict[str, Any]) -> None:
     _validate_share_graph(payload)
 
 
+def _scenario_prior_scene_aliases(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return scenario-prior scene_id features for auto or fixed scene layouts."""
+
+    aliases: list[str] = []
+    for feature in payload["features"]:
+        name = str(feature["name"])
+        if name == "scenario_prior_scene_id_hn":
+            aliases.append(name)
+            continue
+        if name.startswith("scenario_") and name.endswith("_prior_scene_id_hn"):
+            aliases.append(name)
+    return tuple(aliases)
+
+
 def _apply_phase2_mdl_priors(payload: dict[str, Any]) -> None:
     """MDL-only prior alias merges; requires the three task-prior sequences."""
 
@@ -1527,14 +1538,14 @@ def _apply_phase2_mdl_priors(payload: dict[str, Any]) -> None:
                 continue
             _share_embedding(payload, f"{sequence_name}.{field_name}", base_name)
 
-    for alias_name, base_name in PHASE2_SCENARIO_PRIOR_SHARES.items():
-        try:
-            _find_feature(payload, alias_name)
-        except KeyError as error:
-            raise ValueError(
-                f"Phase 2 MDL prior profile requires feature {alias_name!r}"
-            ) from error
-        _share_embedding(payload, alias_name, base_name)
+    scenario_aliases = _scenario_prior_scene_aliases(payload)
+    if not scenario_aliases:
+        raise ValueError(
+            "Phase 2 MDL prior profile requires scenario_prior_scene_id_hn "
+            "or scenario_<id>_prior_scene_id_hn features"
+        )
+    for alias_name in scenario_aliases:
+        _share_embedding(payload, alias_name, "scene_id_hn")
 
     _propagate_shared_shapes(payload)
     _validate_share_graph(payload)
@@ -1742,14 +1753,14 @@ def build_config(
     length_quantile: str = "p99",
     max_sequence_length: int | None = None,
     max_bag_length: int | None = None,
-    embedding_budget_gib_per_gpu: float = 40.0,
+    embedding_budget_gib_per_gpu: float = 80.0,
     event_token_budget_per_gpu: int = 262_144,
     batch_size: int | None = None,
     auto_discover_scenes: bool = False,
-    gpu_count: int = 8,
-    embedding_weight_dtype: str = "fp32",
-    sparse_optimizer: str = "adagrad",
-    embedding_profile: str = "baseline",
+    gpu_count: int = 2,
+    embedding_weight_dtype: str = "bf16",
+    sparse_optimizer: str = "rowwise_adagrad",
+    embedding_profile: str = "shared_dim",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if model_name not in SUPPORTED_MODELS:
         raise ValueError(
@@ -2150,8 +2161,8 @@ def build_config(
             "compile_mode": "default",
             "require_compact_sequence_batches": False,
             "allow_tf32": True,
-            "activation_checkpoint": "full",
-            "attention_backend": "auto",
+            "activation_checkpoint": "none",
+            "attention_backend": "sdpa",
             "distributed": "ddp",
             "nproc_per_node": gpu_count,
             "master_addr": "127.0.0.1",
@@ -2368,27 +2379,28 @@ def main() -> int:
     parser.add_argument("--length-quantile", choices=("p95", "p99", "max"), default="p99")
     parser.add_argument("--max-sequence-length", type=int)
     parser.add_argument("--max-bag-length", type=int)
-    parser.add_argument("--embedding-budget-gib-per-gpu", type=float, default=40.0)
+    parser.add_argument("--embedding-budget-gib-per-gpu", type=float, default=80.0)
     parser.add_argument("--event-token-budget-per-gpu", type=int, default=262_144)
     parser.add_argument("--batch-size", type=int)
-    parser.add_argument("--gpu-count", type=int, default=8)
+    parser.add_argument("--gpu-count", type=int, default=2)
     parser.add_argument(
         "--embedding-weight-dtype",
         choices=("fp32", "bf16"),
-        default="fp32",
+        default="bf16",
     )
     parser.add_argument(
         "--sparse-optimizer",
         choices=("adagrad", "rowwise_adagrad"),
-        default="adagrad",
+        default="rowwise_adagrad",
     )
     parser.add_argument(
         "--embedding-profile",
         choices=EMBEDDING_PROFILES,
-        default="baseline",
+        default="shared_dim",
         help=(
             "Phase 2 embedding memory profile: baseline, shared tables, "
-            "shared+dim, and optional bucket compression tiers."
+            "shared+dim, and optional bucket compression tiers. "
+            "Default shared_dim targets 2×H100 + BF16 + Row-Wise."
         ),
     )
     parser.add_argument("--dry-run", action="store_true")

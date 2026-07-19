@@ -84,20 +84,22 @@ def _requires_varlen_attention(config: AppConfig) -> bool:
 def _needs_padded_sdpa_flash(config: AppConfig) -> bool:
     """True when strict flash would also exercise ordinary padded SDPA Flash.
 
-    LONGER / OneTrans S-streams use Varlen. RankMixer layers and MDL
-    DomainAwareAttention still use padded FlashAttention under the same
-    ``attention_backend='flash'`` setting, so both capabilities can be required
-    at once (they are not mutually exclusive).
+    LONGER / OneTrans S-streams use Varlen. Ordinary padded FlashAttention is
+    only required when MDL constructs ``DomainAwareAttention`` for enabled
+    task/scenario feature interactions. Plain RankMixer token mixing does not
+    use padded Flash, so both capabilities are independent.
     """
 
     model = config.model
-    if model.name in {"rankmixer", "mdl_rankmixer"}:
-        return True
-    if getattr(model, "use_task_feature_interaction", False):
-        return True
-    if getattr(model, "use_scenario_feature_interaction", False):
-        return True
-    return False
+    if model.name not in {"mdl_rankmixer", "mdl_onetrans"}:
+        return False
+    task_attention_enabled = (
+        model.use_task_tokens and model.use_task_feature_interaction
+    )
+    scenario_attention_enabled = (
+        model.use_scenario_tokens and model.use_scenario_feature_interaction
+    )
+    return task_attention_enabled or scenario_attention_enabled
 
 
 def _ordinary_sdpa_flash_available() -> bool:
