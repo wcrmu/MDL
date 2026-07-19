@@ -1,5 +1,8 @@
-# Standalone single-node 8xA100-80G production training config.
-# Bucket sizes and embedding dimensions remain profiling estimates.
+# Standalone 2×H100 production training config (SDPA eager + Row-Wise Adagrad).
+# Phase 2B embedding profile: shared tables + dimension compression.
+# Physical embedding tables: 202; planned static embedding+state: 27.643 GiB/GPU.
+# goods/uid/sku: 64→48; query identity tables: 48→32; buckets unchanged.
+# Phase 2 changes embedding shapes; train from a fresh checkpoint path (no Phase 1 remap).
 runtime:
   device: cuda
   precision: bf16
@@ -8,10 +11,9 @@ runtime:
   require_compact_sequence_batches: false
   allow_tf32: true
   activation_checkpoint: none
-  # Platform torch builds before 2.10 lack torch.nn.attention.varlen; use SDPA.
   attention_backend: sdpa
   distributed: ddp
-  nproc_per_node: 4
+  nproc_per_node: 2
   master_addr: 127.0.0.1
   master_port: 29500
   trim_all_invalid_sequence_prefix: false
@@ -1353,7 +1355,7 @@ features:
   kind: categorical
   source: origin_query_hash_hn
   embedding_scope: feature
-  embedding_dim: 48
+  embedding_dim: 32
   encoding:
     type: pre_hashed
     num_buckets: 33554432
@@ -1379,7 +1381,7 @@ features:
   kind: categorical
   source: query_hash_hn
   embedding_scope: feature
-  embedding_dim: 48
+  embedding_dim: 32
   encoding:
     type: pre_hashed
     num_buckets: 33554432
@@ -1523,7 +1525,7 @@ features:
   kind: categorical
   source: uid_or_bg_hn
   embedding_scope: feature
-  embedding_dim: 64
+  embedding_dim: 48
   encoding:
     type: pre_hashed
     num_buckets: 67108864
@@ -1863,7 +1865,7 @@ features:
   kind: categorical
   source: goods_id_hn
   embedding_scope: feature
-  embedding_dim: 64
+  embedding_dim: 48
   encoding:
     type: pre_hashed
     num_buckets: 134217728
@@ -2012,7 +2014,7 @@ features:
   kind: categorical
   source: sku_id_hn
   embedding_scope: feature
-  embedding_dim: 64
+  embedding_dim: 48
   encoding:
     type: pre_hashed
     num_buckets: 67108864
@@ -2192,7 +2194,7 @@ features:
   kind: categorical
   source: is_promotion_hn
   embedding_scope: feature
-  embedding_dim: 16
+  embedding_dim: 32
   encoding:
     type: pre_hashed
     num_buckets: 16
@@ -3034,6 +3036,8 @@ features:
     type: pre_hashed
     num_buckets: 1024
     padding_id: 0
+    share_embedding: true
+    share_with: scene_id_hn
 - name: task_important_currency_hn
   kind: categorical
   source: currency_hn
@@ -3127,7 +3131,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: impr_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -3258,7 +3262,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: clk_long_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -3391,7 +3395,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: view_long_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -3668,7 +3672,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: cart_long_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -3708,18 +3712,18 @@ sequences:
   - name: spec_hn
     kind: categorical
     source: cart_long_x_spec_hn
-    embedding_dim: 32
+    embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 262144
+      num_buckets: 8388608
       padding_id: 0
   - name: sku_ids_hn
     kind: categorical
     source: cart_long_x_sku_ids_hn
-    embedding_dim: 32
+    embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 262144
+      num_buckets: 16777216
       padding_id: 0
   target_inputs: []
   rankmixer_summary_tokens: 1
@@ -3797,7 +3801,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: buy_long_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -3847,20 +3851,20 @@ sequences:
   - name: spec_hn
     kind: categorical
     source: buy_long_x_spec_hn
-    embedding_dim: 32
+    embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 262144
+      num_buckets: 8388608
       padding_id: 0
       share_with: cart_long.spec_hn
       share_embedding: true
   - name: sku_ids_hn
     kind: categorical
     source: buy_long_x_sku_ids_hn
-    embedding_dim: 32
+    embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 262144
+      num_buckets: 16777216
       padding_id: 0
       share_with: cart_long.sku_ids_hn
       share_embedding: true
@@ -3900,7 +3904,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: semi_clk_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -4013,7 +4017,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: srch_q2i_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -4116,7 +4120,7 @@ sequences:
   - name: goods_id_hn
     kind: categorical
     source: ups_clk_sku_x_goods_id_hn
-    embedding_dim: 64
+    embedding_dim: 48
     encoding:
       type: pre_hashed
       num_buckets: 134217728
@@ -4146,10 +4150,10 @@ sequences:
   - name: spec_hn
     kind: categorical
     source: ups_clk_sku_x_spec_hn
-    embedding_dim: 32
+    embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 262144
+      num_buckets: 8388608
       padding_id: 0
       share_with: cart_long.spec_hn
       share_embedding: true
@@ -4179,7 +4183,7 @@ sequences:
   - name: flat_q_hash_hn
     kind: categorical
     source: flatten_query_hash_x_flat_q_hash_hn
-    embedding_dim: 48
+    embedding_dim: 32
     encoding:
       type: pre_hashed
       num_buckets: 33554432
@@ -4225,6 +4229,8 @@ sequences:
       type: pre_hashed
       num_buckets: 256
       padding_id: 0
+      share_embedding: true
+      share_with: cat1_id_hn
   - name: cat2_id_hn
     kind: categorical
     source: cart_long_x_cat2_id_hn
@@ -4233,6 +4239,8 @@ sequences:
       type: pre_hashed
       num_buckets: 4096
       padding_id: 0
+      share_embedding: true
+      share_with: cat2_id_hn
   - name: cat3_id_hn
     kind: categorical
     source: cart_long_x_cat3_id_hn
@@ -4241,6 +4249,8 @@ sequences:
       type: pre_hashed
       num_buckets: 32768
       padding_id: 0
+      share_embedding: true
+      share_with: cat3_id_hn
   - name: cat4_id_hn
     kind: categorical
     source: cart_long_x_cat4_id_hn
@@ -4249,6 +4259,8 @@ sequences:
       type: pre_hashed
       num_buckets: 131072
       padding_id: 0
+      share_embedding: true
+      share_with: cat4_id_hn
   - name: cat_id_hn
     kind: categorical
     source: cart_long_x_cat_id_hn
@@ -4257,14 +4269,18 @@ sequences:
       type: pre_hashed
       num_buckets: 262144
       padding_id: 0
+      share_embedding: true
+      share_with: cat_id_hn
   - name: goods_id_hn
     kind: categorical
     source: cart_long_x_goods_id_hn
     embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 33554432
+      num_buckets: 134217728
       padding_id: 0
+      share_embedding: true
+      share_with: goods_id_hn
   - name: mall_id_hn
     kind: categorical
     source: cart_long_x_mall_id_hn
@@ -4273,6 +4289,8 @@ sequences:
       type: pre_hashed
       num_buckets: 4194304
       padding_id: 0
+      share_embedding: true
+      share_with: mall_id_hn
   - name: price_hn
     kind: categorical
     source: cart_long_x_price_hn
@@ -4281,6 +4299,8 @@ sequences:
       type: pre_hashed
       num_buckets: 4096
       padding_id: 0
+      share_embedding: true
+      share_with: price_hn
   - name: timegap_hn
     kind: categorical
     source: cart_long_x_timegap_hn
@@ -4297,6 +4317,8 @@ sequences:
       type: pre_hashed
       num_buckets: 8388608
       padding_id: 0
+      share_embedding: true
+      share_with: cart_long.spec_hn
   - name: sku_ids_hn
     kind: categorical
     source: cart_long_x_sku_ids_hn
@@ -4305,6 +4327,8 @@ sequences:
       type: pre_hashed
       num_buckets: 16777216
       padding_id: 0
+      share_embedding: true
+      share_with: cart_long.sku_ids_hn
 - name: task_upid_pay_prior
   embedding_scope: task
   max_length: 256
@@ -4325,6 +4349,8 @@ sequences:
       type: pre_hashed
       num_buckets: 256
       padding_id: 0
+      share_embedding: true
+      share_with: cat1_id_hn
   - name: cat2_id_hn
     kind: categorical
     source: buy_long_x_cat2_id_hn
@@ -4333,6 +4359,8 @@ sequences:
       type: pre_hashed
       num_buckets: 4096
       padding_id: 0
+      share_embedding: true
+      share_with: cat2_id_hn
   - name: cat3_id_hn
     kind: categorical
     source: buy_long_x_cat3_id_hn
@@ -4341,6 +4369,8 @@ sequences:
       type: pre_hashed
       num_buckets: 32768
       padding_id: 0
+      share_embedding: true
+      share_with: cat3_id_hn
   - name: cat4_id_hn
     kind: categorical
     source: buy_long_x_cat4_id_hn
@@ -4349,6 +4379,8 @@ sequences:
       type: pre_hashed
       num_buckets: 131072
       padding_id: 0
+      share_embedding: true
+      share_with: cat4_id_hn
   - name: cat_id_hn
     kind: categorical
     source: buy_long_x_cat_id_hn
@@ -4357,14 +4389,18 @@ sequences:
       type: pre_hashed
       num_buckets: 262144
       padding_id: 0
+      share_embedding: true
+      share_with: cat_id_hn
   - name: goods_id_hn
     kind: categorical
     source: buy_long_x_goods_id_hn
     embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 16777216
+      num_buckets: 134217728
       padding_id: 0
+      share_embedding: true
+      share_with: goods_id_hn
   - name: mall_id_hn
     kind: categorical
     source: buy_long_x_mall_id_hn
@@ -4373,6 +4409,8 @@ sequences:
       type: pre_hashed
       num_buckets: 4194304
       padding_id: 0
+      share_embedding: true
+      share_with: mall_id_hn
   - name: sales_hn
     kind: categorical
     source: buy_long_x_sales_hn
@@ -4381,6 +4419,8 @@ sequences:
       type: pre_hashed
       num_buckets: 4096
       padding_id: 0
+      share_embedding: true
+      share_with: sales_hn
   - name: price_hn
     kind: categorical
     source: buy_long_x_price_hn
@@ -4389,6 +4429,8 @@ sequences:
       type: pre_hashed
       num_buckets: 4096
       padding_id: 0
+      share_embedding: true
+      share_with: price_hn
   - name: timegap_hn
     kind: categorical
     source: buy_long_x_timegap_hn
@@ -4405,14 +4447,18 @@ sequences:
       type: pre_hashed
       num_buckets: 8388608
       padding_id: 0
+      share_embedding: true
+      share_with: cart_long.spec_hn
   - name: sku_ids_hn
     kind: categorical
     source: buy_long_x_sku_ids_hn
     embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 8388608
+      num_buckets: 16777216
       padding_id: 0
+      share_embedding: true
+      share_with: cart_long.sku_ids_hn
 - name: task_cateid_filter_prior
   embedding_scope: task
   max_length: 256
@@ -4433,6 +4479,8 @@ sequences:
       type: pre_hashed
       num_buckets: 256
       padding_id: 0
+      share_embedding: true
+      share_with: cat1_id_hn
   - name: cat2_id_hn
     kind: categorical
     source: buy_long_x_cat2_id_hn
@@ -4441,6 +4489,8 @@ sequences:
       type: pre_hashed
       num_buckets: 4096
       padding_id: 0
+      share_embedding: true
+      share_with: cat2_id_hn
   - name: cat3_id_hn
     kind: categorical
     source: buy_long_x_cat3_id_hn
@@ -4449,6 +4499,8 @@ sequences:
       type: pre_hashed
       num_buckets: 32768
       padding_id: 0
+      share_embedding: true
+      share_with: cat3_id_hn
   - name: cat4_id_hn
     kind: categorical
     source: buy_long_x_cat4_id_hn
@@ -4457,6 +4509,8 @@ sequences:
       type: pre_hashed
       num_buckets: 131072
       padding_id: 0
+      share_embedding: true
+      share_with: cat4_id_hn
   - name: cat_id_hn
     kind: categorical
     source: buy_long_x_cat_id_hn
@@ -4465,14 +4519,18 @@ sequences:
       type: pre_hashed
       num_buckets: 262144
       padding_id: 0
+      share_embedding: true
+      share_with: cat_id_hn
   - name: goods_id_hn
     kind: categorical
     source: buy_long_x_goods_id_hn
     embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 16777216
+      num_buckets: 134217728
       padding_id: 0
+      share_embedding: true
+      share_with: goods_id_hn
   - name: mall_id_hn
     kind: categorical
     source: buy_long_x_mall_id_hn
@@ -4481,6 +4539,8 @@ sequences:
       type: pre_hashed
       num_buckets: 4194304
       padding_id: 0
+      share_embedding: true
+      share_with: mall_id_hn
   - name: sales_hn
     kind: categorical
     source: buy_long_x_sales_hn
@@ -4489,6 +4549,8 @@ sequences:
       type: pre_hashed
       num_buckets: 4096
       padding_id: 0
+      share_embedding: true
+      share_with: sales_hn
   - name: price_hn
     kind: categorical
     source: buy_long_x_price_hn
@@ -4497,6 +4559,8 @@ sequences:
       type: pre_hashed
       num_buckets: 4096
       padding_id: 0
+      share_embedding: true
+      share_with: price_hn
   - name: timegap_hn
     kind: categorical
     source: buy_long_x_timegap_hn
@@ -4513,14 +4577,18 @@ sequences:
       type: pre_hashed
       num_buckets: 8388608
       padding_id: 0
+      share_embedding: true
+      share_with: task_upid_pay_prior.spec_hn
   - name: sku_ids_hn
     kind: categorical
     source: buy_long_x_sku_ids_hn
     embedding_dim: 48
     encoding:
       type: pre_hashed
-      num_buckets: 8388608
+      num_buckets: 16777216
       padding_id: 0
+      share_embedding: true
+      share_with: task_upid_pay_prior.sku_ids_hn
 scenarios:
   names:
   - __auto__
@@ -4801,7 +4869,7 @@ training:
   fused_dense_optimizer: true
   rmsprop_alpha: 0.99999
   rmsprop_momentum: 0.0
-  sparse_optimizer: adagrad
+  sparse_optimizer: rowwise_adagrad
   adagrad_initial_accumulator_value: 0.1
   adagrad_eps: 1.0e-10
   embedding_sparse_gradients: true
@@ -4810,7 +4878,7 @@ training:
   dense_clip_norm: 1.0
   sparse_clip_norm: 1.0
   loss_reduction: mean_per_task
-  checkpoint_path: artifacts/checkpoints/mdl_rankmixer.pt
+  checkpoint_path: artifacts/checkpoints/mdl_rankmixer_2xh100_phase2_shared_dim
   embedding_weight_dtype: bf16
   embedding_collect_stats: false
   embedding_validate_indices: false

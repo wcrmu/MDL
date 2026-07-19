@@ -51,7 +51,7 @@ class AttentionPreflightTest(unittest.TestCase):
         config = load_app_config(ROOT / "configs" / "mdl_rankmixer.yaml")
         self.assertEqual(config.runtime.attention_backend, "sdpa")
         self.assertFalse(config.runtime.compile)
-        self.assertEqual(config.runtime.nproc_per_node, 4)
+        self.assertEqual(config.runtime.nproc_per_node, 2)
         with patch("src.train.varlen_attention_available", return_value=False):
             description = _attention_runtime_description(config, torch.device("cuda"))
         self.assertIn("resolved=padded_sdpa", description)

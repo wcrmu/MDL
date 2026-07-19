@@ -185,7 +185,7 @@ class PlannerAndConfigTest(unittest.TestCase):
 
     def test_config_accepts_rowwise_sharded_and_rejects_invalid(self) -> None:
         root = __import__("pathlib").Path(__file__).resolve().parents[1]
-        config = load_app_config(root / "configs" / "mdl_rankmixer_2xh100_rowwise.yaml")
+        config = load_app_config(root / "configs" / "mdl_rankmixer.yaml")
         self.assertEqual(config.training.sparse_optimizer, "rowwise_adagrad")
         self.assertEqual(config.training.embedding_distribution, "sharded")
         self.assertEqual(config.runtime.attention_backend, "sdpa")

@@ -154,6 +154,62 @@ ONETRANS_SEQUENCE_LENGTH_CAPS = {
 }
 ONETRANS_NS_TOKENS = 32
 
+EMBEDDING_PROFILES = (
+    "baseline",
+    "shared",
+    "shared_dim",
+    "shared_dim_query_bucket",
+    "shared_dim_aggressive_bucket",
+)
+PHASE2_TASK_PRIOR_SEQUENCES = (
+    "task_fst_cart_prior",
+    "task_upid_pay_prior",
+    "task_cateid_filter_prior",
+)
+# Buy-prior dedup excludes timegap (Phase 2 keeps independent prior timegap tables).
+PHASE2_BUY_PRIOR_SHARE_FIELDS = (
+    "cat1_id_hn",
+    "cat2_id_hn",
+    "cat3_id_hn",
+    "cat4_id_hn",
+    "cat_id_hn",
+    "goods_id_hn",
+    "mall_id_hn",
+    "sales_hn",
+    "price_hn",
+    "spec_hn",
+    "sku_ids_hn",
+)
+PHASE2_TASK_PRIOR_BASE_SHARES = {
+    "goods_id_hn": "goods_id_hn",
+    "cat1_id_hn": "cat1_id_hn",
+    "cat2_id_hn": "cat2_id_hn",
+    "cat3_id_hn": "cat3_id_hn",
+    "cat4_id_hn": "cat4_id_hn",
+    "cat_id_hn": "cat_id_hn",
+    "mall_id_hn": "mall_id_hn",
+    "price_hn": "price_hn",
+    "sales_hn": "sales_hn",
+}
+PHASE2_SPEC_SHARE_ALIASES = (
+    "buy_long.spec_hn",
+    "ups_clk_sku.spec_hn",
+    "task_fst_cart_prior.spec_hn",
+    "task_upid_pay_prior.spec_hn",
+    "task_cateid_filter_prior.spec_hn",
+)
+PHASE2_SKU_LIST_SHARE_ALIASES = (
+    "buy_long.sku_ids_hn",
+    "task_fst_cart_prior.sku_ids_hn",
+    "task_upid_pay_prior.sku_ids_hn",
+    "task_cateid_filter_prior.sku_ids_hn",
+)
+PHASE2_SCENARIO_PRIOR_SHARES = {
+    # Important task/scenario extras must stay share_embedding=false
+    # (_validate_mdl_extra_embeddings). Only the scene prior scalar may share.
+    "scenario_prior_scene_id_hn": "scene_id_hn",
+}
+
 
 def _semantic_source(source: str) -> tuple[str | None, str]:
     if "_x_" not in source:
@@ -1204,6 +1260,317 @@ def _power_of_two_floor(value: int) -> int:
     return 1 << (max(1, value).bit_length() - 1)
 
 
+def _iter_categorical_entries(payload: Mapping[str, Any]):
+    for feature in payload["features"]:
+        if feature["kind"] != "categorical":
+            continue
+        yield str(feature["name"]), feature
+    for sequence in payload["sequences"]:
+        sequence_name = str(sequence["name"])
+        for field in sequence["fields"]:
+            if field["kind"] != "categorical":
+                continue
+            yield f"{sequence_name}.{field['name']}", field
+
+
+def _categorical_entries_by_name(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    entries: dict[str, dict[str, Any]] = {}
+    for name, entry in _iter_categorical_entries(payload):
+        if name in entries:
+            raise ValueError(f"duplicate categorical input name {name!r}")
+        entries[name] = entry
+    return entries
+
+
+def _find_feature(payload: Mapping[str, Any], name: str) -> dict[str, Any]:
+    for feature in payload["features"]:
+        if feature["name"] == name:
+            return feature
+    raise KeyError(f"feature {name!r} not found")
+
+
+def _find_sequence_field(payload: Mapping[str, Any], qualified_name: str) -> dict[str, Any]:
+    if "." not in qualified_name:
+        raise KeyError(f"sequence field {qualified_name!r} must be qualified as sequence.field")
+    sequence_name, field_name = qualified_name.split(".", 1)
+    for sequence in payload["sequences"]:
+        if sequence["name"] != sequence_name:
+            continue
+        for field in sequence["fields"]:
+            if field["name"] == field_name:
+                return field
+        raise KeyError(f"sequence field {qualified_name!r} not found")
+    raise KeyError(f"sequence {sequence_name!r} not found")
+
+
+def _find_categorical_entry(payload: Mapping[str, Any], name: str) -> dict[str, Any]:
+    if "." in name:
+        return _find_sequence_field(payload, name)
+    return _find_feature(payload, name)
+
+
+def _resolve_share_root(
+    entries: Mapping[str, Mapping[str, Any]],
+    name: str,
+) -> str:
+    seen: set[str] = set()
+    current = name
+    while True:
+        if current in seen:
+            raise ValueError(f"shared embedding cycle detected at {name!r}")
+        seen.add(current)
+        try:
+            entry = entries[current]
+        except KeyError as error:
+            raise ValueError(
+                f"shared embedding target {current!r} does not exist (from {name!r})"
+            ) from error
+        encoding = entry["encoding"]
+        if not encoding.get("share_embedding"):
+            return current
+        target = encoding.get("share_with")
+        if not target:
+            raise ValueError(
+                f"share_embedding=true requires share_with for categorical input {current!r}"
+            )
+        current = str(target)
+
+
+def _set_embedding_shape(
+    payload: Mapping[str, Any],
+    table_name: str,
+    *,
+    num_buckets: int | None = None,
+    embedding_dim: int | None = None,
+) -> None:
+    entries = _categorical_entries_by_name(payload)
+    root_name = _resolve_share_root(entries, table_name)
+    entry = entries[root_name]
+    if num_buckets is not None:
+        if num_buckets <= 0:
+            raise ValueError("num_buckets must be positive")
+        entry["encoding"]["num_buckets"] = int(num_buckets)
+    if embedding_dim is not None:
+        if embedding_dim <= 0:
+            raise ValueError("embedding_dim must be positive")
+        entry["embedding_dim"] = int(embedding_dim)
+
+
+def _share_embedding(
+    payload: Mapping[str, Any],
+    alias_name: str,
+    base_name: str,
+) -> None:
+    entries = _categorical_entries_by_name(payload)
+    if alias_name not in entries:
+        raise KeyError(f"categorical alias {alias_name!r} not found")
+    if base_name not in entries:
+        raise KeyError(f"categorical base {base_name!r} not found")
+    if alias_name == base_name:
+        raise ValueError(f"categorical input {alias_name!r} cannot share with itself")
+    # Reject cycles before mutating the live payload.
+    probe = {
+        name: {
+            **entry,
+            "encoding": dict(entry["encoding"]),
+        }
+        for name, entry in entries.items()
+    }
+    probe[alias_name]["encoding"]["share_embedding"] = True
+    probe[alias_name]["encoding"]["share_with"] = base_name
+    root = _resolve_share_root(probe, alias_name)
+
+    physical = entries[root]
+    alias = entries[alias_name]
+    alias["embedding_dim"] = int(physical["embedding_dim"])
+    encoding = alias["encoding"]
+    encoding["type"] = physical["encoding"]["type"]
+    encoding["num_buckets"] = int(physical["encoding"]["num_buckets"])
+    encoding["padding_id"] = int(physical["encoding"]["padding_id"])
+    encoding["share_embedding"] = True
+    encoding["share_with"] = base_name
+
+
+def _propagate_shared_shapes(payload: Mapping[str, Any]) -> None:
+    entries = _categorical_entries_by_name(payload)
+    for name, entry in entries.items():
+        encoding = entry["encoding"]
+        if not encoding.get("share_embedding"):
+            continue
+        root_name = _resolve_share_root(entries, name)
+        physical = entries[root_name]
+        entry["embedding_dim"] = int(physical["embedding_dim"])
+        encoding["type"] = physical["encoding"]["type"]
+        encoding["num_buckets"] = int(physical["encoding"]["num_buckets"])
+        encoding["padding_id"] = int(physical["encoding"]["padding_id"])
+
+
+def _validate_share_graph(payload: Mapping[str, Any]) -> None:
+    entries = _categorical_entries_by_name(payload)
+    for name, entry in entries.items():
+        encoding = entry["encoding"]
+        if not encoding.get("share_embedding"):
+            continue
+        target = encoding.get("share_with")
+        if not target:
+            raise ValueError(
+                f"share_embedding=true requires share_with for categorical input {name!r}"
+            )
+        root_name = _resolve_share_root(entries, name)
+        physical = entries[root_name]
+        if int(entry["embedding_dim"]) != int(physical["embedding_dim"]):
+            raise ValueError(
+                f"shared alias {name!r} embedding_dim={entry['embedding_dim']} "
+                f"does not match base {root_name!r} embedding_dim={physical['embedding_dim']}"
+            )
+        if int(encoding["num_buckets"]) != int(physical["encoding"]["num_buckets"]):
+            raise ValueError(
+                f"shared alias {name!r} num_buckets={encoding['num_buckets']} "
+                f"does not match base {root_name!r} "
+                f"num_buckets={physical['encoding']['num_buckets']}"
+            )
+        if int(encoding["padding_id"]) != int(physical["encoding"]["padding_id"]):
+            raise ValueError(
+                f"shared alias {name!r} padding_id={encoding['padding_id']} "
+                f"does not match base {root_name!r} "
+                f"padding_id={physical['encoding']['padding_id']}"
+            )
+        if encoding["type"] != physical["encoding"]["type"]:
+            raise ValueError(
+                f"shared alias {name!r} encoding type {encoding['type']!r} "
+                f"does not match base {root_name!r} type {physical['encoding']['type']!r}"
+            )
+
+
+def _physical_table_count(payload: Mapping[str, Any]) -> int:
+    return sum(
+        1
+        for _name, entry in _iter_categorical_entries(payload)
+        if not entry["encoding"].get("share_embedding")
+    )
+
+
+def _sequence_has_field(payload: Mapping[str, Any], sequence_name: str, field_name: str) -> bool:
+    for sequence in payload["sequences"]:
+        if sequence["name"] != sequence_name:
+            continue
+        return any(field["name"] == field_name for field in sequence["fields"])
+    return False
+
+
+def _apply_phase2_shared(payload: dict[str, Any]) -> None:
+    """Merge duplicate task-prior / important tables onto shared physical bases."""
+
+    # Spec / SKU-list: enlarge the main cart_long bases, then share all aliases.
+    _set_embedding_shape(
+        payload,
+        "cart_long.spec_hn",
+        num_buckets=1 << 23,
+        embedding_dim=48,
+    )
+    _set_embedding_shape(
+        payload,
+        "cart_long.sku_ids_hn",
+        num_buckets=1 << 24,
+        embedding_dim=48,
+    )
+    for alias in PHASE2_SPEC_SHARE_ALIASES:
+        _share_embedding(payload, alias, "cart_long.spec_hn")
+    for alias in PHASE2_SKU_LIST_SHARE_ALIASES:
+        _share_embedding(payload, alias, "cart_long.sku_ids_hn")
+
+    # Lowest-risk buy-prior dedup, then point entity fields at scalar bases.
+    for field_name in PHASE2_BUY_PRIOR_SHARE_FIELDS:
+        alias = f"task_cateid_filter_prior.{field_name}"
+        base = f"task_upid_pay_prior.{field_name}"
+        if not _sequence_has_field(payload, "task_cateid_filter_prior", field_name):
+            continue
+        if not _sequence_has_field(payload, "task_upid_pay_prior", field_name):
+            continue
+        _share_embedding(payload, alias, base)
+
+    for sequence_name in PHASE2_TASK_PRIOR_SEQUENCES:
+        for field_name, base_name in PHASE2_TASK_PRIOR_BASE_SHARES.items():
+            if not _sequence_has_field(payload, sequence_name, field_name):
+                continue
+            _share_embedding(payload, f"{sequence_name}.{field_name}", base_name)
+
+    for alias_name, base_name in PHASE2_SCENARIO_PRIOR_SHARES.items():
+        try:
+            _find_feature(payload, alias_name)
+        except KeyError:
+            continue
+        _share_embedding(payload, alias_name, base_name)
+
+    _propagate_shared_shapes(payload)
+    _validate_share_graph(payload)
+
+
+def _apply_phase2_shared_dim(payload: dict[str, Any]) -> None:
+    _apply_phase2_shared(payload)
+    _set_embedding_shape(payload, "goods_id_hn", embedding_dim=48)
+    _set_embedding_shape(payload, "uid_or_bg_hn", embedding_dim=48)
+    _set_embedding_shape(payload, "sku_id_hn", embedding_dim=48)
+    _set_embedding_shape(payload, "origin_query_hash_hn", embedding_dim=32)
+    _set_embedding_shape(payload, "query_hash_hn", embedding_dim=32)
+    _set_embedding_shape(
+        payload,
+        "flatten_query_hash.flat_q_hash_hn",
+        embedding_dim=32,
+    )
+    _propagate_shared_shapes(payload)
+    _validate_share_graph(payload)
+
+
+def _apply_phase2_shared_dim_query_bucket(payload: dict[str, Any]) -> None:
+    _apply_phase2_shared_dim(payload)
+    query_buckets = 1 << 24
+    for table_name in (
+        "origin_query_hash_hn",
+        "query_hash_hn",
+        "flatten_query_hash.flat_q_hash_hn",
+    ):
+        _set_embedding_shape(payload, table_name, num_buckets=query_buckets)
+    _propagate_shared_shapes(payload)
+    _validate_share_graph(payload)
+
+
+def _apply_phase2_shared_dim_aggressive_bucket(payload: dict[str, Any]) -> None:
+    _apply_phase2_shared_dim_query_bucket(payload)
+    _set_embedding_shape(payload, "goods_id_hn", num_buckets=1 << 26)
+    _set_embedding_shape(payload, "uid_or_bg_hn", num_buckets=1 << 25)
+    _set_embedding_shape(payload, "sku_id_hn", num_buckets=1 << 25)
+    _propagate_shared_shapes(payload)
+    _validate_share_graph(payload)
+
+
+def apply_embedding_profile(payload: dict[str, Any], profile: str) -> dict[str, Any]:
+    """Mutate payload embedding tables according to a Phase 2 memory profile."""
+
+    if profile not in EMBEDDING_PROFILES:
+        raise ValueError(
+            "embedding_profile must be one of " + ", ".join(EMBEDDING_PROFILES)
+        )
+    if profile == "baseline":
+        _validate_share_graph(payload)
+        return payload
+    if profile == "shared":
+        _apply_phase2_shared(payload)
+    elif profile == "shared_dim":
+        _apply_phase2_shared_dim(payload)
+    elif profile == "shared_dim_query_bucket":
+        _apply_phase2_shared_dim_query_bucket(payload)
+    else:
+        _apply_phase2_shared_dim_aggressive_bucket(payload)
+    return payload
+
+
+def _embedding_profile_checkpoint_path(model_name: str, profile: str) -> str:
+    if profile == "baseline":
+        return f"artifacts/checkpoints/{model_name}.pt"
+    return f"artifacts/checkpoints/{model_name}_2xh100_phase2_{profile}"
+
+
 def _embedding_memory_summary(
     payload: Mapping[str, Any],
     *,
@@ -1336,6 +1703,7 @@ def build_config(
     gpu_count: int = 8,
     embedding_weight_dtype: str = "fp32",
     sparse_optimizer: str = "adagrad",
+    embedding_profile: str = "baseline",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if model_name not in SUPPORTED_MODELS:
         raise ValueError(
@@ -1357,6 +1725,10 @@ def build_config(
         raise ValueError("embedding_weight_dtype must be fp32 or bf16")
     if sparse_optimizer not in {"adagrad", "rowwise_adagrad"}:
         raise ValueError("sparse_optimizer must be adagrad or rowwise_adagrad")
+    if embedding_profile not in EMBEDDING_PROFILES:
+        raise ValueError(
+            "embedding_profile must be one of " + ", ".join(EMBEDDING_PROFILES)
+        )
 
     raw_features = sample.get("features")
     raw_sequences = sample.get("sequences")
@@ -1795,9 +2167,23 @@ def build_config(
                 "split": "train",
                 "auc_bins": 4096,
             },
-            "checkpoint_path": f"artifacts/checkpoints/{model_name}.pt",
+            "checkpoint_path": _embedding_profile_checkpoint_path(
+                model_name,
+                embedding_profile,
+            ),
         },
     }
+
+    apply_embedding_profile(payload, embedding_profile)
+    if rankmixer_family:
+        # Dim/bucket profiles can change feature widths after the initial align.
+        adjustment = _align_rankmixer_input_width(
+            payload["features"],
+            len(main_sequences),
+            token_count=32,
+            token_dim=768,
+            shared_sources=set(values.source_to_group),
+        )
 
     # Validate the exact in-memory config before any output file is replaced.
     config = AppConfig.from_mapping(payload)
@@ -1811,6 +2197,8 @@ def build_config(
     )
     summary = {
         "model_name": model_name,
+        "embedding_profile": embedding_profile,
+        "physical_embedding_tables": memory["unique_tables"],
         "profile": {
             "format_version": report.get("format_version"),
             "rows_scanned": report.get("rows_scanned"),
@@ -1882,6 +2270,8 @@ def render_config(payload: Mapping[str, Any], summary: Mapping[str, Any]) -> str
         )
     comments.extend(
         [
+            f"# Embedding profile: {summary.get('embedding_profile', 'baseline')}; "
+            f"physical tables: {summary.get('physical_embedding_tables', memory['unique_tables'])}.",
             "# Estimated sharded embedding weight + optimizer state: "
             f"{memory['planned_weight_plus_state_gib_per_gpu']:.2f} GiB/GPU "
             f"({memory['optimizer_state_layout']}, {memory['embedding_weight_dtype']}, "
@@ -1940,6 +2330,15 @@ def main() -> int:
         choices=("adagrad", "rowwise_adagrad"),
         default="adagrad",
     )
+    parser.add_argument(
+        "--embedding-profile",
+        choices=EMBEDDING_PROFILES,
+        default="baseline",
+        help=(
+            "Phase 2 embedding memory profile: baseline, shared tables, "
+            "shared+dim, and optional bucket compression tiers."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     try:
@@ -1974,6 +2373,7 @@ def main() -> int:
             gpu_count=args.gpu_count,
             embedding_weight_dtype=args.embedding_weight_dtype,
             sparse_optimizer=args.sparse_optimizer,
+            embedding_profile=args.embedding_profile,
         )
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))

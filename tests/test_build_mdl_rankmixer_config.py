@@ -15,8 +15,12 @@ from scripts.build_mdl_rankmixer_config import (
     EXPECTED_UPS_TYPES,
     ITEM_BAG_FIELDS,
     ONETRANS_SEQUENCE_LENGTH_CAPS,
+    apply_embedding_profile,
     build_config,
     build_name_estimate_report,
+    _find_sequence_field,
+    _resolve_share_root,
+    _categorical_entries_by_name,
     render_config,
 )
 from scripts.profile_prehashed_parquet import profile_spec_from_mapping
@@ -103,6 +107,8 @@ def _compact_production_config(model_name: str):
             batch_size=2,
             embedding_distribution="replicated",
             embedding_weight_dtype="fp32",
+            # Toy CPU forwards use replicated tables; Row-Wise is sharded-only.
+            sparse_optimizer="adagrad",
         ),
     )
     config.validate()
@@ -760,8 +766,8 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             "rankmixer": ("flash", True, 8),
             "onetrans": ("flash", True, 8),
             "mdl_onetrans": ("flash", True, 8),
-            # Current platform lacks torch.nn.attention.varlen; use SDPA eager.
-            "mdl_rankmixer": ("sdpa", False, 4),
+            # Current platform: 2×H100 SDPA eager + Row-Wise Adagrad.
+            "mdl_rankmixer": ("sdpa", False, 2),
         }
         for model_name, (attention_backend, compile_enabled, nproc) in expected_runtime.items():
             with self.subTest(model=model_name):
@@ -831,6 +837,62 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     config.data.train.reader.schema_validation_samples,
                     64,
                 )
+                if model_name == "mdl_rankmixer":
+                    self.assertEqual(
+                        config.training.sparse_optimizer,
+                        "rowwise_adagrad",
+                    )
+                    self.assertEqual(
+                        config.training.checkpoint_path,
+                        "artifacts/checkpoints/mdl_rankmixer_2xh100_phase2_shared_dim",
+                    )
+                    goods = config.resolved.categorical_input_by_name["goods_id_hn"]
+                    self.assertEqual(goods.encoding.num_buckets, 1 << 27)
+                    self.assertEqual(
+                        config.resolved.categorical_embedding_dims["goods_id_hn"],
+                        48,
+                    )
+                    prior_goods = config.resolved.categorical_input_by_name[
+                        "task_upid_pay_prior.goods_id_hn"
+                    ]
+                    self.assertTrue(prior_goods.encoding.share_embedding)
+                    self.assertEqual(prior_goods.encoding.share_with, "goods_id_hn")
+                    self.assertEqual(
+                        config.resolved.categorical_embedding_dims[
+                            "task_upid_pay_prior.goods_id_hn"
+                        ],
+                        48,
+                    )
+                    self.assertEqual(
+                        config.resolved.categorical_embedding_dims["uid_or_bg_hn"],
+                        48,
+                    )
+                    self.assertEqual(
+                        config.resolved.categorical_embedding_dims["sku_id_hn"],
+                        48,
+                    )
+                    self.assertEqual(
+                        config.resolved.categorical_embedding_dims[
+                            "origin_query_hash_hn"
+                        ],
+                        32,
+                    )
+                    self.assertEqual(
+                        config.resolved.categorical_embedding_dims["query_hash_hn"],
+                        32,
+                    )
+                    self.assertEqual(
+                        config.resolved.categorical_embedding_dims[
+                            "flatten_query_hash.flat_q_hash_hn"
+                        ],
+                        32,
+                    )
+                    physical = sum(
+                        1
+                        for item in config.resolved.categorical_input_by_name.values()
+                        if not getattr(item.encoding, "share_embedding", False)
+                    )
+                    self.assertEqual(physical, 202)
 
     def test_bf16_sharded_embeddings_keep_fp32_dense_parameters(self) -> None:
         config = _compact_production_config("rankmixer")
@@ -892,6 +954,124 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 train_inputs=["/tmp/train"],
                 test_inputs=["/tmp/test"],
             )
+
+    def test_embedding_profiles_share_shapes_and_hit_memory_targets(self) -> None:
+        report = build_name_estimate_report(self.sample)
+        expected = {
+            "baseline": (235, 38.285),
+            # Important/scenario extras cannot share (MDL invariant); scene prior can.
+            "shared": (202, 33.143),
+            "shared_dim": (202, 27.643),
+            "shared_dim_query_bucket": (202, 26.049),
+            "shared_dim_aggressive_bucket": (202, 19.799),
+        }
+        for profile, (tables, gib) in expected.items():
+            with self.subTest(profile=profile):
+                payload, summary = build_config(
+                    self.sample,
+                    report,
+                    train_inputs=["/tmp/train"],
+                    test_inputs=["/tmp/test"],
+                    auto_discover_scenes=True,
+                    gpu_count=2,
+                    embedding_weight_dtype="bf16",
+                    sparse_optimizer="rowwise_adagrad",
+                    embedding_budget_gib_per_gpu=80.0,
+                    embedding_profile=profile,
+                )
+                self.assertEqual(summary["embedding_profile"], profile)
+                self.assertEqual(summary["physical_embedding_tables"], tables)
+                self.assertEqual(
+                    summary["embedding_memory"]["unique_tables"],
+                    tables,
+                )
+                planned = summary["embedding_memory"][
+                    "planned_weight_plus_state_gib_per_gpu"
+                ]
+                self.assertAlmostEqual(planned, gib, places=2)
+                entries = _categorical_entries_by_name(payload)
+                for name, entry in entries.items():
+                    encoding = entry["encoding"]
+                    if not encoding.get("share_embedding"):
+                        continue
+                    root = _resolve_share_root(entries, name)
+                    physical = entries[root]
+                    self.assertEqual(
+                        int(entry["embedding_dim"]),
+                        int(physical["embedding_dim"]),
+                    )
+                    self.assertEqual(
+                        int(encoding["num_buckets"]),
+                        int(physical["encoding"]["num_buckets"]),
+                    )
+                    self.assertEqual(
+                        int(encoding["padding_id"]),
+                        int(physical["encoding"]["padding_id"]),
+                    )
+                if profile != "baseline":
+                    self.assertIn("phase2", payload["training"]["checkpoint_path"])
+                    spec = _find_sequence_field(payload, "cart_long.spec_hn")
+                    sku = _find_sequence_field(payload, "cart_long.sku_ids_hn")
+                    self.assertEqual(spec["embedding_dim"], 48)
+                    self.assertEqual(spec["encoding"]["num_buckets"], 1 << 23)
+                    self.assertEqual(sku["embedding_dim"], 48)
+                    self.assertEqual(sku["encoding"]["num_buckets"], 1 << 24)
+                    for sequence_name in (
+                        "task_fst_cart_prior",
+                        "task_upid_pay_prior",
+                        "task_cateid_filter_prior",
+                    ):
+                        goods = _find_sequence_field(
+                            payload,
+                            f"{sequence_name}.goods_id_hn",
+                        )
+                        self.assertTrue(goods["encoding"]["share_embedding"])
+                        self.assertEqual(
+                            goods["encoding"]["share_with"],
+                            "goods_id_hn",
+                        )
+                        expected_dim = 48 if profile != "shared" else 64
+                        expected_buckets = (
+                            1 << 26
+                            if profile == "shared_dim_aggressive_bucket"
+                            else 1 << 27
+                        )
+                        self.assertEqual(goods["embedding_dim"], expected_dim)
+                        self.assertEqual(
+                            goods["encoding"]["num_buckets"],
+                            expected_buckets,
+                        )
+                        timegap = _find_sequence_field(
+                            payload,
+                            f"{sequence_name}.timegap_hn",
+                        )
+                        self.assertFalse(
+                            timegap["encoding"].get("share_embedding", False)
+                        )
+
+    def test_share_embedding_rejects_cycles(self) -> None:
+        report = build_name_estimate_report(self.sample)
+        payload, _summary = build_config(
+            self.sample,
+            report,
+            train_inputs=["/tmp/train"],
+            test_inputs=["/tmp/test"],
+            auto_discover_scenes=True,
+            gpu_count=2,
+            embedding_weight_dtype="bf16",
+            sparse_optimizer="rowwise_adagrad",
+            embedding_budget_gib_per_gpu=80.0,
+            embedding_profile="baseline",
+        )
+        goods = next(
+            feature
+            for feature in payload["features"]
+            if feature["name"] == "goods_id_hn"
+        )
+        goods["encoding"]["share_embedding"] = True
+        goods["encoding"]["share_with"] = "impr.goods_id_hn"
+        with self.assertRaisesRegex(ValueError, "cycle"):
+            apply_embedding_profile(payload, "baseline")
 
 
 if __name__ == "__main__":
