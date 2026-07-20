@@ -4379,6 +4379,92 @@ def _write_scenario_discovery_cache(
     os.replace(temporary, path)
 
 
+def _scenario_discovery_split(split: ParquetSplitConfig) -> ParquetSplitConfig:
+    """Clone a train split with scanner settings suited to scene_id discovery.
+
+    Training often uses tiny ``scanner_batch_rows`` and row-group LPT for the
+    full Adapter path. Discovery only needs one integer column and should not
+    inherit those knobs.
+    """
+
+    return replace(
+        split,
+        reader=replace(
+            split.reader,
+            scanner_batch_rows=262_144,
+            shard_unit="file",
+            eager_schema_validation="sample",
+            schema_validation_samples=1,
+            # Discovery is a one-shot metadata pass; keep I/O parallel but skip
+            # Adapter-oriented length buckets / shuffle buffering.
+            length_buckets=(),
+            shuffle_buffer_rows=0,
+            trusted_input=False,
+        ),
+    )
+
+
+def _add_unique_scenario_values(
+    values: set[int],
+    array: Any,
+    *,
+    source: str,
+    max_discovered: int,
+) -> None:
+    """Merge unique integer scenario ids from one Arrow array into ``values``."""
+
+    pa, pc, _ds, _pq = _require_pyarrow()
+    current = array
+    if pa.types.is_dictionary(current.type):
+        current = pc.take(current.dictionary, current.indices)
+
+    # Agg layouts store request-level scene_id as list<int64>. Flatten once.
+    if pa.types.is_list(current.type) or pa.types.is_large_list(current.type):
+        if current.null_count:
+            raise ValueError(f"scenario source {source!r} contains null")
+        lengths = pc.list_value_length(current)
+        if lengths.null_count:
+            lengths = pc.fill_null(lengths, 0)
+        if bool(pc.any(pc.equal(lengths, 0)).as_py()):
+            raise ValueError(f"scenario source {source!r} contains an empty list")
+        current = pc.list_flatten(current)
+        if pa.types.is_list(current.type) or pa.types.is_large_list(current.type):
+            raise ValueError(
+                f"scenario source {source!r} must be a scalar or list of integers; "
+                f"got nested list type {current.type}"
+            )
+
+    if current.null_count:
+        raise ValueError(f"scenario source {source!r} contains null")
+    if not (
+        pa.types.is_integer(current.type)
+        or pa.types.is_string(current.type)
+        or pa.types.is_large_string(current.type)
+    ):
+        raise ValueError(
+            f"scenario source {source!r} must contain integer ids; got {current.type}"
+        )
+    if pa.types.is_string(current.type) or pa.types.is_large_string(current.type):
+        # Keep string scenes as a rejected path for raw integer discovery.
+        raise ValueError(
+            f"scenario source {source!r} must contain integer ids; got string values"
+        )
+
+    for value in pc.unique(current).to_pylist():
+        if value is None:
+            raise ValueError(f"scenario source {source!r} contains null")
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError(
+                f"scenario source {source!r} must contain integer ids; got {value!r}"
+            )
+        values.add(int(value))
+        if len(values) > max_discovered:
+            raise ValueError(
+                f"scenario discovery found more than {max_discovered} values; "
+                "increase scenarios.max_discovered only after checking the source column"
+            )
+
+
 def discover_scenario_values(
     config: AppConfig,
     *,
@@ -4399,45 +4485,21 @@ def discover_scenario_values(
     cached = _load_scenario_discovery_cache(config, split_name)
     if cached is not None:
         return cached
-    split = _split_for_name(config, split_name)
+    split = _scenario_discovery_split(_split_for_name(config, split_name))
     scanner = ParquetScanner(split, [scenario.source])
     values: set[int] = set()
 
-    def observe(value: Any, *, raw_row: int) -> None:
-        if value is None:
-            raise ValueError(
-                f"scenario source {scenario.source!r} contains null at raw row {raw_row}"
-            )
-        if isinstance(value, (list, tuple)):
-            if not value:
-                raise ValueError(
-                    f"scenario source {scenario.source!r} contains an empty list "
-                    f"at raw row {raw_row}"
-                )
-            for item in value:
-                observe(item, raw_row=raw_row)
-            return
-        if isinstance(value, bool) or not isinstance(value, Integral):
-            raise ValueError(
-                f"scenario source {scenario.source!r} must contain integer ids; "
-                f"got {value!r} at raw row {raw_row}"
-            )
-        values.add(int(value))
-        if len(values) > scenario.max_discovered:
-            raise ValueError(
-                f"scenario discovery found more than {scenario.max_discovered} values; "
-                "increase scenarios.max_discovered only after checking the source column"
-            )
-
-    raw_row_offset = 0
     for table in scanner.iter_tables():
         if scenario.source not in table.column_names:
             raise ValueError(
                 f"scenario discovery is missing source column {scenario.source!r}"
             )
-        for row_index, value in enumerate(_column_values(table, scenario.source)):
-            observe(value, raw_row=raw_row_offset + row_index)
-        raw_row_offset += table.num_rows
+        _add_unique_scenario_values(
+            values,
+            _column_array(table, scenario.source),
+            source=scenario.source,
+            max_discovered=scenario.max_discovered,
+        )
     if not values:
         raise ValueError(
             f"scenario discovery found no values in source column {scenario.source!r}"

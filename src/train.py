@@ -4,6 +4,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import timedelta
 from importlib import import_module
 import inspect
 import logging
@@ -57,6 +58,10 @@ from .optim import ShardedAdagrad, ShardedRowWiseAdagrad
 logger = logging.getLogger(__name__)
 
 _CONTROL_PROCESS_GROUP: torch_dist.ProcessGroup | None = None
+# Cold scenario discovery on HDFS can exceed the default 10-minute store wait
+# before the first collective. Keep process-group timeouts generous so peers
+# survive a slow rank-0 metadata pass; discovery itself is also optimized.
+_PROCESS_GROUP_TIMEOUT = timedelta(minutes=60)
 
 
 def _varlen_attention_reasons(config: AppConfig) -> tuple[str, ...]:
@@ -412,14 +417,31 @@ def _setup_distributed(config: AppConfig) -> DistributedContext:
 
     if enabled and not torch_dist.is_initialized():
         backend = "nccl" if device.type == "cuda" else "gloo"
-        torch_dist.init_process_group(backend=backend, init_method="env://")
+        torch_dist.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=_PROCESS_GROUP_TIMEOUT,
+        )
         initialized_here = True
 
     control_group: torch_dist.ProcessGroup | None = None
     if enabled and device.type == "cuda":
         if _CONTROL_PROCESS_GROUP is None:
             try:
-                _CONTROL_PROCESS_GROUP = torch_dist.new_group(backend="gloo")
+                _CONTROL_PROCESS_GROUP = torch_dist.new_group(
+                    backend="gloo",
+                    timeout=_PROCESS_GROUP_TIMEOUT,
+                )
+            except TypeError:
+                # Older PyTorch builds reject timeout= on new_group.
+                try:
+                    _CONTROL_PROCESS_GROUP = torch_dist.new_group(backend="gloo")
+                except RuntimeError as error:
+                    logger.warning(
+                        "Could not create a CPU control process group; active-rank "
+                        "coordination will synchronize CUDA: %s",
+                        error,
+                    )
             except RuntimeError as error:
                 logger.warning(
                     "Could not create a CPU control process group; active-rank "
@@ -471,7 +493,12 @@ def _resolve_distributed_auto_scenarios(
             }
         except Exception as error:  # Broadcast failure instead of hanging peers.
             payload[0] = {"values": None, "error": str(error)}
-    torch_dist.broadcast_object_list(payload, src=0)
+    # Prefer the CPU control group so peers wait on gloo while rank 0 scans
+    # Parquet, instead of lazily initializing NCCL before discovery finishes.
+    if context.control_group is not None:
+        torch_dist.broadcast_object_list(payload, src=0, group=context.control_group)
+    else:
+        torch_dist.broadcast_object_list(payload, src=0)
     result = payload[0]
     if not isinstance(result, dict):
         raise RuntimeError("distributed scenario discovery broadcast an invalid payload")
