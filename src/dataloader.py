@@ -1599,6 +1599,22 @@ def _map_request_value(
     )
 
 
+def _normalize_optional_outer_list(value: Any) -> list[Any]:
+    """Map top-level null/[] to an empty Python list for optional list payloads.
+
+    Only the outermost list/tuple is normalized. Nested memberships such as
+    ``[[], [0]]`` are preserved so orphan UPS tokens can still be rejected.
+    """
+
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    raise TypeError(
+        f"optional list-valued field must be null or a list/tuple, got {type(value).__name__}"
+    )
+
+
 def _as_list(
     value: Any,
     *,
@@ -1609,6 +1625,8 @@ def _as_list(
     if value is None:
         return []
     if not validate_contract:
+        if isinstance(value, (list, tuple)):
+            return list(value)
         return value
     if isinstance(value, (list, tuple)):
         return list(value)
@@ -1663,21 +1681,16 @@ def _bag_value(
     logical_row: int,
     validate_contract: bool = True,
 ) -> Any:
-    if value is None:
-        return None
-    if not validate_contract:
-        return value
-    if not isinstance(value, (list, tuple)):
+    """Normalize optional categorical bags; top-level null/[] mean length 0."""
+
+    del validate_contract  # Outer null/[] are always accepted as zero-length bags.
+    try:
+        return _normalize_optional_outer_list(value)
+    except TypeError as error:
         raise ValueError(
             f"multivalue feature {column!r} must be list-valued at raw row "
             f"{raw_row}, logical row {logical_row}"
-        )
-    if not value:
-        raise ValueError(
-            f"multivalue feature {column!r} contains an empty array at raw row "
-            f"{raw_row}, logical row {logical_row}; missing values must be null"
-        )
-    return value
+        ) from error
 
 
 def _candidate_count_req(
@@ -1788,23 +1801,19 @@ def _req_context_value(
     Most req fields remove the train request axis and arrive as ``list<int64>``.
     A small set of multivalue User fields remains ``list<list<int64>>``; it can
     be either one request containing a bag or a bag of singleton encoded values.
+    Top-level null/[] mean missing: multivalue → ``[]``, scalar → ``None``.
     """
 
     if not has_request_axis:
         return value
-    if value is None:
-        return None
-    outer = _as_list(
-        value,
-        column=column,
-        row_index=raw_row,
-        validate_contract=validate_contract,
-    )
-    if validate_contract and not outer:
+    try:
+        outer = _normalize_optional_outer_list(value)
+    except TypeError as error:
         raise ValueError(
-            f"req context column {column!r} contains an empty outer list at raw row "
-            f"{raw_row}; production missing values must be null"
-        )
+            f"req context column {column!r} must be list-valued at raw row {raw_row}"
+        ) from error
+    if not outer:
+        return [] if multivalue else None
     if not multivalue:
         if validate_contract and len(outer) != 1:
             raise ValueError(
@@ -1832,9 +1841,16 @@ def _sequence_membership_positions(
     index_column: str,
     raw_row: int,
     validate_contract: bool = True,
+    validate_structure: bool | None = None,
 ) -> dict[int, list[int]]:
-    """Validate one UPS membership vector and index it once per raw row."""
+    """Validate one UPS membership vector and index it once per raw row.
 
+    Structure checks (empty membership / unknown / duplicate request) stay on
+    even when payload diagnostics are skipped under trusted_input.
+    """
+
+    if validate_structure is None:
+        validate_structure = validate_contract
     selected: dict[int, list[int]] = {request: [] for request in known_requests}
     for token_position, raw_membership in enumerate(memberships):
         members = (
@@ -1842,7 +1858,7 @@ def _sequence_membership_positions(
             if isinstance(raw_membership, (list, tuple))
             else [raw_membership]
         )
-        if validate_contract and not members:
+        if validate_structure and not members:
             raise ValueError(
                 f"UPS indices column {index_column!r} has an empty membership "
                 f"at raw row {raw_row}, token {token_position}"
@@ -1852,16 +1868,16 @@ def _sequence_membership_positions(
                 value,
                 column=index_column,
                 row_index=raw_row,
-                validate_contract=validate_contract,
+                validate_contract=validate_structure,
             )
             for value in members
         ]
-        if validate_contract and len(normalized) != len(set(normalized)):
+        if validate_structure and len(normalized) != len(set(normalized)):
             raise ValueError(
                 f"UPS indices column {index_column!r} repeats a request at raw row "
                 f"{raw_row}, token {token_position}"
             )
-        if validate_contract:
+        if validate_structure:
             unknown = sorted(set(normalized) - known_requests)
             if unknown:
                 raise ValueError(
@@ -1883,22 +1899,30 @@ def _select_sequence(
     validated_flat: bool = False,
     max_length: int | None = None,
     validate_contract: bool = True,
+    validate_structure: bool | None = None,
+    validate_payload: bool | None = None,
 ) -> list[Any]:
+    """Select and optionally validate one UPS attribute sequence.
+
+    Top-level null/[] are zero-length. Length alignment against indices runs
+    under ``validate_structure`` (before truncation). Token singleton/null
+    diagnostics run under ``validate_payload``.
+    """
+
+    if validate_structure is None:
+        validate_structure = validate_contract
+    if validate_payload is None:
+        validate_payload = validate_contract
     items = _as_list(
         values,
         column=column,
         row_index=raw_row,
-        validate_contract=validate_contract,
+        validate_contract=validate_structure,
     )
-    if validate_contract and values is not None and not items:
-        raise ValueError(
-            f"UPS column {column!r} contains an empty sequence at raw row {raw_row}; "
-            "empty sequences must be null"
-        )
     if selected_positions is not None:
         if expected_length is None:
             raise RuntimeError("selected UPS positions require an expected raw length")
-        if validate_contract and len(items) != expected_length:
+        if validate_structure and len(items) != expected_length:
             raise ValueError(
                 f"UPS column {column!r} length {len(items)} does not match its indices "
                 f"length {expected_length} at raw row {raw_row}"
@@ -1912,12 +1936,14 @@ def _select_sequence(
     if validated_flat:
         return items
 
-    if not validate_contract:
+    if not validate_payload:
         return [
             item[0] if isinstance(item, (list, tuple)) else item
             for item in items
         ]
 
+    # Token-level nulls are allowed: null_anchor_field compresses whole steps
+    # downstream, and non-anchor nulls encode as padding ID 0 / 0.0.
     normalized: list[Any] = []
     for token_position, item in enumerate(items):
         if isinstance(item, (list, tuple)):
@@ -1927,11 +1953,6 @@ def _select_sequence(
                     f"{len(item)} at raw row {raw_row}; expected exactly 1"
                 )
             item = item[0]
-        if item is None:
-            raise ValueError(
-                f"UPS column {column!r} token {token_position} is null at raw row "
-                f"{raw_row}; only the complete sequence may be null"
-            )
         normalized.append(item)
     return normalized
 
@@ -2070,29 +2091,24 @@ def _time_deltas(
     transform: str,
     validate_contract: bool = True,
 ) -> list[float]:
-    if not validate_contract:
-        try:
-            import numpy as np
-        except ImportError:
-            deltas = [int(request_time) - int(event_time) for event_time in event_times]
-            if transform == "raw_ms":
-                return [float(delta) for delta in deltas]
-            if transform == "seconds":
-                return [float(delta) / 1000.0 for delta in deltas]
-            if transform == "log1p_seconds":
-                return [math.log1p(float(delta) / 1000.0) for delta in deltas]
-            raise RuntimeError(f"unsupported time delta transform {transform!r}")
-        values = np.asarray(event_times, dtype=np.int64)
-        deltas = int(request_time) - values
+    def _transform_delta(delta: int) -> float:
         if transform == "raw_ms":
-            transformed = deltas.astype(np.float64)
-        elif transform == "seconds":
-            transformed = deltas.astype(np.float64) / 1000.0
-        elif transform == "log1p_seconds":
-            transformed = np.log1p(deltas.astype(np.float64) / 1000.0)
-        else:
-            raise RuntimeError(f"unsupported time delta transform {transform!r}")
-        return transformed.tolist()
+            return float(delta)
+        if transform == "seconds":
+            return float(delta) / 1000.0
+        if transform == "log1p_seconds":
+            return math.log1p(float(delta) / 1000.0)
+        raise RuntimeError(f"unsupported time delta transform {transform!r}")
+
+    if not validate_contract:
+        result: list[float] = []
+        for event_time in event_times:
+            if event_time is None:
+                # Non-anchor null times pad to 0.0; anchor-null steps are dropped later.
+                result.append(0.0)
+                continue
+            result.append(_transform_delta(int(request_time) - int(event_time)))
+        return result
 
     if event_times and (
         isinstance(request_time, bool) or not isinstance(request_time, int)
@@ -2100,10 +2116,10 @@ def _time_deltas(
         raise ValueError(
             f"request time is required to derive {sequence!r} time deltas at raw row {raw_row}"
         )
-    if len(event_times) >= 64:
+    if len(event_times) >= 64 and all(event_time is not None for event_time in event_times):
         # Long histories dominate adapter CPU. NumPy performs validation,
         # subtraction, and log1p in native loops instead of one Python/math
-        # call per event.
+        # call per event. Skip when any null times are present.
         try:
             import numpy as np
         except ImportError:
@@ -2131,18 +2147,13 @@ def _time_deltas(
                     f"at raw row {raw_row}, position {position}: "
                     f"delta_ms={int(deltas[position])}"
                 )
-            if transform == "raw_ms":
-                transformed = deltas.astype(np.float64)
-            elif transform == "seconds":
-                transformed = deltas.astype(np.float64) / 1000.0
-            elif transform == "log1p_seconds":
-                transformed = np.log1p(deltas.astype(np.float64) / 1000.0)
-            else:
-                raise RuntimeError(f"unsupported time delta transform {transform!r}")
-            return transformed.tolist()
-    result: list[float] = []
+            return [_transform_delta(int(delta)) for delta in deltas.tolist()]
+    result = []
     previous_time: int | None = None
     for position, event_time in enumerate(event_times):
+        if event_time is None:
+            result.append(0.0)
+            continue
         if isinstance(event_time, bool) or not isinstance(event_time, int):
             raise ValueError(
                 f"sequence {sequence!r} has invalid event time {event_time!r} "
@@ -2161,15 +2172,7 @@ def _time_deltas(
                 f"sequence {sequence!r} event time is later than request time "
                 f"at raw row {raw_row}, position {position}: delta_ms={delta}"
             )
-        if transform == "raw_ms":
-            transformed = float(delta)
-        elif transform == "seconds":
-            transformed = float(delta) / 1000.0
-        elif transform == "log1p_seconds":
-            transformed = math.log1p(float(delta) / 1000.0)
-        else:  # Validated once in adapt().
-            raise RuntimeError(f"unsupported time delta transform {transform!r}")
-        result.append(transformed)
+        result.append(_transform_delta(delta))
     return result
 
 
@@ -2614,15 +2617,18 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
     complete_label_contract = not label_masks and not any(
         label_missing_values.values()
     )
-    validate_adapter_contract = not trusted_input and (
+    # Payload diagnostics may stay off under trusted_input. Structure checks that
+    # guarantee lossless UPS/candidate interpretation stay on for every row.
+    validate_payload = not trusted_input and (
         not first_batch_already_adapted or not complete_label_contract
     )
-    validate_row_contract = not trusted_input
+    validate_structure = True
+    validate_row_contract = validate_structure
     output: dict[str, list[Any]] = {column: [] for column in required}
     raw, validated_flat_sequence_columns = _adapter_table_to_python(
         table,
         plan.raw_sequence_columns,
-        validate_contract=validate_adapter_contract,
+        validate_contract=validate_payload,
     )
     candidate_metadata_types: dict[str, Any] = {}
     schema_names = set(table.schema.names)
@@ -2721,7 +2727,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                 row_index=raw_row,
                 validate_contract=validate_row_contract,
             )
-            if validate_adapter_contract and len(outer) != candidate_count:
+            if validate_structure and len(outer) != candidate_count:
                 raise ValueError(
                     f"item column {column!r} length {len(outer)} != candidate count "
                     f"{candidate_count} at raw row {raw_row}"
@@ -2747,7 +2753,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                     row_index=raw_row,
                     validate_contract=validate_row_contract,
                 )
-            if validate_adapter_contract and len(values) != candidate_count:
+            if validate_structure and len(values) != candidate_count:
                 raise ValueError(
                     f"label {column!r} length {len(values)} != candidate count "
                     f"{candidate_count} at raw row {raw_row}"
@@ -2777,7 +2783,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                 row_index=raw_row,
                 validate_contract=validate_row_contract,
             )
-            if validate_adapter_contract and len(values) != candidate_count:
+            if validate_structure and len(values) != candidate_count:
                 raise ValueError(
                     f"candidate metadata {column!r} length {len(values)} != candidate "
                     f"count {candidate_count} at raw row {raw_row}"
@@ -2805,7 +2811,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                     row_index=raw_row,
                     validate_contract=validate_row_contract,
                 )
-                if validate_adapter_contract and len(outer) != request_count:
+                if validate_structure and len(outer) != request_count:
                     raise ValueError(
                         f"context column {column!r} length {len(outer)} != "
                         f"context_indices length {request_count} at raw row {raw_row}"
@@ -2826,28 +2832,20 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                     row[index_column],
                     column=index_column,
                     row_index=raw_row,
-                    validate_contract=validate_row_contract,
+                    validate_contract=validate_structure,
                 )
-                if (
-                    validate_adapter_contract
-                    and row[index_column] is not None
-                    and not memberships
-                ):
-                    raise ValueError(
-                        f"UPS indices column {index_column!r} contains an empty array "
-                        f"at raw row {raw_row}; an empty sequence must use null"
-                    )
+                # Top-level null/[] mean zero UPS tokens (token-major empty list).
                 membership_lengths[ups] = len(memberships)
                 membership_positions[ups] = _sequence_membership_positions(
                     memberships,
                     known_requests=known_requests,
                     index_column=index_column,
                     raw_row=raw_row,
-                    validate_contract=validate_adapter_contract,
+                    validate_structure=validate_structure,
                 )
 
         unique_candidate_requests = tuple(dict.fromkeys(candidate_requests))
-        if validate_adapter_contract:
+        if validate_structure:
             for request_index in unique_candidate_requests:
                 if request_index not in positions:
                     raise ValueError(
@@ -2939,7 +2937,8 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         raw_row=raw_row,
                         validated_flat=column in validated_flat_sequence_columns,
                         max_length=sequence_max_lengths.get(ups),
-                        validate_contract=validate_adapter_contract,
+                        validate_structure=validate_structure,
+                        validate_payload=validate_payload,
                     )
                 if ups in time_delta_outputs:
                     raw_time_column = f"{ups}_x_time"
@@ -2955,7 +2954,8 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                             raw_time_column in validated_flat_sequence_columns
                         ),
                         max_length=sequence_max_lengths.get(ups),
-                        validate_contract=validate_adapter_contract,
+                        validate_structure=validate_structure,
+                        validate_payload=validate_payload,
                     )
                     cached_sequences[time_delta_outputs[ups]] = _time_deltas(
                         event_times,
@@ -2963,7 +2963,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         sequence=ups,
                         raw_row=raw_row,
                         transform=time_delta_transform,
-                        validate_contract=validate_adapter_contract,
+                        validate_contract=validate_payload,
                     )
             sequence_cache[request_index] = cached_sequences
 
@@ -2990,7 +2990,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                 )
             normalized_items[column] = normalized
 
-        if validate_adapter_contract:
+        if validate_structure:
             for group in aligned_groups:
                 for candidate_index in range(candidate_count):
                     lengths = {
@@ -3015,9 +3015,8 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                 continue
             values = label_arrays[column]
             if mask_column is None and not label_missing_values[task]:
-                # Complete-label production data is checked vectorially on the
-                # first flat batch. Avoid three Python type/finite/binary tests
-                # for every candidate on the training hot path.
+                # Complete-label rows are checked by
+                # ``_validate_complete_label_contract`` on every flat batch.
                 normalized_labels[column] = values
                 continue
             task_labels: list[int | None] = []
@@ -3207,13 +3206,16 @@ def _validate_sequence_contract(config: AppConfig, table: Any, split_name: str) 
                 )
 
 
-def _validate_flat_table_contract(
+def _validate_flat_table_static_contract(
     config: AppConfig,
     split: ParquetSplitConfig,
     split_name: str,
     table: Any,
     required_columns: list[str],
 ) -> None:
+    """Validate required columns, list typing, and sequence field alignment once."""
+
+    del split  # Reserved for callers that already selected the active split.
     missing = sorted(set(required_columns) - set(table.column_names))
     if missing:
         raise ValueError(
@@ -3254,12 +3256,19 @@ def _validate_flat_table_contract(
 
     _validate_sequence_contract(config, table, split_name)
 
-    # Complete-label production paths do not allocate masks. Prove the strict
-    # binary/no-null contract once with Arrow kernels, then keep candidate-level
-    # Python checks out of subsequent adapter batches.
+
+def _validate_complete_label_contract(
+    split: ParquetSplitConfig,
+    table: Any,
+    required_columns: list[str],
+) -> None:
+    """Reject null / non-binary labels on every flat batch for complete-label paths."""
+
+    if split.label_masks:
+        return
     required_set = set(required_columns)
     pa, pc, _ds, _pq = _require_pyarrow()
-    for task, column in (() if split.label_masks else split.labels.items()):
+    for task, column in split.labels.items():
         if column not in required_set:
             continue
         array = _column_array(table, column)
@@ -3282,6 +3291,21 @@ def _validate_flat_table_contract(
                 )
 
 
+def _validate_flat_table_contract(
+    config: AppConfig,
+    split: ParquetSplitConfig,
+    split_name: str,
+    table: Any,
+    required_columns: list[str],
+) -> None:
+    """Backward-compatible wrapper used by tests and non-iterating callers."""
+
+    _validate_flat_table_static_contract(
+        config, split, split_name, table, required_columns
+    )
+    _validate_complete_label_contract(split, table, required_columns)
+
+
 def _iter_adapted_flat_tables(
     config: AppConfig,
     split_name: str,
@@ -3294,7 +3318,9 @@ def _iter_adapted_flat_tables(
     max_batches: int | None = None,
 ) -> Iterator[Any]:
     raw_batch_index = 0
-    validated_flat_contract = False
+    validated_static_contract = False
+    # Complete-label paths omit masks; every flat batch must still prove 0/1/no-null.
+    complete_label_contract = not bool(scanner.split.label_masks)
     for raw_table in scanner.iter_tables():
         if max_batches is not None and raw_batch_index >= max_batches:
             break
@@ -3306,20 +3332,21 @@ def _iter_adapted_flat_tables(
             result = adapter(raw_table, context=context)
             flat_tables = _normalize_adapter_result(result, adapter_name, split_name)
             for flat_table in flat_tables:
-                if not validated_flat_contract:
-                    sample_table = (
-                        flat_table.slice(0, 1)
-                        if scanner.split.reader.trusted_input
-                        else flat_table
-                    )
-                    _validate_flat_table_contract(
+                if not validated_static_contract:
+                    _validate_flat_table_static_contract(
                         config,
                         scanner.split,
                         split_name,
-                        sample_table,
+                        flat_table,
                         required_columns,
                     )
-                    validated_flat_contract = flat_table.num_rows > 0
+                    validated_static_contract = flat_table.num_rows > 0
+                if complete_label_contract:
+                    _validate_complete_label_contract(
+                        scanner.split,
+                        flat_table,
+                        required_columns,
+                    )
                 if counters is not None:
                     counters.flat_tables += 1
                     counters.flat_rows += flat_table.num_rows
@@ -3330,7 +3357,6 @@ def _iter_adapted_flat_tables(
             raise RuntimeError(
                 f"parquet adapter {adapter_name!r} failed for split {split_name!r}: {error}"
             ) from error
-
 
 def iter_flat_tables(
     config: AppConfig,
@@ -3755,33 +3781,89 @@ def _tensorize_categorical_bag(
 # --- Dense features ---
 
 
-def _dense_feature_value(value: Any, dimension: int) -> float | list[float]:
-    """Normalize one dense value and reject shapes that would silently broadcast."""
+def _dense_feature_value(
+    value: Any, dimension: int
+) -> tuple[float | list[float], float]:
+    """Normalize one dense value and its presence bit.
+
+    Returns ``(filled_value, presence)`` where missing/null maps to zeros with
+    presence 0, and a real zero keeps presence 1.
+    """
     if value is None:
-        return 0.0 if dimension == 1 else [0.0] * dimension
+        filled: float | list[float] = 0.0 if dimension == 1 else [0.0] * dimension
+        return filled, 0.0
     if dimension == 1:
         if isinstance(value, (list, tuple)):
             if len(value) != 1:
                 raise ValueError(f"dense feature expected 1 value, got {len(value)}")
             value = value[0]
-        return 0.0 if value is None else float(value)
+        if value is None:
+            return 0.0, 0.0
+        return float(value), 1.0
     if not isinstance(value, (list, tuple)):
         raise ValueError(f"dense feature expected {dimension} values, got scalar {value!r}")
     if len(value) != dimension:
         raise ValueError(f"dense feature expected {dimension} values, got {len(value)}")
-    return [0.0 if item is None else float(item) for item in value]
+    return [0.0 if item is None else float(item) for item in value], 1.0
 
 
-def _tensorize_dense(feature: FeatureConfig, values: list[Any]) -> Tensor:
-    """Build a ``[batch, dim]`` float tensor from already-extracted Python values."""
+def _tensorize_dense(feature: FeatureConfig, values: list[Any]) -> Tensor | dict[str, Tensor]:
+    """Build a ``[batch, dim]`` float tensor; optionally attach presence."""
     normalized = [_dense_feature_value(value, feature.dimension) for value in values]
-    return torch.tensor(normalized, dtype=torch.float32)
+    filled = [item[0] for item in normalized]
+    tensor = torch.tensor(filled, dtype=torch.float32)
+    if feature.kind == "dense" and feature.presence:
+        presence = torch.tensor(
+            [[item[1]] for item in normalized],
+            dtype=torch.float32,
+        )
+        return {"values": tensor, "presence": presence}
+    return tensor
 
 
-def _tensorize_dense_column(feature: FeatureConfig, table: Any) -> Tensor:
+def _numeric_column_with_presence(
+    table: Any, column: str
+) -> tuple[Tensor, Tensor]:
+    """Convert a scalar numeric column to values + presence, null→0 / presence 0."""
+    array = _column_array(table, column)
+    try:
+        import pyarrow.compute as pc
+
+        presence = torch.ones(len(array), 1, dtype=torch.float32)
+        if array.null_count:
+            null_mask = array.is_null()
+            presence = torch.tensor(
+                [[0.0 if flag else 1.0] for flag in null_mask.to_pylist()],
+                dtype=torch.float32,
+            )
+            array = pc.fill_null(array, 0.0)
+        values = array.to_numpy(zero_copy_only=False)
+        if hasattr(values, "flags") and not values.flags.writeable:
+            values = values.copy()
+        return torch.as_tensor(values, dtype=torch.float32), presence
+    except (TypeError, ValueError, NotImplementedError):
+        filled: list[float] = []
+        presence_rows: list[list[float]] = []
+        for value in array.to_pylist():
+            if value is None:
+                filled.append(0.0)
+                presence_rows.append([0.0])
+            else:
+                filled.append(float(value))
+                presence_rows.append([1.0])
+        return (
+            torch.tensor(filled, dtype=torch.float32),
+            torch.tensor(presence_rows, dtype=torch.float32),
+        )
+
+
+def _tensorize_dense_column(feature: FeatureConfig, table: Any) -> Tensor | dict[str, Tensor]:
     # Scalar columns use the Arrow/NumPy fast path; vector columns require
     # row-level shape validation before tensor construction.
     if feature.dimension == 1:
+        if feature.presence:
+            values, presence = _numeric_column_with_presence(table, feature.source)
+            return {"values": values, "presence": presence}
         return _numeric_column_tensor(table, feature.source, torch.float32)
     return _tensorize_dense(feature, _column_values(table, feature.source))
 
@@ -3798,6 +3880,39 @@ def _coerce_sequence_items(row: Any) -> list[Any]:
     if isinstance(row, tuple):
         return list(row)
     return [row]
+
+
+def _sequence_step_is_present(value: Any) -> bool:
+    """Return False when an anchor step is missing (null or singleton [null])."""
+    if value is None:
+        return False
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            return value[0] is not None
+        return len(value) > 0
+    return True
+
+
+def _compress_row_fields_by_anchor(
+    raw_items_by_field: dict[str, list[Any]],
+    *,
+    anchor_field: str | None,
+) -> dict[str, list[Any]]:
+    """Drop steps whose anchor value is null from every aligned field."""
+    if anchor_field is None:
+        return raw_items_by_field
+    anchor_items = raw_items_by_field[anchor_field]
+    keep = [
+        index
+        for index, value in enumerate(anchor_items)
+        if _sequence_step_is_present(value)
+    ]
+    if len(keep) == len(anchor_items):
+        return raw_items_by_field
+    return {
+        name: [items[index] for index in keep]
+        for name, items in raw_items_by_field.items()
+    }
 
 
 def _sequence_bounds(length: int, sequence: SequenceConfig) -> tuple[int, int]:
@@ -3910,6 +4025,61 @@ def _gather_padded_sequence(
     return torch.where(mask, gathered, gathered.new_full((), padding_value))
 
 
+def _compact_direct_sequence_by_anchor(
+    arrays: dict[str, Any],
+    reference_offsets: Tensor,
+    reference_base: int,
+    reference_stop: int,
+    *,
+    anchor_field: str,
+) -> tuple[dict[str, Any], Tensor, int, int]:
+    """Remove flat tokens whose anchor value is null and rebuild list arrays."""
+
+    pa, pc, _ds, _pq = _require_pyarrow()
+    total_values = reference_stop - reference_base
+    if total_values <= 0:
+        return arrays, reference_offsets, reference_base, reference_stop
+
+    anchor_array = arrays[anchor_field]
+    anchor_flat = anchor_array.values.slice(reference_base, total_values)
+    if anchor_flat.null_count == 0:
+        return arrays, reference_offsets, reference_base, reference_stop
+
+    keep_mask = pc.invert(anchor_flat.is_null())
+    if not bool(pc.any(pc.invert(keep_mask)).as_py()):
+        return arrays, reference_offsets, reference_base, reference_stop
+
+    raw_lengths = (reference_offsets[1:] - reference_offsets[:-1]).tolist()
+    keep_flags = keep_mask.to_pylist()
+    new_lengths: list[int] = []
+    offset = 0
+    for length in raw_lengths:
+        kept = sum(1 for flag in keep_flags[offset : offset + length] if flag)
+        new_lengths.append(kept)
+        offset += length
+
+    new_offsets = [0]
+    for length in new_lengths:
+        new_offsets.append(new_offsets[-1] + length)
+    keep_indices = [index for index, flag in enumerate(keep_flags) if flag]
+
+    compacted: dict[str, Any] = {}
+    for name, array in arrays.items():
+        flat = array.values.slice(reference_base, total_values)
+        if keep_indices:
+            taken = pc.take(flat, pa.array(keep_indices, type=pa.int64()))
+        else:
+            taken = flat.slice(0, 0)
+        offsets = pa.array(new_offsets, type=array.offsets.type)
+        if pa.types.is_large_list(array.type):
+            compacted[name] = pa.LargeListArray.from_arrays(offsets, taken)
+        else:
+            compacted[name] = pa.ListArray.from_arrays(offsets, taken)
+
+    new_reference = torch.tensor(new_offsets, dtype=torch.long)
+    return compacted, new_reference, 0, new_offsets[-1]
+
+
 def _tensorize_direct_sequence(
     config: AppConfig,
     sequence: SequenceConfig,
@@ -3943,7 +4113,23 @@ def _tensorize_direct_sequence(
                 "match the other aligned fields"
             )
     if reference_offsets is None:
-        return {"fields": {}, "lengths": torch.empty(0, dtype=torch.long)}
+        empty_lengths = torch.empty(0, dtype=torch.long)
+        return {
+            "fields": {},
+            "lengths": empty_lengths,
+            "has_sequence": empty_lengths > 0,
+        }
+
+    if sequence.null_anchor_field is not None:
+        arrays, reference_offsets, reference_base, reference_stop = (
+            _compact_direct_sequence_by_anchor(
+                arrays,
+                reference_offsets,
+                reference_base,
+                reference_stop,
+                anchor_field=sequence.null_anchor_field,
+            )
+        )
 
     raw_lengths = reference_offsets[1:] - reference_offsets[:-1]
     lengths = raw_lengths
@@ -3989,7 +4175,11 @@ def _tensorize_direct_sequence(
             max_length,
             padding_value,
         )
-    return {"fields": tensor_fields, "lengths": lengths}
+    return {
+        "fields": tensor_fields,
+        "lengths": lengths,
+        "has_sequence": lengths > 0,
+    }
 
 
 def _dense_vector(value: Any, dimension: int) -> list[float]:
@@ -4037,6 +4227,11 @@ def _sequence_rows(
                     f"but expected {row_length} at row {row_index}"
                 )
             raw_items_by_field[field.name] = items
+        raw_items_by_field = _compress_row_fields_by_anchor(
+            raw_items_by_field,
+            anchor_field=sequence.null_anchor_field,
+        )
+        row_length = len(next(iter(raw_items_by_field.values()))) if raw_items_by_field else 0
         start, end = _sequence_bounds(row_length or 0, sequence)
         lengths.append(end - start)
         for field in sequence.fields:
@@ -4107,7 +4302,11 @@ def _tensorize_multi_field_sequence(
             )
         else:
             raise ValueError(f"unsupported sequence field kind {field.kind!r}")
-    return {"fields": tensor_fields, "lengths": lengths}
+    return {
+        "fields": tensor_fields,
+        "lengths": lengths,
+        "has_sequence": lengths > 0,
+    }
 
 
 # --- Scenario and evaluation metadata ---

@@ -2983,6 +2983,7 @@ features:
     padding_id: 0
 sequences:
 - name: impr
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 256
   truncation: head
@@ -3103,6 +3104,7 @@ sequences:
       num_buckets: 4096
       padding_id: 0
 - name: clk_long
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 512
   truncation: head
@@ -3225,6 +3227,7 @@ sequences:
       share_with: impr.timegap_hn
       share_embedding: true
 - name: view_long
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 512
   truncation: head
@@ -3491,6 +3494,7 @@ sequences:
       num_buckets: 64
       padding_id: 0
 - name: cart_long
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 192
   truncation: head
@@ -3609,6 +3613,7 @@ sequences:
       num_buckets: 16777216
       padding_id: 0
 - name: buy_long
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 128
   truncation: head
@@ -3741,6 +3746,7 @@ sequences:
       share_with: cart_long.sku_ids_hn
       share_embedding: true
 - name: semi_clk
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 64
   truncation: head
@@ -3803,6 +3809,7 @@ sequences:
       share_with: impr.timegap_hn
       share_embedding: true
 - name: srch_q2i
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 100
   truncation: head
@@ -3895,6 +3902,7 @@ sequences:
       share_with: impr.timegap_hn
       share_embedding: true
 - name: ups_clk_sku
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 128
   truncation: head
@@ -3997,6 +4005,7 @@ sequences:
       share_with: cart_long.spec_hn
       share_embedding: true
 - name: flatten_query_hash
+  null_anchor_field: flat_q_hash_hn
   embedding_scope: feature
   max_length: 156
   truncation: head

@@ -1019,6 +1019,9 @@ def _main_sequences(
             "sequence_order": "newest_to_oldest",
             "encoder": encoder,
             "time_delta_field": TIME_DELTA_FIELD,
+            "null_anchor_field": (
+                "flat_q_hash_hn" if name == "flatten_query_hash" else "goods_id_hn"
+            ),
             "fields": fields,
         }
         if encoder == "longer":
@@ -1087,6 +1090,7 @@ def _task_prior_sequence(
         "sequence_order": "newest_to_oldest",
         "encoder": "mean_pool",
         "time_delta_field": TIME_DELTA_FIELD,
+        "null_anchor_field": "goods_id_hn",
         "fields": fields,
     }
 
@@ -1100,7 +1104,15 @@ def _align_rankmixer_input_width(
     shared_sources: set[str],
 ) -> dict[str, Any] | None:
     main_features = features[:EXPECTED_FEATURE_COUNT]
-    input_width = sum(int(feature["embedding_dim"]) for feature in main_features)
+    input_width = 0
+    for feature in main_features:
+        if feature.get("kind") == "dense":
+            width = int(feature.get("dimension", 1))
+            if feature.get("presence", True):
+                width += 1
+            input_width += width
+        else:
+            input_width += int(feature["embedding_dim"])
     input_width += main_sequence_count * token_dim
     remainder = input_width % token_count
     if remainder == 0:
@@ -1109,7 +1121,8 @@ def _align_rankmixer_input_width(
     candidates = [
         feature
         for feature in main_features
-        if str(feature["source"]) not in shared_sources
+        if feature.get("kind") != "dense"
+        and str(feature["source"]) not in shared_sources
     ]
     target = (
         min(

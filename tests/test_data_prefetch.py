@@ -263,7 +263,10 @@ class EagerSchemaValidationTest(unittest.TestCase):
         )
         context = SimpleNamespace()
 
-        with patch("src.dataloader._validate_flat_table_contract") as validate:
+        with (
+            patch("src.dataloader._validate_flat_table_static_contract") as validate_static,
+            patch("src.dataloader._validate_complete_label_contract") as validate_labels,
+        ):
             actual = list(
                 _iter_adapted_flat_tables(
                     config,
@@ -277,9 +280,10 @@ class EagerSchemaValidationTest(unittest.TestCase):
             )
 
         self.assertEqual([table["value"].to_pylist() for table in actual], [[1], [2]])
-        validate.assert_called_once()
+        validate_static.assert_called_once()
+        self.assertEqual(validate_labels.call_count, 2)
 
-    def test_trusted_input_validates_only_one_flat_row(self) -> None:
+    def test_complete_label_contract_runs_on_every_flat_batch(self) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(root / "configs" / "reference" / "default.yaml")
         split = replace(
@@ -289,7 +293,10 @@ class EagerSchemaValidationTest(unittest.TestCase):
         tables = [pa.table({"value": [1, 2, 3]}), pa.table({"value": [4, 5]})]
         scanner = SimpleNamespace(split=split, iter_tables=lambda: iter(tables))
 
-        with patch("src.dataloader._validate_flat_table_contract") as validate:
+        with (
+            patch("src.dataloader._validate_flat_table_static_contract") as validate_static,
+            patch("src.dataloader._validate_complete_label_contract") as validate_labels,
+        ):
             actual = list(
                 _iter_adapted_flat_tables(
                     config,
@@ -303,8 +310,13 @@ class EagerSchemaValidationTest(unittest.TestCase):
             )
 
         self.assertEqual([table.num_rows for table in actual], [3, 2])
-        validate.assert_called_once()
-        self.assertEqual(validate.call_args.args[3].num_rows, 1)
+        validate_static.assert_called_once()
+        self.assertEqual(validate_static.call_args.args[3].num_rows, 3)
+        self.assertEqual(validate_labels.call_count, 2)
+        self.assertEqual(
+            [call.args[1].num_rows for call in validate_labels.call_args_list],
+            [3, 2],
+        )
 
     def test_row_group_sharding_covers_rows_exactly_once_across_eight_ranks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

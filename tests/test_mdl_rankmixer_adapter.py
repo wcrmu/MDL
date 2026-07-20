@@ -10,10 +10,12 @@ import pyarrow as pa
 from src.dataloader import (
     _adapter_table_to_python,
     _column_array,
+    _normalize_optional_outer_list,
     _normalized_list_array,
     _select_sequence,
     _sequence_membership_positions,
     _time_deltas,
+    _validate_complete_label_contract,
     adapt_mdl_rankmixer_parquet,
 )
 from src.train import _table_sequence_lengths
@@ -123,22 +125,55 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
                 raw_row=3,
                 transform="raw_ms",
             )
-        with self.assertRaisesRegex(ValueError, "empty sequence"):
+        with self.assertRaisesRegex(ValueError, "empty membership"):
+            _sequence_membership_positions(
+                [[], [0]],
+                known_requests={0, 1},
+                index_column="impr_x_indices",
+                raw_row=3,
+            )
+        self.assertEqual(
             _select_sequence(
                 [],
                 None,
                 expected_length=None,
                 column="impr_x_goods_id_hn",
                 raw_row=3,
-            )
-        with self.assertRaisesRegex(ValueError, "only the complete sequence may be null"):
+            ),
+            [],
+        )
+        self.assertEqual(
+            _select_sequence(
+                None,
+                None,
+                expected_length=None,
+                column="impr_x_goods_id_hn",
+                raw_row=3,
+            ),
+            [],
+        )
+        self.assertEqual(
             _select_sequence(
                 [[None]],
                 None,
                 expected_length=None,
                 column="impr_x_goods_id_hn",
                 raw_row=3,
-            )
+            ),
+            [None],
+        )
+        self.assertEqual(
+            _normalize_optional_outer_list(None),
+            [],
+        )
+        self.assertEqual(
+            _normalize_optional_outer_list([]),
+            [],
+        )
+        # Helper must not recurse into memberships.
+        nested = [[], [0]]
+        self.assertEqual(_normalize_optional_outer_list(nested), [[], [0]])
+        self.assertIs(_normalize_optional_outer_list(nested)[0], nested[0])
 
     def test_vectorized_long_time_delta_path_preserves_semantics(self) -> None:
         events = [10_000 - index * 100 for index in range(128)]
@@ -212,7 +247,7 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         actual = adapt(table, context=context).to_pydict()
 
         self.assertEqual(actual["ctx_scalar_hn"], [101, 102, 102])
-        self.assertEqual(actual["ctx_bag_hn"], [[1, 2], None, None])
+        self.assertEqual(actual["ctx_bag_hn"], [[1, 2], [], []])
         self.assertEqual(actual["item_scalar_hn"], [201, 202, 203])
         self.assertEqual(actual["sku_b_hn"], [[21, None], [22], [23, 24]])
         self.assertEqual(
@@ -552,6 +587,105 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "aligned multivalue group mismatch"):
             adapt(req, context=_context(REQUIRED))
+
+    def test_empty_outer_bag_and_ups_are_zero_length(self) -> None:
+        table = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[]],
+                "item_scalar_hn": [[[201]]],
+                "sku_a_hn": [[[11]]],
+                "sku_b_hn": [[[21]]],
+                "impr_x_goods_id_hn": [[]],
+                "impr_x_time": [[]],
+                "scene_id": [7],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": [[0]],
+                "label_b": [[1]],
+                "label_c": [[0]],
+            }
+        )
+        actual = adapt(table, context=_context(REQUIRED)).to_pydict()
+        self.assertEqual(actual["ctx_bag_hn"], [[]])
+        self.assertEqual(actual["impr_x_goods_id_hn"], [[]])
+        self.assertEqual(actual["impr_x_time_delta_ms"], [[]])
+
+        null_outer = table.set_column(
+            table.schema.get_field_index("ctx_bag_hn"),
+            "ctx_bag_hn",
+            pa.array([None], type=pa.list_(pa.int64())),
+        )
+        null_outer = null_outer.set_column(
+            null_outer.schema.get_field_index("impr_x_goods_id_hn"),
+            "impr_x_goods_id_hn",
+            pa.array([None], type=pa.list_(pa.int64())),
+        )
+        null_outer = null_outer.set_column(
+            null_outer.schema.get_field_index("impr_x_time"),
+            "impr_x_time",
+            pa.array([None], type=pa.list_(pa.int64())),
+        )
+        null_actual = adapt(null_outer, context=_context(REQUIRED)).to_pydict()
+        self.assertEqual(null_actual["ctx_bag_hn"], [[]])
+        self.assertEqual(null_actual["impr_x_goods_id_hn"], [[]])
+
+    def test_trusted_structure_rejects_values_indices_mismatch_on_row1(self) -> None:
+        good = {
+            "context_indices": [[0]],
+            "target_indices": [[0]],
+            "ctx_scalar_hn": [[[101]]],
+            "ctx_bag_hn": [[[1]]],
+            "item_scalar_hn": [[[201]]],
+            "sku_a_hn": [[[11]]],
+            "sku_b_hn": [[[21]]],
+            "impr_x_goods_id_hn": [[-1]],
+            "impr_x_time": [[4900]],
+            "impr_x_indices": [[[0]]],
+            "scene_id": [[7]],
+            "search_id": [["r0"]],
+            "impr_time": [[5000]],
+            "label_a": [[0]],
+            "label_b": [[1]],
+            "label_c": [[0]],
+        }
+        bad = dict(good)
+        bad["impr_x_goods_id_hn"] = [[-1, -2]]  # length 2 vs indices length 1
+        table = pa.table(
+            {
+                key: pa.array([good[key][0], bad[key][0]])
+                for key in good
+            }
+        )
+        context = _context(REQUIRED)
+        context.trusted_input = True
+        context._runtime_cache = {}
+        with self.assertRaisesRegex(ValueError, "does not match its indices"):
+            adapt(table, context=context)
+
+        # After warm-up on a clean first batch, a later batch still validates structure.
+        warm = pa.table({key: pa.array([good[key][0]]) for key in good})
+        adapt(warm, context=context)
+        self.assertTrue(
+            context._runtime_cache.get("mdl_rankmixer_raw_sample_validated")
+        )
+        with self.assertRaisesRegex(ValueError, "does not match its indices"):
+            adapt(table.slice(1, 1), context=context)
+
+    def test_complete_label_contract_rejects_non_first_row_and_batch(self) -> None:
+        split = SimpleNamespace(labels={"a": "label_a"}, label_masks={})
+        good = pa.table({"label_a": pa.array([0, 1], type=pa.int64())})
+        _validate_complete_label_contract(split, good, ["label_a"])
+
+        bad_null = pa.table(
+            {"label_a": pa.array([0, None], type=pa.int64())}
+        )
+        with self.assertRaisesRegex(ValueError, "contains null"):
+            _validate_complete_label_contract(split, bad_null, ["label_a"])
+
+        bad_value = pa.table({"label_a": pa.array([0, 2], type=pa.int64())})
+        with self.assertRaisesRegex(ValueError, "only 0/1"):
+            _validate_complete_label_contract(split, bad_value, ["label_a"])
 
 
 if __name__ == "__main__":

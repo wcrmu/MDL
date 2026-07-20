@@ -811,6 +811,9 @@ class FeatureConfig:
     pooling_null_policy: PoolingNullPolicy = "exclude"
     max_length: int | None = None
     truncation: Literal["head", "tail"] = "tail"
+    # Dense features append a presence bit so null→0 is distinct from a real 0.
+    # Ignored for categorical features (null still maps to padding ID 0).
+    presence: bool = True
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "FeatureConfig":
@@ -975,6 +978,9 @@ class SequenceConfig(_DeeplyImmutableConfig):
     # Explicit temporal semantics used by OneTrans and LONGER.
     timestamp_field: str | None = None
     time_delta_field: str | None = None
+    # When set, steps whose anchor value is null are removed from every field
+    # together. Non-anchor nulls stay as padding ID 0 / 0.0.
+    null_anchor_field: str | None = None
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "SequenceConfig":
@@ -1012,6 +1018,7 @@ class SequenceConfig(_DeeplyImmutableConfig):
             longer_candidate_global_tokens=payload.get("longer_candidate_global_tokens"),
             timestamp_field=payload.get("timestamp_field"),
             time_delta_field=payload.get("time_delta_field"),
+            null_anchor_field=payload.get("null_anchor_field"),
         )
 
     def resolved_longer_candidate_global_tokens(self) -> int:
@@ -1112,6 +1119,7 @@ class SequenceConfig(_DeeplyImmutableConfig):
         for option_name, field_name in (
             ("timestamp_field", self.timestamp_field),
             ("time_delta_field", self.time_delta_field),
+            ("null_anchor_field", self.null_anchor_field),
         ):
             if field_name is None:
                 continue
@@ -1120,7 +1128,9 @@ class SequenceConfig(_DeeplyImmutableConfig):
                 raise ValueError(
                     f"sequence {self.name!r} {option_name} references unknown field {field_name!r}"
                 )
-            if temporal_field.kind != "dense" or temporal_field.dimension != 1:
+            if option_name != "null_anchor_field" and (
+                temporal_field.kind != "dense" or temporal_field.dimension != 1
+            ):
                 raise ValueError(
                     f"sequence {self.name!r} {option_name} must reference a scalar dense field"
                 )

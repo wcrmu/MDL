@@ -1210,7 +1210,9 @@ class FeatureEncoderBank(nn.Module):
             if feature.name not in self.included_scalar_feature_names:
                 continue
             if feature.kind == "dense":
-                self.output_dims[feature.name] = feature.dimension
+                self.output_dims[feature.name] = feature.dimension + (
+                    1 if feature.presence else 0
+                )
             elif feature.kind == "categorical":
                 self.output_dims[feature.name] = categorical_dims[feature.name]
 
@@ -1563,13 +1565,44 @@ class FeatureEncoderBank(nn.Module):
     ) -> Tensor:
         if feature.kind == "dense":
             original_value = value
-            value = value.get("values") if isinstance(value, dict) else value
+            presence = None
+            if isinstance(value, dict):
+                presence = value.get("presence")
+                value = value.get("values")
             if not isinstance(value, Tensor):
                 raise ValueError(f"dense feature {feature.name!r} must be a tensor")
             dense = value.to(
                 dtype=getattr(self, "embedding_weight_dtype", torch.float32)
             ).view(value.size(0), -1)
-            if dense.size(1) != feature.dimension:
+            expected_dim = feature.dimension + (1 if feature.presence else 0)
+            if feature.presence:
+                if isinstance(presence, Tensor):
+                    if dense.size(1) != feature.dimension:
+                        raise ValueError(
+                            f"dense feature {feature.name!r} expected dimension "
+                            f"{feature.dimension}, got {dense.size(1)}"
+                        )
+                    presence = presence.to(
+                        dtype=getattr(self, "embedding_weight_dtype", torch.float32)
+                    ).view(value.size(0), -1)
+                    if presence.size(1) != 1:
+                        raise ValueError(
+                            f"dense feature {feature.name!r} presence must have width 1, "
+                            f"got {presence.size(1)}"
+                        )
+                    dense = torch.cat([dense, presence], dim=1)
+                elif dense.size(1) == feature.dimension:
+                    # Plain tensors (tests / legacy callers) are treated as fully present.
+                    dense = torch.cat(
+                        [dense, dense.new_ones(dense.size(0), 1)],
+                        dim=1,
+                    )
+                elif dense.size(1) != expected_dim:
+                    raise ValueError(
+                        f"dense feature {feature.name!r} expected dimension "
+                        f"{expected_dim}, got {dense.size(1)}"
+                    )
+            elif dense.size(1) != feature.dimension:
                 raise ValueError(
                     f"dense feature {feature.name!r} expected dimension {feature.dimension}, "
                     f"got {dense.size(1)}"
@@ -1829,6 +1862,8 @@ class FeatureEncoderBank(nn.Module):
         sequence_cache: LongerSequenceCache | None = None,
     ) -> Tensor:
         output_dim = self.output_dims[sequence.name]
+        # Empty non-LONGER sequences collapse to a zero summary. LONGER keeps its
+        # learned CLS / global tokens; callers can read has_sequence=lengths>0.
         if tokens.size(1) == 0 and sequence.encoder != "longer":
             return tokens.new_zeros(tokens.size(0), output_dim)
         mask_float = mask.unsqueeze(-1).to(dtype=tokens.dtype)

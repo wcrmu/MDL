@@ -111,6 +111,7 @@ features:
     kind: dense
     source: rankmixer_context_dense
     dimension: 16
+    presence: false
     embedding_scope: feature
 
 sequences:

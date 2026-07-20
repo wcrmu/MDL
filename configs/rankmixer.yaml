@@ -2983,6 +2983,7 @@ features:
     padding_id: 0
 sequences:
 - name: impr
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 1024
   truncation: head
@@ -3114,6 +3115,7 @@ sequences:
   longer_cls_tokens: 1
   longer_candidate_global_tokens: 0
 - name: clk_long
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 2048
   truncation: head
@@ -3247,6 +3249,7 @@ sequences:
   longer_cls_tokens: 1
   longer_candidate_global_tokens: 0
 - name: view_long
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 2048
   truncation: head
@@ -3524,6 +3527,7 @@ sequences:
   longer_cls_tokens: 1
   longer_candidate_global_tokens: 0
 - name: cart_long
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 512
   truncation: head
@@ -3653,6 +3657,7 @@ sequences:
   longer_cls_tokens: 1
   longer_candidate_global_tokens: 0
 - name: buy_long
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 256
   truncation: head
@@ -3796,6 +3801,7 @@ sequences:
   longer_cls_tokens: 1
   longer_candidate_global_tokens: 0
 - name: semi_clk
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 128
   truncation: head
@@ -3869,6 +3875,7 @@ sequences:
   longer_cls_tokens: 1
   longer_candidate_global_tokens: 0
 - name: srch_q2i
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 100
   truncation: head
@@ -3972,6 +3979,7 @@ sequences:
   longer_cls_tokens: 1
   longer_candidate_global_tokens: 0
 - name: ups_clk_sku
+  null_anchor_field: goods_id_hn
   embedding_scope: feature
   max_length: 200
   truncation: head
@@ -4085,6 +4093,7 @@ sequences:
   longer_cls_tokens: 1
   longer_candidate_global_tokens: 0
 - name: flatten_query_hash
+  null_anchor_field: flat_q_hash_hn
   embedding_scope: feature
   max_length: 512
   truncation: head

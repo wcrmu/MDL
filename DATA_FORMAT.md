@@ -203,16 +203,28 @@ list<list<int64>>, with an inner length of exactly one for every token.
 
 ### Null semantics
 
-- A top-level null UPS value represents a zero-length sequence.
-- Historical probes found no empty UPS arrays; [] is not the established empty
-  representation.
-- A null inside an UPS event token is invalid.
-- An optional scalar null maps to padding ID 0.
+- A top-level null **or empty `[]`** UPS / optional bag / request-context list
+  represents a zero-length value. Adapter canonical form is `[]`.
+- Structure axes (`context_indices`, `target_indices`, candidate item/label lists)
+  are **not** opened to empty-as-missing; they must keep their structural lengths.
+- `{ups}_x_indices` is token-major: outer `[]` means zero UPS tokens (legal). An
+  individual membership of `[]` on a present token is an orphan and is rejected.
+- A null inside an UPS event on the configured `null_anchor_field` drops that
+  whole step from every aligned field. Non-anchor nulls stay as padding ID 0 /
+  dense 0.0.
+- Sequence payloads expose `has_sequence = lengths > 0`. Empty `mean_pool`
+  summaries are zero vectors; empty LONGER sequences keep learned CLS tokens.
+- Dense scalar features append a presence bit: `null → value 0 + presence 0`,
+  real `0 → presence 1`. Categorical null still maps to padding ID 0 only.
 - A null inside an ordinary bag is masked.
 - A null attribute at a valid SKU position keeps the position and pads only
   that attribute.
 - Core candidate identifiers and all three labels are expected to be present.
+  Complete-label contracts reject null / non-{0,1} on every flat batch.
 - Candidates are not dropped merely because an optional feature is null.
+- `trusted_input: true` may skip payload diagnostics after a one-row warm-up,
+  but structure checks (UPS values/indices length alignment, membership,
+  candidate/request outer lengths) stay on for every row.
 
 ## 5. Metadata, labels, indices, and generated columns
 
