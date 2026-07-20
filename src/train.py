@@ -41,6 +41,7 @@ from .dataloader import (
     move_feature_batch,
     pin_feature_batch,
     resolve_auto_scenarios,
+    run_feature_cardinality_audit,
     table_to_feature_batch,
 )
 from .features import load_vocab_maps
@@ -512,6 +513,38 @@ def _resolve_distributed_auto_scenarios(
     if context.rank == 0:
         logger.info("Discovered raw scene_id values: %s", resolved.scenarios.names)
     return resolved
+
+
+def _resolve_distributed_cardinality_audit(
+    config: AppConfig,
+    context: DistributedContext,
+    split_name: str,
+) -> AppConfig:
+    """Sample scalar/bag cardinalities on each rank, merge, fail once if needed."""
+
+    split = config.data.train if split_name == "train" else config.data.test
+    if split is None:
+        return config
+    if split.reader.effective_cardinality_audit_raw_rows() <= 0:
+        return config
+    auditor = run_feature_cardinality_audit(
+        config,
+        split_name,
+        shard_rank=context.rank,
+        shard_world_size=context.world_size if context.enabled else 1,
+        process_group=(
+            context.control_group
+            if context.enabled and context.control_group is not None
+            else None
+        ),
+    )
+    if auditor is not None and context.rank == 0:
+        logger.info(
+            "Feature cardinality audit passed for split %s (raw_rows_seen=%s)",
+            split_name,
+            auditor.raw_rows_seen,
+        )
+    return config
 
 
 def _load_external_train_adapter(dotted_path: str | None) -> ExternalTrainAdapter:
@@ -2317,6 +2350,7 @@ def train_mdl(
         if log_steps and context.rank == 0:
             print(f"Attention backend | {attention_runtime}")
         config = _resolve_distributed_auto_scenarios(config, context)
+        config = _resolve_distributed_cardinality_audit(config, context, "train")
         vocab_maps = load_vocab_maps(config)
         base_model = build_model(config, vocab_maps).to(device)
         _validate_sharded_embedding_metadata(context, base_model)
@@ -3226,6 +3260,7 @@ def evaluate_mdl(
         if context.rank == 0:
             print(f"Attention backend | {attention_runtime}")
         config = _resolve_distributed_auto_scenarios(config, context)
+        config = _resolve_distributed_cardinality_audit(config, context, split_name)
         if split_name not in {"train", "test"}:
             raise ValueError("evaluation split must be train or test")
         if group_metric_name not in {None, "qauc", "uauc"}:

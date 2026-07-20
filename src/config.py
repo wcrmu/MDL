@@ -472,11 +472,13 @@ class ReaderConfig(_DeeplyImmutableConfig):
     # Strictly reject non-null zero before pre-hashed low-bit bucketing. Secure
     # production profiles may disable this after establishing the invariant.
     validate_prehashed_nonzero: bool = True
-    # Trust the upstream row-level contract after one raw row and one flat row
-    # have been sampled. This keeps full-batch diagnostic shape/alignment scans
-    # out of the training hot path while Parquet/Arrow decoding still fails on
-    # unreadable or physically incompatible data.
+    # Trust the upstream row-level contract after one raw/flat sample, then avoid
+    # diagnostic per-row/per-token checks on complete batches.
     trusted_input: bool = False
+    # Soft-sample this many raw Parquet rows at scan start to audit scalar/bag
+    # cardinalities across all configured fields, then fail once with a full
+    # report. ``None`` means 256 when trusted_input else 0. Set 0 to disable.
+    cardinality_audit_raw_rows: int | None = None
     # DDP can shard by files, row groups, or record batches depending on data layout.
     shard_unit: Literal["file", "row_group", "record_batch"] = "row_group"
     # Optional Arrow scanner batch size. Training batch size is independent.
@@ -535,6 +537,13 @@ class ReaderConfig(_DeeplyImmutableConfig):
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise ValueError(f"reader.{field_name} must be a boolean")
+        if self.cardinality_audit_raw_rows is not None and (
+            type(self.cardinality_audit_raw_rows) is not int
+            or self.cardinality_audit_raw_rows < 0
+        ):
+            raise ValueError(
+                "reader.cardinality_audit_raw_rows must be a non-negative integer or null"
+            )
         if self.device_prefetch_batches < 0:
             raise ValueError("reader.device_prefetch_batches must be non-negative")
         if self.shard_unit not in {"file", "row_group", "record_batch"}:
@@ -571,6 +580,13 @@ class ReaderConfig(_DeeplyImmutableConfig):
                 raise ValueError(
                     "reader.length_buckets requires a final max_length: null catch-all"
                 )
+
+    def effective_cardinality_audit_raw_rows(self) -> int:
+        """Resolve auto audit size: 256 under trusted_input, else 0, unless set."""
+
+        if self.cardinality_audit_raw_rows is not None:
+            return self.cardinality_audit_raw_rows
+        return 256 if self.trusted_input else 0
 
 
 @dataclass(frozen=True)

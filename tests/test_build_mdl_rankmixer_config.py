@@ -844,6 +844,14 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 )
                 self.assertTrue(config.data.train.reader.trusted_input)
                 self.assertTrue(config.data.test.reader.trusted_input)
+                self.assertEqual(
+                    config.data.train.reader.effective_cardinality_audit_raw_rows(),
+                    256,
+                )
+                self.assertEqual(
+                    config.data.test.reader.effective_cardinality_audit_raw_rows(),
+                    256,
+                )
                 self.assertFalse(config.data.train.label_masks)
                 self.assertFalse(config.data.test.label_masks)
                 self.assertEqual(config.training.loss_reduction, "mean_per_task")

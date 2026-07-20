@@ -8,10 +8,12 @@ from unittest.mock import patch
 import pyarrow as pa
 
 from src.dataloader import (
+    FeatureCardinalityAuditor,
     _adapter_table_to_python,
     _column_array,
     _normalize_optional_outer_list,
     _normalized_list_array,
+    _scalarize,
     _select_sequence,
     _sequence_membership_positions,
     _time_deltas,
@@ -629,6 +631,135 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         null_actual = adapt(null_outer, context=_context(REQUIRED)).to_pydict()
         self.assertEqual(null_actual["ctx_bag_hn"], [[]])
         self.assertEqual(null_actual["impr_x_goods_id_hn"], [[]])
+
+    def test_scalarize_empty_list_is_missing_but_longer_lists_fail(self) -> None:
+        self.assertIsNone(
+            _scalarize([], column="search_method_hn", raw_row=0, logical_row=0)
+        )
+        self.assertIsNone(
+            _scalarize(None, column="search_method_hn", raw_row=0, logical_row=0)
+        )
+        self.assertEqual(
+            _scalarize([7], column="search_method_hn", raw_row=0, logical_row=0),
+            7,
+        )
+        with self.assertRaisesRegex(ValueError, "inner length 5"):
+            _scalarize(
+                [1, 2, 3, 4, 5],
+                column="goods_scene_clk_cnt_15d_hn",
+                raw_row=0,
+                logical_row=0,
+            )
+        # Trusted hot path must never silently take value[0].
+        with self.assertRaisesRegex(ValueError, "inner length 2"):
+            _scalarize(
+                [9, 8],
+                column="sku_spec_vids_hn",
+                raw_row=1,
+                logical_row=0,
+                validate_contract=False,
+            )
+
+    def test_soft_cardinality_auditor_collects_all_scalar_multis(self) -> None:
+        auditor = FeatureCardinalityAuditor(soft=True)
+        self.assertIsNone(
+            _scalarize(
+                [],
+                column="search_method_hn",
+                raw_row=0,
+                logical_row=0,
+                auditor=auditor,
+            )
+        )
+        self.assertIsNone(
+            _scalarize(
+                [1, 2, 3, 4, 5],
+                column="goods_scene_clk_cnt_15d_hn",
+                raw_row=0,
+                logical_row=0,
+                auditor=auditor,
+            )
+        )
+        self.assertIsNone(
+            _scalarize(
+                [11, 12, 13],
+                column="sku_spec_vids_hn",
+                raw_row=0,
+                logical_row=1,
+                auditor=auditor,
+            )
+        )
+        self.assertEqual(
+            _scalarize(
+                [7],
+                column="search_method_hn",
+                raw_row=1,
+                logical_row=0,
+                auditor=auditor,
+            ),
+            7,
+        )
+        self.assertTrue(auditor.has_scalar_multis())
+        self.assertEqual(auditor.scalar_stats["search_method_hn"].empty_count, 1)
+        self.assertEqual(auditor.scalar_stats["search_method_hn"].singleton_count, 1)
+        self.assertEqual(auditor.scalar_stats["search_method_hn"].multi_count, 0)
+        self.assertEqual(
+            auditor.scalar_stats["goods_scene_clk_cnt_15d_hn"].multi_count, 1
+        )
+        self.assertEqual(auditor.scalar_stats["sku_spec_vids_hn"].multi_count, 1)
+        report = auditor.format_report()
+        self.assertIn("goods_scene_clk_cnt_15d_hn", report)
+        self.assertIn("sku_spec_vids_hn", report)
+
+        peer = FeatureCardinalityAuditor(soft=False)
+        peer.observe_scalar("mid_goods_prc_list_dis", [4, 5])
+        peer.note_raw_rows(3)
+        auditor.merge_payload(peer.to_payload())
+        self.assertEqual(auditor.raw_rows_seen, 3)
+        self.assertEqual(auditor.scalar_stats["mid_goods_prc_list_dis"].multi_count, 1)
+
+    def test_soft_auditor_on_adapter_does_not_fail_fast_on_first_multi(self) -> None:
+        table = pa.table(
+            {
+                "context_indices": pa.array([[0]], type=pa.list_(pa.int64())),
+                "target_indices": pa.array([[0]], type=pa.list_(pa.int64())),
+                "ctx_scalar_hn": pa.array(
+                    [[[101, 102]]], type=pa.list_(pa.list_(pa.int64()))
+                ),
+                "ctx_bag_hn": pa.array(
+                    [[[1, 2]]], type=pa.list_(pa.list_(pa.int64()))
+                ),
+                "item_scalar_hn": pa.array(
+                    [[[201, 202, 203]]], type=pa.list_(pa.list_(pa.int64()))
+                ),
+                "sku_a_hn": pa.array([[[11]]], type=pa.list_(pa.list_(pa.int64()))),
+                "sku_b_hn": pa.array([[[21]]], type=pa.list_(pa.list_(pa.int64()))),
+                "impr_x_goods_id_hn": pa.array([[-1]], type=pa.list_(pa.int64())),
+                "impr_x_time": pa.array([[4900]], type=pa.list_(pa.int64())),
+                "impr_x_indices": pa.array(
+                    [[[0]]], type=pa.list_(pa.list_(pa.int64()))
+                ),
+                "scene_id": pa.array([[7]], type=pa.list_(pa.int64())),
+                "search_id": pa.array([["r0"]], type=pa.list_(pa.string())),
+                "impr_time": pa.array([[5000]], type=pa.list_(pa.int64())),
+                "label_a": pa.array([[0]], type=pa.list_(pa.int64())),
+                "label_b": pa.array([[1]], type=pa.list_(pa.int64())),
+                "label_c": pa.array([[0]], type=pa.list_(pa.int64())),
+            }
+        )
+        context = _context(REQUIRED)
+        auditor = FeatureCardinalityAuditor(soft=True)
+        context._runtime_cache = {"cardinality_auditor": auditor}
+        flat = adapt(table, context=context)
+        self.assertEqual(flat.num_rows, 1)
+        self.assertTrue(auditor.has_scalar_multis())
+        self.assertEqual(auditor.scalar_stats["ctx_scalar_hn"].multi_count, 1)
+        self.assertEqual(auditor.scalar_stats["item_scalar_hn"].multi_count, 1)
+        # Without soft mode, the same row still fails hard.
+        hard_context = _context(REQUIRED)
+        hard_context._runtime_cache = {}
+        with self.assertRaisesRegex(ValueError, "inner length"):
+            adapt(table, context=hard_context)
 
     def test_trusted_structure_rejects_values_indices_mismatch_on_row1(self) -> None:
         good = {

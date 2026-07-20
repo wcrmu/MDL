@@ -1615,6 +1615,201 @@ def _normalize_optional_outer_list(value: Any) -> list[Any]:
     )
 
 
+@dataclass
+class _FieldCardinalityStats:
+    null_count: int = 0
+    empty_count: int = 0
+    singleton_count: int = 0
+    multi_count: int = 0
+    max_length: int = 0
+    length_histogram: dict[int, int] = field(default_factory=dict)
+    sample_multi_values: list[Any] = field(default_factory=list)
+
+    def observe_length(self, length: int, *, sample: Any | None = None) -> None:
+        self.max_length = max(self.max_length, length)
+        self.length_histogram[length] = self.length_histogram.get(length, 0) + 1
+        if length == 0:
+            self.empty_count += 1
+        elif length == 1:
+            self.singleton_count += 1
+        else:
+            self.multi_count += 1
+            if sample is not None and len(self.sample_multi_values) < 3:
+                self.sample_multi_values.append(sample)
+
+    def merge(self, other: "_FieldCardinalityStats") -> None:
+        self.null_count += other.null_count
+        self.empty_count += other.empty_count
+        self.singleton_count += other.singleton_count
+        self.multi_count += other.multi_count
+        self.max_length = max(self.max_length, other.max_length)
+        for length, count in other.length_histogram.items():
+            self.length_histogram[length] = self.length_histogram.get(length, 0) + count
+        for sample in other.sample_multi_values:
+            if len(self.sample_multi_values) >= 3:
+                break
+            self.sample_multi_values.append(sample)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "null_count": self.null_count,
+            "empty_count": self.empty_count,
+            "singleton_count": self.singleton_count,
+            "multi_count": self.multi_count,
+            "max_length": self.max_length,
+            "length_histogram": dict(sorted(self.length_histogram.items())),
+            "sample_multi_values": list(self.sample_multi_values),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "_FieldCardinalityStats":
+        stats = cls(
+            null_count=int(payload.get("null_count", 0)),
+            empty_count=int(payload.get("empty_count", 0)),
+            singleton_count=int(payload.get("singleton_count", 0)),
+            multi_count=int(payload.get("multi_count", 0)),
+            max_length=int(payload.get("max_length", 0)),
+        )
+        histogram = payload.get("length_histogram", {})
+        if isinstance(histogram, Mapping):
+            stats.length_histogram = {
+                int(length): int(count) for length, count in histogram.items()
+            }
+        samples = payload.get("sample_multi_values", ())
+        if isinstance(samples, Sequence) and not isinstance(samples, (str, bytes)):
+            stats.sample_multi_values = list(samples)[:3]
+        return stats
+
+
+@dataclass
+class FeatureCardinalityAuditor:
+    """Collect scalar/bag list-length stats for a soft sample window."""
+
+    bag_features: frozenset[str] = field(default_factory=frozenset)
+    soft: bool = False
+    raw_rows_seen: int = 0
+    scalar_stats: dict[str, _FieldCardinalityStats] = field(default_factory=dict)
+    bag_stats: dict[str, _FieldCardinalityStats] = field(default_factory=dict)
+
+    def _stats_for(self, column: str, *, bag: bool) -> _FieldCardinalityStats:
+        store = self.bag_stats if bag else self.scalar_stats
+        stats = store.get(column)
+        if stats is None:
+            stats = _FieldCardinalityStats()
+            store[column] = stats
+        return stats
+
+    def observe_scalar(self, column: str, value: Any) -> None:
+        stats = self._stats_for(column, bag=False)
+        if value is None:
+            stats.null_count += 1
+            return
+        if isinstance(value, (list, tuple)):
+            length = len(value)
+            stats.observe_length(
+                length,
+                sample=list(value[:8]) if length > 1 else None,
+            )
+            return
+        stats.observe_length(1)
+
+    def observe_bag(self, column: str, value: Any) -> None:
+        stats = self._stats_for(column, bag=True)
+        if value is None:
+            stats.null_count += 1
+            stats.observe_length(0)
+            return
+        if isinstance(value, (list, tuple)):
+            stats.observe_length(len(value))
+            return
+        stats.observe_length(1)
+
+    def note_raw_rows(self, count: int) -> None:
+        self.raw_rows_seen += max(0, int(count))
+
+    def has_scalar_multis(self) -> bool:
+        return any(stats.multi_count > 0 for stats in self.scalar_stats.values())
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "raw_rows_seen": self.raw_rows_seen,
+            "scalar_stats": {
+                name: stats.to_payload() for name, stats in sorted(self.scalar_stats.items())
+            },
+            "bag_stats": {
+                name: stats.to_payload() for name, stats in sorted(self.bag_stats.items())
+            },
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "FeatureCardinalityAuditor":
+        auditor = cls(raw_rows_seen=int(payload.get("raw_rows_seen", 0)))
+        for name, stats_payload in dict(payload.get("scalar_stats", {})).items():
+            auditor.scalar_stats[str(name)] = _FieldCardinalityStats.from_payload(
+                stats_payload
+            )
+        for name, stats_payload in dict(payload.get("bag_stats", {})).items():
+            auditor.bag_stats[str(name)] = _FieldCardinalityStats.from_payload(
+                stats_payload
+            )
+        return auditor
+
+    def merge_payload(self, payload: Mapping[str, Any]) -> None:
+        other = self.from_payload(payload)
+        self.raw_rows_seen += other.raw_rows_seen
+        for name, stats in other.scalar_stats.items():
+            self._stats_for(name, bag=False).merge(stats)
+        for name, stats in other.bag_stats.items():
+            self._stats_for(name, bag=True).merge(stats)
+
+    def format_report(self) -> str:
+        lines = [
+            "Feature cardinality audit",
+            f"raw_rows_seen={self.raw_rows_seen}",
+            "",
+            "Scalar cardinality violations:"
+            if self.has_scalar_multis()
+            else "Scalar fields (no multi-value cells observed):",
+        ]
+        scalar_items = sorted(
+            self.scalar_stats.items(),
+            key=lambda item: (-item[1].multi_count, item[0]),
+        )
+        if not scalar_items:
+            lines.append("  (no scalar observations)")
+        for name, stats in scalar_items:
+            if stats.multi_count == 0 and self.has_scalar_multis():
+                continue
+            lines.append(
+                f"{name}\n"
+                f"  null={stats.null_count} empty={stats.empty_count} "
+                f"singleton={stats.singleton_count} multi={stats.multi_count} "
+                f"max_length={stats.max_length}\n"
+                f"  length_histogram={dict(sorted(stats.length_histogram.items()))}"
+            )
+            if stats.sample_multi_values:
+                lines.append(f"  sample_multi_values={stats.sample_multi_values!r}")
+        suspicious_bags = [
+            (name, stats)
+            for name, stats in sorted(self.bag_stats.items())
+            if stats.multi_count == 0 and stats.singleton_count > 0
+        ]
+        if suspicious_bags:
+            lines.extend(
+                [
+                    "",
+                    "Bags that only observed length 0/1 in this sample "
+                    "(may be scalars or fixed singleton encodings):",
+                ]
+            )
+            for name, stats in suspicious_bags[:20]:
+                lines.append(
+                    f"{name}: empty={stats.empty_count} singleton={stats.singleton_count} "
+                    f"null={stats.null_count}"
+                )
+        return "\n".join(lines)
+
+
 def _as_list(
     value: Any,
     *,
@@ -1660,16 +1855,44 @@ def _scalarize(
     raw_row: int,
     logical_row: int,
     validate_contract: bool = True,
+    auditor: "FeatureCardinalityAuditor | None" = None,
 ) -> Any:
+    """Collapse optional singleton list wrappers for scalar features.
+
+    Contract (independent of trusted_input / validate_contract):
+
+    - ``None`` / ``[]`` → ``None`` (missing → padding ID 0 downstream)
+    - ``[v]`` → ``v``
+    - length > 1 → always raise (never silently take the first element)
+
+    When an auditor is in soft mode, length > 1 is recorded and the cell is
+    treated as missing so the rest of the row can still be audited.
+    """
+
+    del validate_contract  # Scalar cardinality is never relaxed under trusted_input.
     if value is None:
+        if auditor is not None:
+            auditor.observe_scalar(column, None)
         return None
     if not isinstance(value, (list, tuple)):
+        if auditor is not None:
+            auditor.observe_scalar(column, value)
         return value
-    if validate_contract and len(value) != 1:
+    length = len(value)
+    if length == 0:
+        if auditor is not None:
+            auditor.observe_scalar(column, [])
+        return None
+    if length != 1:
+        if auditor is not None and auditor.soft:
+            auditor.observe_scalar(column, value)
+            return None
         raise ValueError(
-            f"single-valued feature {column!r} has inner length {len(value)} "
+            f"single-valued feature {column!r} has inner length {length} "
             f"at raw row {raw_row}, logical row {logical_row}"
         )
+    if auditor is not None:
+        auditor.observe_scalar(column, value)
     return value[0]
 
 
@@ -1680,17 +1903,21 @@ def _bag_value(
     raw_row: int,
     logical_row: int,
     validate_contract: bool = True,
+    auditor: "FeatureCardinalityAuditor | None" = None,
 ) -> Any:
     """Normalize optional categorical bags; top-level null/[] mean length 0."""
 
     del validate_contract  # Outer null/[] are always accepted as zero-length bags.
     try:
-        return _normalize_optional_outer_list(value)
+        normalized = _normalize_optional_outer_list(value)
     except TypeError as error:
         raise ValueError(
             f"multivalue feature {column!r} must be list-valued at raw row "
             f"{raw_row}, logical row {logical_row}"
         ) from error
+    if auditor is not None:
+        auditor.observe_bag(column, normalized)
+    return normalized
 
 
 def _candidate_count_req(
@@ -2593,11 +2820,27 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
     compact_list_columns = plan.compact_list_columns
     runtime_cache = getattr(context, "_runtime_cache", None)
     trusted_input = bool(getattr(context, "trusted_input", False))
+    cardinality_auditor: FeatureCardinalityAuditor | None = None
+    if isinstance(runtime_cache, dict):
+        cached_auditor = runtime_cache.get("cardinality_auditor")
+        if isinstance(cached_auditor, FeatureCardinalityAuditor):
+            cardinality_auditor = cached_auditor
+    soft_cardinality_audit = bool(
+        cardinality_auditor is not None and cardinality_auditor.soft
+    )
     raw_sample_already_validated = (
         isinstance(runtime_cache, dict)
         and runtime_cache.get("mdl_rankmixer_raw_sample_validated", False)
     )
-    if trusted_input and table.num_rows > 0 and not raw_sample_already_validated:
+    # Soft cardinality audit already walks every configured field; skip the
+    # one-row hard warm-up so the first multi-valued scalar does not abort the
+    # aggregate report.
+    if (
+        trusted_input
+        and table.num_rows > 0
+        and not raw_sample_already_validated
+        and not soft_cardinality_audit
+    ):
         sample_context = ParquetAdapterContext(
             split_name=str(getattr(context, "split_name", "unknown")),
             required_columns=tuple(context.required_columns),
@@ -2795,6 +3038,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                     raw_row=raw_row,
                     logical_row=candidate_index,
                     validate_contract=validate_row_contract,
+                    auditor=cardinality_auditor,
                 )
                 for candidate_index, value in enumerate(values)
             ]
@@ -2879,6 +3123,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         raw_row=raw_row,
                         logical_row=request_index,
                         validate_contract=validate_row_contract,
+                        auditor=cardinality_auditor,
                     )
                     if column in bag_features
                     else _scalarize(
@@ -2887,6 +3132,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         raw_row=raw_row,
                         logical_row=request_index,
                         validate_contract=validate_row_contract,
+                        auditor=cardinality_auditor,
                     )
                 )
             for column in request_columns:
@@ -2978,6 +3224,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         raw_row=raw_row,
                         logical_row=candidate_index,
                         validate_contract=validate_row_contract,
+                        auditor=cardinality_auditor,
                     )
                     if column in bag_features
                     else _scalarize(
@@ -2986,6 +3233,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         raw_row=raw_row,
                         logical_row=candidate_index,
                         validate_contract=validate_row_contract,
+                        auditor=cardinality_auditor,
                     )
                 )
             normalized_items[column] = normalized
@@ -3127,6 +3375,134 @@ def _adapter_context(
         options=options,
         trusted_input=split.reader.trusted_input,
     )
+
+
+def run_feature_cardinality_audit(
+    config: AppConfig,
+    split_name: str,
+    *,
+    shard_rank: int = 0,
+    shard_world_size: int = 1,
+    process_group: Any | None = None,
+) -> FeatureCardinalityAuditor | None:
+    """Soft-sample raw rows on the normal scan path and report all scalar multis.
+
+    Under ``trusted_input``, defaults to 256 raw rows per rank unless
+    ``reader.cardinality_audit_raw_rows`` overrides it. Length > 1 on a declared
+    scalar is recorded without aborting mid-sample; ranks merge via
+    ``all_gather_object`` and then fail once with the full report. YAML is not
+    auto-rewritten from list lengths.
+    """
+
+    split = _split_for_name(config, split_name)
+    audit_rows = split.reader.effective_cardinality_audit_raw_rows()
+    if audit_rows <= 0:
+        return None
+    if split.format != "adapter_parquet":
+        return None
+
+    world_size = 1
+    if process_group is not None:
+        world_size = int(torch.distributed.get_world_size(process_group))
+    elif shard_world_size > 1:
+        world_size = int(shard_world_size)
+
+    bag_features = frozenset()
+    local_payload: dict[str, Any] = {
+        "raw_rows_seen": 0,
+        "scalar_stats": {},
+        "bag_stats": {},
+    }
+    local_error: str | None = None
+    try:
+        required_columns = required_columns_for_split(config, split)
+        scan_columns = _scan_columns_for_split(split, required_columns)
+        scanner = ParquetScanner(
+            split,
+            scan_columns,
+            shard_rank=shard_rank,
+            shard_world_size=shard_world_size,
+            optional_columns=(
+                set(_optional_scan_columns_for_split(split)) & set(scan_columns)
+            ),
+        )
+        adapter_name, adapter = _load_parquet_adapter(split)
+        context = _adapter_context(split_name, split, required_columns)
+        bag_features = frozenset(
+            str(name) for name in context.options.get("multivalue_features", ())
+        )
+        auditor = FeatureCardinalityAuditor(bag_features=bag_features, soft=True)
+        context._runtime_cache["cardinality_auditor"] = auditor
+        # Soft audit already covers every field; skip trusted one-row hard warm-up.
+        context._runtime_cache["mdl_rankmixer_raw_sample_validated"] = True
+
+        remaining = audit_rows
+        try:
+            for raw_table in scanner.iter_tables():
+                if remaining <= 0:
+                    break
+                take = min(remaining, int(raw_table.num_rows))
+                table = (
+                    raw_table if take == raw_table.num_rows else raw_table.slice(0, take)
+                )
+                auditor.note_raw_rows(table.num_rows)
+                result = adapter(table, context=context)
+                for _flat in _normalize_adapter_result(result, adapter_name, split_name):
+                    del _flat
+                remaining -= take
+        finally:
+            context._runtime_cache.pop("cardinality_auditor", None)
+        local_payload = auditor.to_payload()
+    except Exception as error:
+        local_error = (
+            f"feature cardinality audit failed for split {split_name!r}: {error}"
+        )
+
+    if world_size > 1:
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            raise RuntimeError(
+                "feature cardinality audit requires an initialized process group "
+                f"when world_size={world_size}"
+            )
+        gathered: list[Any] = [None] * world_size
+        torch.distributed.all_gather_object(
+            gathered,
+            {"payload": local_payload, "error": local_error},
+            group=process_group,
+        )
+        peer_errors = [
+            item.get("error")
+            for item in gathered
+            if isinstance(item, Mapping) and item.get("error")
+        ]
+        if peer_errors:
+            raise RuntimeError(str(peer_errors[0]))
+        auditor = FeatureCardinalityAuditor(bag_features=bag_features, soft=False)
+        for item in gathered:
+            if not isinstance(item, Mapping) or not isinstance(
+                item.get("payload"), Mapping
+            ):
+                raise RuntimeError(
+                    "feature cardinality audit gathered an invalid peer payload"
+                )
+            auditor.merge_payload(item["payload"])
+    else:
+        if local_error is not None:
+            raise RuntimeError(local_error)
+        auditor = FeatureCardinalityAuditor.from_payload(local_payload)
+        auditor.bag_features = bag_features
+        auditor.soft = False
+
+    report = auditor.format_report()
+    logger.info("Feature cardinality audit for split %s:\n%s", split_name, report)
+    if auditor.has_scalar_multis():
+        raise ValueError(
+            "Feature cardinality audit found declared scalar fields with length > 1. "
+            "Keep runtime scalar checks hard; fix field roles in YAML from this report "
+            "(do not auto-switch to mean pooling).\n\n"
+            f"{report}"
+        )
+    return auditor
 
 
 def _normalize_adapter_result(result: Any, adapter_name: str, split_name: str) -> Iterator[Any]:

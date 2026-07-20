@@ -216,6 +216,11 @@ list<list<int64>>, with an inner length of exactly one for every token.
   summaries are zero vectors; empty LONGER sequences keep learned CLS tokens.
 - Dense scalar features append a presence bit: `null → value 0 + presence 0`,
   real `0 → presence 1`. Categorical null still maps to padding ID 0 only.
+- Optional categorical **scalar** wrappers also treat top-level `[]` as missing
+  (`None` → padding ID 0). Length-1 lists unwrap to the sole element; longer
+  lists **always** raise, including under `trusted_input` (never silently take
+  the first element). Soft cardinality audit may temporarily record length > 1
+  across a sample window, then fail once with a full field report.
 - A null inside an ordinary bag is masked.
 - A null attribute at a valid SKU position keeps the position and pads only
   that attribute.
@@ -797,18 +802,26 @@ The upstream data-team feed is treated as trusted production input.
 - HDFS discovery reads Parquet footers and the current configuration compares
   a deterministic sample of file schemas. schema_validation_samples=64 refers
   to file schemas, not 64 payload rows.
-- trusted_input=true makes each scanner/rank run detailed raw-contract checks
-  on only the first physical row of its first non-empty batch.
+- Before training/eval under `trusted_input`, each rank soft-samples
+  `cardinality_audit_raw_rows` raw Parquet rows (default 256) through the
+  normal adapter path, merges stats over gloo when distributed, and fails once
+  if any declared scalar shows length > 1. This is an audit report, not an
+  automatic bag/mean rewrite.
+- trusted_input=true still runs detailed raw-contract checks on the first
+  physical row of its first non-empty batch after the audit window (skipped
+  while soft audit is active so the first multi-valued scalar cannot abort the
+  aggregate report).
 - The first non-empty flat output is also checked using only one candidate
   row.
 - Later batches skip repeated row-by-row shape, sequence-order, timestamp, and
-  label diagnostics.
+  label diagnostics, but scalar length > 1 remains a hard error on every row.
 - validate_prehashed_nonzero=false avoids scanning every encoded field for
   zero on every tensorization batch.
 - Complete labels use no mask columns or mask tensor.
 
-This keeps a one-row integration smoke check while removing per-sample
-validation from the training hot path.
+This keeps an aggregate cardinality smoke check plus always-on scalar
+structure protection while removing most per-sample diagnostics from the
+training hot path.
 
 ## 12. Authority and historical-material boundaries
 
