@@ -26,6 +26,12 @@ from scripts.build_mdl_rankmixer_config import (
 from scripts.profile_prehashed_parquet import profile_spec_from_mapping
 from src.config import ResolvedPreHashedEncoding, load_app_config
 from src.dataloader import (
+    COARSE_SCENE_INDEX_COLUMN,
+    COARSE_SCENE_PRIOR_ID_COLUMN,
+    RECOMMENDATION_PRIOR_FEATURE,
+    SCENARIO_NAMES,
+    SEARCH_PRIOR_FEATURE,
+    SEARCH_SCENE_IDS,
     _load_parquet_adapter,
     _scenario_tensor,
     discover_scenario_values,
@@ -275,7 +281,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             "include_as_padding",
         )
         self.assertNotIn("pooling", by_name["sku_spec_vids_hn"])
-        self.assertEqual(summary["bag_feature_count"], 50)
+        self.assertEqual(summary["bag_feature_count"], 60)
 
         main_sequences = payload["sequences"][:9]
         self.assertEqual([item["name"] for item in main_sequences], [
@@ -323,9 +329,10 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         self.assertEqual(
             payload["scenarios"],
             {
-                "names": ["7", "19"],
-                "source": "scene_id",
+                "names": list(SCENARIO_NAMES),
+                "source": COARSE_SCENE_INDEX_COLUMN,
                 "source_encoding": "index",
+                "auto_discover": False,
             },
         )
         adapter_options = payload["data"]["train"]["adapter"]["options"]
@@ -347,7 +354,77 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             "f_goods_view_times_tg_l1_hn",
             adapter_payload["optional_input_columns"],
         )
-        self.assertEqual(adapter_options["request_value_maps"]["scene_id"], {7: 0, 19: 1})
+        self.assertNotIn("request_value_maps", adapter_options)
+        self.assertEqual(
+            adapter_options["search_scene_ids"],
+            sorted(SEARCH_SCENE_IDS),
+        )
+        self.assertEqual(
+            adapter_options["coarse_scene_index_column"],
+            COARSE_SCENE_INDEX_COLUMN,
+        )
+        self.assertEqual(
+            adapter_options["coarse_scene_prior_id_column"],
+            COARSE_SCENE_PRIOR_ID_COLUMN,
+        )
+        self.assertEqual(
+            [token["name"] for token in payload["tokenization"]["scenario_tokens"]],
+            ["search", "recommendation", "global"],
+        )
+        self.assertEqual(
+            payload["tokenization"]["scenario_tokens"][0]["prior_inputs"][0],
+            SEARCH_PRIOR_FEATURE,
+        )
+        self.assertEqual(
+            payload["tokenization"]["scenario_tokens"][1]["prior_inputs"][0],
+            RECOMMENDATION_PRIOR_FEATURE,
+        )
+        for prior_name in (SEARCH_PRIOR_FEATURE, RECOMMENDATION_PRIOR_FEATURE):
+            encoding = by_name[prior_name]["encoding"]
+            self.assertEqual(by_name[prior_name]["source"], COARSE_SCENE_PRIOR_ID_COLUMN)
+            self.assertEqual(encoding["type"], "identity")
+            self.assertEqual(encoding["num_buckets"], 3)
+            self.assertEqual(encoding["padding_id"], 0)
+            self.assertEqual(encoding["out_of_range"], "error")
+            self.assertFalse(encoding.get("share_embedding", False))
+            self.assertNotIn("share_with", encoding)
+        self.assertEqual(adapter_options["request_axis_item_features"], [
+            "buy_long_spec_vids_hn",
+            "cart_long_spec_vids_hn",
+            "impr_3h_tg_hn",
+            "impr_all_tg_hn",
+            "main_goods_ids_hn_share",
+            "offline_outside_goods_id_list_hn_share",
+            "opt_id_hn",
+            "query_pay_cnt_15d_hn",
+            "site_q2i_good_list_hn_share",
+        ])
+        self.assertEqual(adapter_options["candidate_axis_context_features"], [
+            "cart_cnt_1d_hn",
+            "cart_cnt_3d_hn",
+            "clk_1d_cat_cnt_hn",
+            "clk_3d_cnt_hn",
+            "clk_cnt_1d_hn",
+        ])
+        for name in (
+            "offline_outside_goods_id_list_hn_share",
+            "i2i_coclk_hn_share",
+            "i2i2cat2_swing_hn",
+            "buy_long_spec_vids_hn",
+            "impr_3h_tg_hn",
+        ):
+            self.assertIn(name, adapter_options["multivalue_features"])
+            self.assertEqual(by_name[name]["pooling"], "mean")
+        for name in (
+            "multimodal_i2i_hit_clk_size_hn",
+            "multimodal_i2i_hit_cart_size_hn",
+            "query_pay_cnt_15d_hn",
+            "opt_id_hn",
+            "clk_cnt_1d_hn",
+            "cart_cnt_3d_hn",
+        ):
+            self.assertNotIn(name, adapter_options["multivalue_features"])
+            self.assertNotIn("pooling", by_name[name])
         self.assertEqual(len(adapter_options["context_features"]), 47)
         self.assertEqual(len(adapter_options["item_features"]), 122)
         self.assertEqual(
@@ -674,6 +751,16 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             self.assertIn("impr", token["prior_inputs"])
             self.assertIn("clk_long", token["prior_inputs"])
             self.assertIn("view_long", token["prior_inputs"])
+        self.assertEqual(
+            [token["name"] for token in mdl_onetrans["tokenization"]["scenario_tokens"]],
+            ["search", "recommendation", "global"],
+        )
+        self.assertEqual(mdl_onetrans["scenarios"]["names"], list(SCENARIO_NAMES))
+        self.assertEqual(
+            mdl_onetrans["scenarios"]["source"],
+            COARSE_SCENE_INDEX_COLUMN,
+        )
+        self.assertFalse(mdl_onetrans["scenarios"]["auto_discover"])
         adapter_limits = mdl_onetrans["data"]["train"]["adapter"]["options"][
             "sequence_max_lengths"
         ]
@@ -830,11 +917,18 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 )
                 self.assertFalse(config.training.embedding_collect_stats)
                 self.assertFalse(config.training.embedding_validate_indices)
+                self.assertFalse(config.scenarios.auto_discover)
+                self.assertIsNone(config.scenarios.discovery_cache_path)
+                self.assertEqual(config.scenarios.names, SCENARIO_NAMES)
                 self.assertEqual(
-                    config.scenarios.discovery_cache_path,
-                    "artifacts/scenarios/cvr_allscene.json",
+                    config.scenarios.source,
+                    COARSE_SCENE_INDEX_COLUMN,
                 )
-                self.assertEqual(config.scenarios.source_encoding, "raw")
+                self.assertEqual(config.scenarios.source_encoding, "index")
+                self.assertEqual(
+                    list(config.data.train.adapter.options["search_scene_ids"]),
+                    sorted(SEARCH_SCENE_IDS),
+                )
                 self.assertTrue(config.training.ddp.static_graph)
                 self.assertTrue(
                     config.data.train.reader.deduplicate_request_features
@@ -915,7 +1009,8 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         for item in config.resolved.categorical_input_by_name.values()
                         if not getattr(item.encoding, "share_embedding", False)
                     )
-                    self.assertEqual(physical, 202)
+                    # 200 shared Phase-2 tables + 2 independent coarse scenario priors.
+                    self.assertEqual(physical, 204)
                     if model_name == "mdl_onetrans":
                         self.assertEqual(len(config.sequences), 12)
                         self.assertEqual(
@@ -1117,6 +1212,51 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                             _resolve_share_root(entries, name),
                             msg=f"multi-hop share chain for {name}",
                         )
+
+    def test_coarse_scenario_priors_stay_independent_across_phase2_profiles(self) -> None:
+        report = build_name_estimate_report(self.sample)
+        for profile in (
+            "shared",
+            "shared_dim",
+            "shared_dim_query_bucket",
+            "shared_dim_aggressive_bucket",
+        ):
+            with self.subTest(profile=profile):
+                payload, _summary = build_config(
+                    self.sample,
+                    report,
+                    train_inputs=["/tmp/train"],
+                    test_inputs=["/tmp/test"],
+                    auto_discover_scenes=False,
+                    embedding_profile=profile,
+                )
+                self.assertEqual(payload["scenarios"]["names"], list(SCENARIO_NAMES))
+                self.assertEqual(
+                    payload["scenarios"]["source"],
+                    COARSE_SCENE_INDEX_COLUMN,
+                )
+                self.assertFalse(payload["scenarios"]["auto_discover"])
+                by_name = {item["name"]: item for item in payload["features"]}
+                for prior_name in (SEARCH_PRIOR_FEATURE, RECOMMENDATION_PRIOR_FEATURE):
+                    encoding = by_name[prior_name]["encoding"]
+                    self.assertEqual(encoding["type"], "identity")
+                    self.assertEqual(encoding["num_buckets"], 3)
+                    self.assertEqual(encoding["padding_id"], 0)
+                    self.assertEqual(encoding["out_of_range"], "error")
+                    self.assertFalse(encoding.get("share_embedding", False))
+                    self.assertNotIn("share_with", encoding)
+                tokens = {
+                    token["name"]: token
+                    for token in payload["tokenization"]["scenario_tokens"]
+                }
+                self.assertEqual(
+                    tokens["search"]["prior_inputs"][0],
+                    SEARCH_PRIOR_FEATURE,
+                )
+                self.assertEqual(
+                    tokens["recommendation"]["prior_inputs"][0],
+                    RECOMMENDATION_PRIOR_FEATURE,
+                )
 
     def test_share_embedding_rejects_cycles(self) -> None:
         report = build_name_estimate_report(self.sample)

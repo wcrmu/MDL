@@ -38,6 +38,19 @@ from scripts.profile_prehashed_parquet import (  # noqa: E402
     profile_spec_from_mapping,
 )
 from src.config import AppConfig  # noqa: E402
+from src.dataloader import (  # noqa: E402
+    COARSE_SCENE_INDEX_COLUMN,
+    COARSE_SCENE_PRIOR_EMBEDDING_DIM,
+    COARSE_SCENE_PRIOR_ID_COLUMN,
+    COARSE_SCENE_PRIOR_NUM_BUCKETS,
+    EXPECTED_SEARCH_SCENE_ID_COUNT,
+    INDEPENDENT_COARSE_SCENARIO_PRIORS,
+    RECOMMENDATION_PRIOR_FEATURE,
+    SCENARIO_NAMES,
+    SEARCH_PRIOR_FEATURE,
+    SEARCH_SCENE_IDS,
+    validate_production_search_scene_ids,
+)
 from src.embeddings import (  # noqa: E402
     EmbeddingTableSpec,
     embedding_local_bytes,
@@ -98,6 +111,77 @@ ITEM_BAG_FIELDS = {
     "g_sku_spec_hn",
     "g_sku_spec_hash_hn",
     "rev_ratings_cnt_crs_pos_hn",
+}
+# Three independent attributes: model group (context/item), physical axis
+# (request/candidate), and slot type (scalar/bag). Logical grouping never
+# implies physical axis.
+REQUEST_AXIS_ITEM_BAG_FIELDS = frozenset(
+    {
+        "offline_outside_goods_id_list_hn_share",
+        "site_q2i_good_list_hn_share",
+        "main_goods_ids_hn_share",
+        "buy_long_spec_vids_hn",
+        "cart_long_spec_vids_hn",
+        "impr_3h_tg_hn",
+        "impr_all_tg_hn",
+    }
+)
+REQUEST_AXIS_ITEM_SCALAR_FIELDS = frozenset(
+    {
+        "query_pay_cnt_15d_hn",
+        "opt_id_hn",
+    }
+)
+REQUEST_AXIS_ITEM_FIELDS = (
+    REQUEST_AXIS_ITEM_BAG_FIELDS | REQUEST_AXIS_ITEM_SCALAR_FIELDS
+)
+CANDIDATE_AXIS_CONTEXT_FIELDS = frozenset(
+    {
+        "clk_cnt_1d_hn",
+        "clk_3d_cnt_hn",
+        "clk_1d_cat_cnt_hn",
+        "cart_cnt_1d_hn",
+        "cart_cnt_3d_hn",
+    }
+)
+CANDIDATE_AXIS_CONTEXT_SCALAR_FIELDS = CANDIDATE_AXIS_CONTEXT_FIELDS
+CONTEXT_SCALAR_FIELDS |= CANDIDATE_AXIS_CONTEXT_SCALAR_FIELDS
+CANDIDATE_ITEM_BAG_FIELDS = frozenset(
+    {
+        "i2i_coclk_hn_share",
+        "i2i_list_amazoni2ifullgmv_hn_share",
+        "i2i_list_swingv3gmv_hn_share",
+        "i2i2cat2_swing_hn",
+        "semi_swingi2i_cut30_hn_share",
+        "i2i_list_multimodal_hn_share",
+        "i2i_hit_site_q2i_idx_hn",
+        "only_semi_swingi2i_cut60_hn_share",
+    }
+)
+CANDIDATE_ITEM_SCALAR_FIELDS = frozenset(
+    {
+        "multimodal_i2i_hit_clk_size_hn",
+        "multimodal_i2i_hit_cart_size_hn",
+    }
+)
+RELATED_ITEM_BAG_FIELDS = REQUEST_AXIS_ITEM_BAG_FIELDS | CANDIDATE_ITEM_BAG_FIELDS
+ITEM_BAG_FIELDS |= RELATED_ITEM_BAG_FIELDS
+RELATED_ITEM_BAG_MAX_LENGTHS = {
+    "offline_outside_goods_id_list_hn_share": 256,
+    "site_q2i_good_list_hn_share": 64,
+    "main_goods_ids_hn_share": 32,
+    "buy_long_spec_vids_hn": 32,
+    "cart_long_spec_vids_hn": 32,
+    "impr_3h_tg_hn": 32,
+    "impr_all_tg_hn": 32,
+    "i2i_coclk_hn_share": 32,
+    "i2i_list_amazoni2ifullgmv_hn_share": 32,
+    "i2i_list_swingv3gmv_hn_share": 32,
+    "i2i2cat2_swing_hn": 32,
+    "semi_swingi2i_cut30_hn_share": 32,
+    "i2i_list_multimodal_hn_share": 32,
+    "i2i_hit_site_q2i_idx_hn": 32,
+    "only_semi_swingi2i_cut60_hn_share": 32,
 }
 CORE_ITEM_FIELDS = ("goods_id_hn", "cat1_id_hn", "price_hn")
 SCENARIO_IMPORTANT_FIELDS = (
@@ -208,8 +292,9 @@ PHASE2_SKU_LIST_SHARE_ALIASES = (
     "task_upid_pay_prior.sku_ids_hn",
     "task_cateid_filter_prior.sku_ids_hn",
 )
-# scenario_prior_scene_id_hn (auto) and scenario_<id>_prior_scene_id_hn (fixed)
-# both share onto scene_id_hn via _scenario_prior_scene_aliases().
+# Coarse scenario priors must keep independent identity tables. Never share them
+# onto scene_id_hn (fine-grained pre_hashed namespace).
+PHASE2_INDEPENDENT_SCENARIO_PRIORS = INDEPENDENT_COARSE_SCENARIO_PRIORS
 
 
 def _semantic_source(source: str) -> tuple[str | None, str]:
@@ -356,6 +441,8 @@ def _estimated_dimension(bucket: int) -> int:
 
 
 def _estimated_bag_length(source: str) -> int:
+    if source in RELATED_ITEM_BAG_MAX_LENGTHS:
+        return int(RELATED_ITEM_BAG_MAX_LENGTHS[source])
     name = source.lower()
     if name.startswith("sku_"):
         return 128
@@ -928,7 +1015,10 @@ def _main_features(
             max_length = (
                 sku_length
                 if source in DEFAULT_SKU_FIELDS
-                else values.bag_length(source, length_quantile)
+                else RELATED_ITEM_BAG_MAX_LENGTHS.get(
+                    source,
+                    values.bag_length(source, length_quantile),
+                )
             )
             if max_bag_length is not None:
                 max_length = min(max_length, max_bag_length)
@@ -1154,6 +1244,9 @@ def _adapter_options(
     bag_fields: set[str],
     scene_ids: Sequence[int] | None,
     sequence_max_lengths: Mapping[str, int],
+    *,
+    coarse_scene: bool = False,
+    search_scene_ids: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     context = [str(item["source"]) for item in sample_features[:CONTEXT_FEATURE_COUNT]]
     items = [str(item["source"]) for item in sample_features[CONTEXT_FEATURE_COUNT:]]
@@ -1165,6 +1258,8 @@ def _adapter_options(
             for item in sample_features
             if str(item["source"]) in bag_fields
         ],
+        "request_axis_item_features": sorted(REQUEST_AXIS_ITEM_FIELDS),
+        "candidate_axis_context_features": sorted(CANDIDATE_AXIS_CONTEXT_FIELDS),
         "aligned_multivalue_groups": [list(DEFAULT_SKU_FIELDS)],
         "ups_types": list(EXPECTED_UPS_TYPES),
         "request_columns": ["scene_id", "search_id", "impr_time"],
@@ -1179,11 +1274,33 @@ def _adapter_options(
         },
         "time_delta_transform": "log1p_seconds",
     }
-    if scene_ids is not None:
+    if coarse_scene:
+        if search_scene_ids is None:
+            raise ValueError("coarse_scene adapter options require search_scene_ids")
+        options["search_scene_ids"] = [int(scene_id) for scene_id in search_scene_ids]
+        options["coarse_scene_index_column"] = COARSE_SCENE_INDEX_COLUMN
+        options["coarse_scene_prior_id_column"] = COARSE_SCENE_PRIOR_ID_COLUMN
+    elif scene_ids is not None:
         options["request_value_maps"] = {
             "scene_id": {scene_id: index for index, scene_id in enumerate(scene_ids)}
         }
     return options
+
+
+def _coarse_scenario_prior_feature(logical_name: str) -> dict[str, Any]:
+    return {
+        "name": logical_name,
+        "kind": "categorical",
+        "source": COARSE_SCENE_PRIOR_ID_COLUMN,
+        "embedding_scope": "scenario",
+        "embedding_dim": COARSE_SCENE_PRIOR_EMBEDDING_DIM,
+        "encoding": {
+            "type": "identity",
+            "num_buckets": COARSE_SCENE_PRIOR_NUM_BUCKETS,
+            "padding_id": 0,
+            "out_of_range": "error",
+        },
+    }
 
 
 def _reader_config(*, training: bool) -> dict[str, Any]:
@@ -1510,17 +1627,62 @@ def _apply_phase2_common(payload: dict[str, Any]) -> None:
 
 
 def _scenario_prior_scene_aliases(payload: Mapping[str, Any]) -> tuple[str, ...]:
-    """Return scenario-prior scene_id features for auto or fixed scene layouts."""
+    """Return legacy fine-grained scenario-prior aliases that share scene_id_hn.
+
+    Coarse search/recommendation priors are intentionally excluded: they use an
+    independent identity table over ``coarse_scene_prior_id``.
+    """
 
     aliases: list[str] = []
     for feature in payload["features"]:
         name = str(feature["name"])
+        if name in PHASE2_INDEPENDENT_SCENARIO_PRIORS:
+            continue
         if name == "scenario_prior_scene_id_hn":
             aliases.append(name)
             continue
         if name.startswith("scenario_") and name.endswith("_prior_scene_id_hn"):
             aliases.append(name)
     return tuple(aliases)
+
+
+def _assert_independent_coarse_scenario_priors(payload: Mapping[str, Any]) -> None:
+    features = {
+        str(feature["name"]): feature
+        for feature in payload["features"]
+        if isinstance(feature, Mapping)
+    }
+    for name in sorted(PHASE2_INDEPENDENT_SCENARIO_PRIORS):
+        feature = features.get(name)
+        if feature is None:
+            raise ValueError(f"missing independent coarse scenario prior {name!r}")
+        encoding = _require_mapping(feature.get("encoding"), f"features.{name}.encoding")
+        if encoding.get("share_embedding", False):
+            raise ValueError(
+                f"coarse scenario prior {name!r} must use an independent table"
+            )
+        if "share_with" in encoding:
+            raise ValueError(
+                f"coarse scenario prior {name!r} must not declare share_with"
+            )
+        if encoding.get("type") != "identity":
+            raise ValueError(
+                f"coarse scenario prior {name!r} must use identity encoding"
+            )
+        if int(encoding.get("num_buckets", -1)) != COARSE_SCENE_PRIOR_NUM_BUCKETS:
+            raise ValueError(
+                f"coarse scenario prior {name!r} must use "
+                f"num_buckets={COARSE_SCENE_PRIOR_NUM_BUCKETS}"
+            )
+        if int(encoding.get("padding_id", -1)) != 0:
+            raise ValueError(
+                f"coarse scenario prior {name!r} must use padding_id=0"
+            )
+        if str(feature.get("source")) != COARSE_SCENE_PRIOR_ID_COLUMN:
+            raise ValueError(
+                f"coarse scenario prior {name!r} must source "
+                f"{COARSE_SCENE_PRIOR_ID_COLUMN!r}"
+            )
 
 
 def _apply_phase2_mdl_priors(payload: dict[str, Any]) -> None:
@@ -1551,14 +1713,25 @@ def _apply_phase2_mdl_priors(payload: dict[str, Any]) -> None:
                 continue
             _share_embedding(payload, f"{sequence_name}.{field_name}", base_name)
 
-    scenario_aliases = _scenario_prior_scene_aliases(payload)
-    if not scenario_aliases:
-        raise ValueError(
-            "Phase 2 MDL prior profile requires scenario_prior_scene_id_hn "
-            "or scenario_<id>_prior_scene_id_hn features"
-        )
-    for alias_name in scenario_aliases:
-        _share_embedding(payload, alias_name, "scene_id_hn")
+    feature_names = {str(feature["name"]) for feature in payload["features"]}
+    if PHASE2_INDEPENDENT_SCENARIO_PRIORS & feature_names:
+        missing = sorted(PHASE2_INDEPENDENT_SCENARIO_PRIORS - feature_names)
+        if missing:
+            raise ValueError(
+                "Phase 2 MDL prior profile requires coarse scenario priors: "
+                + ", ".join(missing)
+            )
+        _assert_independent_coarse_scenario_priors(payload)
+    else:
+        scenario_aliases = _scenario_prior_scene_aliases(payload)
+        if not scenario_aliases:
+            raise ValueError(
+                "Phase 2 MDL prior profile requires coarse scenario priors "
+                f"{sorted(PHASE2_INDEPENDENT_SCENARIO_PRIORS)} or legacy "
+                "scenario_prior_scene_id_hn / scenario_<id>_prior_scene_id_hn features"
+            )
+        for alias_name in scenario_aliases:
+            _share_embedding(payload, alias_name, "scene_id_hn")
 
     _propagate_shared_shapes(payload)
     _validate_share_graph(payload)
@@ -1844,9 +2017,21 @@ def build_config(
     )
 
     scenario_important_names: list[str] = []
-    scenario_prior_names: dict[int, str] = {}
+    scenario_prior_names: dict[str, str] = {}
     auto_scenario_prior_name: str | None = None
     task_important_names: list[str] = []
+    use_coarse_scenes = not auto_discover_scenes
+    production_search_scene_ids: frozenset[int] | None = None
+    if use_coarse_scenes:
+        # Unit tests may pass a smaller set via the module constant while still
+        # exercising the production coarse-scene path. Shipping configs must use
+        # the validated 121-id production list.
+        if len(SEARCH_SCENE_IDS) == EXPECTED_SEARCH_SCENE_ID_COUNT:
+            production_search_scene_ids = validate_production_search_scene_ids(
+                SEARCH_SCENE_IDS
+            )
+        else:
+            production_search_scene_ids = frozenset(int(v) for v in SEARCH_SCENE_IDS)
     if mdl_family:
         for source in SCENARIO_IMPORTANT_FIELDS:
             name = f"scenario_important_{source}"
@@ -1863,12 +2048,14 @@ def build_config(
                 )
             )
         else:
-            for scene_id in scene_ids:
-                name = f"scenario_{_scene_slug(scene_id)}_prior_scene_id_hn"
-                features.append(
-                    _independent_feature(name, "scene_id_hn", "scenario", values)
-                )
-                scenario_prior_names[scene_id] = name
+            features.append(_coarse_scenario_prior_feature(SEARCH_PRIOR_FEATURE))
+            features.append(
+                _coarse_scenario_prior_feature(RECOMMENDATION_PRIOR_FEATURE)
+            )
+            scenario_prior_names = {
+                "search": SEARCH_PRIOR_FEATURE,
+                "recommendation": RECOMMENDATION_PRIOR_FEATURE,
+            }
         for source in TASK_IMPORTANT_FIELDS:
             name = f"task_important_{source}"
             features.append(_independent_feature(name, source, "task", values))
@@ -1931,24 +2118,25 @@ def build_config(
         else:
             scenario_tokens = []
     else:
-        scenario_names = [str(scene_id) for scene_id in scene_ids]
+        scenario_names = list(SCENARIO_NAMES)
         scenario_config = {
             "names": scenario_names,
-            "source": "scene_id",
+            "source": COARSE_SCENE_INDEX_COLUMN,
             "source_encoding": "index",
+            "auto_discover": False,
         }
         if mdl_family:
             scenario_priors = list(MDL_SCENARIO_SHARED_PRIORS)
             scenario_tokens = [
                 {
-                    "name": str(scene_id),
+                    "name": scenario_name,
                     "important_inputs": scenario_important_names,
                     "prior_inputs": [
-                        scenario_prior_names[scene_id],
+                        scenario_prior_names[scenario_name],
                         *scenario_priors,
                     ],
                 }
-                for scene_id in scene_ids
+                for scenario_name in SCENARIO_NAMES
             ]
             scenario_tokens.append(
                 {
@@ -2008,8 +2196,14 @@ def build_config(
     adapter_options = _adapter_options(
         raw_features,
         bag_fields,
-        None if auto_discover_scenes else scene_ids,
+        None if (auto_discover_scenes or use_coarse_scenes) else scene_ids,
         adapter_sequence_limits,
+        coarse_scene=use_coarse_scenes,
+        search_scene_ids=(
+            None
+            if not use_coarse_scenes
+            else tuple(sorted(production_search_scene_ids or ()))
+        ),
     )
     derived_time_columns = set(adapter_options["time_delta_outputs"].values())
     sequence_input_columns = list(
@@ -2284,7 +2478,13 @@ def build_config(
         "scene_id_to_index": (
             {"mode": "auto_discover_from_train"}
             if auto_discover_scenes
-            else {str(scene_id): index for index, scene_id in enumerate(scene_ids)}
+            else {
+                "mode": "coarse_search_recommendation",
+                "search_scene_id_count": len(production_search_scene_ids or ()),
+                "names": list(SCENARIO_NAMES),
+                "source": COARSE_SCENE_INDEX_COLUMN,
+                "prior_source": COARSE_SCENE_PRIOR_ID_COLUMN,
+            }
         ),
         "context_feature_count": CONTEXT_FEATURE_COUNT,
         "item_feature_count": EXPECTED_FEATURE_COUNT - CONTEXT_FEATURE_COUNT,
@@ -2416,6 +2616,14 @@ def main() -> int:
             "Default shared_dim targets 2×H100 + BF16 + Row-Wise."
         ),
     )
+    parser.add_argument(
+        "--auto-discover-scenes",
+        action="store_true",
+        help=(
+            "Discover fine-grained scene_id values at train start. Production "
+            "configs should omit this and use fixed search/recommendation routing."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     try:
@@ -2434,6 +2642,8 @@ def main() -> int:
         )
         if file_spec != memory_spec:
             raise ValueError("internal sample parser disagrees with profile scanner grouping")
+        if not args.auto_discover_scenes:
+            validate_production_search_scene_ids(SEARCH_SCENE_IDS)
         payload, summary = build_config(
             sample,
             report,
@@ -2446,7 +2656,7 @@ def main() -> int:
             embedding_budget_gib_per_gpu=args.embedding_budget_gib_per_gpu,
             event_token_budget_per_gpu=args.event_token_budget_per_gpu,
             batch_size=args.batch_size,
-            auto_discover_scenes=args.estimate_from_names,
+            auto_discover_scenes=args.auto_discover_scenes,
             gpu_count=args.gpu_count,
             embedding_weight_dtype=args.embedding_weight_dtype,
             sparse_optimizer=args.sparse_optimizer,

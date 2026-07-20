@@ -8,6 +8,8 @@ from unittest.mock import patch
 import pyarrow as pa
 
 from src.dataloader import (
+    COARSE_SCENE_INDEX_COLUMN,
+    COARSE_SCENE_PRIOR_ID_COLUMN,
     FeatureCardinalityAuditor,
     _adapter_table_to_python,
     _column_array,
@@ -19,11 +21,14 @@ from src.dataloader import (
     _time_deltas,
     _validate_complete_label_contract,
     adapt_mdl_rankmixer_parquet,
+    coarse_scene_ids,
 )
 from src.train import _table_sequence_lengths
 
 
 adapt = adapt_mdl_rankmixer_parquet
+
+SEARCH_IDS = frozenset({2, 21, 23, 1137})
 
 
 def _context(required: list[str]) -> SimpleNamespace:
@@ -560,6 +565,107 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unmapped value 17"):
             adapt(table, context=context)
 
+    def test_coarse_scene_dual_columns_and_rejects_invalid_raw_ids(self) -> None:
+        self.assertEqual(coarse_scene_ids(2, SEARCH_IDS), (0, 1))
+        self.assertEqual(coarse_scene_ids(21, SEARCH_IDS), (0, 1))
+        self.assertEqual(coarse_scene_ids(1137, SEARCH_IDS), (0, 1))
+        self.assertEqual(coarse_scene_ids(0, SEARCH_IDS), (1, 2))
+        self.assertEqual(coarse_scene_ids(7, SEARCH_IDS), (1, 2))
+        self.assertEqual(coarse_scene_ids(1138, SEARCH_IDS), (1, 2))
+        self.assertNotIn(0, {1, 2})
+        for invalid in (None, True, "abc"):
+            with self.assertRaisesRegex(ValueError, "scene_id must be an integer"):
+                coarse_scene_ids(invalid, SEARCH_IDS)
+
+        required = [
+            *REQUIRED,
+            COARSE_SCENE_INDEX_COLUMN,
+            COARSE_SCENE_PRIOR_ID_COLUMN,
+        ]
+        table = pa.table(
+            {
+                "ctx_scalar_hn": [[101], [102]],
+                "ctx_bag_hn": [[1], [2]],
+                "item_scalar_hn": [[[201]], [[202]]],
+                "sku_a_hn": [[[11]], [[12]]],
+                "sku_b_hn": [[[21]], [[22]]],
+                "impr_x_goods_id_hn": [[-1], [-2]],
+                "impr_x_time": [[4900], [4800]],
+                "scene_id": [21, 7],
+                "search_id": ["r0", "r1"],
+                "impr_time": [5000, 5001],
+                "label_a": [[0], [1]],
+                "label_b": [[1], [0]],
+                "label_c": [[0], [0]],
+            }
+        )
+        context = _context(required)
+        context.options["search_scene_ids"] = sorted(SEARCH_IDS)
+
+        actual = adapt(table, context=context).to_pydict()
+        self.assertEqual(actual["scene_id"], [21, 7])
+        self.assertEqual(actual[COARSE_SCENE_INDEX_COLUMN], [0, 1])
+        self.assertEqual(actual[COARSE_SCENE_PRIOR_ID_COLUMN], [1, 2])
+
+        bad = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[1]],
+                "item_scalar_hn": [[[201]]],
+                "sku_a_hn": [[[11]]],
+                "sku_b_hn": [[[21]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "scene_id": [None],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": [[0]],
+                "label_b": [[1]],
+                "label_c": [[0]],
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "scene_id must be an integer"):
+            adapt(bad, context=context)
+
+    def test_coarse_scene_mapping_runs_once_per_request_not_per_candidate(self) -> None:
+        required = [
+            *REQUIRED,
+            COARSE_SCENE_INDEX_COLUMN,
+            COARSE_SCENE_PRIOR_ID_COLUMN,
+        ]
+        table = pa.table(
+            {
+                "context_indices": [[0, 1]],
+                "target_indices": [[0, 1, 1]],
+                "ctx_scalar_hn": [[[101], [102]]],
+                "ctx_bag_hn": [[[1], [2]]],
+                "item_scalar_hn": [[[201], [202], [203]]],
+                "sku_a_hn": [[[11], [12], [13]]],
+                "sku_b_hn": [[[21], [22], [23]]],
+                "impr_x_goods_id_hn": [[-1, -2]],
+                "impr_x_time": [[4900, 4800]],
+                "impr_x_indices": [[[0, 1], [1]]],
+                "scene_id": [[21, 7]],
+                "search_id": [["r0", "r1"]],
+                "impr_time": [[5000, 5001]],
+                "label_a": [[0, 1, 0]],
+                "label_b": [[1, 0, 1]],
+                "label_c": [[0, 0, 1]],
+            }
+        )
+        context = _context(required)
+        context.options["search_scene_ids"] = sorted(SEARCH_IDS)
+
+        with patch(
+            "src.dataloader.coarse_scene_ids",
+            wraps=coarse_scene_ids,
+        ) as mapped:
+            actual = adapt(table, context=context).to_pydict()
+
+        self.assertEqual(actual[COARSE_SCENE_INDEX_COLUMN], [0, 1, 1])
+        self.assertEqual(actual[COARSE_SCENE_PRIOR_ID_COLUMN], [1, 2, 2])
+        self.assertEqual(mapped.call_count, 2)
+
     def test_rejects_partial_indices_and_misaligned_sku_fields(self) -> None:
         partial = pa.table(
             {
@@ -817,6 +923,293 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         bad_value = pa.table({"label_a": pa.array([0, 2], type=pa.int64())})
         with self.assertRaisesRegex(ValueError, "only 0/1"):
             _validate_complete_label_contract(split, bad_value, ["label_a"])
+
+    def test_request_shared_item_bags_expand_by_target_indices(self) -> None:
+        required = [
+            *REQUIRED,
+            "offline_outside_goods_id_list_hn_share",
+            "i2i_coclk_hn_share",
+        ]
+        table = pa.table(
+            {
+                "context_indices": [[11, 22]],
+                "target_indices": [[11, 22, 11]],
+                "ctx_scalar_hn": [[[101], [102]]],
+                "ctx_bag_hn": [[[1], [2]]],
+                "item_scalar_hn": [[[201], [202], [203]]],
+                "sku_a_hn": [[[11], [12], [13]]],
+                "sku_b_hn": [[[21], [22], [23]]],
+                "offline_outside_goods_id_list_hn_share": [[[1, 2], [3]]],
+                "i2i_coclk_hn_share": [[[10], [], [20, 21]]],
+                "impr_x_goods_id_hn": [[-1, -2]],
+                "impr_x_time": [[4900, 4800]],
+                "impr_x_indices": [[[11, 22], [22]]],
+                "scene_id": [[21, 7]],
+                "search_id": [["r0", "r1"]],
+                "impr_time": [[5000, 5001]],
+                "label_a": [[0, 1, 0]],
+                "label_b": [[1, 0, 1]],
+                "label_c": [[0, 0, 1]],
+            }
+        )
+        context = _context(required)
+        context.options["item_features"] = [
+            *context.options["item_features"],
+            "offline_outside_goods_id_list_hn_share",
+            "i2i_coclk_hn_share",
+        ]
+        context.options["multivalue_features"] = [
+            *context.options["multivalue_features"],
+            "offline_outside_goods_id_list_hn_share",
+            "i2i_coclk_hn_share",
+        ]
+        context.options["request_axis_item_features"] = [
+            "offline_outside_goods_id_list_hn_share",
+        ]
+
+        actual = adapt(table, context=context).to_pydict()
+        self.assertEqual(
+            actual["offline_outside_goods_id_list_hn_share"],
+            [[1, 2], [3], [1, 2]],
+        )
+        self.assertEqual(actual["i2i_coclk_hn_share"], [[10], [], [20, 21]])
+
+    def test_request_shared_item_bag_accepts_request_count_not_candidate_count(
+        self,
+    ) -> None:
+        required = [*REQUIRED, "offline_outside_goods_id_list_hn_share"]
+        # 2 requests, 3 candidates; request-shared bag outer length follows requests.
+        table = pa.table(
+            {
+                "context_indices": [[0, 1]],
+                "target_indices": [[0, 0, 1]],
+                "ctx_scalar_hn": [[[101], [102]]],
+                "ctx_bag_hn": [[[1], [2]]],
+                "item_scalar_hn": [[[201], [202], [203]]],
+                "sku_a_hn": [[[11], [12], [13]]],
+                "sku_b_hn": [[[21], [22], [23]]],
+                "offline_outside_goods_id_list_hn_share": [[[1], [2]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "impr_x_indices": [[[0, 1]]],
+                "scene_id": [[7, 8]],
+                "search_id": [["r0", "r1"]],
+                "impr_time": [[5000, 6000]],
+                "label_a": [[0, 1, 0]],
+                "label_b": [[1, 0, 1]],
+                "label_c": [[0, 0, 1]],
+            }
+        )
+        context = _context(required)
+        context.options["item_features"] = [
+            *context.options["item_features"],
+            "offline_outside_goods_id_list_hn_share",
+        ]
+        context.options["multivalue_features"] = [
+            *context.options["multivalue_features"],
+            "offline_outside_goods_id_list_hn_share",
+        ]
+        context.options["request_axis_item_features"] = [
+            "offline_outside_goods_id_list_hn_share",
+        ]
+        actual = adapt(table, context=context).to_pydict()
+        self.assertEqual(len(actual["offline_outside_goods_id_list_hn_share"]), 3)
+        self.assertEqual(
+            actual["offline_outside_goods_id_list_hn_share"],
+            [[1], [1], [2]],
+        )
+
+    def test_request_axis_and_candidate_axis_length_errors(self) -> None:
+        required = [
+            *REQUIRED,
+            "offline_outside_goods_id_list_hn_share",
+            "i2i_coclk_hn_share",
+        ]
+        base = {
+            "context_indices": [[0, 1]],
+            "target_indices": [[0, 1, 1]],
+            "ctx_scalar_hn": [[[101], [102]]],
+            "ctx_bag_hn": [[[1], [2]]],
+            "item_scalar_hn": [[[201], [202], [203]]],
+            "sku_a_hn": [[[11], [12], [13]]],
+            "sku_b_hn": [[[21], [22], [23]]],
+            "offline_outside_goods_id_list_hn_share": [[[1], [2]]],
+            "i2i_coclk_hn_share": [[[10], [11], [12]]],
+            "impr_x_goods_id_hn": [[-1]],
+            "impr_x_time": [[4900]],
+            "impr_x_indices": [[[0, 1]]],
+            "scene_id": [[7, 8]],
+            "search_id": [["r0", "r1"]],
+            "impr_time": [[5000, 6000]],
+            "label_a": [[0, 1, 0]],
+            "label_b": [[1, 0, 1]],
+            "label_c": [[0, 0, 1]],
+        }
+        context = _context(required)
+        context.options["item_features"] = [
+            *context.options["item_features"],
+            "offline_outside_goods_id_list_hn_share",
+            "i2i_coclk_hn_share",
+        ]
+        context.options["multivalue_features"] = [
+            *context.options["multivalue_features"],
+            "offline_outside_goods_id_list_hn_share",
+            "i2i_coclk_hn_share",
+        ]
+        context.options["request_axis_item_features"] = [
+            "offline_outside_goods_id_list_hn_share",
+        ]
+
+        bad_request = dict(base)
+        bad_request["offline_outside_goods_id_list_hn_share"] = [[[1]]]
+        with self.assertRaisesRegex(
+            ValueError,
+            r"request-axis feature 'offline_outside_goods_id_list_hn_share' "
+            r"length 1 != request count 2",
+        ):
+            adapt(pa.table(bad_request), context=context)
+
+        bad_candidate = dict(base)
+        bad_candidate["i2i_coclk_hn_share"] = [[[10], [11]]]
+        with self.assertRaisesRegex(
+            ValueError,
+            r"candidate-axis feature 'i2i_coclk_hn_share' "
+            r"length 2 != candidate count 3",
+        ):
+            adapt(pa.table(bad_candidate), context=context)
+
+    def test_request_axis_item_scalar_expands_empty_as_missing(self) -> None:
+        required = [*REQUIRED, "query_pay_cnt_15d_hn"]
+        table = pa.table(
+            {
+                "context_indices": [[10, 20]],
+                "target_indices": [[10, 10, 20]],
+                "ctx_scalar_hn": [[[101], [102]]],
+                "ctx_bag_hn": [[[1], [2]]],
+                "item_scalar_hn": [[[201], [202], [203]]],
+                "sku_a_hn": [[[11], [12], [13]]],
+                "sku_b_hn": [[[21], [22], [23]]],
+                "query_pay_cnt_15d_hn": [[[7], []]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "impr_x_indices": [[[10, 20]]],
+                "scene_id": [[7, 8]],
+                "search_id": [["r0", "r1"]],
+                "impr_time": [[5000, 6000]],
+                "label_a": [[0, 1, 0]],
+                "label_b": [[1, 0, 1]],
+                "label_c": [[0, 0, 1]],
+            }
+        )
+        context = _context(required)
+        context.options["item_features"] = [
+            *context.options["item_features"],
+            "query_pay_cnt_15d_hn",
+        ]
+        context.options["request_axis_item_features"] = ["query_pay_cnt_15d_hn"]
+        actual = adapt(table, context=context).to_pydict()
+        self.assertEqual(actual["query_pay_cnt_15d_hn"], [7, 7, None])
+
+    def test_request_axis_item_bag_expands_by_target_indices(self) -> None:
+        required = [*REQUIRED, "buy_long_spec_vids_hn"]
+        table = pa.table(
+            {
+                "context_indices": [[10, 20]],
+                "target_indices": [[10, 10, 20]],
+                "ctx_scalar_hn": [[[101], [102]]],
+                "ctx_bag_hn": [[[1], [2]]],
+                "item_scalar_hn": [[[201], [202], [203]]],
+                "sku_a_hn": [[[11], [12], [13]]],
+                "sku_b_hn": [[[21], [22], [23]]],
+                "buy_long_spec_vids_hn": [[[101, 102], [201]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "impr_x_indices": [[[10, 20]]],
+                "scene_id": [[7, 8]],
+                "search_id": [["r0", "r1"]],
+                "impr_time": [[5000, 6000]],
+                "label_a": [[0, 1, 0]],
+                "label_b": [[1, 0, 1]],
+                "label_c": [[0, 0, 1]],
+            }
+        )
+        context = _context(required)
+        context.options["item_features"] = [
+            *context.options["item_features"],
+            "buy_long_spec_vids_hn",
+        ]
+        context.options["multivalue_features"] = [
+            *context.options["multivalue_features"],
+            "buy_long_spec_vids_hn",
+        ]
+        context.options["request_axis_item_features"] = ["buy_long_spec_vids_hn"]
+        actual = adapt(table, context=context).to_pydict()
+        self.assertEqual(
+            actual["buy_long_spec_vids_hn"],
+            [[101, 102], [101, 102], [201]],
+        )
+
+    def test_candidate_axis_context_scalar_not_request_cached(self) -> None:
+        required = [*REQUIRED, "clk_cnt_1d_hn"]
+        table = pa.table(
+            {
+                "context_indices": [[10, 20]],
+                "target_indices": [[10, 10, 20]],
+                "ctx_scalar_hn": [[[101], [102]]],
+                "ctx_bag_hn": [[[1], [2]]],
+                "clk_cnt_1d_hn": [[[3], [], [8]]],
+                "item_scalar_hn": [[[201], [202], [203]]],
+                "sku_a_hn": [[[11], [12], [13]]],
+                "sku_b_hn": [[[21], [22], [23]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "impr_x_indices": [[[10, 20]]],
+                "scene_id": [[7, 8]],
+                "search_id": [["r0", "r1"]],
+                "impr_time": [[5000, 6000]],
+                "label_a": [[0, 1, 0]],
+                "label_b": [[1, 0, 1]],
+                "label_c": [[0, 0, 1]],
+            }
+        )
+        context = _context(required)
+        context.options["context_features"] = [
+            *context.options["context_features"],
+            "clk_cnt_1d_hn",
+        ]
+        context.options["candidate_axis_context_features"] = ["clk_cnt_1d_hn"]
+        actual = adapt(table, context=context).to_pydict()
+        # Per-candidate values; must not expand/copy request-axis style.
+        self.assertEqual(actual["clk_cnt_1d_hn"], [3, None, 8])
+        self.assertEqual(actual["ctx_scalar_hn"], [101, 101, 102])
+
+    def test_candidate_scalar_rejects_multi_value_slots(self) -> None:
+        required = [*REQUIRED, "multimodal_i2i_hit_clk_size_hn"]
+        table = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[1]],
+                "item_scalar_hn": [[[201]]],
+                "sku_a_hn": [[[11]]],
+                "sku_b_hn": [[[21]]],
+                "multimodal_i2i_hit_clk_size_hn": [[[2, 3]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "scene_id": [7],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": [[0]],
+                "label_b": [[1]],
+                "label_c": [[0]],
+            }
+        )
+        context = _context(required)
+        context.options["item_features"] = [
+            *context.options["item_features"],
+            "multimodal_i2i_hit_clk_size_hn",
+        ]
+        with self.assertRaisesRegex(ValueError, "inner length 2"):
+            adapt(table, context=context)
 
 
 if __name__ == "__main__":

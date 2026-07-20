@@ -8,7 +8,7 @@ files, streams Arrow batches, encodes configured features, and builds the
 """
 
 from collections import defaultdict
-from collections.abc import Iterable as RuntimeIterable, Sequence
+from collections.abc import Collection, Iterable as RuntimeIterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 import fnmatch
@@ -1539,6 +1539,198 @@ def _is_missing_label(value: Any, sentinels: Sequence[Any]) -> bool:
     return False
 
 
+# Coarse search/recommendation routing: index space is 0/1 for scenarios.source
+# (source_encoding=index). Prior embeddings use a separate identity space 1/2 so
+# padding_id=0 never collides with a real scenario.
+COARSE_SCENE_INDEX_COLUMN = "coarse_scene_index"
+COARSE_SCENE_PRIOR_ID_COLUMN = "coarse_scene_prior_id"
+SEARCH_SCENARIO_INDEX = 0
+RECOMMENDATION_SCENARIO_INDEX = 1
+SCENARIO_NAMES = ("search", "recommendation")
+COARSE_SCENE_PRIOR_NUM_BUCKETS = 3
+COARSE_SCENE_PRIOR_EMBEDDING_DIM = 16
+SEARCH_PRIOR_FEATURE = "scenario_search_prior_coarse_scene"
+RECOMMENDATION_PRIOR_FEATURE = "scenario_recommendation_prior_coarse_scene"
+INDEPENDENT_COARSE_SCENARIO_PRIORS = frozenset(
+    {
+        SEARCH_PRIOR_FEATURE,
+        RECOMMENDATION_PRIOR_FEATURE,
+    }
+)
+# Production search scene_ids. Unlisted integer scene_ids default to recommendation.
+SEARCH_SCENE_IDS: frozenset[int] = frozenset(
+    {
+        2,
+        21,
+        23,
+        27,
+        28,
+        31,
+        35,
+        38,
+        39,
+        40,
+        42,
+        45,
+        50,
+        62,
+        68,
+        70,
+        76,
+        77,
+        78,
+        81,
+        85,
+        90,
+        93,
+        94,
+        95,
+        98,
+        100,
+        110,
+        111,
+        130,
+        133,
+        135,
+        137,
+        141,
+        145,
+        146,
+        150,
+        152,
+        159,
+        160,
+        167,
+        168,
+        175,
+        186,
+        187,
+        191,
+        197,
+        198,
+        204,
+        211,
+        219,
+        231,
+        233,
+        240,
+        245,
+        246,
+        252,
+        255,
+        282,
+        283,
+        294,
+        298,
+        299,
+        301,
+        310,
+        317,
+        319,
+        325,
+        335,
+        338,
+        340,
+        341,
+        351,
+        356,
+        357,
+        366,
+        377,
+        383,
+        384,
+        385,
+        391,
+        392,
+        393,
+        394,
+        396,
+        398,
+        401,
+        403,
+        404,
+        415,
+        416,
+        417,
+        419,
+        420,
+        421,
+        423,
+        424,
+        428,
+        430,
+        435,
+        436,
+        437,
+        438,
+        446,
+        448,
+        452,
+        459,
+        464,
+        471,
+        475,
+        482,
+        485,
+        492,
+        504,
+        519,
+        1105,
+        1106,
+        1116,
+        1121,
+        1136,
+        1137,
+    }
+)
+EXPECTED_SEARCH_SCENE_ID_COUNT = 121
+
+
+def validate_production_search_scene_ids(
+    search_scene_ids: Collection[Any],
+    *,
+    expected_count: int = EXPECTED_SEARCH_SCENE_ID_COUNT,
+) -> frozenset[int]:
+    """Validate the production search scene id set."""
+
+    normalized: list[int] = []
+    for value in search_scene_ids:
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError(
+                f"SEARCH_SCENE_IDS values must be non-negative integers, got {value!r}"
+            )
+        scene_id = int(value)
+        if scene_id < 0:
+            raise ValueError(
+                f"SEARCH_SCENE_IDS values must be non-negative integers, got {value!r}"
+            )
+        normalized.append(scene_id)
+    values = frozenset(normalized)
+    if len(values) != expected_count:
+        raise ValueError(
+            "SEARCH_SCENE_IDS must contain exactly "
+            f"{expected_count} unique integers, got {len(values)}"
+        )
+    return values
+
+
+def coarse_scene_ids(
+    raw_scene_id: Any,
+    search_scene_ids: Collection[int],
+) -> tuple[int, int]:
+    """Map one raw scene_id to ``(coarse_scene_index, coarse_scene_prior_id)``."""
+
+    if isinstance(raw_scene_id, bool) or not isinstance(raw_scene_id, Integral):
+        raise ValueError(f"scene_id must be an integer, got {raw_scene_id!r}")
+    scene_id = int(raw_scene_id)
+    coarse_index = (
+        SEARCH_SCENARIO_INDEX
+        if scene_id in search_scene_ids
+        else RECOMMENDATION_SCENARIO_INDEX
+    )
+    return coarse_index, coarse_index + 1
+
+
 def _request_value_maps(
     options: Mapping[str, Any],
     request_columns: set[str],
@@ -1596,6 +1788,64 @@ def _map_request_value(
         return mapping[rendered]
     raise ValueError(
         f"request-level column {column!r} contains unmapped value {value!r}"
+    )
+
+
+@dataclass(frozen=True)
+class _CoarseScenePlan:
+    search_scene_ids: frozenset[int]
+    raw_scene_column: str
+    index_column: str
+    prior_id_column: str
+
+    @property
+    def derived_columns(self) -> frozenset[str]:
+        return frozenset({self.index_column, self.prior_id_column})
+
+
+def _coarse_scene_plan(
+    options: Mapping[str, Any],
+    request_columns: set[str],
+) -> _CoarseScenePlan | None:
+    raw_ids = options.get("search_scene_ids")
+    if raw_ids is None:
+        return None
+    if isinstance(raw_ids, (str, bytes)) or not isinstance(raw_ids, Sequence) or not raw_ids:
+        raise ValueError("adapter option 'search_scene_ids' must be a non-empty list")
+    search_scene_ids: set[int] = set()
+    for value in raw_ids:
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError(
+                f"adapter option 'search_scene_ids' values must be integers, got {value!r}"
+            )
+        search_scene_ids.add(int(value))
+    raw_scene_column = str(options.get("coarse_scene_raw_column", "scene_id"))
+    if raw_scene_column not in request_columns:
+        raise ValueError(
+            "coarse scene mapping requires request column "
+            f"{raw_scene_column!r} in adapter request_columns"
+        )
+    index_column = str(
+        options.get("coarse_scene_index_column", COARSE_SCENE_INDEX_COLUMN)
+    )
+    prior_id_column = str(
+        options.get("coarse_scene_prior_id_column", COARSE_SCENE_PRIOR_ID_COLUMN)
+    )
+    if not index_column or not prior_id_column:
+        raise ValueError("coarse scene derived column names must be non-empty")
+    if index_column == prior_id_column:
+        raise ValueError("coarse scene index and prior id columns must be distinct")
+    derived = {index_column, prior_id_column}
+    if derived & request_columns:
+        raise ValueError(
+            "coarse scene derived columns conflict with request_columns: "
+            + ", ".join(sorted(derived & request_columns))
+        )
+    return _CoarseScenePlan(
+        search_scene_ids=frozenset(search_scene_ids),
+        raw_scene_column=raw_scene_column,
+        index_column=index_column,
+        prior_id_column=prior_id_column,
     )
 
 
@@ -2475,9 +2725,17 @@ class _MdlRankMixerAdapterPlan:
     context_features: tuple[str, ...]
     item_features: tuple[str, ...]
     bag_features: frozenset[str]
+    request_axis_item_features: tuple[str, ...]
+    request_axis_context_features: tuple[str, ...]
+    candidate_axis_context_features: tuple[str, ...]
+    candidate_axis_item_features: tuple[str, ...]
+    candidate_axis_features: tuple[str, ...]
+    request_axis_set: frozenset[str]
+    candidate_axis_set: frozenset[str]
     ups_types: tuple[str, ...]
     request_columns: tuple[str, ...]
     request_maps: Mapping[str, Mapping[Any, int]]
+    coarse_scene: _CoarseScenePlan | None
     integer_request_columns: frozenset[str]
     labels: Mapping[str, str]
     label_masks: Mapping[str, str]
@@ -2517,9 +2775,21 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     context_features = _string_list(options, "context_features")
     item_features = _string_list(options, "item_features")
     bag_features = frozenset(_string_list(options, "multivalue_features"))
+    if "request_shared_features" in options:
+        raise ValueError(
+            "adapter option 'request_shared_features' was renamed; use "
+            "'request_axis_item_features' and 'candidate_axis_context_features'"
+        )
+    request_axis_item_override = frozenset(
+        _string_list(options, "request_axis_item_features")
+    )
+    candidate_axis_context_override = frozenset(
+        _string_list(options, "candidate_axis_context_features")
+    )
     ups_types = _string_list(options, "ups_types")
     request_columns = _string_list(options, "request_columns")
     request_maps = _request_value_maps(options, set(request_columns))
+    coarse_scene = _coarse_scene_plan(options, set(request_columns))
     integer_request_columns = frozenset(
         _string_list(options, "integer_request_columns")
     )
@@ -2574,6 +2844,62 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     item_set = frozenset(item_features)
     if context_set & item_set:
         raise ValueError("context_features and item_features must be disjoint")
+    unknown_request_axis_items = sorted(request_axis_item_override - item_set)
+    if unknown_request_axis_items:
+        raise ValueError(
+            "request_axis_item_features must be configured item features: "
+            + ", ".join(unknown_request_axis_items)
+        )
+    unknown_candidate_axis_context = sorted(
+        candidate_axis_context_override - context_set
+    )
+    if unknown_candidate_axis_context:
+        raise ValueError(
+            "candidate_axis_context_features must be configured context features: "
+            + ", ".join(unknown_candidate_axis_context)
+        )
+    request_axis_item_features = tuple(
+        column for column in item_features if column in request_axis_item_override
+    )
+    candidate_axis_item_features = tuple(
+        column for column in item_features if column not in request_axis_item_override
+    )
+    candidate_axis_context_features = tuple(
+        column
+        for column in context_features
+        if column in candidate_axis_context_override
+    )
+    request_axis_context_features = tuple(
+        column
+        for column in context_features
+        if column not in candidate_axis_context_override
+    )
+    request_axis_set = frozenset(request_axis_context_features) | frozenset(
+        request_axis_item_features
+    )
+    candidate_axis_set = frozenset(candidate_axis_item_features) | frozenset(
+        candidate_axis_context_features
+    )
+    if request_axis_set & candidate_axis_set:
+        raise ValueError(
+            "request/candidate physical axes must be disjoint after overrides: "
+            + ", ".join(sorted(request_axis_set & candidate_axis_set))
+        )
+    if request_axis_set | candidate_axis_set != context_set | item_set:
+        missing = sorted((context_set | item_set) - (request_axis_set | candidate_axis_set))
+        extra = sorted((request_axis_set | candidate_axis_set) - (context_set | item_set))
+        details = []
+        if missing:
+            details.append("missing: " + ", ".join(missing))
+        if extra:
+            details.append("extra: " + ", ".join(extra))
+        raise ValueError(
+            "physical axis partitions must cover all context/item features; "
+            + "; ".join(details)
+        )
+    candidate_axis_features = (
+        candidate_axis_item_features + candidate_axis_context_features
+    )
     known_alias_targets = (
         context_set
         | item_set
@@ -2640,6 +2966,37 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         for column in columns
     )
     time_delta_columns = frozenset(time_delta_outputs.values())
+    derived_request_columns = (
+        frozenset() if coarse_scene is None else coarse_scene.derived_columns
+    )
+    if derived_request_columns & (
+        context_set
+        | item_set
+        | set(request_columns)
+        | label_columns
+        | label_mask_columns
+        | sequence_columns
+        | time_delta_columns
+        | generated_candidate_columns
+    ):
+        raise ValueError(
+            "coarse scene derived columns conflict with other adapter outputs: "
+            + ", ".join(
+                sorted(
+                    derived_request_columns
+                    & (
+                        context_set
+                        | item_set
+                        | set(request_columns)
+                        | label_columns
+                        | label_mask_columns
+                        | sequence_columns
+                        | time_delta_columns
+                        | generated_candidate_columns
+                    )
+                )
+            )
+        )
     generated_overlap = generated_candidate_columns & (
         context_set
         | item_set
@@ -2648,6 +3005,7 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         | label_mask_columns
         | sequence_columns
         | time_delta_columns
+        | derived_request_columns
     )
     if generated_overlap:
         raise ValueError(
@@ -2690,7 +3048,11 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         and column not in sequence_columns
         and column not in time_delta_columns
         and column not in item_set
-        and (column in context_set or column in request_columns)
+        and (
+            column in context_set
+            or column in request_columns
+            or column in derived_request_columns
+        )
     )
     classified_output_columns = {
         *label_output_columns,
@@ -2707,7 +3069,9 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
             + ", ".join(unknown_required)
         )
     compact_list_columns = frozenset(
-        (bag_features & context_set) | sequence_columns | time_delta_columns
+        (bag_features & request_axis_set & context_set)
+        | sequence_columns
+        | time_delta_columns
     )
     raw_sequence_columns = frozenset(
         {
@@ -2718,6 +3082,7 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     integer_output_columns = frozenset(
         {
             *integer_request_columns,
+            *derived_request_columns,
             *label_mask_columns,
             *(() if candidate_position_column is None else (candidate_position_column,)),
         }
@@ -2726,9 +3091,17 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         context_features=context_features,
         item_features=item_features,
         bag_features=bag_features,
+        request_axis_item_features=request_axis_item_features,
+        request_axis_context_features=request_axis_context_features,
+        candidate_axis_context_features=candidate_axis_context_features,
+        candidate_axis_item_features=candidate_axis_item_features,
+        candidate_axis_features=candidate_axis_features,
+        request_axis_set=request_axis_set,
+        candidate_axis_set=candidate_axis_set,
         ups_types=ups_types,
         request_columns=request_columns,
         request_maps=request_maps,
+        coarse_scene=coarse_scene,
         integer_request_columns=integer_request_columns,
         labels=labels,
         label_masks=label_masks,
@@ -2786,9 +3159,16 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
     context_features = plan.context_features
     item_features = plan.item_features
     bag_features = plan.bag_features
+    request_axis_item_features = plan.request_axis_item_features
+    request_axis_context_features = plan.request_axis_context_features
+    candidate_axis_context_features = plan.candidate_axis_context_features
+    candidate_axis_item_features = plan.candidate_axis_item_features
+    candidate_axis_features = plan.candidate_axis_features
+    candidate_axis_set = plan.candidate_axis_set
     ups_types = plan.ups_types
     request_columns = plan.request_columns
     request_maps = plan.request_maps
+    coarse_scene = plan.coarse_scene
     integer_request_columns = plan.integer_request_columns
     labels = plan.labels
     label_masks = plan.label_masks
@@ -2908,10 +3288,22 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             "agg/req detection requires both context_indices and target_indices or neither"
         )
     is_agg = has_context_indices
+    request_axis_item_set = frozenset(request_axis_item_features)
     nested_req_context = {
         alias_to_canonical.get(field.name, field.name)
         for field in table.schema
-        if alias_to_canonical.get(field.name, field.name) in context_set
+        if alias_to_canonical.get(field.name, field.name)
+        in frozenset(request_axis_context_features)
+        and (pa.types.is_list(field.type) or pa.types.is_large_list(field.type))
+        and (
+            pa.types.is_list(field.type.value_type)
+            or pa.types.is_large_list(field.type.value_type)
+        )
+    }
+    nested_req_request_axis_items = {
+        alias_to_canonical.get(field.name, field.name)
+        for field in table.schema
+        if alias_to_canonical.get(field.name, field.name) in request_axis_item_set
         and (pa.types.is_list(field.type) or pa.types.is_large_list(field.type))
         and (
             pa.types.is_list(field.type.value_type)
@@ -2952,7 +3344,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             positions = {0: 0}
             candidate_count = _candidate_count_req(
                 row,
-                item_features,
+                candidate_axis_features,
                 tuple(labels.values()),
                 raw_row,
                 validate_contract=validate_row_contract,
@@ -2960,22 +3352,98 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             candidate_requests = [0] * candidate_count
 
         candidate_count = len(candidate_requests)
+        request_count = len(positions)
+        request_shared_arrays: dict[str, list[Any]] = {}
         item_arrays: dict[str, list[Any]] = {}
-        for column in item_features:
-            if validate_row_contract and column not in row:
-                raise ValueError(f"missing item column {column!r}")
-            outer = _as_list(
-                row[column],
-                column=column,
-                row_index=raw_row,
-                validate_contract=validate_row_contract,
-            )
-            if validate_structure and len(outer) != candidate_count:
-                raise ValueError(
-                    f"item column {column!r} length {len(outer)} != candidate count "
-                    f"{candidate_count} at raw row {raw_row}"
+        if is_agg:
+            for column in request_axis_item_features:
+                if validate_row_contract and column not in row:
+                    raise ValueError(f"missing item column {column!r}")
+                outer = _as_list(
+                    row[column],
+                    column=column,
+                    row_index=raw_row,
+                    validate_contract=validate_row_contract,
                 )
-            item_arrays[column] = outer
+                if validate_structure and len(outer) != request_count:
+                    raise ValueError(
+                        f"request-axis feature {column!r} length {len(outer)} != "
+                        f"request count {request_count} at raw row {raw_row}"
+                    )
+                request_shared_arrays[column] = outer
+            for column in candidate_axis_item_features:
+                if validate_row_contract and column not in row:
+                    raise ValueError(f"missing item column {column!r}")
+                outer = _as_list(
+                    row[column],
+                    column=column,
+                    row_index=raw_row,
+                    validate_contract=validate_row_contract,
+                )
+                if validate_structure and len(outer) != candidate_count:
+                    raise ValueError(
+                        f"candidate-axis feature {column!r} length {len(outer)} != "
+                        f"candidate count {candidate_count} at raw row {raw_row}"
+                    )
+                item_arrays[column] = outer
+            for column in candidate_axis_context_features:
+                if validate_row_contract and column not in row:
+                    raise ValueError(f"missing context column {column!r}")
+                outer = _as_list(
+                    row[column],
+                    column=column,
+                    row_index=raw_row,
+                    validate_contract=validate_row_contract,
+                )
+                if validate_structure and len(outer) != candidate_count:
+                    raise ValueError(
+                        f"candidate-axis feature {column!r} length {len(outer)} != "
+                        f"candidate count {candidate_count} at raw row {raw_row}"
+                    )
+                item_arrays[column] = outer
+        else:
+            for column in request_axis_item_features:
+                if validate_row_contract and column not in row:
+                    raise ValueError(f"missing item column {column!r}")
+                value = _req_context_value(
+                    row[column],
+                    has_request_axis=column in nested_req_request_axis_items,
+                    multivalue=column in bag_features,
+                    column=column,
+                    raw_row=raw_row,
+                    validate_contract=validate_row_contract,
+                )
+                request_shared_arrays[column] = [value]
+            for column in candidate_axis_item_features:
+                if validate_row_contract and column not in row:
+                    raise ValueError(f"missing item column {column!r}")
+                outer = _as_list(
+                    row[column],
+                    column=column,
+                    row_index=raw_row,
+                    validate_contract=validate_row_contract,
+                )
+                if validate_structure and len(outer) != candidate_count:
+                    raise ValueError(
+                        f"candidate-axis feature {column!r} length {len(outer)} != "
+                        f"candidate count {candidate_count} at raw row {raw_row}"
+                    )
+                item_arrays[column] = outer
+            for column in candidate_axis_context_features:
+                if validate_row_contract and column not in row:
+                    raise ValueError(f"missing context column {column!r}")
+                outer = _as_list(
+                    row[column],
+                    column=column,
+                    row_index=raw_row,
+                    validate_contract=validate_row_contract,
+                )
+                if validate_structure and len(outer) != candidate_count:
+                    raise ValueError(
+                        f"candidate-axis feature {column!r} length {len(outer)} != "
+                        f"candidate count {candidate_count} at raw row {raw_row}"
+                    )
+                item_arrays[column] = outer
 
         label_arrays: dict[str, list[Any]] = {}
         for task, column in labels.items():
@@ -3044,8 +3512,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             ]
 
         context_arrays: dict[str, Any] = {}
-        request_count = len(positions)
-        for column in context_features:
+        for column in request_axis_context_features:
             if validate_row_contract and column not in row:
                 raise ValueError(f"missing context column {column!r}")
             if is_agg:
@@ -3057,8 +3524,8 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                 )
                 if validate_structure and len(outer) != request_count:
                     raise ValueError(
-                        f"context column {column!r} length {len(outer)} != "
-                        f"context_indices length {request_count} at raw row {raw_row}"
+                        f"request-axis feature {column!r} length {len(outer)} != "
+                        f"request count {request_count} at raw row {raw_row}"
                     )
                 context_arrays[column] = outer
             else:
@@ -3104,7 +3571,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
         for request_index in unique_candidate_requests:
             request_position = positions[request_index]
             cached: dict[str, Any] = {}
-            for column in context_features:
+            for column in request_axis_context_features:
                 if is_agg:
                     value = context_arrays[column][request_position]
                 else:
@@ -3147,6 +3614,16 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                     agg=is_agg,
                     validate_contract=validate_row_contract,
                 )
+                if (
+                    coarse_scene is not None
+                    and column == coarse_scene.raw_scene_column
+                ):
+                    coarse_index, coarse_prior_id = coarse_scene_ids(
+                        value,
+                        coarse_scene.search_scene_ids,
+                    )
+                    cached[coarse_scene.index_column] = coarse_index
+                    cached[coarse_scene.prior_id_column] = coarse_prior_id
                 if column in request_maps:
                     value = _map_request_value(
                         value,
@@ -3214,8 +3691,56 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             sequence_cache[request_index] = cached_sequences
 
         normalized_items: dict[str, list[Any]] = {}
-        for column in item_features:
+        for column in request_axis_item_features:
             normalized: list[Any] = []
+            for candidate_index, request_index in enumerate(candidate_requests):
+                request_position = positions[request_index]
+                value = request_shared_arrays[column][request_position]
+                normalized.append(
+                    _bag_value(
+                        value,
+                        column=column,
+                        raw_row=raw_row,
+                        logical_row=candidate_index,
+                        validate_contract=validate_row_contract,
+                        auditor=cardinality_auditor,
+                    )
+                    if column in bag_features
+                    else _scalarize(
+                        value,
+                        column=column,
+                        raw_row=raw_row,
+                        logical_row=candidate_index,
+                        validate_contract=validate_row_contract,
+                        auditor=cardinality_auditor,
+                    )
+                )
+            normalized_items[column] = normalized
+        for column in candidate_axis_item_features:
+            normalized = []
+            for candidate_index, value in enumerate(item_arrays[column]):
+                normalized.append(
+                    _bag_value(
+                        value,
+                        column=column,
+                        raw_row=raw_row,
+                        logical_row=candidate_index,
+                        validate_contract=validate_row_contract,
+                        auditor=cardinality_auditor,
+                    )
+                    if column in bag_features
+                    else _scalarize(
+                        value,
+                        column=column,
+                        raw_row=raw_row,
+                        logical_row=candidate_index,
+                        validate_contract=validate_row_contract,
+                        auditor=cardinality_auditor,
+                    )
+                )
+            normalized_items[column] = normalized
+        for column in candidate_axis_context_features:
+            normalized = []
             for candidate_index, value in enumerate(item_arrays[column]):
                 normalized.append(
                     _bag_value(
@@ -3293,10 +3818,13 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                 normalized_label_masks[mask_column] = task_masks
 
         for column in request_output_columns:
-            output[column].extend(
-                request_cache[request_index][column]
-                for request_index in candidate_requests
-            )
+            if column in candidate_axis_set:
+                output[column].extend(normalized_items[column])
+            else:
+                output[column].extend(
+                    request_cache[request_index][column]
+                    for request_index in candidate_requests
+                )
         for column in item_output_columns:
             output[column].extend(normalized_items[column])
         for column in candidate_metadata_output_columns:
@@ -5240,12 +5768,18 @@ def table_to_feature_batch(
     context_sources = {
         str(source) for source in adapter_options.get("context_features", ())
     }
+    candidate_axis_context_sources = {
+        str(source)
+        for source in adapter_options.get("candidate_axis_context_features", ())
+    }
     validate_prehashed_nonzero = active_split.reader.validate_prehashed_nonzero
     validate_sequence_alignment = not active_split.reader.trusted_input
     features: dict[str, Any] = {}
     for feature in config.features:
         request_level = (
-            request_row_indices is not None and feature.source in context_sources
+            request_row_indices is not None
+            and feature.source in context_sources
+            and feature.source not in candidate_axis_context_sources
         )
         source_table = request_table if request_level else table
         if feature.kind == "categorical":

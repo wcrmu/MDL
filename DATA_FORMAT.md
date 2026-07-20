@@ -324,8 +324,8 @@ The only raw UPS values with continuous time meaning are the nine
 
 ### Bag and aligned-SKU handling
 
-The 50 fields marked B in the inventory are unordered categorical bags and
-use masked mean pooling. The other 119 non-sequence fields are logical scalar
+The 60 fields marked B/RB/CB in the inventory are unordered categorical bags and
+use masked mean pooling. The other 108 non-sequence fields are logical scalar
 categories.
 
 The following nine candidate bags are position-aligned SKU attributes:
@@ -388,7 +388,13 @@ Legend:
 
 - S: logical scalar categorical field;
 - B: unordered categorical bag;
-- O: optional physical input in the current projection.
+- RB: request-axis item bag (agg outer length follows ``context_indices``;
+  adapter expands to candidates via ``target_indices``);
+- RS: request-axis item scalar (same expand; ``[]`` → missing);
+- CB: candidate-axis item bag;
+- CS: candidate-axis item scalar;
+- CCS: candidate-axis context scalar (logical context token, physical candidate);
+- O: optional field that may be absent in some partitions.
 
 Every field below becomes an encoded categorical model input, including the
 six fields without an _hn substring.
@@ -427,11 +433,11 @@ S  scene_impr_cnt_15d_hit_hn
 ~~~text
 S  uid_or_bg_hn
 B  u_fst_ordr_cnt_mix_d_hn
-B  clk_cnt_1d_hn
-B  clk_3d_cnt_hn
-B  clk_1d_cat_cnt_hn
-B  cart_cnt_1d_hn
-B  cart_cnt_3d_hn
+CCS clk_cnt_1d_hn
+CCS clk_3d_cnt_hn
+CCS clk_1d_cat_cnt_hn
+CCS cart_cnt_1d_hn
+CCS cart_cnt_3d_hn
 B  clk_7d_page_sns_hn
 B  clk_7d_page_elsns_hn
 B  cart_7d_cat1_ids_hn
@@ -450,7 +456,7 @@ B  view_7d_page_sns_hn
 B  view_7d_page_elsns_hn
 ~~~
 
-The 47 Context plus User fields contain 14 logical scalars and 33 bags.
+The 47 Context plus User fields contain 19 logical scalars and 28 bags.
 
 ### 8.3 Item fields: 104 candidate-level fields
 
@@ -527,33 +533,33 @@ S    scene_cart_cnt_15d_hn
 S    nfk_sales_14d_hn
 S    nfk_price_14d_hn
 S    nfk_gmv_14d_hn
-S    i2i2cat2_swing_hn
-S    i2i_coclk_hn_share
-S    i2i_list_amazoni2ifullgmv_hn_share
-S    i2i_list_multimodal_hn_share
-S    i2i_list_swingv3gmv_hn_share
-S    i2i_hit_site_q2i_idx_hn
-S    only_semi_swingi2i_cut60_hn_share
-S    semi_swingi2i_cut30_hn_share
-S    offline_outside_goods_id_list_hn_share
-S    site_q2i_good_list_hn_share
-S    multimodal_i2i_hit_cart_size_hn
-S    multimodal_i2i_hit_clk_size_hn
-S    main_goods_ids_hn_share
+CB   i2i2cat2_swing_hn
+CB   i2i_coclk_hn_share
+CB   i2i_list_amazoni2ifullgmv_hn_share
+CB   i2i_list_multimodal_hn_share
+CB   i2i_list_swingv3gmv_hn_share
+CB   i2i_hit_site_q2i_idx_hn
+CB   only_semi_swingi2i_cut60_hn_share
+CB   semi_swingi2i_cut30_hn_share
+RB   offline_outside_goods_id_list_hn_share
+RB   site_q2i_good_list_hn_share
+CS   multimodal_i2i_hit_cart_size_hn
+CS   multimodal_i2i_hit_clk_size_hn
+RB   main_goods_ids_hn_share
 S    adj_cartcvr_hn
 S    adj_ctr_hn
 S    adj_cvr_hn
-S    buy_long_spec_vids_hn
-S    cart_long_spec_vids_hn
+RB   buy_long_spec_vids_hn
+RB   cart_long_spec_vids_hn
 S    create_time_hn
 S    mall_id_hn
 S    sellr_type_hn
-S    opt_id_hn
+RS   opt_id_hn
 S    site_x_asian_code_hn
 S/O  f_goods_view_times_tg_l1_hn
 S    target_gs_last_cart_tg_hn
-S    impr_3h_tg_hn
-S    impr_all_tg_hn
+RB   impr_3h_tg_hn
+RB   impr_all_tg_hn
 S    impr_clk_6h_cnt_hn
 S    clk_long_goods_abs_timegap_1d_hn
 S    impr_long_goods_abs_timegap_1d_hn
@@ -571,7 +577,7 @@ S  q2c_cart_15d_hit_val_hn
 S  tit_in_top_query_cnt_hn
 S  goods_query_emb32v3_cos_hn
 S  query_cat_hn
-S  query_pay_cnt_15d_hn
+RS query_pay_cnt_15d_hn
 S  clk_hit_i2i_idx_hn
 S  cart_hit_i2i_idx_hn
 S  cart_long_hit_samestyle_i2i_idx_hn
@@ -589,8 +595,8 @@ S  campaign_id_hn
 S  idx_goods_creative_id_hn
 ~~~
 
-The 122 Item plus Cross plus Creative fields contain 105 logical scalars and
-17 bags.
+The 122 Item plus Cross plus Creative fields contain 101 logical scalars and
+21 bags.
 
 ## 9. Complete raw UPS field inventory
 
@@ -917,11 +923,11 @@ snapshot. The req/test snapshot recorded 50 as `list<int64>` and 119 as
 |---|---|---|---|---|---|---|
 | `uid_or_bg_hn` | request scalar | `list<int64>` | `list<list<int64>>` | `list<int64>` | `int64` | — |
 | `u_fst_ordr_cnt_mix_d_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | — |
-| `clk_cnt_1d_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | — |
-| `clk_3d_cnt_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | — |
-| `clk_1d_cat_cnt_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | — |
-| `cart_cnt_1d_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | — |
-| `cart_cnt_3d_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | — |
+| `clk_cnt_1d_hn` | candidate scalar (context) | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CCS. Outer follows candidates. |
+| `clk_3d_cnt_hn` | candidate scalar (context) | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CCS. Outer follows candidates. |
+| `clk_1d_cat_cnt_hn` | candidate scalar (context) | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CCS. Outer follows candidates. |
+| `cart_cnt_1d_hn` | candidate scalar (context) | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CCS. Outer follows candidates. |
+| `cart_cnt_3d_hn` | candidate scalar (context) | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CCS. Outer follows candidates. |
 | `clk_7d_page_sns_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | — |
 | `clk_7d_page_elsns_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | — |
 | `cart_7d_cat1_ids_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | — |
@@ -1015,33 +1021,33 @@ snapshot. The req/test snapshot recorded 50 as `list<int64>` and 119 as
 | `nfk_sales_14d_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `nfk_price_14d_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `nfk_gmv_14d_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
-| `i2i2cat2_swing_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
-| `i2i_coclk_hn_share` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
-| `i2i_list_amazoni2ifullgmv_hn_share` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
-| `i2i_list_multimodal_hn_share` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
-| `i2i_list_swingv3gmv_hn_share` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
-| `i2i_hit_site_q2i_idx_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | Historical sample contained several null values. |
-| `only_semi_swingi2i_cut60_hn_share` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
-| `semi_swingi2i_cut30_hn_share` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
-| `offline_outside_goods_id_list_hn_share` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | Both agg/train and req/test examples were inspected. |
-| `site_q2i_good_list_hn_share` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<int64>` | `int64` | The historical table records req/test as list<int64>; verify against a refreshed live schema if the producer changes. |
-| `multimodal_i2i_hit_cart_size_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
-| `multimodal_i2i_hit_clk_size_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
-| `main_goods_ids_hn_share` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<int64>` | `int64` | Historical req/test non-null: 9,824 / 29,906. |
+| `i2i2cat2_swing_hn` | candidate bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | Mean-pooled CB. |
+| `i2i_coclk_hn_share` | candidate bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | Mean-pooled CB. |
+| `i2i_list_amazoni2ifullgmv_hn_share` | candidate bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | Mean-pooled CB. |
+| `i2i_list_multimodal_hn_share` | candidate bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | Mean-pooled CB. |
+| `i2i_list_swingv3gmv_hn_share` | candidate bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | Mean-pooled CB. |
+| `i2i_hit_site_q2i_idx_hn` | candidate bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | Mean-pooled CB. Historical sample contained several null values. |
+| `only_semi_swingi2i_cut60_hn_share` | candidate bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | Mean-pooled CB. |
+| `semi_swingi2i_cut30_hn_share` | candidate bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | Mean-pooled CB. |
+| `offline_outside_goods_id_list_hn_share` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | RB: agg outer axis is request; adapter expands by ``target_indices``. |
+| `site_q2i_good_list_hn_share` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | RB. Req/test may omit the request axis; verify against live schema. |
+| `multimodal_i2i_hit_cart_size_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CS; keep scalar (no pooling). |
+| `multimodal_i2i_hit_clk_size_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CS; keep scalar (no pooling). |
+| `main_goods_ids_hn_share` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | RB. Historical req/test non-null: 9,824 / 29,906. |
 | `adj_cartcvr_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `adj_ctr_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `adj_cvr_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
-| `buy_long_spec_vids_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<int64>` | `int64` | — |
-| `cart_long_spec_vids_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<int64>` | `int64` | — |
+| `buy_long_spec_vids_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | RB. Outer follows requests; expand by target_indices. |
+| `cart_long_spec_vids_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | RB. Outer follows requests; expand by target_indices. |
 | `create_time_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `mall_id_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `sellr_type_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
-| `opt_id_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<int64>` | `int64` | — |
+| `opt_id_hn` | request scalar | `list<int64>` | `list<list<int64>>` | `list<int64>` | `int64` | RS. Outer follows requests; `[]` → missing. |
 | `site_x_asian_code_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `f_goods_view_times_tg_l1_hn` | candidate scalar; optional scan column | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | Historical sample contained null values; the old document spelled the field f_goods_view_times_tg_11_hn. |
 | `target_gs_last_cart_tg_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | Historical examples were all null. |
-| `impr_3h_tg_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<int64>` | `int64` | — |
-| `impr_all_tg_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<int64>` | `int64` | — |
+| `impr_3h_tg_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | RB. Outer follows requests; expand by target_indices. |
+| `impr_all_tg_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | RB. Outer follows requests; expand by target_indices. |
 | `impr_clk_6h_cnt_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `clk_long_goods_abs_timegap_1d_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | Historical sample contained null values. |
 | `impr_long_goods_abs_timegap_1d_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
@@ -1059,7 +1065,7 @@ snapshot. The req/test snapshot recorded 50 as `list<int64>` and 119 as
 | `tit_in_top_query_cnt_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `goods_query_emb32v3_cos_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `query_cat_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | Historical req/test non-null: 7,032 / 29,906. |
-| `query_pay_cnt_15d_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<int64>` | `int64` | Historical req/test non-null: 6,342 / 29,906. |
+| `query_pay_cnt_15d_hn` | request scalar | `list<int64>` | `list<list<int64>>` | `list<int64>` | `int64` | RS. Outer follows requests; `[]` → missing. Historical req/test non-null: 6,342 / 29,906. |
 | `clk_hit_i2i_idx_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `cart_hit_i2i_idx_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `cart_long_hit_samestyle_i2i_idx_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | Historical examples were all null. |

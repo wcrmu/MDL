@@ -2,6 +2,8 @@
 # SDPA eager + Row-Wise Adagrad + Phase 2 shared_dim embedding profile.
 # Physical embedding tables: 202; planned static embedding+state: 27.643 GiB/GPU.
 # Fresh checkpoint path required (no remap from pre-Phase-2 weights).
+# Scenarios: fixed search/recommendation via coarse_scene_index (121 search scene_ids; others -> recommendation).
+# Axis overrides: 9 request-axis item + 5 candidate-axis context; bags use mean pooling.
 runtime:
   device: cuda
   precision: bf16
@@ -382,11 +384,6 @@ data:
         - scene_impr_cnt_15d_hit_hn
         - uid_or_bg_hn
         - u_fst_ordr_cnt_mix_d_hn
-        - clk_cnt_1d_hn
-        - clk_3d_cnt_hn
-        - clk_1d_cat_cnt_hn
-        - cart_cnt_1d_hn
-        - cart_cnt_3d_hn
         - clk_7d_page_sns_hn
         - clk_7d_page_elsns_hn
         - cart_7d_cat1_ids_hn
@@ -539,11 +536,6 @@ data:
         - recall_merge_cate_ids_hn
         - scene_impr_cnt_15d_hn
         - u_fst_ordr_cnt_mix_d_hn
-        - clk_cnt_1d_hn
-        - clk_3d_cnt_hn
-        - clk_1d_cat_cnt_hn
-        - cart_cnt_1d_hn
-        - cart_cnt_3d_hn
         - clk_7d_page_sns_hn
         - clk_7d_page_elsns_hn
         - cart_7d_cat1_ids_hn
@@ -577,6 +569,21 @@ data:
         - sku_ordr_cnt_1m_hn
         - sku_price_dis_hn
         - sku_sales_dis_hn
+        - i2i2cat2_swing_hn
+        - i2i_coclk_hn_share
+        - i2i_hit_site_q2i_idx_hn
+        - i2i_list_amazoni2ifullgmv_hn_share
+        - i2i_list_multimodal_hn_share
+        - i2i_list_swingv3gmv_hn_share
+        - main_goods_ids_hn_share
+        - offline_outside_goods_id_list_hn_share
+        - only_semi_swingi2i_cut60_hn_share
+        - semi_swingi2i_cut30_hn_share
+        - site_q2i_good_list_hn_share
+        - buy_long_spec_vids_hn
+        - cart_long_spec_vids_hn
+        - impr_3h_tg_hn
+        - impr_all_tg_hn
         aligned_multivalue_groups:
         - - sku_id_hn
           - sku_price_v2_hn
@@ -634,6 +641,146 @@ data:
           flatten_query_hash: flatten_query_hash_x_time_delta_log1p_seconds
         time_delta_transform: log1p_seconds
         compact_request_lists: true
+        search_scene_ids:
+        - 2
+        - 21
+        - 23
+        - 27
+        - 28
+        - 31
+        - 35
+        - 38
+        - 39
+        - 40
+        - 42
+        - 45
+        - 50
+        - 62
+        - 68
+        - 70
+        - 76
+        - 77
+        - 78
+        - 81
+        - 85
+        - 90
+        - 93
+        - 94
+        - 95
+        - 98
+        - 100
+        - 110
+        - 111
+        - 130
+        - 133
+        - 135
+        - 137
+        - 141
+        - 145
+        - 146
+        - 150
+        - 152
+        - 159
+        - 160
+        - 167
+        - 168
+        - 175
+        - 186
+        - 187
+        - 191
+        - 197
+        - 198
+        - 204
+        - 211
+        - 219
+        - 231
+        - 233
+        - 240
+        - 245
+        - 246
+        - 252
+        - 255
+        - 282
+        - 283
+        - 294
+        - 298
+        - 299
+        - 301
+        - 310
+        - 317
+        - 319
+        - 325
+        - 335
+        - 338
+        - 340
+        - 341
+        - 351
+        - 356
+        - 357
+        - 366
+        - 377
+        - 383
+        - 384
+        - 385
+        - 391
+        - 392
+        - 393
+        - 394
+        - 396
+        - 398
+        - 401
+        - 403
+        - 404
+        - 415
+        - 416
+        - 417
+        - 419
+        - 420
+        - 421
+        - 423
+        - 424
+        - 428
+        - 430
+        - 435
+        - 436
+        - 437
+        - 438
+        - 446
+        - 448
+        - 452
+        - 459
+        - 464
+        - 471
+        - 475
+        - 482
+        - 485
+        - 492
+        - 504
+        - 519
+        - 1105
+        - 1106
+        - 1116
+        - 1121
+        - 1136
+        - 1137
+        coarse_scene_index_column: coarse_scene_index
+        coarse_scene_prior_id_column: coarse_scene_prior_id
+        request_axis_item_features:
+        - buy_long_spec_vids_hn
+        - cart_long_spec_vids_hn
+        - impr_3h_tg_hn
+        - impr_all_tg_hn
+        - main_goods_ids_hn_share
+        - offline_outside_goods_id_list_hn_share
+        - opt_id_hn
+        - query_pay_cnt_15d_hn
+        - site_q2i_good_list_hn_share
+        candidate_axis_context_features:
+        - cart_cnt_1d_hn
+        - cart_cnt_3d_hn
+        - clk_1d_cat_cnt_hn
+        - clk_3d_cnt_hn
+        - clk_cnt_1d_hn
   schema_policy:
     require_same_schema: true
     allow_missing_nullable_columns: false
@@ -1001,11 +1148,6 @@ data:
         - scene_impr_cnt_15d_hit_hn
         - uid_or_bg_hn
         - u_fst_ordr_cnt_mix_d_hn
-        - clk_cnt_1d_hn
-        - clk_3d_cnt_hn
-        - clk_1d_cat_cnt_hn
-        - cart_cnt_1d_hn
-        - cart_cnt_3d_hn
         - clk_7d_page_sns_hn
         - clk_7d_page_elsns_hn
         - cart_7d_cat1_ids_hn
@@ -1158,11 +1300,6 @@ data:
         - recall_merge_cate_ids_hn
         - scene_impr_cnt_15d_hn
         - u_fst_ordr_cnt_mix_d_hn
-        - clk_cnt_1d_hn
-        - clk_3d_cnt_hn
-        - clk_1d_cat_cnt_hn
-        - cart_cnt_1d_hn
-        - cart_cnt_3d_hn
         - clk_7d_page_sns_hn
         - clk_7d_page_elsns_hn
         - cart_7d_cat1_ids_hn
@@ -1196,6 +1333,21 @@ data:
         - sku_ordr_cnt_1m_hn
         - sku_price_dis_hn
         - sku_sales_dis_hn
+        - i2i2cat2_swing_hn
+        - i2i_coclk_hn_share
+        - i2i_hit_site_q2i_idx_hn
+        - i2i_list_amazoni2ifullgmv_hn_share
+        - i2i_list_multimodal_hn_share
+        - i2i_list_swingv3gmv_hn_share
+        - main_goods_ids_hn_share
+        - offline_outside_goods_id_list_hn_share
+        - only_semi_swingi2i_cut60_hn_share
+        - semi_swingi2i_cut30_hn_share
+        - site_q2i_good_list_hn_share
+        - buy_long_spec_vids_hn
+        - cart_long_spec_vids_hn
+        - impr_3h_tg_hn
+        - impr_all_tg_hn
         aligned_multivalue_groups:
         - - sku_id_hn
           - sku_price_v2_hn
@@ -1253,6 +1405,146 @@ data:
           flatten_query_hash: flatten_query_hash_x_time_delta_log1p_seconds
         time_delta_transform: log1p_seconds
         compact_request_lists: true
+        search_scene_ids:
+        - 2
+        - 21
+        - 23
+        - 27
+        - 28
+        - 31
+        - 35
+        - 38
+        - 39
+        - 40
+        - 42
+        - 45
+        - 50
+        - 62
+        - 68
+        - 70
+        - 76
+        - 77
+        - 78
+        - 81
+        - 85
+        - 90
+        - 93
+        - 94
+        - 95
+        - 98
+        - 100
+        - 110
+        - 111
+        - 130
+        - 133
+        - 135
+        - 137
+        - 141
+        - 145
+        - 146
+        - 150
+        - 152
+        - 159
+        - 160
+        - 167
+        - 168
+        - 175
+        - 186
+        - 187
+        - 191
+        - 197
+        - 198
+        - 204
+        - 211
+        - 219
+        - 231
+        - 233
+        - 240
+        - 245
+        - 246
+        - 252
+        - 255
+        - 282
+        - 283
+        - 294
+        - 298
+        - 299
+        - 301
+        - 310
+        - 317
+        - 319
+        - 325
+        - 335
+        - 338
+        - 340
+        - 341
+        - 351
+        - 356
+        - 357
+        - 366
+        - 377
+        - 383
+        - 384
+        - 385
+        - 391
+        - 392
+        - 393
+        - 394
+        - 396
+        - 398
+        - 401
+        - 403
+        - 404
+        - 415
+        - 416
+        - 417
+        - 419
+        - 420
+        - 421
+        - 423
+        - 424
+        - 428
+        - 430
+        - 435
+        - 436
+        - 437
+        - 438
+        - 446
+        - 448
+        - 452
+        - 459
+        - 464
+        - 471
+        - 475
+        - 482
+        - 485
+        - 492
+        - 504
+        - 519
+        - 1105
+        - 1106
+        - 1116
+        - 1121
+        - 1136
+        - 1137
+        coarse_scene_index_column: coarse_scene_index
+        coarse_scene_prior_id_column: coarse_scene_prior_id
+        request_axis_item_features:
+        - buy_long_spec_vids_hn
+        - cart_long_spec_vids_hn
+        - impr_3h_tg_hn
+        - impr_all_tg_hn
+        - main_goods_ids_hn_share
+        - offline_outside_goods_id_list_hn_share
+        - opt_id_hn
+        - query_pay_cnt_15d_hn
+        - site_q2i_good_list_hn_share
+        candidate_axis_context_features:
+        - cart_cnt_1d_hn
+        - cart_cnt_3d_hn
+        - clk_1d_cat_cnt_hn
+        - clk_3d_cnt_hn
+        - clk_cnt_1d_hn
     prediction_keys:
       search_id: search_id
       candidate_position: candidate_position
@@ -1551,10 +1843,6 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
-  pooling: mean
-  pooling_null_policy: exclude
-  max_length: 32
-  truncation: head
 - name: clk_3d_cnt_hn
   kind: categorical
   source: clk_3d_cnt_hn
@@ -1564,10 +1852,6 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
-  pooling: mean
-  pooling_null_policy: exclude
-  max_length: 32
-  truncation: head
 - name: clk_1d_cat_cnt_hn
   kind: categorical
   source: clk_1d_cat_cnt_hn
@@ -1577,10 +1861,6 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
-  pooling: mean
-  pooling_null_policy: exclude
-  max_length: 32
-  truncation: head
 - name: cart_cnt_1d_hn
   kind: categorical
   source: cart_cnt_1d_hn
@@ -1590,10 +1870,6 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
-  pooling: mean
-  pooling_null_policy: exclude
-  max_length: 32
-  truncation: head
 - name: cart_cnt_3d_hn
   kind: categorical
   source: cart_cnt_3d_hn
@@ -1603,10 +1879,6 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
-  pooling: mean
-  pooling_null_policy: exclude
-  max_length: 32
-  truncation: head
 - name: clk_7d_page_sns_hn
   kind: categorical
   source: clk_7d_page_sns_hn
@@ -2540,6 +2812,10 @@ features:
     type: pre_hashed
     num_buckets: 262144
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
 - name: i2i_coclk_hn_share
   kind: categorical
   source: i2i_coclk_hn_share
@@ -2549,6 +2825,10 @@ features:
     type: pre_hashed
     num_buckets: 262144
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
 - name: i2i_list_amazoni2ifullgmv_hn_share
   kind: categorical
   source: i2i_list_amazoni2ifullgmv_hn_share
@@ -2558,6 +2838,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
 - name: i2i_list_multimodal_hn_share
   kind: categorical
   source: i2i_list_multimodal_hn_share
@@ -2567,6 +2851,10 @@ features:
     type: pre_hashed
     num_buckets: 262144
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
 - name: i2i_list_swingv3gmv_hn_share
   kind: categorical
   source: i2i_list_swingv3gmv_hn_share
@@ -2576,6 +2864,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
 - name: i2i_hit_site_q2i_idx_hn
   kind: categorical
   source: i2i_hit_site_q2i_idx_hn
@@ -2585,6 +2877,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
 - name: only_semi_swingi2i_cut60_hn_share
   kind: categorical
   source: only_semi_swingi2i_cut60_hn_share
@@ -2594,6 +2890,10 @@ features:
     type: pre_hashed
     num_buckets: 262144
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
 - name: semi_swingi2i_cut30_hn_share
   kind: categorical
   source: semi_swingi2i_cut30_hn_share
@@ -2603,6 +2903,10 @@ features:
     type: pre_hashed
     num_buckets: 262144
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
 - name: offline_outside_goods_id_list_hn_share
   kind: categorical
   source: offline_outside_goods_id_list_hn_share
@@ -2612,6 +2916,10 @@ features:
     type: pre_hashed
     num_buckets: 16777216
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 256
+  truncation: head
 - name: site_q2i_good_list_hn_share
   kind: categorical
   source: site_q2i_good_list_hn_share
@@ -2621,6 +2929,10 @@ features:
     type: pre_hashed
     num_buckets: 262144
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 64
+  truncation: head
 - name: multimodal_i2i_hit_cart_size_hn
   kind: categorical
   source: multimodal_i2i_hit_cart_size_hn
@@ -2648,6 +2960,10 @@ features:
     type: pre_hashed
     num_buckets: 16777216
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
 - name: adj_cartcvr_hn
   kind: categorical
   source: adj_cartcvr_hn
@@ -2684,6 +3000,10 @@ features:
     type: pre_hashed
     num_buckets: 8388608
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
 - name: cart_long_spec_vids_hn
   kind: categorical
   source: cart_long_spec_vids_hn
@@ -2693,6 +3013,10 @@ features:
     type: pre_hashed
     num_buckets: 8388608
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
 - name: create_time_hn
   kind: categorical
   source: create_time_hn
@@ -2765,6 +3089,10 @@ features:
     type: pre_hashed
     num_buckets: 262144
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
 - name: impr_all_tg_hn
   kind: categorical
   source: impr_all_tg_hn
@@ -2774,6 +3102,10 @@ features:
     type: pre_hashed
     num_buckets: 262144
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 32
+  truncation: head
 - name: impr_clk_6h_cnt_hn
   kind: categorical
   source: impr_clk_6h_cnt_hn
@@ -3026,17 +3358,26 @@ features:
     type: pre_hashed
     num_buckets: 8192
     padding_id: 0
-- name: scenario_prior_scene_id_hn
+- name: scenario_search_prior_coarse_scene
   kind: categorical
-  source: scene_id_hn
+  source: coarse_scene_prior_id
   embedding_scope: scenario
   embedding_dim: 16
   encoding:
-    type: pre_hashed
-    num_buckets: 1024
+    type: identity
+    num_buckets: 3
     padding_id: 0
-    share_embedding: true
-    share_with: scene_id_hn
+    out_of_range: error
+- name: scenario_recommendation_prior_coarse_scene
+  kind: categorical
+  source: coarse_scene_prior_id
+  embedding_scope: scenario
+  embedding_dim: 16
+  encoding:
+    type: identity
+    num_buckets: 3
+    padding_id: 0
+    out_of_range: error
 - name: task_important_currency_hn
   kind: categorical
   source: currency_hn
@@ -4602,12 +4943,11 @@ sequences:
       share_with: cart_long.sku_ids_hn
 scenarios:
   names:
-  - __auto__
-  source: scene_id
-  source_encoding: raw
-  auto_discover: true
-  max_discovered: 256
-  discovery_cache_path: artifacts/scenarios/cvr_allscene.json
+  - search
+  - recommendation
+  source: coarse_scene_index
+  source_encoding: index
+  auto_discover: false
 tokenization:
   feature_tokenizer: rankmixer
   num_feature_tokens: 32
@@ -4807,20 +5147,37 @@ tokenization:
     prior_inputs:
     - task_cateid_filter_prior
   scenario_tokens:
-  - name: __auto__
-    important_inputs: &id002
+  - name: search
+    important_inputs:
     - scenario_important_currency_hn
     - scenario_important_hash_language_site_hn
     - scenario_important_language_hn
     - scenario_important_page_elsn_hn
     - scenario_important_page_sn_hn
     prior_inputs:
-    - scenario_prior_scene_id_hn
+    - scenario_search_prior_coarse_scene
+    - impr
+    - clk_long
+    - view_long
+  - name: recommendation
+    important_inputs:
+    - scenario_important_currency_hn
+    - scenario_important_hash_language_site_hn
+    - scenario_important_language_hn
+    - scenario_important_page_elsn_hn
+    - scenario_important_page_sn_hn
+    prior_inputs:
+    - scenario_recommendation_prior_coarse_scene
     - impr
     - clk_long
     - view_long
   - name: global
-    important_inputs: *id002
+    important_inputs:
+    - scenario_important_currency_hn
+    - scenario_important_hash_language_site_hn
+    - scenario_important_language_hn
+    - scenario_important_page_elsn_hn
+    - scenario_important_page_sn_hn
     prior_inputs:
     - impr
     - clk_long
