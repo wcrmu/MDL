@@ -85,9 +85,10 @@ class BenchmarkScenarioResolutionTest(unittest.TestCase):
             device=torch.device("cpu"),
         )
 
-    def test_compute_uses_synthetic_scenarios_without_data_scan(self) -> None:
+    def test_compute_keeps_fixed_coarse_scenarios_without_data_scan(self) -> None:
         self.assertEqual(self.config.data.train.inputs, ())
-        self.assertTrue(self.config.scenarios.auto_discover)
+        self.assertFalse(self.config.scenarios.auto_discover)
+        self.assertEqual(self.config.scenarios.names, ("search", "recommendation"))
         options = BenchmarkOptions(
             mode="compute",
             synthetic_scenario_count=4,
@@ -104,14 +105,14 @@ class BenchmarkScenarioResolutionTest(unittest.TestCase):
                 options,
             )
         real_discovery.assert_not_called()
-        self.assertEqual(resolved.scenarios.names, ("0", "1", "2", "3"))
+        self.assertEqual(resolved.scenarios.names, ("search", "recommendation"))
         self.assertFalse(resolved.scenarios.auto_discover)
         self.assertEqual(
             [token.name for token in resolved.tokenization.scenario_tokens],
-            ["0", "1", "2", "3", "global"],
+            ["search", "recommendation", "global"],
         )
 
-    def test_embedding_uses_synthetic_scenarios_without_data_scan(self) -> None:
+    def test_embedding_keeps_fixed_coarse_scenarios_without_data_scan(self) -> None:
         options = BenchmarkOptions(
             mode="embedding",
             synthetic_scenario_count=3,
@@ -128,7 +129,42 @@ class BenchmarkScenarioResolutionTest(unittest.TestCase):
                 options,
             )
         real_discovery.assert_not_called()
-        self.assertEqual(resolved.scenarios.names, ("0", "1", "2"))
+        self.assertEqual(resolved.scenarios.names, ("search", "recommendation"))
+
+    def test_compute_uses_synthetic_scenarios_when_auto_discover_enabled(self) -> None:
+        from dataclasses import replace
+
+        # Non-MDL configs resolve synthetic scenes without the MDL prior
+        # template feature that production mdl_* YAMLs no longer ship.
+        base = load_app_config(self.root / "configs" / "rankmixer.yaml")
+        auto_config = replace(
+            base,
+            scenarios=replace(
+                base.scenarios,
+                auto_discover=True,
+                names=("__auto__",),
+                source="scene_id",
+                source_encoding="raw",
+            ),
+        )
+        options = BenchmarkOptions(
+            mode="compute",
+            synthetic_scenario_count=4,
+            warmup_steps=0,
+            measured_steps=1,
+            profile_steps=0,
+        )
+        with patch(
+            "src.benchmark._resolve_distributed_auto_scenarios"
+        ) as real_discovery:
+            resolved = _resolve_benchmark_scenarios(
+                auto_config,
+                self._fake_context(),
+                options,
+            )
+        real_discovery.assert_not_called()
+        self.assertEqual(resolved.scenarios.names, ("0", "1", "2", "3"))
+        self.assertFalse(resolved.scenarios.auto_discover)
 
     def test_end_to_end_still_uses_real_discovery(self) -> None:
         options = BenchmarkOptions(

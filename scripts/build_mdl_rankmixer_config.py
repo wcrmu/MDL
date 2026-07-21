@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Build a production model YAML from sample fields and optional stats.
 
-The reference ``sample.yaml`` is authoritative for ordered fields, the 47/122
-context/item split, UPS schemas, and labels.  It is deliberately *not*
-authoritative for hash buckets, embedding widths, sequence lengths, scenes, or
-training capacity.  Those values come from ``profile_prehashed_parquet.py``.
+The reference ``tests/fixtures/mdl_sample.yaml`` is authoritative for ordered
+fields, the 51/118 context/item split (request axis / candidate axis), UPS
+schemas, and labels.  It is deliberately *not* authoritative for hash buckets,
+embedding widths, sequence lengths, scenes, or training capacity.  Those values
+come from ``profile_prehashed_parquet.py``.
 
 This command is offline: it reads YAML/JSON files only and never opens a local
 or HDFS Parquet path.  A real profile report remains the production-quality
@@ -32,6 +33,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from scripts.profile_prehashed_parquet import (  # noqa: E402
+    ALIGNED_SKU_FIELDS,
     DEFAULT_SKU_FIELDS,
     ProfileSpec,
     load_profile_spec,
@@ -58,8 +60,9 @@ from src.embeddings import (  # noqa: E402
 )
 
 
-CONTEXT_FEATURE_COUNT = 47
+CONTEXT_FEATURE_COUNT = 51
 EXPECTED_FEATURE_COUNT = 169
+ITEM_FEATURE_COUNT = EXPECTED_FEATURE_COUNT - CONTEXT_FEATURE_COUNT
 EXPECTED_UPS_TYPES = (
     "impr",
     "clk_long",
@@ -77,6 +80,8 @@ SUPPORTED_MODELS = (
     "onetrans",
     "mdl_onetrans",
 )
+# Adapter contract: context_features == request axis, item_features == candidate
+# axis. Slot type (scalar/bag) is independent.
 CONTEXT_SCALAR_FIELDS = {
     "currency_hn",
     "hash_language_site_hn",
@@ -92,7 +97,28 @@ CONTEXT_SCALAR_FIELDS = {
     "scene_clk_cnt_15d_hit_hn",
     "scene_impr_cnt_15d_hit_hn",
     "uid_or_bg_hn",
+    # Request-axis scalars (outer length follows requests; not multivalue).
+    "query_pay_cnt_15d_hn",
+    "opt_id_hn",
 }
+REQUEST_CONTEXT_BAG_FIELDS = frozenset(
+    {
+        "offline_outside_goods_id_list_hn_share",
+        "site_q2i_good_list_hn_share",
+        "main_goods_ids_hn_share",
+        "buy_long_spec_vids_hn",
+        "cart_long_spec_vids_hn",
+        "impr_3h_tg_hn",
+        "impr_all_tg_hn",
+    }
+)
+REQUEST_CONTEXT_SCALAR_FIELDS = frozenset(
+    {
+        "query_pay_cnt_15d_hn",
+        "opt_id_hn",
+    }
+)
+REQUEST_CONTEXT_FIELDS = REQUEST_CONTEXT_BAG_FIELDS | REQUEST_CONTEXT_SCALAR_FIELDS
 ITEM_BAG_FIELDS = {
     "sku_id_hn",
     "sku_price_v2_hn",
@@ -112,40 +138,6 @@ ITEM_BAG_FIELDS = {
     "g_sku_spec_hash_hn",
     "rev_ratings_cnt_crs_pos_hn",
 }
-# Three independent attributes: model group (context/item), physical axis
-# (request/candidate), and slot type (scalar/bag). Logical grouping never
-# implies physical axis.
-REQUEST_AXIS_ITEM_BAG_FIELDS = frozenset(
-    {
-        "offline_outside_goods_id_list_hn_share",
-        "site_q2i_good_list_hn_share",
-        "main_goods_ids_hn_share",
-        "buy_long_spec_vids_hn",
-        "cart_long_spec_vids_hn",
-        "impr_3h_tg_hn",
-        "impr_all_tg_hn",
-    }
-)
-REQUEST_AXIS_ITEM_SCALAR_FIELDS = frozenset(
-    {
-        "query_pay_cnt_15d_hn",
-        "opt_id_hn",
-    }
-)
-REQUEST_AXIS_ITEM_FIELDS = (
-    REQUEST_AXIS_ITEM_BAG_FIELDS | REQUEST_AXIS_ITEM_SCALAR_FIELDS
-)
-CANDIDATE_AXIS_CONTEXT_FIELDS = frozenset(
-    {
-        "clk_cnt_1d_hn",
-        "clk_3d_cnt_hn",
-        "clk_1d_cat_cnt_hn",
-        "cart_cnt_1d_hn",
-        "cart_cnt_3d_hn",
-    }
-)
-CANDIDATE_AXIS_CONTEXT_SCALAR_FIELDS = CANDIDATE_AXIS_CONTEXT_FIELDS
-CONTEXT_SCALAR_FIELDS |= CANDIDATE_AXIS_CONTEXT_SCALAR_FIELDS
 CANDIDATE_ITEM_BAG_FIELDS = frozenset(
     {
         "i2i_coclk_hn_share",
@@ -156,16 +148,23 @@ CANDIDATE_ITEM_BAG_FIELDS = frozenset(
         "i2i_list_multimodal_hn_share",
         "i2i_hit_site_q2i_idx_hn",
         "only_semi_swingi2i_cut60_hn_share",
+        # Candidate-outer list of i2i hit indices (mean-pooled bag).
+        "cart_long_hit_samestyle_i2i_idx_hn",
     }
 )
 CANDIDATE_ITEM_SCALAR_FIELDS = frozenset(
     {
         "multimodal_i2i_hit_clk_size_hn",
         "multimodal_i2i_hit_cart_size_hn",
+        # Candidate-axis scalars previously misgrouped as context.
+        "clk_cnt_1d_hn",
+        "clk_3d_cnt_hn",
+        "clk_1d_cat_cnt_hn",
+        "cart_cnt_1d_hn",
+        "cart_cnt_3d_hn",
     }
 )
-RELATED_ITEM_BAG_FIELDS = REQUEST_AXIS_ITEM_BAG_FIELDS | CANDIDATE_ITEM_BAG_FIELDS
-ITEM_BAG_FIELDS |= RELATED_ITEM_BAG_FIELDS
+ITEM_BAG_FIELDS |= CANDIDATE_ITEM_BAG_FIELDS
 RELATED_ITEM_BAG_MAX_LENGTHS = {
     "offline_outside_goods_id_list_hn_share": 256,
     "site_q2i_good_list_hn_share": 64,
@@ -182,6 +181,7 @@ RELATED_ITEM_BAG_MAX_LENGTHS = {
     "i2i_list_multimodal_hn_share": 32,
     "i2i_hit_site_q2i_idx_hn": 32,
     "only_semi_swingi2i_cut60_hn_share": 32,
+    "cart_long_hit_samestyle_i2i_idx_hn": 32,
 }
 CORE_ITEM_FIELDS = ("goods_id_hn", "cat1_id_hn", "price_hn")
 SCENARIO_IMPORTANT_FIELDS = (
@@ -531,6 +531,8 @@ def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tup
     for key in (
         "context_outer_mismatches",
         "item_outer_mismatches",
+        "request_outer_mismatches",
+        "candidate_outer_mismatches",
         "label_length_mismatches",
         "sequence_length_mismatches",
         "invalid_sequence_membership",
@@ -587,15 +589,29 @@ def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tup
             errors.append(
                 f"fields.{source} contains non-null zero values; 0 is reserved for padding"
             )
-        if field.get("rows_with_empty_list", 0):
+        # Outer empty lists mean missing request/candidate slots and remain illegal.
+        # Inner empty lists are legal (scalar [] → missing, bag [] → empty bag).
+        empty_by_depth = field.get("empty_lists_by_depth") or {}
+        outer_empty = 0
+        if isinstance(empty_by_depth, Mapping):
+            outer_empty = int(empty_by_depth.get("0", empty_by_depth.get(0, 0)) or 0)
+        if outer_empty:
             errors.append(
-                f"fields.{source} contains empty arrays, contrary to the production contract"
+                f"fields.{source} contains empty outer arrays, contrary to the "
+                "production contract"
             )
     for source in spec.time_sources:
         field = _require_mapping(field_reports.get(source), f"fields.{source}")
         if field.get("invalid_leaf_count", 0):
             errors.append(f"fields.{source}.invalid_leaf_count must be zero")
-        if field.get("rows_with_empty_list", 0):
+        empty_by_depth = field.get("empty_lists_by_depth") or {}
+        outer_empty = 0
+        if isinstance(empty_by_depth, Mapping):
+            outer_empty = int(empty_by_depth.get("0", empty_by_depth.get(0, 0)) or 0)
+        if outer_empty or (
+            not isinstance(empty_by_depth, Mapping)
+            and field.get("rows_with_empty_list", 0)
+        ):
             errors.append(
                 f"fields.{source} contains empty arrays, contrary to the production contract"
             )
@@ -634,12 +650,12 @@ def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tup
     missing_context_scalars = CONTEXT_SCALAR_FIELDS - context_sources
     if missing_context_scalars:
         errors.append(
-            "the first 47 fields are missing expected scalar context fields: "
+            "the first 51 fields are missing expected scalar context fields: "
             + ", ".join(sorted(missing_context_scalars))
         )
     if not ITEM_BAG_FIELDS <= item_sources:
         errors.append(
-            "the final 122 fields are missing expected item bags: "
+            "the final 118 fields are missing expected item bags: "
             + ", ".join(sorted(ITEM_BAG_FIELDS - item_sources))
         )
     declared_bags = (context_sources - CONTEXT_SCALAR_FIELDS) | ITEM_BAG_FIELDS
@@ -863,12 +879,40 @@ def _main_encoding(
 
 def _feature_bag_fields(sample_features: Sequence[Mapping[str, Any]]) -> set[str]:
     context_sources = {str(item["source"]) for item in sample_features[:CONTEXT_FEATURE_COUNT]}
-    context_bags = context_sources - CONTEXT_SCALAR_FIELDS
     item_sources = {str(item["source"]) for item in sample_features[CONTEXT_FEATURE_COUNT:]}
+    missing_request_context = REQUEST_CONTEXT_FIELDS - context_sources
+    if missing_request_context:
+        raise ValueError(
+            "sample fixture context slice is missing request-axis fields: "
+            + ", ".join(sorted(missing_request_context))
+        )
+    misplaced_request = sorted(REQUEST_CONTEXT_FIELDS & item_sources)
+    if misplaced_request:
+        raise ValueError(
+            "request-axis fields must be in the context slice, not item: "
+            + ", ".join(misplaced_request)
+        )
+    candidate_scalars = CANDIDATE_ITEM_SCALAR_FIELDS - {
+        "multimodal_i2i_hit_clk_size_hn",
+        "multimodal_i2i_hit_cart_size_hn",
+    }
+    missing_candidate = candidate_scalars - item_sources
+    if missing_candidate:
+        raise ValueError(
+            "sample fixture item slice is missing candidate-axis scalars: "
+            + ", ".join(sorted(missing_candidate))
+        )
+    misplaced_candidate = sorted(candidate_scalars & context_sources)
+    if misplaced_candidate:
+        raise ValueError(
+            "candidate-axis scalars must be in the item slice, not context: "
+            + ", ".join(misplaced_candidate)
+        )
+    context_bags = context_sources - CONTEXT_SCALAR_FIELDS
     missing_item_bags = ITEM_BAG_FIELDS - item_sources
     if missing_item_bags:
         raise ValueError(
-            "sample.yaml is missing expected item bag fields: "
+            "sample fixture is missing expected item bag fields: "
             + ", ".join(sorted(missing_item_bags))
         )
     return context_bags | ITEM_BAG_FIELDS
@@ -890,7 +934,7 @@ def build_name_estimate_report(sample: Mapping[str, Any]) -> dict[str, Any]:
 
     raw_features = sample.get("features")
     if not isinstance(raw_features, list) or len(raw_features) != EXPECTED_FEATURE_COUNT:
-        raise ValueError(f"sample.yaml must contain exactly {EXPECTED_FEATURE_COUNT} features")
+        raise ValueError(f"sample fixture must contain exactly {EXPECTED_FEATURE_COUNT} features")
     spec = profile_spec_from_mapping(
         sample,
         context_feature_count=CONTEXT_FEATURE_COUNT,
@@ -1258,9 +1302,7 @@ def _adapter_options(
             for item in sample_features
             if str(item["source"]) in bag_fields
         ],
-        "request_axis_item_features": sorted(REQUEST_AXIS_ITEM_FIELDS),
-        "candidate_axis_context_features": sorted(CANDIDATE_AXIS_CONTEXT_FIELDS),
-        "aligned_multivalue_groups": [list(DEFAULT_SKU_FIELDS)],
+        "aligned_multivalue_groups": [list(ALIGNED_SKU_FIELDS)],
         "ups_types": list(EXPECTED_UPS_TYPES),
         "request_columns": ["scene_id", "search_id", "impr_time"],
         "integer_request_columns": ["scene_id", "impr_time"],
@@ -1280,6 +1322,9 @@ def _adapter_options(
         options["search_scene_ids"] = [int(scene_id) for scene_id in search_scene_ids]
         options["coarse_scene_index_column"] = COARSE_SCENE_INDEX_COLUMN
         options["coarse_scene_prior_id_column"] = COARSE_SCENE_PRIOR_ID_COLUMN
+        # Production contract: unlisted non-negative scene_ids map to recommendation.
+        # Set to "error" only when operating with a closed search allowlist.
+        options["unlisted_scene_policy"] = "recommendation"
     elif scene_ids is not None:
         options["request_value_maps"] = {
             "scene_id": {scene_id: index for index, scene_id in enumerate(scene_ids)}
@@ -1976,19 +2021,19 @@ def build_config(
     raw_features = sample.get("features")
     raw_sequences = sample.get("sequences")
     if not isinstance(raw_features, list) or len(raw_features) != EXPECTED_FEATURE_COUNT:
-        raise ValueError(f"sample.yaml must contain exactly {EXPECTED_FEATURE_COUNT} features")
+        raise ValueError(f"sample fixture must contain exactly {EXPECTED_FEATURE_COUNT} features")
     if not isinstance(raw_sequences, list):
-        raise ValueError("sample.yaml sequences must be a list")
+        raise ValueError("sample fixture sequences must be a list")
     sequence_names = tuple(str(sequence.get("name")) for sequence in raw_sequences)
     if sequence_names != EXPECTED_UPS_TYPES:
         raise ValueError(
-            "sample.yaml UPS order must be " + ", ".join(EXPECTED_UPS_TYPES)
+            "sample fixture UPS order must be " + ", ".join(EXPECTED_UPS_TYPES)
         )
     sample_labels = (
         sample.get("data", {}).get("train", {}).get("agg_layout", {}).get("labels", {})
     )
     if sample_labels != EXPECTED_LABELS:
-        raise ValueError(f"sample.yaml labels must equal {EXPECTED_LABELS}")
+        raise ValueError(f"sample fixture labels must equal {EXPECTED_LABELS}")
 
     spec = profile_spec_from_mapping(
         sample,
@@ -2527,9 +2572,9 @@ def render_config(payload: Mapping[str, Any], summary: Mapping[str, Any]) -> str
         else "# Buckets/dimensions/lengths come from the supplied Parquet profile JSON."
     )
     comments = [
-        "# Generated by scripts/build_mdl_rankmixer_config.py; do not copy bucket sizes from sample.yaml.",
+        "# Generated by scripts/build_mdl_rankmixer_config.py; do not copy bucket sizes from the sample fixture.",
         f"# Production model surface: {model_name}.",
-        "# Fields and ordering come from sample.yaml.",
+        "# Fields and ordering come from tests/fixtures/mdl_sample.yaml.",
         sizing_comment,
         f"# Profile rows scanned: {summary['profile']['rows_scanned']}; "
         f"files scanned: {summary['profile']['files_scanned']}.",
@@ -2567,7 +2612,12 @@ def render_config(payload: Mapping[str, Any], summary: Mapping[str, Any]) -> str
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sample", type=Path, default=Path("sample.yaml"))
+    parser.add_argument(
+        "--sample",
+        type=Path,
+        default=Path("tests/fixtures/mdl_sample.yaml"),
+        help="Ordered feature/sequence contract fixture (default: tests/fixtures/mdl_sample.yaml).",
+    )
     parser.add_argument(
         "--model",
         choices=SUPPORTED_MODELS,

@@ -87,7 +87,7 @@ compared as if they were all physical schema widths.
 | 630 | All physical columns in the observed upstream Parquet schema |
 | 427 | Physical schema names containing _hn in the upstream probe |
 | 565 | Earlier reported YAML _hn entries/usages, including sequence and repeated use sites; not a unique physical-column count |
-| 169 | Logical non-sequence fields used by the model: 47 request plus 122 candidate |
+| 169 | Logical non-sequence fields used by the model: 51 request plus 118 candidate |
 | 107 | Raw attributes across the nine UPS sequences: 9 timestamps plus 98 encoded categorical attributes |
 | 281 | Mandatory raw columns projected by the current adapter |
 | 12 | Optional train columns: agg indices plus one optional item feature |
@@ -192,7 +192,8 @@ or an event membership list uses the inner list as real data. Only known
 singleton axes may be collapsed. In particular:
 
 - non-sequence bag fields must preserve all tokens;
-- the nine aligned SKU arrays must preserve token positions;
+- the eight aligned SKU arrays (excluding nullable ``sku_spec_hn``) must preserve
+  token positions;
 - {ups}_x_indices must preserve event-to-request membership;
 - UPS attribute inner lists may be flattened only when each event token is a
   singleton.
@@ -244,9 +245,17 @@ list<list<int64>>, with an inner length of exactly one for every token.
 scene_id is distinct from scene_id_hn. The former is a small raw evaluation
 dimension; the latter is an opaque encoded categorical model feature.
 
-The current scenario configuration discovers sorted raw scene_id values from
-the training split, accepts at most 64 values, and caches the mapping at
-artifacts/scenarios/cvr_allscene.json.
+Production configs use a fixed two-scenario coarse contract
+(`[search, recommendation]`) with `scenarios.source: coarse_scene_index` and
+`source_encoding: index`. The adapter maps raw `scene_id` through the search
+allowlist (`search_scene_ids`) into `coarse_scene_index` / `coarse_scene_prior_id`.
+Negative `scene_id` values are always rejected. Unlisted non-negative IDs follow
+`adapter.options.unlisted_scene_policy`: `recommendation` (default) or `error`.
+Opt-in `--auto-discover-scenes` remains available for closed raw-scene experiments.
+
+For agg rows with multiple requests, request metadata (`scene_id`, `search_id`,
+`impr_time`) must have length equal to the request count. A length-1 list is not
+broadcast across requests.
 
 ### 5.2 Candidate metadata
 
@@ -328,14 +337,19 @@ The 60 fields marked B/RB/CB in the inventory are unordered categorical bags and
 use masked mean pooling. The other 108 non-sequence fields are logical scalar
 categories.
 
-The following nine candidate bags are position-aligned SKU attributes:
+The following nine candidate bags share SKU bag pooling settings. Eight of them
+(excluding ``sku_spec_hn``) are enforced as a position-aligned
+``aligned_multivalue_groups`` entry. ``sku_spec_hn`` stays an independent bag:
+upstream may emit ``None``/``[]`` while the other SKU bags remain length-aligned;
+null/empty is normalized to an empty bag and pooled with
+``include_as_padding``.
 
 ~~~text
 sku_id_hn
 sku_price_v2_hn
 sku_sales_hn
 sku_spec_hash_hn
-sku_spec_hn
+sku_spec_hn          # not in aligned_multivalue_groups
 sku_cart_cnt_7d_hn
 sku_ordr_cnt_1m_hn
 sku_price_dis_hn
@@ -344,7 +358,7 @@ sku_sales_dis_hn
 
 Observed SKU-array lengths were 1 through 202. sku_spec_vids_hn belongs to the
 broader SKU business group but was observed as a logical scalar and is not in
-the nine-column aligned pooling group.
+the SKU bag pooling set.
 
 ## 7. UPS sequence contract
 
@@ -388,16 +402,18 @@ Legend:
 
 - S: logical scalar categorical field;
 - B: unordered categorical bag;
-- RB: request-axis item bag (agg outer length follows ``context_indices``;
+- RB: request-axis context bag (agg outer length follows ``context_indices``;
   adapter expands to candidates via ``target_indices``);
-- RS: request-axis item scalar (same expand; ``[]`` → missing);
+- RS: request-axis context scalar (same expand; ``[]`` → missing);
 - CB: candidate-axis item bag;
 - CS: candidate-axis item scalar;
-- CCS: candidate-axis context scalar (logical context token, physical candidate);
 - O: optional field that may be absent in some partitions.
 
 Every field below becomes an encoded categorical model input, including the
 six fields without an _hn substring.
+
+Adapter grouping matches physical axis: ``context_features`` (51) are
+request-axis; ``item_features`` (118) are candidate-axis.
 
 ### 8.1 Context fields: 24 request-level fields
 
@@ -428,16 +444,11 @@ B  scene_impr_cnt_15d_hn
 S  scene_impr_cnt_15d_hit_hn
 ~~~
 
-### 8.2 User fields: 23 request-level fields
+### 8.2 User / request-shared fields: 27 request-level fields
 
 ~~~text
 S  uid_or_bg_hn
 B  u_fst_ordr_cnt_mix_d_hn
-CCS clk_cnt_1d_hn
-CCS clk_3d_cnt_hn
-CCS clk_1d_cat_cnt_hn
-CCS cart_cnt_1d_hn
-CCS cart_cnt_3d_hn
 B  clk_7d_page_sns_hn
 B  clk_7d_page_elsns_hn
 B  cart_7d_cat1_ids_hn
@@ -454,11 +465,20 @@ B  ups_search_method_hash_hn
 B  view_30m_cat1_ids_hn
 B  view_7d_page_sns_hn
 B  view_7d_page_elsns_hn
+RB offline_outside_goods_id_list_hn_share
+RB site_q2i_good_list_hn_share
+RB main_goods_ids_hn_share
+RB buy_long_spec_vids_hn
+RB cart_long_spec_vids_hn
+RS opt_id_hn
+RB impr_3h_tg_hn
+RB impr_all_tg_hn
+RS query_pay_cnt_15d_hn
 ~~~
 
-The 47 Context plus User fields contain 19 logical scalars and 28 bags.
+The 51 Context plus User fields contain 21 logical scalars and 30 bags.
 
-### 8.3 Item fields: 104 candidate-level fields
+### 8.3 Item fields: 101 candidate-level fields
 
 ~~~text
 S    cat_id_hn
@@ -541,25 +561,22 @@ CB   i2i_list_swingv3gmv_hn_share
 CB   i2i_hit_site_q2i_idx_hn
 CB   only_semi_swingi2i_cut60_hn_share
 CB   semi_swingi2i_cut30_hn_share
-RB   offline_outside_goods_id_list_hn_share
-RB   site_q2i_good_list_hn_share
 CS   multimodal_i2i_hit_cart_size_hn
 CS   multimodal_i2i_hit_clk_size_hn
-RB   main_goods_ids_hn_share
 S    adj_cartcvr_hn
 S    adj_ctr_hn
 S    adj_cvr_hn
-RB   buy_long_spec_vids_hn
-RB   cart_long_spec_vids_hn
 S    create_time_hn
 S    mall_id_hn
 S    sellr_type_hn
-RS   opt_id_hn
 S    site_x_asian_code_hn
 S/O  f_goods_view_times_tg_l1_hn
 S    target_gs_last_cart_tg_hn
-RB   impr_3h_tg_hn
-RB   impr_all_tg_hn
+CS   clk_cnt_1d_hn
+CS   clk_3d_cnt_hn
+CS   clk_1d_cat_cnt_hn
+CS   cart_cnt_1d_hn
+CS   cart_cnt_3d_hn
 S    impr_clk_6h_cnt_hn
 S    clk_long_goods_abs_timegap_1d_hn
 S    impr_long_goods_abs_timegap_1d_hn
@@ -567,7 +584,7 @@ S    mid_goods_prc_list_dis
 S    mid_cmprc_diff_list_dis
 ~~~
 
-### 8.4 Cross fields: 15 candidate-level fields
+### 8.4 Cross fields: 14 candidate-level fields
 
 ~~~text
 S  rel_score_hn
@@ -577,10 +594,9 @@ S  q2c_cart_15d_hit_val_hn
 S  tit_in_top_query_cnt_hn
 S  goods_query_emb32v3_cos_hn
 S  query_cat_hn
-RS query_pay_cnt_15d_hn
 S  clk_hit_i2i_idx_hn
 S  cart_hit_i2i_idx_hn
-S  cart_long_hit_samestyle_i2i_idx_hn
+CB cart_long_hit_samestyle_i2i_idx_hn
 S  ups_clkv2_i2i_goods_ids_hit_size
 S  ups_clkv2_i2i_goods_ids_hit_all_size
 S  us_ctr_price_dis50_hn
@@ -595,8 +611,8 @@ S  campaign_id_hn
 S  idx_goods_creative_id_hn
 ~~~
 
-The 122 Item plus Cross plus Creative fields contain 101 logical scalars and
-21 bags.
+The 118 Item plus Cross plus Creative fields contain 96 logical scalars and
+22 bags.
 
 ## 9. Complete raw UPS field inventory
 
@@ -923,11 +939,11 @@ snapshot. The req/test snapshot recorded 50 as `list<int64>` and 119 as
 |---|---|---|---|---|---|---|
 | `uid_or_bg_hn` | request scalar | `list<int64>` | `list<list<int64>>` | `list<int64>` | `int64` | — |
 | `u_fst_ordr_cnt_mix_d_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | — |
-| `clk_cnt_1d_hn` | candidate scalar (context) | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CCS. Outer follows candidates. |
-| `clk_3d_cnt_hn` | candidate scalar (context) | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CCS. Outer follows candidates. |
-| `clk_1d_cat_cnt_hn` | candidate scalar (context) | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CCS. Outer follows candidates. |
-| `cart_cnt_1d_hn` | candidate scalar (context) | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CCS. Outer follows candidates. |
-| `cart_cnt_3d_hn` | candidate scalar (context) | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CCS. Outer follows candidates. |
+| `clk_cnt_1d_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CS. Outer follows candidates. |
+| `clk_3d_cnt_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CS. Outer follows candidates. |
+| `clk_1d_cat_cnt_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CS. Outer follows candidates. |
+| `cart_cnt_1d_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CS. Outer follows candidates. |
+| `cart_cnt_3d_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | CS. Outer follows candidates. |
 | `clk_7d_page_sns_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | — |
 | `clk_7d_page_elsns_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | — |
 | `cart_7d_cat1_ids_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | — |
@@ -945,7 +961,7 @@ snapshot. The req/test snapshot recorded 50 as `list<int64>` and 119 as
 | `view_7d_page_sns_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | Historical req/test non-null: 28,990 / 29,906. |
 | `view_7d_page_elsns_hn` | request bag | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | `list<int64>` | Historical req/test non-null: 28,990 / 29,906. |
 
-### 13.3 Item: 104 candidate fields
+### 13.3 Item: 101 candidate fields
 
 | Field | Logical kind | Current HDFS normal form | Historical agg/train raw type | Historical req/test raw type | Adapter logical value type | Historical note |
 |---|---|---|---|---|---|---|
@@ -1068,7 +1084,7 @@ snapshot. The req/test snapshot recorded 50 as `list<int64>` and 119 as
 | `query_pay_cnt_15d_hn` | request scalar | `list<int64>` | `list<list<int64>>` | `list<int64>` | `int64` | RS. Outer follows requests; `[]` → missing. Historical req/test non-null: 6,342 / 29,906. |
 | `clk_hit_i2i_idx_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `cart_hit_i2i_idx_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
-| `cart_long_hit_samestyle_i2i_idx_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | Historical examples were all null. |
+| `cart_long_hit_samestyle_i2i_idx_hn` | candidate bag | `list<list<int64>>` | `list<list<int64>>` | `list<list<int64>>` | `list<int64>` | Mean-pooled CB. Outer axis is candidate; inner values are i2i hit indices. |
 | `ups_clkv2_i2i_goods_ids_hit_size` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `ups_clkv2_i2i_goods_ids_hit_all_size` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
 | `us_ctr_price_dis50_hn` | candidate scalar | `list<int64>` | `list<list<int64>>` | `list<list<int64>>` | `int64` | — |
@@ -1249,7 +1265,7 @@ each field.
 | `pt` | Hive directory token `YYYY-MM-DD` | Same | Partition path component; not assumed to be a Parquet column |
 | `hr` | Hive directory token `HH` | Same | Partition path component; not assumed to be a Parquet column |
 | `search_id` | `list<T>` over requests | scalar `T` or singleton `list<T>` | Scalar `T` repeated per candidate; producer scalar type is preserved |
-| `scene_id` | `list<int64>` over requests | `int64` or singleton `list<int64>` | `int64` per candidate |
+| `scene_id` | `list<int64>` over requests (length must equal request count; no length-1 broadcast) | `int64` or singleton `list<int64>` | `int64` per candidate; also drives `coarse_scene_index` / `coarse_scene_prior_id` when coarse routing is enabled |
 | `impr_time` | `list<int64>` over requests | `int64` or singleton `list<int64>` | `int64` milliseconds per candidate |
 | `example_ids` | candidate-aligned `list<T>` when present | candidate-aligned `list<T>` when present | Optional scalar `T` per candidate |
 | `label_fst_cart` | candidate-aligned `list<int64>` | candidate-aligned `list<int64>` | scalar `int64`, then training `float32` |

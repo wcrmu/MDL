@@ -576,6 +576,14 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         for invalid in (None, True, "abc"):
             with self.assertRaisesRegex(ValueError, "scene_id must be an integer"):
                 coarse_scene_ids(invalid, SEARCH_IDS)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            coarse_scene_ids(-1, SEARCH_IDS)
+        with self.assertRaisesRegex(ValueError, "not in the configured search allowlist"):
+            coarse_scene_ids(7, SEARCH_IDS, unlisted_policy="error")
+        self.assertEqual(
+            coarse_scene_ids(21, SEARCH_IDS, unlisted_policy="error"),
+            (0, 1),
+        )
 
         required = [
             *REQUIRED,
@@ -924,7 +932,7 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only 0/1"):
             _validate_complete_label_contract(split, bad_value, ["label_a"])
 
-    def test_request_shared_item_bags_expand_by_target_indices(self) -> None:
+    def test_request_context_bags_expand_by_target_indices(self) -> None:
         required = [
             *REQUIRED,
             "offline_outside_goods_id_list_hn_share",
@@ -936,10 +944,10 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
                 "target_indices": [[11, 22, 11]],
                 "ctx_scalar_hn": [[[101], [102]]],
                 "ctx_bag_hn": [[[1], [2]]],
+                "offline_outside_goods_id_list_hn_share": [[[1, 2], [3]]],
                 "item_scalar_hn": [[[201], [202], [203]]],
                 "sku_a_hn": [[[11], [12], [13]]],
                 "sku_b_hn": [[[21], [22], [23]]],
-                "offline_outside_goods_id_list_hn_share": [[[1, 2], [3]]],
                 "i2i_coclk_hn_share": [[[10], [], [20, 21]]],
                 "impr_x_goods_id_hn": [[-1, -2]],
                 "impr_x_time": [[4900, 4800]],
@@ -953,18 +961,18 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
             }
         )
         context = _context(required)
+        context.options["context_features"] = [
+            *context.options["context_features"],
+            "offline_outside_goods_id_list_hn_share",
+        ]
         context.options["item_features"] = [
             *context.options["item_features"],
-            "offline_outside_goods_id_list_hn_share",
             "i2i_coclk_hn_share",
         ]
         context.options["multivalue_features"] = [
             *context.options["multivalue_features"],
             "offline_outside_goods_id_list_hn_share",
             "i2i_coclk_hn_share",
-        ]
-        context.options["request_axis_item_features"] = [
-            "offline_outside_goods_id_list_hn_share",
         ]
 
         actual = adapt(table, context=context).to_pydict()
@@ -974,21 +982,20 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         )
         self.assertEqual(actual["i2i_coclk_hn_share"], [[10], [], [20, 21]])
 
-    def test_request_shared_item_bag_accepts_request_count_not_candidate_count(
+    def test_request_context_bag_accepts_request_count_not_candidate_count(
         self,
     ) -> None:
         required = [*REQUIRED, "offline_outside_goods_id_list_hn_share"]
-        # 2 requests, 3 candidates; request-shared bag outer length follows requests.
         table = pa.table(
             {
                 "context_indices": [[0, 1]],
                 "target_indices": [[0, 0, 1]],
                 "ctx_scalar_hn": [[[101], [102]]],
                 "ctx_bag_hn": [[[1], [2]]],
+                "offline_outside_goods_id_list_hn_share": [[[1], [2]]],
                 "item_scalar_hn": [[[201], [202], [203]]],
                 "sku_a_hn": [[[11], [12], [13]]],
                 "sku_b_hn": [[[21], [22], [23]]],
-                "offline_outside_goods_id_list_hn_share": [[[1], [2]]],
                 "impr_x_goods_id_hn": [[-1]],
                 "impr_x_time": [[4900]],
                 "impr_x_indices": [[[0, 1]]],
@@ -1001,15 +1008,12 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
             }
         )
         context = _context(required)
-        context.options["item_features"] = [
-            *context.options["item_features"],
+        context.options["context_features"] = [
+            *context.options["context_features"],
             "offline_outside_goods_id_list_hn_share",
         ]
         context.options["multivalue_features"] = [
             *context.options["multivalue_features"],
-            "offline_outside_goods_id_list_hn_share",
-        ]
-        context.options["request_axis_item_features"] = [
             "offline_outside_goods_id_list_hn_share",
         ]
         actual = adapt(table, context=context).to_pydict()
@@ -1030,10 +1034,10 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
             "target_indices": [[0, 1, 1]],
             "ctx_scalar_hn": [[[101], [102]]],
             "ctx_bag_hn": [[[1], [2]]],
+            "offline_outside_goods_id_list_hn_share": [[[1], [2]]],
             "item_scalar_hn": [[[201], [202], [203]]],
             "sku_a_hn": [[[11], [12], [13]]],
             "sku_b_hn": [[[21], [22], [23]]],
-            "offline_outside_goods_id_list_hn_share": [[[1], [2]]],
             "i2i_coclk_hn_share": [[[10], [11], [12]]],
             "impr_x_goods_id_hn": [[-1]],
             "impr_x_time": [[4900]],
@@ -1046,18 +1050,18 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
             "label_c": [[0, 0, 1]],
         }
         context = _context(required)
+        context.options["context_features"] = [
+            *context.options["context_features"],
+            "offline_outside_goods_id_list_hn_share",
+        ]
         context.options["item_features"] = [
             *context.options["item_features"],
-            "offline_outside_goods_id_list_hn_share",
             "i2i_coclk_hn_share",
         ]
         context.options["multivalue_features"] = [
             *context.options["multivalue_features"],
             "offline_outside_goods_id_list_hn_share",
             "i2i_coclk_hn_share",
-        ]
-        context.options["request_axis_item_features"] = [
-            "offline_outside_goods_id_list_hn_share",
         ]
 
         bad_request = dict(base)
@@ -1078,7 +1082,7 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         ):
             adapt(pa.table(bad_candidate), context=context)
 
-    def test_request_axis_item_scalar_expands_empty_as_missing(self) -> None:
+    def test_request_context_scalar_expands_empty_as_missing(self) -> None:
         required = [*REQUIRED, "query_pay_cnt_15d_hn"]
         table = pa.table(
             {
@@ -1086,78 +1090,7 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
                 "target_indices": [[10, 10, 20]],
                 "ctx_scalar_hn": [[[101], [102]]],
                 "ctx_bag_hn": [[[1], [2]]],
-                "item_scalar_hn": [[[201], [202], [203]]],
-                "sku_a_hn": [[[11], [12], [13]]],
-                "sku_b_hn": [[[21], [22], [23]]],
                 "query_pay_cnt_15d_hn": [[[7], []]],
-                "impr_x_goods_id_hn": [[-1]],
-                "impr_x_time": [[4900]],
-                "impr_x_indices": [[[10, 20]]],
-                "scene_id": [[7, 8]],
-                "search_id": [["r0", "r1"]],
-                "impr_time": [[5000, 6000]],
-                "label_a": [[0, 1, 0]],
-                "label_b": [[1, 0, 1]],
-                "label_c": [[0, 0, 1]],
-            }
-        )
-        context = _context(required)
-        context.options["item_features"] = [
-            *context.options["item_features"],
-            "query_pay_cnt_15d_hn",
-        ]
-        context.options["request_axis_item_features"] = ["query_pay_cnt_15d_hn"]
-        actual = adapt(table, context=context).to_pydict()
-        self.assertEqual(actual["query_pay_cnt_15d_hn"], [7, 7, None])
-
-    def test_request_axis_item_bag_expands_by_target_indices(self) -> None:
-        required = [*REQUIRED, "buy_long_spec_vids_hn"]
-        table = pa.table(
-            {
-                "context_indices": [[10, 20]],
-                "target_indices": [[10, 10, 20]],
-                "ctx_scalar_hn": [[[101], [102]]],
-                "ctx_bag_hn": [[[1], [2]]],
-                "item_scalar_hn": [[[201], [202], [203]]],
-                "sku_a_hn": [[[11], [12], [13]]],
-                "sku_b_hn": [[[21], [22], [23]]],
-                "buy_long_spec_vids_hn": [[[101, 102], [201]]],
-                "impr_x_goods_id_hn": [[-1]],
-                "impr_x_time": [[4900]],
-                "impr_x_indices": [[[10, 20]]],
-                "scene_id": [[7, 8]],
-                "search_id": [["r0", "r1"]],
-                "impr_time": [[5000, 6000]],
-                "label_a": [[0, 1, 0]],
-                "label_b": [[1, 0, 1]],
-                "label_c": [[0, 0, 1]],
-            }
-        )
-        context = _context(required)
-        context.options["item_features"] = [
-            *context.options["item_features"],
-            "buy_long_spec_vids_hn",
-        ]
-        context.options["multivalue_features"] = [
-            *context.options["multivalue_features"],
-            "buy_long_spec_vids_hn",
-        ]
-        context.options["request_axis_item_features"] = ["buy_long_spec_vids_hn"]
-        actual = adapt(table, context=context).to_pydict()
-        self.assertEqual(
-            actual["buy_long_spec_vids_hn"],
-            [[101, 102], [101, 102], [201]],
-        )
-
-    def test_candidate_axis_context_scalar_not_request_cached(self) -> None:
-        required = [*REQUIRED, "clk_cnt_1d_hn"]
-        table = pa.table(
-            {
-                "context_indices": [[10, 20]],
-                "target_indices": [[10, 10, 20]],
-                "ctx_scalar_hn": [[[101], [102]]],
-                "ctx_bag_hn": [[[1], [2]]],
-                "clk_cnt_1d_hn": [[[3], [], [8]]],
                 "item_scalar_hn": [[[201], [202], [203]]],
                 "sku_a_hn": [[[11], [12], [13]]],
                 "sku_b_hn": [[[21], [22], [23]]],
@@ -1175,13 +1108,507 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         context = _context(required)
         context.options["context_features"] = [
             *context.options["context_features"],
+            "query_pay_cnt_15d_hn",
+        ]
+        actual = adapt(table, context=context).to_pydict()
+        self.assertEqual(actual["query_pay_cnt_15d_hn"], [7, 7, None])
+
+    def test_request_context_bag_expands_by_target_indices(self) -> None:
+        required = [*REQUIRED, "buy_long_spec_vids_hn"]
+        table = pa.table(
+            {
+                "context_indices": [[10, 20]],
+                "target_indices": [[10, 10, 20]],
+                "ctx_scalar_hn": [[[101], [102]]],
+                "ctx_bag_hn": [[[1], [2]]],
+                "buy_long_spec_vids_hn": [[[101, 102], [201]]],
+                "item_scalar_hn": [[[201], [202], [203]]],
+                "sku_a_hn": [[[11], [12], [13]]],
+                "sku_b_hn": [[[21], [22], [23]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "impr_x_indices": [[[10, 20]]],
+                "scene_id": [[7, 8]],
+                "search_id": [["r0", "r1"]],
+                "impr_time": [[5000, 6000]],
+                "label_a": [[0, 1, 0]],
+                "label_b": [[1, 0, 1]],
+                "label_c": [[0, 0, 1]],
+            }
+        )
+        context = _context(required)
+        context.options["context_features"] = [
+            *context.options["context_features"],
+            "buy_long_spec_vids_hn",
+        ]
+        context.options["multivalue_features"] = [
+            *context.options["multivalue_features"],
+            "buy_long_spec_vids_hn",
+        ]
+        actual = adapt(table, context=context).to_pydict()
+        self.assertEqual(
+            actual["buy_long_spec_vids_hn"],
+            [[101, 102], [101, 102], [201]],
+        )
+
+    def test_candidate_item_scalar_not_request_cached(self) -> None:
+        required = [*REQUIRED, "clk_cnt_1d_hn"]
+        table = pa.table(
+            {
+                "context_indices": [[10, 20]],
+                "target_indices": [[10, 10, 20]],
+                "ctx_scalar_hn": [[[101], [102]]],
+                "ctx_bag_hn": [[[1], [2]]],
+                "item_scalar_hn": [[[201], [202], [203]]],
+                "sku_a_hn": [[[11], [12], [13]]],
+                "sku_b_hn": [[[21], [22], [23]]],
+                "clk_cnt_1d_hn": [[[3], [], [8]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "impr_x_indices": [[[10, 20]]],
+                "scene_id": [[7, 8]],
+                "search_id": [["r0", "r1"]],
+                "impr_time": [[5000, 6000]],
+                "label_a": [[0, 1, 0]],
+                "label_b": [[1, 0, 1]],
+                "label_c": [[0, 0, 1]],
+            }
+        )
+        context = _context(required)
+        context.options["item_features"] = [
+            *context.options["item_features"],
             "clk_cnt_1d_hn",
         ]
-        context.options["candidate_axis_context_features"] = ["clk_cnt_1d_hn"]
         actual = adapt(table, context=context).to_pydict()
-        # Per-candidate values; must not expand/copy request-axis style.
         self.assertEqual(actual["clk_cnt_1d_hn"], [3, None, 8])
         self.assertEqual(actual["ctx_scalar_hn"], [101, 101, 102])
+
+    def test_all_request_context_scalars_expand(self) -> None:
+        from scripts.build_mdl_rankmixer_config import REQUEST_CONTEXT_SCALAR_FIELDS
+
+        for field in sorted(REQUEST_CONTEXT_SCALAR_FIELDS):
+            with self.subTest(field=field):
+                required = [*REQUIRED, field]
+                table = pa.table(
+                    {
+                        "context_indices": [[10, 20]],
+                        "target_indices": [[10, 10, 20]],
+                        "ctx_scalar_hn": [[[101], [102]]],
+                        "ctx_bag_hn": [[[1], [2]]],
+                        field: [[[7], []]],
+                        "item_scalar_hn": [[[201], [202], [203]]],
+                        "sku_a_hn": [[[11], [12], [13]]],
+                        "sku_b_hn": [[[21], [22], [23]]],
+                        "impr_x_goods_id_hn": [[-1]],
+                        "impr_x_time": [[4900]],
+                        "impr_x_indices": [[[10, 20]]],
+                        "scene_id": [[7, 8]],
+                        "search_id": [["r0", "r1"]],
+                        "impr_time": [[5000, 6000]],
+                        "label_a": [[0, 1, 0]],
+                        "label_b": [[1, 0, 1]],
+                        "label_c": [[0, 0, 1]],
+                    }
+                )
+                context = _context(required)
+                context.options["context_features"] = [
+                    *context.options["context_features"],
+                    field,
+                ]
+                actual = adapt(table, context=context).to_pydict()
+                self.assertEqual(actual[field], [7, 7, None])
+
+    def test_all_request_context_bags_expand(self) -> None:
+        from scripts.build_mdl_rankmixer_config import REQUEST_CONTEXT_BAG_FIELDS
+
+        for field in sorted(REQUEST_CONTEXT_BAG_FIELDS):
+            with self.subTest(field=field):
+                required = [*REQUIRED, field]
+                table = pa.table(
+                    {
+                        "context_indices": [[10, 20]],
+                        "target_indices": [[10, 10, 20]],
+                        "ctx_scalar_hn": [[[101], [102]]],
+                        "ctx_bag_hn": [[[1], [2]]],
+                        field: [[[101, 102], [201]]],
+                        "item_scalar_hn": [[[201], [202], [203]]],
+                        "sku_a_hn": [[[11], [12], [13]]],
+                        "sku_b_hn": [[[21], [22], [23]]],
+                        "impr_x_goods_id_hn": [[-1]],
+                        "impr_x_time": [[4900]],
+                        "impr_x_indices": [[[10, 20]]],
+                        "scene_id": [[7, 8]],
+                        "search_id": [["r0", "r1"]],
+                        "impr_time": [[5000, 6000]],
+                        "label_a": [[0, 1, 0]],
+                        "label_b": [[1, 0, 1]],
+                        "label_c": [[0, 0, 1]],
+                    }
+                )
+                context = _context(required)
+                context.options["context_features"] = [
+                    *context.options["context_features"],
+                    field,
+                ]
+                context.options["multivalue_features"] = [
+                    *context.options["multivalue_features"],
+                    field,
+                ]
+                actual = adapt(table, context=context).to_pydict()
+                self.assertEqual(actual[field], [[101, 102], [101, 102], [201]])
+
+    def test_all_candidate_item_clk_cart_scalars_stay_candidate_aligned(self) -> None:
+        candidate_item_scalars = {
+            "clk_cnt_1d_hn",
+            "clk_3d_cnt_hn",
+            "clk_1d_cat_cnt_hn",
+            "cart_cnt_1d_hn",
+            "cart_cnt_3d_hn",
+        }
+
+        for field in sorted(candidate_item_scalars):
+            with self.subTest(field=field):
+                required = [*REQUIRED, field]
+                table = pa.table(
+                    {
+                        "context_indices": [[10, 20]],
+                        "target_indices": [[10, 10, 20]],
+                        "ctx_scalar_hn": [[[101], [102]]],
+                        "ctx_bag_hn": [[[1], [2]]],
+                        "item_scalar_hn": [[[201], [202], [203]]],
+                        "sku_a_hn": [[[11], [12], [13]]],
+                        "sku_b_hn": [[[21], [22], [23]]],
+                        field: [[[3], [], [8]]],
+                        "impr_x_goods_id_hn": [[-1]],
+                        "impr_x_time": [[4900]],
+                        "impr_x_indices": [[[10, 20]]],
+                        "scene_id": [[7, 8]],
+                        "search_id": [["r0", "r1"]],
+                        "impr_time": [[5000, 6000]],
+                        "label_a": [[0, 1, 0]],
+                        "label_b": [[1, 0, 1]],
+                        "label_c": [[0, 0, 1]],
+                    }
+                )
+                context = _context(required)
+                context.options["item_features"] = [
+                    *context.options["item_features"],
+                    field,
+                ]
+                actual = adapt(table, context=context).to_pydict()
+                self.assertEqual(actual[field], [3, None, 8])
+                self.assertEqual(actual["ctx_scalar_hn"], [101, 101, 102])
+
+    def test_obsolete_axis_override_options_rejected(self) -> None:
+        context = _context(REQUIRED)
+        context.options["request_axis_item_features"] = ["item_scalar_hn"]
+        with self.assertRaisesRegex(ValueError, "request_axis_item_features.*removed"):
+            adapt(
+                pa.table(
+                    {
+                        "ctx_scalar_hn": [[101]],
+                        "ctx_bag_hn": [[1]],
+                        "item_scalar_hn": [[[201]]],
+                        "sku_a_hn": [[[11]]],
+                        "sku_b_hn": [[[21]]],
+                        "impr_x_goods_id_hn": [[-1]],
+                        "impr_x_time": [[4900]],
+                        "scene_id": [7],
+                        "search_id": ["r0"],
+                        "impr_time": [5000],
+                        "label_a": [[0]],
+                        "label_b": [[1]],
+                        "label_c": [[0]],
+                    }
+                ),
+                context=context,
+            )
+
+    def test_coarse_scene_unlisted_policy_error_rejects_during_adapt(self) -> None:
+        required = [
+            *REQUIRED,
+            COARSE_SCENE_INDEX_COLUMN,
+            COARSE_SCENE_PRIOR_ID_COLUMN,
+        ]
+        table = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[1]],
+                "item_scalar_hn": [[[201]]],
+                "sku_a_hn": [[[11]]],
+                "sku_b_hn": [[[21]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "scene_id": [7],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": [[0]],
+                "label_b": [[1]],
+                "label_c": [[0]],
+            }
+        )
+        context = _context(required)
+        context.options["search_scene_ids"] = sorted(SEARCH_IDS)
+        context.options["unlisted_scene_policy"] = "error"
+        with self.assertRaisesRegex(ValueError, "not in the configured search allowlist"):
+            adapt(table, context=context)
+
+    def test_agg_rejects_length_one_request_metadata_broadcast(self) -> None:
+        table = pa.table(
+            {
+                "context_indices": [[0, 1]],
+                "target_indices": [[0, 1]],
+                "ctx_scalar_hn": [[[101], [102]]],
+                "ctx_bag_hn": [[[1], [2]]],
+                "item_scalar_hn": [[[201], [202]]],
+                "sku_a_hn": [[[11], [12]]],
+                "sku_b_hn": [[[21], [22]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "impr_x_indices": [[[0, 1]]],
+                "scene_id": [[7]],
+                "search_id": [["r0", "r1"]],
+                "impr_time": [[5000, 6000]],
+                "label_a": [[0, 1]],
+                "label_b": [[1, 0]],
+                "label_c": [[0, 0]],
+            }
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            r"agg request-level column 'scene_id' has length 1, expected 2",
+        ):
+            adapt(table, context=_context(REQUIRED))
+
+    def test_agg_rejects_bare_scalar_request_metadata_broadcast(self) -> None:
+        table = pa.table(
+            {
+                "context_indices": [[0, 1]],
+                "target_indices": [[0, 1]],
+                "ctx_scalar_hn": [[[101], [102]]],
+                "ctx_bag_hn": [[[1], [2]]],
+                "item_scalar_hn": [[[201], [202]]],
+                "sku_a_hn": [[[11], [12]]],
+                "sku_b_hn": [[[21], [22]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "impr_x_indices": [[[0, 1]]],
+                "scene_id": [7],
+                "search_id": [["r0", "r1"]],
+                "impr_time": [[5000, 6000]],
+                "label_a": [[0, 1]],
+                "label_b": [[1, 0]],
+                "label_c": [[0, 0]],
+            }
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            r"agg request-level column 'scene_id' is scalar but request_count=2",
+        ):
+            adapt(table, context=_context(REQUIRED))
+
+    def test_request_level_scalarizes_selected_singleton_wrapper(self) -> None:
+        from src.dataloader import _request_level_value
+
+        self.assertEqual(
+            _request_level_value(
+                [[7], [8]],
+                request_position=1,
+                request_count=2,
+                column="scene_id",
+                raw_row=0,
+                agg=True,
+            ),
+            8,
+        )
+
+    def test_complete_label_fast_path_scalarizes_singleton_wrappers(self) -> None:
+        table = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[1]],
+                "item_scalar_hn": [[[201], [202]]],
+                "sku_a_hn": [[[11], [12]]],
+                "sku_b_hn": [[[21], [22]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "scene_id": [7],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": [[[0], [1]]],
+                "label_b": [[[1], [0]]],
+                "label_c": [[[0], [1]]],
+            }
+        )
+        actual = adapt(table, context=_context(REQUIRED)).to_pydict()
+        self.assertEqual(actual["label_a"], [0, 1])
+        self.assertEqual(actual["label_b"], [1, 0])
+        self.assertEqual(actual["label_c"], [0, 1])
+
+    def test_masked_label_path_scalarizes_empty_as_missing(self) -> None:
+        table = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[1]],
+                "item_scalar_hn": [[[201], [202]]],
+                "sku_a_hn": [[[11], [12]]],
+                "sku_b_hn": [[[21], [22]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "scene_id": [7],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": [[[0], []]],
+                "label_b": [[[1], [0]]],
+                "label_c": [[[0], [1]]],
+            }
+        )
+        masks = {task: f"label_{task}_valid" for task in ("a", "b", "c")}
+        context = _context([*REQUIRED, *masks.values()])
+        context.options["label_masks"] = masks
+        context.options["label_missing_values"] = {"a": [None], "b": [], "c": []}
+        actual = adapt(table, context=context).to_pydict()
+        self.assertEqual(actual["label_a"], [0, None])
+        self.assertEqual(actual["label_a_valid"], [1, 0])
+
+    def test_multi_value_label_cell_raises(self) -> None:
+        table = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[1]],
+                "item_scalar_hn": [[[201]]],
+                "sku_a_hn": [[[11]]],
+                "sku_b_hn": [[[21]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "scene_id": [7],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": [[[0, 1]]],
+                "label_b": [[[1]]],
+                "label_c": [[[0]]],
+            }
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            r"single-valued feature 'label_a' has inner length 2",
+        ):
+            adapt(table, context=_context(REQUIRED))
+
+    def test_illegal_label_values_raise_on_masked_path(self) -> None:
+        table = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[1]],
+                "item_scalar_hn": [[[201]]],
+                "sku_a_hn": [[[11]]],
+                "sku_b_hn": [[[21]]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "scene_id": [7],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": [[2]],
+                "label_b": [[1]],
+                "label_c": [[0]],
+            }
+        )
+        masks = {"a": "label_a_valid", "b": "label_b_valid", "c": "label_c_valid"}
+        context = _context([*REQUIRED, *masks.values()])
+        context.options["label_masks"] = masks
+        context.options["label_missing_values"] = {"a": [None], "b": [], "c": []}
+        with self.assertRaisesRegex(ValueError, r"label 'label_a' must be numeric 0/1"):
+            adapt(table, context=context)
+
+    def test_sku_spec_hn_null_outside_aligned_group_is_allowed(self) -> None:
+        from scripts.profile_prehashed_parquet import ALIGNED_SKU_FIELDS
+
+        aligned = list(ALIGNED_SKU_FIELDS)
+        required = [
+            "ctx_scalar_hn",
+            "ctx_bag_hn",
+            "item_scalar_hn",
+            *aligned,
+            "sku_spec_hn",
+            "impr_x_goods_id_hn",
+            "impr_x_time_delta_ms",
+            "scene_id",
+            "search_id",
+            "label_a",
+            "label_b",
+            "label_c",
+        ]
+        sku_bags = {name: [[[10, 11]]] for name in aligned}
+        table = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[1]],
+                "item_scalar_hn": [[[201]]],
+                **sku_bags,
+                "sku_spec_hn": [[None]],
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "scene_id": [7],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": [[0]],
+                "label_b": [[1]],
+                "label_c": [[0]],
+            }
+        )
+        context = _context(required)
+        context.options["item_features"] = ["item_scalar_hn", *aligned, "sku_spec_hn"]
+        context.options["multivalue_features"] = [
+            "ctx_bag_hn",
+            *aligned,
+            "sku_spec_hn",
+        ]
+        context.options["aligned_multivalue_groups"] = [aligned]
+        actual = adapt(table, context=context).to_pydict()
+        self.assertEqual(actual["sku_id_hn"], [[10, 11]])
+        self.assertEqual(actual["sku_spec_hn"], [[]])
+
+    def test_aligned_sku_group_still_rejects_inner_length_mismatch(self) -> None:
+        from scripts.profile_prehashed_parquet import ALIGNED_SKU_FIELDS
+
+        aligned = list(ALIGNED_SKU_FIELDS)
+        required = [
+            "ctx_scalar_hn",
+            "ctx_bag_hn",
+            "item_scalar_hn",
+            *aligned,
+            "impr_x_goods_id_hn",
+            "impr_x_time_delta_ms",
+            "scene_id",
+            "search_id",
+            "label_a",
+            "label_b",
+            "label_c",
+        ]
+        sku_bags = {name: [[[10, 11]]] for name in aligned}
+        sku_bags["sku_price_v2_hn"] = [[[10]]]  # length 1 vs 2
+        table = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[1]],
+                "item_scalar_hn": [[[201]]],
+                **sku_bags,
+                "impr_x_goods_id_hn": [[-1]],
+                "impr_x_time": [[4900]],
+                "scene_id": [7],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": [[0]],
+                "label_b": [[1]],
+                "label_c": [[0]],
+            }
+        )
+        context = _context(required)
+        context.options["item_features"] = ["item_scalar_hn", *aligned]
+        context.options["multivalue_features"] = ["ctx_bag_hn", *aligned]
+        context.options["aligned_multivalue_groups"] = [aligned]
+        with self.assertRaisesRegex(ValueError, "aligned multivalue group mismatch"):
+            adapt(table, context=context)
 
     def test_candidate_scalar_rejects_multi_value_slots(self) -> None:
         required = [*REQUIRED, "multimodal_i2i_hit_clk_size_hn"]

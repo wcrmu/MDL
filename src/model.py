@@ -280,18 +280,56 @@ def _mean_pool_categorical_bag(
     lengths: Tensor,
     null_policy: str,
 ) -> Tensor:
-    """Pool ``[batch, bag, dim]`` embeddings with explicit null semantics."""
+    """Pool categorical bag embeddings with explicit null semantics.
 
-    if embedded.ndim != 3 or indices.ndim != 2 or lengths.ndim != 1:
-        raise ValueError("categorical bag tensors must have shapes [B,L,D], [B,L], and [B]")
+    Accepts either padded ``[B,L,D]`` / ``[B,L]`` / ``[B]`` or flat CSR-like
+    ``[N,D]`` / ``[N]`` / ``[B]`` (preferred; no pad slots in the ID tensor).
+    """
+
+    if lengths.ndim != 1:
+        raise ValueError("categorical bag lengths must have shape [B]")
+    if null_policy not in {"exclude", "include_as_padding"}:
+        raise ValueError(f"unsupported categorical bag null policy {null_policy!r}")
+
+    if embedded.ndim == 2 and indices.ndim == 1:
+        if embedded.size(0) != indices.size(0):
+            raise ValueError("categorical bag flat values and embeddings are misaligned")
+        expected = int(lengths.sum().item()) if lengths.numel() else 0
+        if indices.numel() != expected:
+            raise ValueError(
+                "categorical bag flat length "
+                f"{indices.numel()} != sum(lengths) {expected}"
+            )
+        batch = int(lengths.numel())
+        if null_policy == "exclude":
+            weights = indices.ne(0).to(dtype=embedded.dtype)
+        else:
+            weights = embedded.new_ones(indices.shape)
+        if batch == 0:
+            return embedded.new_zeros((0, embedded.size(-1)))
+        segment_ids = torch.repeat_interleave(
+            torch.arange(batch, device=lengths.device, dtype=torch.long),
+            lengths.long(),
+        )
+        weighted = embedded * weights.unsqueeze(-1)
+        sums = embedded.new_zeros((batch, embedded.size(-1)))
+        counts = embedded.new_zeros((batch,))
+        if segment_ids.numel():
+            sums.index_add_(0, segment_ids, weighted)
+            counts.index_add_(0, segment_ids, weights)
+        return sums / counts.clamp(min=1).unsqueeze(-1)
+
+    if embedded.ndim != 3 or indices.ndim != 2:
+        raise ValueError(
+            "categorical bag tensors must be flat [N,D]/[N]/[B] "
+            "or padded [B,L,D]/[B,L]/[B]"
+        )
     if embedded.shape[:2] != indices.shape or embedded.size(0) != lengths.numel():
         raise ValueError("categorical bag values, embeddings, and lengths are misaligned")
     positions = torch.arange(indices.size(1), device=indices.device).view(1, -1)
     valid = positions < lengths.view(-1, 1)
     if null_policy == "exclude":
         valid = valid & indices.ne(0)
-    elif null_policy != "include_as_padding":
-        raise ValueError(f"unsupported categorical bag null policy {null_policy!r}")
     weights = valid.unsqueeze(-1).to(embedded.dtype)
     denominator = valid.sum(dim=1, keepdim=True).clamp(min=1).to(embedded.dtype)
     return (embedded * weights).sum(dim=1) / denominator

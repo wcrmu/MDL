@@ -13,6 +13,7 @@ from scripts.profile_prehashed_parquet import (
     ContractProfile,
     FieldProfile,
     ProfileSpec,
+    detect_scalar_multi_conflicts,
     load_profile_spec,
     profile_paths,
 )
@@ -340,6 +341,100 @@ class PreHashedParquetProfileTest(unittest.TestCase):
         ]
         self.assertEqual(overlap[0]["sample_intersection"], 1)
         self.assertNotIn("impr_x_time", report["shared_embedding_groups"])
+
+    def test_context_and_item_drive_outer_length_checks(self) -> None:
+        spec = ProfileSpec(
+            all_sources=("ctx_hn", "req_bag_hn", "item_hn", "cand_scalar_hn"),
+            categorical_sources=("ctx_hn", "req_bag_hn", "item_hn", "cand_scalar_hn"),
+            time_sources=(),
+            context_sources=("ctx_hn", "req_bag_hn"),
+            item_sources=("item_hn", "cand_scalar_hn"),
+            sequence_sources={},
+            sequence_time_sources={},
+            label_sources={},
+            shared_groups={},
+            sku_fields=(),
+            scene_source="scene_id",
+            request_axis_sources=("ctx_hn", "req_bag_hn"),
+            candidate_axis_sources=("item_hn", "cand_scalar_hn"),
+        )
+        contract = ContractProfile(spec)
+        # 2 requests, 3 candidates. Axes follow context/item grouping.
+        contract.observe(
+            {
+                "context_indices": [0, 1],
+                "target_indices": [0, 0, 1],
+                "ctx_hn": [[1], [2]],
+                "req_bag_hn": [[3], [4]],
+                "item_hn": [[5], [6], [7]],
+                "cand_scalar_hn": [[8], [9], [10]],
+                "scene_id": [7, 8],
+                "impr_time": [1, 2],
+            }
+        )
+        report = contract.as_dict()
+        self.assertEqual(report["request_outer_mismatches"], {})
+        self.assertEqual(report["candidate_outer_mismatches"], {})
+
+        bad = ContractProfile(spec)
+        bad.observe(
+            {
+                "context_indices": [0, 1],
+                "target_indices": [0, 0, 1],
+                "ctx_hn": [[1], [2]],
+                # request-axis context wrongly sized like candidates
+                "req_bag_hn": [[3], [4], [5]],
+                "item_hn": [[5], [6], [7]],
+                # candidate-axis item wrongly sized like requests
+                "cand_scalar_hn": [[8], [9]],
+                "scene_id": [7, 8],
+                "impr_time": [1, 2],
+            }
+        )
+        bad_report = bad.as_dict()
+        self.assertEqual(bad_report["request_outer_mismatches"], {"req_bag_hn": 1})
+        self.assertEqual(bad_report["candidate_outer_mismatches"], {"cand_scalar_hn": 1})
+
+    def test_detect_scalar_multi_conflicts_flags_deepest_multi_only(self) -> None:
+        field_reports = {
+            "scalar_ok_hn": {
+                "list_lengths_by_depth": {
+                    "0": {"count": 2, "min": 1, "p50": 1, "p95": 1, "p99": 1, "max": 1},
+                    "1": {"count": 2, "min": 1, "p50": 1, "p95": 1, "p99": 1, "max": 1},
+                }
+            },
+            "scalar_bad_hn": {
+                "list_lengths_by_depth": {
+                    "0": {"count": 2, "min": 1, "p50": 1, "p95": 1, "p99": 1, "max": 1},
+                    "1": {"count": 2, "min": 1, "p50": 2, "p95": 3, "p99": 3, "max": 4},
+                }
+            },
+            "bag_hn": {
+                "list_lengths_by_depth": {
+                    "0": {"count": 2, "min": 1, "p50": 1, "p95": 1, "p99": 1, "max": 1},
+                    "1": {"count": 2, "min": 2, "p50": 4, "p95": 8, "p99": 8, "max": 8},
+                }
+            },
+            "impr_x_goods_id_hn": {
+                "list_lengths_by_depth": {
+                    "0": {"count": 2, "min": 4, "p50": 8, "p95": 16, "p99": 16, "max": 16},
+                }
+            },
+            "label_a": {
+                "list_lengths_by_depth": {
+                    "0": {"count": 2, "min": 2, "p50": 2, "p95": 2, "p99": 2, "max": 2},
+                }
+            },
+        }
+        conflicts = detect_scalar_multi_conflicts(
+            field_reports,
+            bag_sources=["bag_hn"],
+            sequence_sources={"impr": ["impr_x_goods_id_hn"]},
+            label_sources=["label_a"],
+        )
+        self.assertEqual([item["source"] for item in conflicts], ["scalar_bad_hn"])
+        self.assertEqual(conflicts[0]["depth"], 1)
+        self.assertEqual(conflicts[0]["max_inner_length"], 4)
 
 
 if __name__ == "__main__":

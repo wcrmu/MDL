@@ -326,6 +326,8 @@ def generate_synthetic_agg_dataset(
     context_features = tuple(str(item) for item in options["context_features"])
     item_features = tuple(str(item) for item in options["item_features"])
     bag_features = {str(item) for item in options["multivalue_features"]}
+    request_axis_features = context_features
+    candidate_axis_features = item_features
     ups_types = tuple(str(item) for item in options["ups_types"])
     lengths = dict(OBSERVED_MEDIAN_SEQUENCE_LENGTHS)
     if sequence_lengths is not None:
@@ -348,7 +350,7 @@ def generate_synthetic_agg_dataset(
     columns: dict[str, Any] = {}
     seed = 1000
 
-    for column in context_features:
+    for column in request_axis_features:
         inner_length = bag_lengths[column] if column in bag_features else 1
         count = raw_rows_per_file * requests_per_agg * inner_length
         columns[column] = _nested_int64(
@@ -361,7 +363,7 @@ def generate_synthetic_agg_dataset(
         )
         seed += 1
 
-    for column in item_features:
+    for column in candidate_axis_features:
         inner_length = bag_lengths[column] if column in bag_features else 1
         count = raw_rows_per_file * candidates_per_agg * inner_length
         columns[column] = _nested_int64(

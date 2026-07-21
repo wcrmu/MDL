@@ -25,7 +25,7 @@ import math
 from numbers import Real
 from pathlib import Path
 import sys
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Collection, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
 
 import yaml
@@ -46,6 +46,11 @@ DEFAULT_SKU_FIELDS = (
     "sku_ordr_cnt_1m_hn",
     "sku_price_dis_hn",
     "sku_sales_dis_hn",
+)
+# Spec ID may be null/[] while other SKU bags stay length-aligned; keep it out of
+# adapter aligned_multivalue_groups while still sharing SKU bag max_length/pooling.
+ALIGNED_SKU_FIELDS = tuple(
+    name for name in DEFAULT_SKU_FIELDS if name != "sku_spec_hn"
 )
 
 
@@ -169,6 +174,58 @@ def _length_summary(counts: Counter[int]) -> dict[str, int | None]:
         "p99": _counter_quantile(counts, 0.99),
         "max": max(counts) if counts else None,
     }
+
+
+def detect_scalar_multi_conflicts(
+    field_reports: Mapping[str, Mapping[str, Any]],
+    *,
+    bag_sources: Iterable[str] = (),
+    sequence_sources: Mapping[str, Sequence[str]] | Iterable[str] = (),
+    label_sources: Iterable[str] = (),
+) -> list[dict[str, Any]]:
+    """Flag configured scalars whose deepest list depth has length > 1.
+
+    Bags and UPS sequence token columns are excluded. The deepest observed list
+    depth is the inner value container after request/candidate axes; max > 1
+    there means a scalar field is carrying a multi-valued payload.
+    """
+
+    bags = {str(source) for source in bag_sources}
+    if isinstance(sequence_sources, Mapping):
+        sequences = {
+            str(source)
+            for sources in sequence_sources.values()
+            for source in sources
+        }
+    else:
+        sequences = {str(source) for source in sequence_sources}
+    labels = {str(source) for source in label_sources}
+    skip = bags | sequences | labels
+    conflicts: list[dict[str, Any]] = []
+    for source, report in sorted(field_reports.items()):
+        if source in skip:
+            continue
+        lengths = report.get("list_lengths_by_depth") or {}
+        if not isinstance(lengths, Mapping) or not lengths:
+            continue
+        depth_keys = [int(depth) for depth in lengths]
+        deepest = max(depth_keys)
+        summary = lengths.get(str(deepest)) or lengths.get(deepest)
+        if not isinstance(summary, Mapping):
+            continue
+        max_length = summary.get("max")
+        if max_length is None or int(max_length) <= 1:
+            continue
+        conflicts.append(
+            {
+                "source": source,
+                "depth": deepest,
+                "max_inner_length": int(max_length),
+                "p99_inner_length": summary.get("p99"),
+                "observations": summary.get("count"),
+            }
+        )
+    return conflicts
 
 
 class FieldProfile:
@@ -395,12 +452,25 @@ class ProfileSpec:
     sku_fields: tuple[str, ...]
     scene_source: str
     request_time_source: str = "impr_time"
+    # Physical Parquet outer axes (may differ from logical context/item).
+    request_axis_sources: tuple[str, ...] = ()
+    candidate_axis_sources: tuple[str, ...] = ()
+    bag_sources: tuple[str, ...] = ()
+
+
+def _physical_axis_sources(
+    context_sources: Sequence[str],
+    item_sources: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Request axis is context_features; candidate axis is item_features."""
+
+    return tuple(context_sources), tuple(item_sources)
 
 
 def profile_spec_from_mapping(
     payload: Mapping[str, Any],
     *,
-    context_feature_count: int = 47,
+    context_feature_count: int = 51,
     source_name: str = "sample config",
 ) -> ProfileSpec:
     raw_features = payload.get("features", [])
@@ -483,12 +553,39 @@ def profile_spec_from_mapping(
         )
     )
     all_sources = tuple(dict.fromkeys([*categorical_sources, *time_sources]))
+    adapter = train.get("adapter", {}) if isinstance(train, dict) else {}
+    adapter_options = (
+        adapter.get("options", {}) if isinstance(adapter, Mapping) else {}
+    )
+    if not isinstance(adapter_options, Mapping):
+        adapter_options = {}
+    adapter_context = adapter_options.get("context_features")
+    adapter_items = adapter_options.get("item_features")
+    if isinstance(adapter_context, list) and isinstance(adapter_items, list):
+        context_sources = tuple(str(item) for item in adapter_context)
+        item_sources = tuple(str(item) for item in adapter_items)
+    else:
+        context_sources = feature_sources[:context_feature_count]
+        item_sources = feature_sources[context_feature_count:]
+    request_axis_sources, candidate_axis_sources = _physical_axis_sources(
+        context_sources,
+        item_sources,
+    )
+    bag_sources = tuple(
+        dict.fromkeys(
+            str(item["source"])
+            for item in raw_features
+            if isinstance(item, dict)
+            and item.get("pooling") == "mean"
+            and item.get("source")
+        )
+    )
     return ProfileSpec(
         all_sources=all_sources,
         categorical_sources=categorical_sources,
         time_sources=tuple(dict.fromkeys(time_sources)),
-        context_sources=feature_sources[:context_feature_count],
-        item_sources=feature_sources[context_feature_count:],
+        context_sources=context_sources,
+        item_sources=item_sources,
         sequence_sources=sequence_sources,
         sequence_time_sources=sequence_time_sources,
         label_sources={str(k): str(v) for k, v in label_sources.items()},
@@ -497,13 +594,16 @@ def profile_spec_from_mapping(
             source for source in DEFAULT_SKU_FIELDS if source in feature_sources
         ),
         scene_source="scene_id",
+        request_axis_sources=request_axis_sources,
+        candidate_axis_sources=candidate_axis_sources,
+        bag_sources=bag_sources,
     )
 
 
 def load_profile_spec(
     config_path: str | Path,
     *,
-    context_feature_count: int = 47,
+    context_feature_count: int = 51,
 ) -> ProfileSpec:
     path = Path(config_path)
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -531,6 +631,8 @@ class ContractProfile:
         self.target_without_context = 0
         self.context_outer_mismatches: Counter[str] = Counter()
         self.item_outer_mismatches: Counter[str] = Counter()
+        self.request_outer_mismatches: Counter[str] = Counter()
+        self.candidate_outer_mismatches: Counter[str] = Counter()
         self.label_length_mismatches: Counter[str] = Counter()
         self.invalid_labels: Counter[str] = Counter()
         self.sequence_length_mismatches: Counter[str] = Counter()
@@ -621,17 +723,26 @@ class ContractProfile:
             self.agg_rows += 1
             context_count = self._list_length(row.get("context_indices"))
             target_count = self._list_length(row.get("target_indices"))
+            request_axis_sources = (
+                self.spec.request_axis_sources or self.spec.context_sources
+            )
+            candidate_axis_sources = (
+                self.spec.candidate_axis_sources or self.spec.item_sources
+            )
             if context_count is not None:
-                for source in self.spec.context_sources:
+                for source in request_axis_sources:
                     if source not in row:
                         continue
                     if self._list_length(row[source]) != context_count:
+                        self.request_outer_mismatches[source] += 1
+                        # Legacy alias kept for older report consumers.
                         self.context_outer_mismatches[source] += 1
             if target_count is not None:
-                for source in self.spec.item_sources:
+                for source in candidate_axis_sources:
                     if source not in row:
                         continue
                     if self._list_length(row[source]) != target_count:
+                        self.candidate_outer_mismatches[source] += 1
                         self.item_outer_mismatches[source] += 1
                 for task, source in self.spec.label_sources.items():
                     if source in row and self._list_length(row[source]) != target_count:
@@ -825,15 +936,12 @@ class ContractProfile:
             ):
                 return
             scenes = list(raw_scene) if isinstance(raw_scene, (list, tuple)) else [raw_scene]
-            if len(scenes) == 1:
-                scene_by_request = {
-                    request: scenes[0]
-                    for request in context_indices
-                    if isinstance(request, int) and not isinstance(request, bool)
-                }
-            elif len(scenes) == len(context_indices):
+            if len(scenes) == len(context_indices):
                 scene_by_request = dict(zip(context_indices, scenes))
+            elif len(scenes) == 1 and len(context_indices) == 1:
+                scene_by_request = {context_indices[0]: scenes[0]}
             else:
+                # Do not silently broadcast length-1 scenes across multi-request rows.
                 return
             candidate_scenes = [scene_by_request.get(request) for request in target_indices]
         else:
@@ -883,6 +991,8 @@ class ContractProfile:
             "target_without_context": self.target_without_context,
             "context_outer_mismatches": dict(self.context_outer_mismatches),
             "item_outer_mismatches": dict(self.item_outer_mismatches),
+            "request_outer_mismatches": dict(self.request_outer_mismatches),
+            "candidate_outer_mismatches": dict(self.candidate_outer_mismatches),
             "label_length_mismatches": dict(self.label_length_mismatches),
             "invalid_labels": dict(self.invalid_labels),
             "sequence_length_mismatches": dict(self.sequence_length_mismatches),
@@ -1165,6 +1275,12 @@ def profile_paths(
         "contract": contract.as_dict(),
         "fields": field_reports,
         "shared_embedding_groups": shared_reports,
+        "scalar_multi_conflicts": detect_scalar_multi_conflicts(
+            field_reports,
+            bag_sources=spec.bag_sources,
+            sequence_sources=spec.sequence_sources,
+            label_sources=spec.label_sources.values(),
+        ),
         "notes": [
             "distinct_estimate uses HyperLogLog and is approximate",
             "bucket collision rates use a deterministic bounded sample of distinct raw values",
@@ -1172,6 +1288,7 @@ def profile_paths(
             "shared-field overlap is diagnostic overlap among deterministic bottom-k samples",
             "signed min/max diagnose upstream encoding only and are not embedding indices",
             "embedding dimensions are starting points; finalize them with the 8-GPU memory budget",
+            "scalar_multi_conflicts lists non-bag fields whose deepest list depth has max length > 1",
         ],
     }
 
@@ -1188,7 +1305,7 @@ def _parse_buckets(raw: str) -> tuple[int, ...]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("sample.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/mdl_rankmixer.yaml"))
     parser.add_argument(
         "--input",
         action="append",
@@ -1196,7 +1313,7 @@ def main() -> int:
         help="Local path or HDFS URI. Repeat to scan multiple partitions.",
     )
     parser.add_argument("--output", type=Path, help="JSON report path; stdout when omitted")
-    parser.add_argument("--context-feature-count", type=int, default=47)
+    parser.add_argument("--context-feature-count", type=int, default=51)
     parser.add_argument("--candidate-buckets", type=_parse_buckets, default=DEFAULT_BUCKETS)
     parser.add_argument("--collision-target", type=float, default=0.01)
     parser.add_argument("--cardinality-headroom", type=float, default=1.5)

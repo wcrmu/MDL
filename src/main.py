@@ -125,6 +125,8 @@ _TRAINING_OVERRIDE_FIELDS = (
     "checkpoint_path",
 )
 
+_RUNTIME_OVERRIDE_FIELDS = ("activation_checkpoint",)
+
 
 def _scale_length_buckets(buckets: tuple, old_batch_size: int, new_batch_size: int) -> tuple:
     """Keep length-bucket ratios when CLI overrides training.batch_size."""
@@ -184,6 +186,21 @@ def _apply_training_overrides(config, args: argparse.Namespace):
     return replace(config, training=training, data=data)
 
 
+def _apply_runtime_overrides(config, args: argparse.Namespace):
+    """Apply optional CLI runtime overrides (e.g. activation checkpoint)."""
+
+    updates: dict[str, object] = {}
+    for field_name in _RUNTIME_OVERRIDE_FIELDS:
+        value = getattr(args, field_name, None)
+        if value is not None:
+            updates[field_name] = value
+    if not updates:
+        return config
+    runtime = replace(config.runtime, **updates)
+    runtime.validate()
+    return replace(config, runtime=runtime)
+
+
 def _load_config(args: argparse.Namespace):
     config = load_app_config(args.config)
     if any(
@@ -201,6 +218,8 @@ def _load_config(args: argparse.Namespace):
         config = _apply_data_input_overrides(config, args)
     if any(getattr(args, name, None) is not None for name in _TRAINING_OVERRIDE_FIELDS):
         config = _apply_training_overrides(config, args)
+    if any(getattr(args, name, None) is not None for name in _RUNTIME_OVERRIDE_FIELDS):
+        config = _apply_runtime_overrides(config, args)
     return config
 
 
@@ -330,6 +349,15 @@ def _add_training_override_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_runtime_override_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--activation-checkpoint",
+        choices=["none", "selective", "full"],
+        default=None,
+        help="override runtime.activation_checkpoint (none|selective|full)",
+    )
+
+
 def _cmd_validate_config(args: argparse.Namespace) -> int:
     config = _load_config(args)
     print(f"config: OK ({args.config})")
@@ -341,6 +369,7 @@ def _cmd_validate_config(args: argparse.Namespace) -> int:
     print(f"batch_size: {config.training.batch_size}")
     print(f"lr_dense: {config.training.lr_dense}")
     print(f"lr_sparse: {config.training.lr_sparse}")
+    print(f"activation_checkpoint: {config.runtime.activation_checkpoint}")
     buckets = config.data.train.reader.length_buckets
     if buckets:
         rendered = ",".join(
@@ -552,6 +581,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     validate.add_argument("--config", required=True)
     _add_data_input_args(validate)
     _add_training_override_args(validate)
+    _add_runtime_override_args(validate)
     validate.set_defaults(func=_cmd_validate_config)
 
     profile = subparsers.add_parser("profile")
@@ -560,6 +590,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     profile.add_argument("--max-batches", type=int, default=10)
     _add_data_input_args(profile)
     _add_training_override_args(profile)
+    _add_runtime_override_args(profile)
     profile.set_defaults(func=_cmd_profile)
 
     fit_vocab = subparsers.add_parser("fit-vocab")
@@ -576,6 +607,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--master-port", type=int, default=None)
     _add_data_input_args(train)
     _add_training_override_args(train)
+    _add_runtime_override_args(train)
     train.set_defaults(func=_cmd_train)
 
     benchmark = subparsers.add_parser("benchmark")
@@ -635,6 +667,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--master-addr", default=None)
     benchmark.add_argument("--master-port", type=int, default=None)
     _add_data_input_args(benchmark)
+    _add_runtime_override_args(benchmark)
     benchmark.set_defaults(func=_cmd_benchmark)
 
     predict = subparsers.add_parser("predict")
@@ -644,6 +677,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     predict.add_argument("--allow-random-init", action="store_true")
     _add_data_input_args(predict)
     _add_training_override_args(predict)
+    _add_runtime_override_args(predict)
     predict.set_defaults(func=_cmd_predict)
 
     evaluate = subparsers.add_parser("evaluate")
@@ -661,6 +695,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--master-port", type=int, default=None)
     _add_data_input_args(evaluate)
     _add_training_override_args(evaluate)
+    _add_runtime_override_args(evaluate)
     evaluate.set_defaults(func=_cmd_evaluate)
 
     return parser

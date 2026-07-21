@@ -10,11 +10,15 @@ import torch
 import yaml
 
 from scripts.build_mdl_rankmixer_config import (
+    CANDIDATE_ITEM_BAG_FIELDS,
+    CANDIDATE_ITEM_SCALAR_FIELDS,
     CONTEXT_SCALAR_FIELDS,
     EXPECTED_LABELS,
     EXPECTED_UPS_TYPES,
     ITEM_BAG_FIELDS,
     ONETRANS_SEQUENCE_LENGTH_CAPS,
+    REQUEST_CONTEXT_BAG_FIELDS,
+    REQUEST_CONTEXT_SCALAR_FIELDS,
     apply_embedding_profile,
     build_config,
     build_name_estimate_report,
@@ -42,6 +46,7 @@ from src.embeddings import ShardedEmbedding
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SAMPLE_FIXTURE = ROOT / "tests" / "fixtures" / "mdl_sample.yaml"
 
 
 def _compact_production_config(model_name: str):
@@ -174,6 +179,7 @@ def _synthetic_report(sample: dict) -> dict:
             "invalid_leaf_count": 0,
             "zero_count": 0,
             "rows_with_empty_list": 0,
+            "empty_lists_by_depth": {},
             "nulls_by_depth": {},
             "list_lengths_by_depth": {
                 "0": {"count": 10, "min": 1, "p50": 2, "p95": 4, "p99": 5, "max": 6},
@@ -233,6 +239,8 @@ def _synthetic_report(sample: dict) -> dict:
             "partial_indices_rows": 0,
             "context_outer_mismatches": {},
             "item_outer_mismatches": {},
+            "request_outer_mismatches": {},
+            "candidate_outer_mismatches": {},
             "label_length_mismatches": {},
             "invalid_labels": {},
             "sequence_length_mismatches": {},
@@ -251,7 +259,7 @@ def _synthetic_report(sample: dict) -> dict:
 class BuildMDLRankMixerConfigTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.sample = yaml.safe_load((ROOT / "sample.yaml").read_text(encoding="utf-8"))
+        cls.sample = yaml.safe_load(SAMPLE_FIXTURE.read_text(encoding="utf-8"))
 
     def test_builds_valid_report_driven_production_config(self) -> None:
         report = _synthetic_report(self.sample)
@@ -281,7 +289,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             "include_as_padding",
         )
         self.assertNotIn("pooling", by_name["sku_spec_vids_hn"])
-        self.assertEqual(summary["bag_feature_count"], 60)
+        self.assertEqual(summary["bag_feature_count"], 61)
 
         main_sequences = payload["sequences"][:9]
         self.assertEqual([item["name"] for item in main_sequences], [
@@ -388,33 +396,45 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             self.assertEqual(encoding["out_of_range"], "error")
             self.assertFalse(encoding.get("share_embedding", False))
             self.assertNotIn("share_with", encoding)
-        self.assertEqual(adapter_options["request_axis_item_features"], [
-            "buy_long_spec_vids_hn",
-            "cart_long_spec_vids_hn",
-            "impr_3h_tg_hn",
-            "impr_all_tg_hn",
-            "main_goods_ids_hn_share",
+        self.assertNotIn("request_axis_item_features", adapter_options)
+        self.assertNotIn("candidate_axis_context_features", adapter_options)
+        for name in (
             "offline_outside_goods_id_list_hn_share",
-            "opt_id_hn",
+            "buy_long_spec_vids_hn",
+            "impr_3h_tg_hn",
             "query_pay_cnt_15d_hn",
-            "site_q2i_good_list_hn_share",
-        ])
-        self.assertEqual(adapter_options["candidate_axis_context_features"], [
+            "opt_id_hn",
+        ):
+            self.assertIn(name, adapter_options["context_features"])
+            self.assertNotIn(name, adapter_options["item_features"])
+        for name in (
+            "clk_cnt_1d_hn",
+            "clk_3d_cnt_hn",
+            "clk_1d_cat_cnt_hn",
             "cart_cnt_1d_hn",
             "cart_cnt_3d_hn",
-            "clk_1d_cat_cnt_hn",
-            "clk_3d_cnt_hn",
-            "clk_cnt_1d_hn",
-        ])
+        ):
+            self.assertIn(name, adapter_options["item_features"])
+            self.assertNotIn(name, adapter_options["context_features"])
         for name in (
             "offline_outside_goods_id_list_hn_share",
             "i2i_coclk_hn_share",
             "i2i2cat2_swing_hn",
             "buy_long_spec_vids_hn",
             "impr_3h_tg_hn",
+            "cart_long_hit_samestyle_i2i_idx_hn",
         ):
             self.assertIn(name, adapter_options["multivalue_features"])
             self.assertEqual(by_name[name]["pooling"], "mean")
+        self.assertEqual(
+            by_name["cart_long_hit_samestyle_i2i_idx_hn"]["max_length"],
+            32,
+        )
+        expected_bags = (
+            set(adapter_options["context_features"]) - CONTEXT_SCALAR_FIELDS
+        ) | ITEM_BAG_FIELDS
+        self.assertEqual(set(adapter_options["multivalue_features"]), expected_bags)
+        self.assertEqual(summary["bag_feature_count"], len(expected_bags))
         for name in (
             "multimodal_i2i_hit_clk_size_hn",
             "multimodal_i2i_hit_cart_size_hn",
@@ -425,8 +445,18 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         ):
             self.assertNotIn(name, adapter_options["multivalue_features"])
             self.assertNotIn("pooling", by_name[name])
-        self.assertEqual(len(adapter_options["context_features"]), 47)
-        self.assertEqual(len(adapter_options["item_features"]), 122)
+        aligned_sku = adapter_options["aligned_multivalue_groups"][0]
+        self.assertEqual(len(aligned_sku), 8)
+        self.assertNotIn("sku_spec_hn", aligned_sku)
+        self.assertIn("sku_id_hn", aligned_sku)
+        self.assertIn("sku_spec_hash_hn", aligned_sku)
+        self.assertIn("sku_spec_hn", adapter_options["multivalue_features"])
+        self.assertEqual(by_name["sku_spec_hn"]["pooling"], "mean")
+        self.assertEqual(
+            by_name["sku_spec_hn"]["pooling_null_policy"], "include_as_padding"
+        )
+        self.assertEqual(len(adapter_options["context_features"]), 51)
+        self.assertEqual(len(adapter_options["item_features"]), 118)
         self.assertEqual(
             adapter_options["labels"]["cateid_filter"],
             "cateid_is_fst_scene_sp_filter",
@@ -1282,6 +1312,90 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cycle"):
             apply_embedding_profile(payload, "baseline")
 
+
+    def test_production_yamls_build_adapter_plans(self) -> None:
+        from types import SimpleNamespace
+
+        from src.dataloader import (
+            _build_mdl_rankmixer_adapter_plan,
+            required_columns_for_split,
+        )
+
+        for config_name in (
+            "rankmixer.yaml",
+            "onetrans.yaml",
+            "mdl_rankmixer.yaml",
+            "mdl_onetrans.yaml",
+        ):
+            with self.subTest(config=config_name):
+                config = load_app_config(ROOT / "configs" / config_name)
+                for split_name, split in (
+                    ("train", config.data.train),
+                    ("test", config.data.test),
+                ):
+                    with self.subTest(split=split_name):
+                        self.assertIsNotNone(split.adapter)
+                        options = split.adapter.options
+                        self.assertEqual(len(options["context_features"]), 51)
+                        self.assertEqual(len(options["item_features"]), 118)
+                        self.assertNotIn("request_axis_item_features", options)
+                        self.assertNotIn("candidate_axis_context_features", options)
+                        self.assertEqual(
+                            options.get("unlisted_scene_policy"), "recommendation"
+                        )
+                        self.assertEqual(
+                            len(options.get("search_scene_ids", ())),
+                            len(SEARCH_SCENE_IDS),
+                        )
+                        for name in (
+                            "query_pay_cnt_15d_hn",
+                            "opt_id_hn",
+                            "buy_long_spec_vids_hn",
+                            "offline_outside_goods_id_list_hn_share",
+                        ):
+                            self.assertIn(name, options["context_features"])
+                            self.assertNotIn(name, options["item_features"])
+                        for name in (
+                            "clk_cnt_1d_hn",
+                            "cart_cnt_3d_hn",
+                        ):
+                            self.assertIn(name, options["item_features"])
+                            self.assertNotIn(name, options["context_features"])
+                            self.assertNotIn(name, options["multivalue_features"])
+                        for name in REQUEST_CONTEXT_BAG_FIELDS | REQUEST_CONTEXT_SCALAR_FIELDS:
+                            self.assertIn(name, options["context_features"])
+                            self.assertNotIn(name, options["item_features"])
+                        for name in REQUEST_CONTEXT_BAG_FIELDS:
+                            self.assertIn(name, options["multivalue_features"])
+                        for name in REQUEST_CONTEXT_SCALAR_FIELDS:
+                            self.assertNotIn(name, options["multivalue_features"])
+                        for name in CANDIDATE_ITEM_BAG_FIELDS | CANDIDATE_ITEM_SCALAR_FIELDS:
+                            self.assertIn(name, options["item_features"])
+                            self.assertNotIn(name, options["context_features"])
+                        for name in CANDIDATE_ITEM_BAG_FIELDS:
+                            self.assertIn(name, options["multivalue_features"])
+                        for name in CANDIDATE_ITEM_SCALAR_FIELDS:
+                            self.assertNotIn(name, options["multivalue_features"])
+                        self.assertIn(
+                            "cart_long_hit_samestyle_i2i_idx_hn",
+                            options["multivalue_features"],
+                        )
+                        expected_bags = (
+                            set(options["context_features"]) - CONTEXT_SCALAR_FIELDS
+                        ) | ITEM_BAG_FIELDS
+                        self.assertEqual(
+                            set(options["multivalue_features"]),
+                            expected_bags,
+                        )
+                        required = required_columns_for_split(config, split)
+                        plan = _build_mdl_rankmixer_adapter_plan(
+                            SimpleNamespace(
+                                options=options,
+                                required_columns=tuple(required),
+                            )
+                        )
+                        self.assertEqual(len(plan.context_features), 51)
+                        self.assertEqual(len(plan.item_features), 118)
 
     def test_production_mdl_yamls_flatten_spec_sku_aliases(self) -> None:
         for config_name in ("mdl_rankmixer.yaml", "mdl_onetrans.yaml"):

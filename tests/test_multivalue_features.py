@@ -57,13 +57,15 @@ class MultiValueCategoricalFeatureTest(unittest.TestCase):
         actual = _tensorize_categorical_bag(self._config(), feature, table, {})
 
         torch.testing.assert_close(actual["lengths"], torch.tensor([3, 0, 1]))
+        # Flat CSR: row0 keeps 3 tokens, row1 empty, row2 keeps 1.
         torch.testing.assert_close(
             actual["values"],
-            torch.tensor([[2, 0, 8], [0, 0, 0], [1, 0, 0]]),
+            torch.tensor([2, 0, 8, 1]),
         )
+        self.assertEqual(actual["values"].ndim, 1)
 
     def test_pooling_null_policies_have_distinct_denominators(self) -> None:
-        indices = torch.tensor([[2, 0, 8], [0, 0, 0]])
+        indices = torch.tensor([2, 0, 8])
         lengths = torch.tensor([3, 0])
         embedded = indices.float().unsqueeze(-1)
 
@@ -79,6 +81,15 @@ class MultiValueCategoricalFeatureTest(unittest.TestCase):
             preserved,
             torch.tensor([[(2.0 + 8.0) / 3.0], [0.0]]),
         )
+
+    def test_padded_bag_pooling_path_still_supported(self) -> None:
+        indices = torch.tensor([[2, 0, 8], [0, 0, 0]])
+        lengths = torch.tensor([3, 0])
+        embedded = indices.float().unsqueeze(-1)
+        excluded = _mean_pool_categorical_bag(
+            embedded, indices, lengths, "exclude"
+        )
+        torch.testing.assert_close(excluded, torch.tensor([[5.0], [0.0]]))
 
     def test_dense_feature_cannot_enable_categorical_pooling(self) -> None:
         feature = FeatureConfig(

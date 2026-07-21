@@ -701,13 +701,14 @@ def _synthetic_feature_batch(
         if feature.kind == "categorical":
             if feature.pooling == "mean":
                 bag_length = min(feature.max_length or 4, 8)
+                flat_ids = _synthetic_ids(
+                    (rows * bag_length,),
+                    _categorical_size(config, feature.name),
+                    device,
+                    generator,
+                )
                 value: Any = {
-                    "values": _synthetic_ids(
-                        (rows, bag_length),
-                        _categorical_size(config, feature.name),
-                        device,
-                        generator,
-                    ),
+                    "values": flat_ids,
                     "lengths": torch.full(
                         (rows,),
                         bag_length,
@@ -1321,11 +1322,14 @@ def _resolve_benchmark_scenarios(
 
     ``compute`` / ``embedding`` never read training inputs. When auto-discover
     is enabled they expand a deterministic synthetic scene set so MDL scenario
-    tokens reflect production-scale routing cost. ``data`` / ``end-to-end`` keep
-    the real cache-or-Parquet discovery path.
+    tokens reflect production-scale routing cost. Fixed two-scenario production
+    configs are left unchanged. ``data`` / ``end-to-end`` keep the real
+    cache-or-Parquet discovery path when auto-discover is on.
     """
 
-    if options.mode in {"compute", "embedding"} and config.scenarios.auto_discover:
+    if options.mode in {"compute", "embedding"}:
+        if not config.scenarios.auto_discover:
+            return config
         synthetic_values = tuple(range(options.synthetic_scenario_count))
         resolved = resolve_auto_scenarios(config, synthetic_values)
         if context.rank == 0:
