@@ -47,6 +47,16 @@ from .features import (
     encode_categorical_value,
     encode_categorical_values,
 )
+from .remote_io import (
+    RemoteIoPolicy,
+    apply_worker_stagger,
+    close_hdfs_native_file,
+    iter_parquet_record_batches,
+    open_parquet_via_native,
+    run_under_file_lock,
+    scaled_hdfs_prefetch_workers,
+    thread_local_hdfs_filesystem,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -425,19 +435,76 @@ def _coerce_parquet_input_ref(path: str | Path | ParquetInputRef) -> ParquetInpu
     return refs[0]
 
 
-def parquet_schema(path: str | Path | ParquetInputRef) -> Any:
+def parquet_schema(
+    path: str | Path | ParquetInputRef,
+    policy: RemoteIoPolicy | None = None,
+) -> Any:
     """Read Parquet schema metadata only; does not scan row data."""
     _pa, _pc, _ds, pq = _require_pyarrow()
     ref = _coerce_parquet_input_ref(path)
-    return pq.read_schema(ref.fs_path, filesystem=ref.filesystem)
+    remote = any(
+        str(ref.filesystem_key).startswith(f"{scheme}://")
+        for scheme in _REMOTE_URI_SCHEMES
+    )
+    if policy is None:
+        io_policy = RemoteIoPolicy.from_reader(
+            type(
+                "Reader",
+                (),
+                {
+                    "hdfs_op_timeout": 30.0,
+                    "hdfs_open_timeout": 120.0,
+                    "hdfs_retry_count": 5,
+                    "hdfs_retry_base_sec": 0.5,
+                    "hdfs_file_lock": True,
+                    "on_hdfs_failure": "fail",
+                    "worker_stagger_sec": 0.0,
+                    "hdfs_pre_buffer": False,
+                    "hdfs_close_timeout": 5.0,
+                },
+            )(),
+            remote=remote,
+        )
+    else:
+        io_policy = policy
+    if not io_policy.enabled:
+        return pq.read_schema(ref.fs_path, filesystem=ref.filesystem)
+
+    filesystem = thread_local_hdfs_filesystem(
+        ref.filesystem_key,
+        prototype=ref.filesystem,
+    )
+    schema_policy = replace(io_policy, pre_buffer=False)
+    parquet_file, native_file = open_parquet_via_native(
+        filesystem=filesystem,
+        fs_path=ref.fs_path,
+        lock_key=ref.canonical_uri,
+        policy=schema_policy,
+        pq_module=pq,
+        description=f"read schema {ref.canonical_uri}",
+    )
+    try:
+        return parquet_file.schema_arrow
+    finally:
+        close_hdfs_native_file(
+            native_file,
+            timeout_sec=io_policy.close_timeout,
+            description=f"close schema handle {ref.canonical_uri}",
+        )
 
 
-def validate_matching_schemas(paths: Iterable[str | Path | ParquetInputRef]) -> str:
+def validate_matching_schemas(
+    paths: Iterable[str | Path | ParquetInputRef],
+    policy: RemoteIoPolicy | None = None,
+) -> str:
     """Require identical schemas across files; return the shared fingerprint."""
     refs = [_coerce_parquet_input_ref(path) for path in paths]
     if not refs:
         raise ValueError("paths must not be empty")
-    fingerprints = {ref: schema_fingerprint(parquet_schema(ref)) for ref in refs}
+    fingerprints = {
+        ref: schema_fingerprint(parquet_schema(ref, policy=policy))
+        for ref in refs
+    }
     expected = next(iter(fingerprints.values()))
     mismatched = [
         ref.canonical_uri
@@ -470,14 +537,20 @@ def _eager_schema_validation_refs(
     return [refs[index] for index in sorted(indices)]
 
 
-def _configure_pyarrow_threads(pa: Any, num_workers: int) -> None:
-    """Align PyArrow CPU/IO threads with ``reader.num_workers`` when set."""
-    if num_workers <= 0:
+def _configure_pyarrow_threads(
+    pa: Any,
+    num_workers: int,
+    *,
+    io_thread_count: int | None = None,
+) -> None:
+    """Align PyArrow CPU/IO threads with reader settings when set."""
+    if num_workers <= 0 and io_thread_count is None:
         return
-    if hasattr(pa, "set_cpu_count"):
+    if num_workers > 0 and hasattr(pa, "set_cpu_count"):
         pa.set_cpu_count(num_workers)
-    if hasattr(pa, "set_io_thread_count"):
-        pa.set_io_thread_count(num_workers)
+    resolved_io = io_thread_count if io_thread_count is not None else num_workers
+    if resolved_io > 0 and hasattr(pa, "set_io_thread_count"):
+        pa.set_io_thread_count(resolved_io)
 
 
 def _put_queue_item(
@@ -653,63 +726,138 @@ class _ShardPlan:
     fingerprint: str
 
 
-def _metadata_worker_count(num_workers: int, file_count: int) -> int:
+def _metadata_worker_count(
+    num_workers: int,
+    file_count: int,
+    *,
+    remote: bool = False,
+) -> int:
     """Cap parallel metadata readers by file count and a hard limit of 16."""
+    if remote:
+        # Footer opens on HDFS are NameNode-heavy; keep them serial per rank.
+        return 1 if file_count else 0
     configured = num_workers if num_workers > 0 else min(8, os.cpu_count() or 1)
     return min(file_count, configured, 16)
 
 
-def _load_file_metadata_cache(ref: ParquetInputRef, scan_columns: list[str] | None) -> _FileMetadataCache:
+def _refs_are_remote(refs: Sequence[ParquetInputRef]) -> bool:
+    if not refs:
+        return False
+    key = str(refs[0].filesystem_key)
+    return any(key.startswith(f"{scheme}://") for scheme in _REMOTE_URI_SCHEMES)
+
+
+def _load_file_metadata_cache(
+    ref: ParquetInputRef,
+    scan_columns: list[str] | None,
+    policy: RemoteIoPolicy | None = None,
+) -> _FileMetadataCache:
     """Read row-group row counts and compressed-byte weights from the footer only."""
+    io_policy = policy or RemoteIoPolicy.disabled()
     _pa, _pc, _ds, pq = _require_pyarrow()
-    parquet_file = pq.ParquetFile(ref.fs_path, filesystem=ref.filesystem)
-    schema = parquet_file.schema_arrow
-    column_names = scan_columns if scan_columns is not None else list(schema.names)
-    column_indices = {
-        column_name: schema.get_field_index(column_name)
-        for column_name in column_names
-    }
-    row_groups: list[_RowGroupMetadata] = []
-    for local_row_group_index in range(parquet_file.metadata.num_row_groups):
-        row_group = parquet_file.metadata.row_group(local_row_group_index)
-        compressed_bytes = 0
-        missing_bytes = False
-        for column_name in column_names:
-            column_index = column_indices[column_name]
-            if column_index < 0:
-                missing_bytes = True
-                break
-            column_meta = row_group.column(column_index)
-            if column_meta.total_compressed_size is None or column_meta.total_compressed_size < 0:
-                missing_bytes = True
-                break
-            compressed_bytes += int(column_meta.total_compressed_size)
-        row_groups.append(
-            _RowGroupMetadata(
-                input_ref=ref,
-                local_row_group_index=local_row_group_index,
-                num_rows=row_group.num_rows,
-                compressed_bytes=None if missing_bytes else compressed_bytes,
-            )
+
+    def load() -> _FileMetadataCache:
+        filesystem = thread_local_hdfs_filesystem(
+            ref.filesystem_key,
+            prototype=ref.filesystem,
         )
-    return _FileMetadataCache(schema=schema, row_groups=tuple(row_groups))
+        meta_policy = replace(io_policy, pre_buffer=False) if io_policy.enabled else io_policy
+        if io_policy.enabled:
+            parquet_file, native_file = open_parquet_via_native(
+                filesystem=filesystem,
+                fs_path=ref.fs_path,
+                lock_key=ref.canonical_uri,
+                policy=meta_policy,
+                pq_module=pq,
+                description=f"load parquet metadata {ref.canonical_uri}",
+            )
+        else:
+            parquet_file = pq.ParquetFile(ref.fs_path, filesystem=ref.filesystem)
+            native_file = None
+        try:
+            schema = parquet_file.schema_arrow
+            column_names = (
+                scan_columns if scan_columns is not None else list(schema.names)
+            )
+            column_indices = {
+                column_name: schema.get_field_index(column_name)
+                for column_name in column_names
+            }
+            row_groups: list[_RowGroupMetadata] = []
+            for local_row_group_index in range(parquet_file.metadata.num_row_groups):
+                row_group = parquet_file.metadata.row_group(local_row_group_index)
+                compressed_bytes = 0
+                missing_bytes = False
+                for column_name in column_names:
+                    column_index = column_indices[column_name]
+                    if column_index < 0:
+                        missing_bytes = True
+                        break
+                    column_meta = row_group.column(column_index)
+                    if (
+                        column_meta.total_compressed_size is None
+                        or column_meta.total_compressed_size < 0
+                    ):
+                        missing_bytes = True
+                        break
+                    compressed_bytes += int(column_meta.total_compressed_size)
+                row_groups.append(
+                    _RowGroupMetadata(
+                        input_ref=ref,
+                        local_row_group_index=local_row_group_index,
+                        num_rows=row_group.num_rows,
+                        compressed_bytes=None if missing_bytes else compressed_bytes,
+                    )
+                )
+            return _FileMetadataCache(schema=schema, row_groups=tuple(row_groups))
+        finally:
+            close_hdfs_native_file(
+                native_file,
+                timeout_sec=io_policy.close_timeout,
+                description=f"close metadata handle {ref.canonical_uri}",
+            )
+
+    # Footer planning must stay strict: skipping here would desync LPT shards.
+    # open_parquet_via_native already locks; for local keep a simple call.
+    if io_policy.enabled:
+        return load()
+    return run_under_file_lock(
+        load,
+        lock_key=ref.canonical_uri,
+        policy=io_policy,
+        description=f"load parquet metadata {ref.canonical_uri}",
+        timeout_sec=None,
+    )
 
 
 def _load_metadata_cache(
     paths: list[ParquetInputRef],
     scan_columns: list[str] | None,
     num_workers: int,
+    policy: RemoteIoPolicy | None = None,
 ) -> dict[ParquetInputRef, _FileMetadataCache]:
     """Load per-file footer metadata, in parallel when beneficial."""
-    worker_count = _metadata_worker_count(num_workers, len(paths))
+    io_policy = policy or RemoteIoPolicy.disabled()
+    worker_count = _metadata_worker_count(
+        num_workers,
+        len(paths),
+        remote=io_policy.enabled,
+    )
     metadata_by_path: dict[ParquetInputRef, _FileMetadataCache] = {}
     if worker_count <= 1:
         for ref in paths:
-            metadata_by_path[ref] = _load_file_metadata_cache(ref, scan_columns)
+            metadata_by_path[ref] = _load_file_metadata_cache(
+                ref,
+                scan_columns,
+                io_policy,
+            )
         return metadata_by_path
 
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = {executor.submit(_load_file_metadata_cache, ref, scan_columns): ref for ref in paths}
+        futures = {
+            executor.submit(_load_file_metadata_cache, ref, scan_columns, io_policy): ref
+            for ref in paths
+        }
         for future in as_completed(futures):
             metadata_by_path[futures[future]] = future.result()
     return metadata_by_path
@@ -900,6 +1048,12 @@ class ParquetScanner:
                 "for distributed scanning"
             )
         self.all_paths = discover_parquet_inputs(split.inputs)
+        self._io_policy = RemoteIoPolicy.from_reader(
+            split.reader,
+            remote=_refs_are_remote(self.all_paths),
+        )
+        if self._io_policy.enabled:
+            apply_worker_stagger(shard_rank, split.reader.worker_stagger_sec)
         global_schema_refs = _eager_schema_validation_refs(
             self.all_paths,
             split.reader.eager_schema_validation,
@@ -917,13 +1071,13 @@ class ParquetScanner:
             )
         else:
             schema_refs = global_schema_refs
-        validate_matching_schemas(schema_refs)
+        validate_matching_schemas(schema_refs, policy=self._io_policy)
         if self.columns:
             # Auto-detecting adapters may support layout-specific raw columns
             # (the agg indices are absent from req files). Project optional
             # columns only when the split schema contains them, while still
             # failing early for a missing mandatory input.
-            schema_names = set(parquet_schema(schema_refs[0]).names)
+            schema_names = set(parquet_schema(schema_refs[0], policy=self._io_policy).names)
             missing = [
                 column
                 for column in self.columns
@@ -940,7 +1094,23 @@ class ParquetScanner:
                 if column not in self.optional_columns or column in schema_names
             ]
         pa, _pc, _ds, _pq = _require_pyarrow()
-        _configure_pyarrow_threads(pa, split.reader.num_workers)
+        if self._io_policy.enabled:
+            # IO pool sized to eason-style prefetch workers (pre_buffer only).
+            # CPU pool can stay larger for decode after copy-off-HDFS.
+            io_workers = scaled_hdfs_prefetch_workers(
+                world_size=shard_world_size,
+                num_workers=split.reader.num_workers,
+                prefetch_batches=max(1, split.reader.prefetch_batches),
+                work_item_count=10**9,
+                remote=True,
+            )
+            _configure_pyarrow_threads(
+                pa,
+                max(split.reader.num_workers, 1),
+                io_thread_count=max(1, io_workers),
+            )
+        else:
+            _configure_pyarrow_threads(pa, split.reader.num_workers)
         # File sharding: each rank scans a disjoint subset of paths.
         if shard_world_size > 1 and split.reader.shard_unit == "file":
             self.paths = self.all_paths[shard_rank::shard_world_size]
@@ -986,6 +1156,7 @@ class ParquetScanner:
                 self.all_paths,
                 self._scan_columns(),
                 self.split.reader.num_workers,
+                self._io_policy,
             )
         return self._metadata_cache
 
@@ -1037,13 +1208,14 @@ class ParquetScanner:
         return assigned
 
     def _prefetch_active_workers(self, row_group_count: int) -> int:
-        """Bound concurrent row-group readers by prefetch budget and a cap of 4."""
-        prefetch_batches = self.split.reader.prefetch_batches
-        if prefetch_batches <= 0:
-            return 0
-        num_workers = self.split.reader.num_workers
-        worker_budget = num_workers if num_workers > 0 else 4
-        return min(row_group_count, prefetch_batches, worker_budget, 4)
+        """Bound concurrent row-group readers; on HDFS scale with GPU count."""
+        return scaled_hdfs_prefetch_workers(
+            world_size=self.shard_world_size,
+            num_workers=self.split.reader.num_workers,
+            prefetch_batches=self.split.reader.prefetch_batches,
+            work_item_count=row_group_count,
+            remote=self._filesystem_is_remote(),
+        )
 
     def _prefetch_queue_capacities(self, active_workers: int) -> list[int]:
         """Split ``prefetch_batches`` across workers as evenly as possible."""
@@ -1063,28 +1235,24 @@ class ParquetScanner:
         for work_item in work_items:
             if stop_event.is_set():
                 return
-            parquet_file = pq.ParquetFile(work_item.input_ref.fs_path, filesystem=work_item.input_ref.filesystem)
-            batch_iterator = iter(
-                parquet_file.iter_batches(
-                    batch_size=batch_size,
-                    row_groups=[work_item.local_row_group_index],
-                    columns=scan_columns,
-                    use_threads=True,
-                )
+            ref = work_item.input_ref
+            yield from iter_parquet_record_batches(
+                fs_path=ref.fs_path,
+                filesystem=ref.filesystem,
+                filesystem_key=ref.filesystem_key,
+                lock_key=ref.canonical_uri,
+                policy=self._io_policy,
+                pq_module=pq,
+                stop_event=stop_event,
+                description=(
+                    f"row group {work_item.local_row_group_index} of "
+                    f"{ref.canonical_uri}"
+                ),
+                batch_size=batch_size,
+                row_groups=[work_item.local_row_group_index],
+                columns=scan_columns,
+                use_threads=not self._io_policy.enabled,
             )
-            try:
-                while not stop_event.is_set():
-                    try:
-                        batch = next(batch_iterator)
-                    except StopIteration:
-                        break
-                    if stop_event.is_set():
-                        return
-                    yield batch
-            finally:
-                close = getattr(batch_iterator, "close", None)
-                if callable(close):
-                    close()
 
     def _row_group_worker(
         self,
@@ -1093,25 +1261,28 @@ class ParquetScanner:
         stop_event: threading.Event,
     ) -> None:
         """Background worker: stream one row group into a bounded prefetch queue."""
-        batch_iterator: Iterator[Any] | None = None
         try:
             _pa, _pc, _ds, pq = _require_pyarrow()
             batch_size = self._reader_batch_size(default=65536)
             scan_columns = self._scan_columns()
-            parquet_file = pq.ParquetFile(work_item.input_ref.fs_path, filesystem=work_item.input_ref.filesystem)
-            batch_iterator = iter(
-                parquet_file.iter_batches(
-                    batch_size=batch_size,
-                    row_groups=[work_item.local_row_group_index],
-                    columns=scan_columns,
-                    use_threads=True,
-                )
-            )
-            while not stop_event.is_set():
-                try:
-                    batch = next(batch_iterator)
-                except StopIteration:
-                    break
+            ref = work_item.input_ref
+            for batch in iter_parquet_record_batches(
+                fs_path=ref.fs_path,
+                filesystem=ref.filesystem,
+                filesystem_key=ref.filesystem_key,
+                lock_key=ref.canonical_uri,
+                policy=self._io_policy,
+                pq_module=pq,
+                stop_event=stop_event,
+                description=(
+                    f"prefetch row group {work_item.local_row_group_index} of "
+                    f"{ref.canonical_uri}"
+                ),
+                batch_size=batch_size,
+                row_groups=[work_item.local_row_group_index],
+                columns=scan_columns,
+                use_threads=not self._io_policy.enabled,
+            ):
                 if stop_event.is_set():
                     return
                 batch_bytes = max(1, int(getattr(batch, "nbytes", 0)))
@@ -1124,14 +1295,6 @@ class ParquetScanner:
         except BaseException as error:
             slot.error = error
         finally:
-            if batch_iterator is not None:
-                close = getattr(batch_iterator, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except BaseException as error:
-                        if slot.error is None:
-                            slot.error = error
             _put_queue_item(slot.queue, _SENTINEL, stop_event)
 
     def _iter_row_group_record_batches_prefetch(
@@ -1285,39 +1448,236 @@ class ParquetScanner:
             return
         yield from self._iter_row_group_record_batches_prefetch(work_items, stop_event)
 
-    def _iter_dataset_record_batches(self, stop_event: threading.Event) -> Iterator[Any]:
-        """Scan via PyArrow Dataset API (file sharding or single-rank workloads)."""
-        _pa, _pc, ds, _pq = _require_pyarrow()
-        if not self.paths:
-            return
-        filesystem = self.paths[0].filesystem
-        dataset = ds.dataset(
-            [ref.fs_path for ref in self.paths],
-            format="parquet",
-            filesystem=filesystem,
-        )
-        scanner_kwargs: dict[str, Any] = {
-            "columns": self._scan_columns(),
-            "use_threads": True,
-            # File-sharded scans rely on Arrow's asynchronous queues. Tie their
-            # depth to the same user-facing prefetch knob; zero still means a
-            # single in-flight unit so synchronous iteration remains valid.
-            "batch_readahead": max(1, self.split.reader.prefetch_batches),
-            "fragment_readahead": max(
-                1,
-                min(
-                    self.split.reader.prefetch_batches,
-                    self.split.reader.num_workers or 4,
-                ),
-            ),
-        }
-        if self.split.reader.scanner_batch_rows is not None:
-            scanner_kwargs["batch_size"] = self.split.reader.scanner_batch_rows
-        scanner = dataset.scanner(**scanner_kwargs)
-        for batch in scanner.to_batches():
+    def _filesystem_is_remote(self) -> bool:
+        return self._io_policy.enabled
+
+    def _iter_file_record_batches_sync(
+        self,
+        paths: list[ParquetInputRef],
+        stop_event: threading.Event,
+    ) -> Iterator[Any]:
+        """Sequentially read whole files via eason-style ParquetFile opens."""
+        _pa, _pc, _ds, pq = _require_pyarrow()
+        batch_size = self._reader_batch_size(default=65536)
+        scan_columns = self._scan_columns()
+        for ref in paths:
             if stop_event.is_set():
                 return
-            yield batch
+            yield from iter_parquet_record_batches(
+                fs_path=ref.fs_path,
+                filesystem=ref.filesystem,
+                filesystem_key=ref.filesystem_key,
+                lock_key=ref.canonical_uri,
+                policy=self._io_policy,
+                pq_module=pq,
+                stop_event=stop_event,
+                description=f"file scan {ref.canonical_uri}",
+                batch_size=batch_size,
+                columns=scan_columns,
+                use_threads=not self._io_policy.enabled,
+            )
+
+    def _file_worker(
+        self,
+        ref: ParquetInputRef,
+        slot: _PrefetchSlot,
+        stop_event: threading.Event,
+    ) -> None:
+        """Background worker: stream one whole file into a bounded prefetch queue."""
+        try:
+            _pa, _pc, _ds, pq = _require_pyarrow()
+            batch_size = self._reader_batch_size(default=65536)
+            scan_columns = self._scan_columns()
+            for batch in iter_parquet_record_batches(
+                fs_path=ref.fs_path,
+                filesystem=ref.filesystem,
+                filesystem_key=ref.filesystem_key,
+                lock_key=ref.canonical_uri,
+                policy=self._io_policy,
+                pq_module=pq,
+                stop_event=stop_event,
+                description=f"prefetch file {ref.canonical_uri}",
+                batch_size=batch_size,
+                columns=scan_columns,
+                use_threads=not self._io_policy.enabled,
+            ):
+                if stop_event.is_set():
+                    return
+                batch_bytes = max(1, int(getattr(batch, "nbytes", 0)))
+                if not slot.byte_budget.acquire(batch_bytes, stop_event):
+                    return
+                queued = _QueuedRecordBatch(batch, batch_bytes)
+                if not _put_queue_item(slot.queue, queued, stop_event):
+                    slot.byte_budget.release(batch_bytes)
+                    return
+        except BaseException as error:
+            slot.error = error
+        finally:
+            _put_queue_item(slot.queue, _SENTINEL, stop_event)
+
+    def _iter_file_record_batches_prefetch(
+        self,
+        paths: list[ParquetInputRef],
+        stop_event: threading.Event,
+    ) -> Iterator[Any]:
+        """Read rank-local files concurrently while yielding in deterministic order."""
+        if not paths:
+            return
+
+        active_workers = scaled_hdfs_prefetch_workers(
+            world_size=self.shard_world_size,
+            num_workers=self.split.reader.num_workers,
+            prefetch_batches=self.split.reader.prefetch_batches,
+            work_item_count=len(paths),
+            remote=self._filesystem_is_remote(),
+        )
+        if active_workers <= 0:
+            yield from self._iter_file_record_batches_sync(paths, stop_event)
+            return
+
+        capacities = self._prefetch_queue_capacities(active_workers)
+        byte_capacity = max(
+            1, self.split.reader.max_prefetch_bytes // active_workers
+        )
+        slots = [
+            _PrefetchSlot(
+                index=index,
+                queue=queue.Queue(maxsize=capacity),
+                byte_budget=_ByteBudget(byte_capacity),
+            )
+            for index, capacity in enumerate(capacities)
+        ]
+        slot_for_item: dict[int, _PrefetchSlot] = {}
+        free_slots: queue.Queue[int] = queue.Queue()
+        for index in range(active_workers):
+            free_slots.put(index)
+        assignment_condition = threading.Condition()
+        next_assign_index = 0
+        assignment_error: BaseException | None = None
+
+        def assign_available_slots() -> None:
+            nonlocal next_assign_index
+            while next_assign_index < len(paths) and not free_slots.empty():
+                if stop_event.is_set():
+                    return
+                try:
+                    slot_index = free_slots.get_nowait()
+                except queue.Empty:
+                    return
+                ref = paths[next_assign_index]
+                slot = slots[slot_index]
+
+                def run_worker(
+                    item: ParquetInputRef = ref,
+                    target_slot: _PrefetchSlot = slot,
+                ) -> None:
+                    self._file_worker(item, target_slot, stop_event)
+
+                slot.thread = threading.Thread(
+                    target=run_worker,
+                    name=f"parquet-file-prefetch-{next_assign_index}",
+                    daemon=True,
+                )
+                slot.thread.start()
+                slot_for_item[next_assign_index] = slot
+                next_assign_index += 1
+
+        def assignment_loop() -> None:
+            nonlocal assignment_error
+            try:
+                while next_assign_index < len(paths) and not stop_event.is_set():
+                    with assignment_condition:
+                        assign_available_slots()
+                        if next_assign_index >= len(paths) or stop_event.is_set():
+                            break
+                        assignment_condition.wait(timeout=0.01)
+            except BaseException as error:
+                assignment_error = error
+                stop_event.set()
+
+        assignment_thread = threading.Thread(
+            target=assignment_loop,
+            name="parquet-file-prefetch-assign",
+            daemon=True,
+        )
+        assignment_thread.start()
+
+        try:
+            for work_index, _ref in enumerate(paths):
+                if stop_event.is_set():
+                    return
+                if assignment_error is not None:
+                    raise assignment_error
+                while work_index not in slot_for_item:
+                    if stop_event.is_set():
+                        return
+                    if assignment_error is not None:
+                        raise assignment_error
+                    with assignment_condition:
+                        assign_available_slots()
+                        assignment_condition.notify_all()
+                    if work_index not in slot_for_item:
+                        time.sleep(0.001)
+
+                slot = slot_for_item[work_index]
+                while True:
+                    if stop_event.is_set():
+                        return
+                    if slot.error is not None:
+                        raise slot.error
+                    try:
+                        item = slot.queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    if item is _SENTINEL:
+                        if slot.error is not None:
+                            raise slot.error
+                        break
+                    if not isinstance(item, _QueuedRecordBatch):
+                        raise RuntimeError("invalid parquet prefetch queue item")
+                    try:
+                        yield item.value
+                    finally:
+                        slot.byte_budget.release(item.nbytes)
+                if slot.thread is not None:
+                    slot.thread.join(timeout=0.01)
+                slot.thread = None
+                slot.error = None
+                free_slots.put(slot.index)
+                with assignment_condition:
+                    assignment_condition.notify_all()
+                del slot_for_item[work_index]
+        finally:
+            stop_event.set()
+            assignment_thread.join(timeout=1.0)
+            for slot in slots:
+                if slot.thread is not None and slot.thread.is_alive():
+                    slot.thread.join(timeout=0.5)
+                _drain_prefetch_slot(slot)
+            slot_for_item.clear()
+
+    def _iter_file_record_batches(self, stop_event: threading.Event) -> Iterator[Any]:
+        """Scan rank-local files via ``ParquetFile`` (never Dataset scanner).
+
+        File sharding previously used Arrow Dataset ``scanner()`` with
+        ``fragment_readahead`` / ``use_threads`` against a shared
+        ``HadoopFileSystem``. That path observed ``Filesystem closed`` during
+        concurrent fragment opens. Whole-file ``ParquetFile`` reads with
+        thread-local HDFS clients match the eason model; optional prefetch
+        parallelizes across disjoint files only.
+        """
+
+        if not self.paths:
+            return
+        if self.split.reader.prefetch_batches <= 0:
+            yield from self._iter_file_record_batches_sync(self.paths, stop_event)
+            return
+        yield from self._iter_file_record_batches_prefetch(self.paths, stop_event)
+
+    def _iter_dataset_record_batches(self, stop_event: threading.Event) -> Iterator[Any]:
+        """Backward-compatible alias for file-sharded scans."""
+
+        yield from self._iter_file_record_batches(stop_event)
 
     def iter_record_batches(self) -> Iterator[Any]:
         """Return a closeable iterator so early exits also stop prefetch workers."""
@@ -1329,7 +1689,7 @@ class ParquetScanner:
             if self._uses_lpt_row_group_sharding():
                 yield from self._iter_row_group_record_batches(stop_event)
             else:
-                yield from self._iter_dataset_record_batches(stop_event)
+                yield from self._iter_file_record_batches(stop_event)
 
         return _ClosableIterator(generator(), stop_event)
 

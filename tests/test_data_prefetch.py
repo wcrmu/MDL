@@ -407,6 +407,67 @@ class EagerSchemaValidationTest(unittest.TestCase):
         refs = self._refs(5)
         self.assertIs(_eager_schema_validation_refs(refs, "all", 2), refs)
 
+    def test_file_shard_uses_parquet_file_not_dataset_scanner(self) -> None:
+        """HDFS file sharding must not use Dataset fragment_readahead opens."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for index in range(3):
+                path = Path(directory) / f"part-{index}.parquet"
+                pq.write_table(pa.table({"row_id": [index, index + 10]}), path)
+                paths.append(path)
+
+            split = ParquetSplitConfig(
+                format="flat_parquet",
+                inputs=tuple(str(path) for path in paths),
+                reader=ReaderConfig(
+                    num_workers=8,
+                    prefetch_batches=8,
+                    shard_unit="file",
+                    scanner_batch_rows=2,
+                ),
+            )
+            scanner = ParquetScanner(
+                split,
+                ["row_id"],
+                shard_rank=0,
+                shard_world_size=1,
+            )
+            opened: list[str] = []
+            real_parquet_file = pq.ParquetFile
+
+            def tracking_parquet_file(fs_path, **kwargs):
+                opened.append(str(fs_path))
+                return real_parquet_file(fs_path, **kwargs)
+
+            with patch("pyarrow.parquet.ParquetFile", side_effect=tracking_parquet_file):
+                with patch("pyarrow.dataset.dataset") as dataset_factory:
+                    rows = [
+                        value
+                        for batch in scanner.iter_record_batches()
+                        for value in batch.column("row_id").to_pylist()
+                    ]
+
+        self.assertEqual(sorted(rows), [0, 1, 2, 10, 11, 12])
+        self.assertEqual(len(opened), 3)
+        dataset_factory.assert_not_called()
+        self.assertFalse(scanner._filesystem_is_remote())
+
+    def test_remote_filesystem_scales_prefetch_workers(self) -> None:
+        from src.remote_io import RemoteIoPolicy
+
+        scanner = ParquetScanner.__new__(ParquetScanner)
+        scanner.paths = self._refs(2)
+        scanner.shard_world_size = 4
+        scanner.split = type(
+            "Split",
+            (),
+            {"reader": ReaderConfig(num_workers=8, prefetch_batches=8)},
+        )()
+        scanner._io_policy = RemoteIoPolicy.from_reader(scanner.split.reader, remote=True)
+        self.assertTrue(scanner._filesystem_is_remote())
+        self.assertEqual(scanner._prefetch_active_workers(8), 4)
+
     def test_optional_adapter_projection_is_selected_only_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "req.parquet"

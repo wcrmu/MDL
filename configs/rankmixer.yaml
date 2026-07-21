@@ -45,6 +45,15 @@ data:
       trusted_input: true
       shuffle_buffer_rows: 8192
       shuffle_seed: 2025
+      hdfs_op_timeout: 30
+      hdfs_open_timeout: 120
+      hdfs_retry_count: 5
+      hdfs_retry_base_sec: 0.5
+      hdfs_file_lock: true
+      on_hdfs_failure: skip
+      worker_stagger_sec: 1.0
+      hdfs_pre_buffer: true
+      hdfs_close_timeout: 5
       length_bucket_metric: sum
       length_buckets:
       - max_length: 1024
@@ -798,6 +807,15 @@ data:
       deduplicate_request_features: true
       validate_prehashed_nonzero: false
       trusted_input: true
+      hdfs_op_timeout: 30
+      hdfs_open_timeout: 120
+      hdfs_retry_count: 5
+      hdfs_retry_base_sec: 0.5
+      hdfs_file_lock: true
+      on_hdfs_failure: skip
+      worker_stagger_sec: 1.0
+      hdfs_pre_buffer: true
+      hdfs_close_timeout: 5
       length_bucket_metric: sum
       length_buckets:
       - max_length: 1024

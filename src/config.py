@@ -497,6 +497,25 @@ class ReaderConfig(_DeeplyImmutableConfig):
     # sequence-length calculation. Zero preserves physical request order.
     shuffle_buffer_rows: int = 0
     shuffle_seed: int = 0
+    # Remote (HDFS/viewfs) IO resilience. Timeouts wrap blocking libhdfs calls
+    # in a daemon thread so hung opens cannot stall the trainer forever.
+    hdfs_op_timeout: float = 30.0
+    # ParquetFile construction / footer open is often slower than a single read.
+    hdfs_open_timeout: float = 120.0
+    # Transient NameNode/DataNode failures retry with exponential backoff.
+    hdfs_retry_count: int = 5
+    hdfs_retry_base_sec: float = 0.5
+    # Serialize concurrent opens of the same remote URI within a node.
+    hdfs_file_lock: bool = True
+    # fail raises after retries; skip logs and drops the bad file / row group.
+    on_hdfs_failure: Literal["fail", "skip"] = "fail"
+    # Sleep shard_rank * worker_stagger_sec before first remote IO so DDP ranks
+    # do not hammer NameNode together at startup. Zero disables.
+    worker_stagger_sec: float = 0.0
+    # Eason-style single-file background readahead on the native input stream.
+    hdfs_pre_buffer: bool = True
+    # Timed close for native HDFS streams that may hang after DFSClient damage.
+    hdfs_close_timeout: float = 5.0
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> "ReaderConfig":
@@ -560,6 +579,22 @@ class ReaderConfig(_DeeplyImmutableConfig):
             raise ValueError("reader.eager_schema_validation must be all or sample")
         if self.schema_validation_samples <= 0:
             raise ValueError("reader.schema_validation_samples must be positive")
+        for timeout_name in ("hdfs_op_timeout", "hdfs_open_timeout", "hdfs_retry_base_sec"):
+            timeout_value = getattr(self, timeout_name)
+            if type(timeout_value) not in {int, float} or timeout_value <= 0:
+                raise ValueError(f"reader.{timeout_name} must be a positive number")
+        if type(self.hdfs_retry_count) is not int or self.hdfs_retry_count < 0:
+            raise ValueError("reader.hdfs_retry_count must be a non-negative integer")
+        if type(self.hdfs_file_lock) is not bool:
+            raise ValueError("reader.hdfs_file_lock must be a boolean")
+        if self.on_hdfs_failure not in {"fail", "skip"}:
+            raise ValueError("reader.on_hdfs_failure must be fail or skip")
+        if type(self.worker_stagger_sec) not in {int, float} or self.worker_stagger_sec < 0:
+            raise ValueError("reader.worker_stagger_sec must be a non-negative number")
+        if type(self.hdfs_pre_buffer) is not bool:
+            raise ValueError("reader.hdfs_pre_buffer must be a boolean")
+        if type(self.hdfs_close_timeout) not in {int, float} or self.hdfs_close_timeout <= 0:
+            raise ValueError("reader.hdfs_close_timeout must be a positive number")
         previous = 0
         saw_catch_all = False
         for index, bucket in enumerate(self.length_buckets):
