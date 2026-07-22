@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 import unittest
 from typing import Any
 
@@ -14,6 +15,7 @@ from src.model import (
     LongerSequenceAttentionBlock,
     LongerSequenceEncoder,
     LongerTokenMerger,
+    _resolve_longer_chunk_rows,
 )
 
 
@@ -64,6 +66,35 @@ def _compressed_tensor(output: Any) -> Tensor:
 
 
 class LongerTokenMergerAlignmentTest(unittest.TestCase):
+    def test_token_budget_scales_rows_with_sequence_length(self) -> None:
+        self.assertEqual(
+            _resolve_longer_chunk_rows(
+                1024, 2048, token_limit=262_144
+            ),
+            128,
+        )
+        self.assertEqual(
+            _resolve_longer_chunk_rows(
+                1024, 1024, token_limit=262_144
+            ),
+            256,
+        )
+        self.assertEqual(
+            _resolve_longer_chunk_rows(
+                1024, 256, token_limit=262_144
+            ),
+            1024,
+        )
+        self.assertEqual(
+            _resolve_longer_chunk_rows(
+                1024,
+                256,
+                row_limit=32,
+                token_limit=262_144,
+            ),
+            32,
+        )
+
     def test_concat_merge_preserves_kd_width_and_slot_order(self) -> None:
         token_dim = 2
         merge_size = 2
@@ -456,6 +487,195 @@ class LongerSequenceEncoderAlignmentTest(unittest.TestCase):
         self.assertIsNotNone(tokens.grad)
         self.assertIsNotNone(user_global.grad)
         self.assertIsNotNone(candidate_global.grad)
+
+    def test_full_checkpoint_drops_longer_kv_and_preserves_gradients(self) -> None:
+        torch.manual_seed(45)
+        baseline = LongerSequenceEncoder(
+            token_dim=4,
+            num_heads=2,
+            hidden_dim=8,
+            query_token_count=2,
+            self_layers=1,
+            summary_tokens=2,
+            token_merge=1,
+            inner_layers=1,
+            user_global_tokens=1,
+            activation_checkpoint=True,
+            drop_cached_kv=False,
+        ).train()
+        low_memory = LongerSequenceEncoder(
+            token_dim=4,
+            num_heads=2,
+            hidden_dim=8,
+            query_token_count=2,
+            self_layers=1,
+            summary_tokens=2,
+            token_merge=1,
+            inner_layers=1,
+            user_global_tokens=1,
+            activation_checkpoint=True,
+            drop_cached_kv=True,
+        ).train()
+        low_memory.load_state_dict(baseline.state_dict())
+        mask = torch.tensor(
+            [[True, True, True, True, True], [False, False, True, True, True]]
+        )
+        baseline_inputs = [
+            torch.randn(2, 5, 4, requires_grad=True),
+            torch.randn(2, 1, 4, requires_grad=True),
+            torch.randn(2, 1, 4, requires_grad=True),
+        ]
+        low_memory_inputs = [value.detach().clone().requires_grad_() for value in baseline_inputs]
+
+        baseline_cache = baseline.precompute_cache(
+            baseline_inputs[0], mask, baseline_inputs[1]
+        )
+        low_memory_cache = low_memory.precompute_cache(
+            low_memory_inputs[0], mask, low_memory_inputs[1]
+        )
+        self.assertGreater(baseline_cache.cross_cacheable_key.size(2), 0)
+        self.assertEqual(low_memory_cache.cross_cacheable_key.size(2), 0)
+        self.assertEqual(low_memory_cache.cross_cacheable_value.size(2), 0)
+        self.assertEqual(low_memory_cache.self_layers[0].cacheable_key.size(2), 0)
+        self.assertEqual(low_memory_cache.self_layers[0].cacheable_value.size(2), 0)
+
+        baseline_output = baseline(
+            baseline_inputs[0],
+            mask,
+            baseline_inputs[2],
+            cache=baseline_cache,
+        )
+        low_memory_output = low_memory(
+            low_memory_inputs[0],
+            mask,
+            low_memory_inputs[2],
+            cache=low_memory_cache,
+        )
+        torch.testing.assert_close(
+            low_memory_output, baseline_output, rtol=1.0e-5, atol=1.0e-6
+        )
+
+        baseline_output.square().mean().backward()
+        low_memory_output.square().mean().backward()
+        for low_grad, baseline_grad in zip(
+            (value.grad for value in low_memory_inputs),
+            (value.grad for value in baseline_inputs),
+        ):
+            torch.testing.assert_close(
+                low_grad, baseline_grad, rtol=2.0e-4, atol=2.0e-5
+            )
+
+    def test_row_chunked_outer_checkpoint_matches_full_batch(self) -> None:
+        torch.manual_seed(46)
+        sequence = SequenceConfig(
+            name="hist",
+            fields=[
+                SequenceFieldConfig(
+                    name="time_delta",
+                    kind="dense",
+                    source="hist_time_delta",
+                )
+            ],
+            encoder="longer",
+            time_delta_field="time_delta",
+            rankmixer_summary_tokens=1,
+            longer_query_tokens=2,
+            longer_self_layers=1,
+            longer_token_merge=1,
+            longer_inner_layers=0,
+            longer_cls_tokens=1,
+            longer_candidate_global_tokens=0,
+            longer_output="summary",
+        )
+        baseline_projector = nn.Linear(3, 4)
+        low_memory_projector = nn.Linear(3, 4)
+        low_memory_projector.load_state_dict(baseline_projector.state_dict())
+        baseline_encoder = LongerSequenceEncoder(
+            token_dim=4,
+            num_heads=2,
+            hidden_dim=8,
+            query_token_count=2,
+            self_layers=1,
+            summary_tokens=1,
+            token_merge=1,
+            inner_layers=0,
+            user_global_tokens=1,
+            summary_only=True,
+        ).train()
+        low_memory_encoder = LongerSequenceEncoder(
+            token_dim=4,
+            num_heads=2,
+            hidden_dim=8,
+            query_token_count=2,
+            self_layers=1,
+            summary_tokens=1,
+            token_merge=1,
+            inner_layers=0,
+            user_global_tokens=1,
+            activation_checkpoint=True,
+            checkpoint_token_merger=True,
+            drop_cached_kv=True,
+            summary_only=True,
+        ).train()
+        low_memory_encoder.load_state_dict(baseline_encoder.state_dict())
+        bank = FeatureEncoderBank.__new__(FeatureEncoderBank)
+        nn.Module.__init__(bank)
+        bank.config = SimpleNamespace(
+            runtime=SimpleNamespace(sequence_encoder_chunk_rows=2)
+        )
+        bank.sequence_step_projectors = nn.ModuleDict(
+            {"hist": low_memory_projector}
+        )
+        bank.sequence_longer_encoders = nn.ModuleDict(
+            {"hist": low_memory_encoder}
+        )
+        mask = torch.tensor(
+            [
+                [True, True, True, True],
+                [False, True, True, True],
+                [False, False, True, True],
+                [True, True, True, True],
+                [False, False, False, True],
+            ]
+        )
+        baseline_inputs = torch.randn(5, 4, 3, requires_grad=True)
+        low_memory_inputs = baseline_inputs.detach().clone().requires_grad_()
+        baseline_user = torch.randn(5, 1, 4, requires_grad=True)
+        low_memory_user = baseline_user.detach().clone().requires_grad_()
+
+        baseline_tokens = baseline_projector(baseline_inputs)
+        baseline_tokens = baseline_tokens * mask.unsqueeze(-1)
+        baseline_output = baseline_encoder(
+            baseline_tokens,
+            mask,
+            baseline_tokens.new_zeros(5, 0, 4),
+            user_global_tokens=baseline_user,
+        )
+        low_memory_output = bank._pool_checkpointed_longer_inputs(
+            sequence,
+            low_memory_inputs,
+            mask,
+            low_memory_user,
+        )
+        torch.testing.assert_close(low_memory_output, baseline_output)
+
+        baseline_output.square().mean().backward()
+        low_memory_output.square().mean().backward()
+        torch.testing.assert_close(low_memory_inputs.grad, baseline_inputs.grad)
+        torch.testing.assert_close(low_memory_user.grad, baseline_user.grad)
+        for low_parameter, baseline_parameter in zip(
+            low_memory_projector.parameters(), baseline_projector.parameters()
+        ):
+            torch.testing.assert_close(low_parameter.grad, baseline_parameter.grad)
+        for low_parameter, baseline_parameter in zip(
+            low_memory_encoder.parameters(), baseline_encoder.parameters()
+        ):
+            torch.testing.assert_close(
+                low_parameter.grad,
+                baseline_parameter.grad,
+                rtol=2.0e-4,
+                atol=2.0e-5,
+            )
 
     def test_summary_only_exposes_one_history_conditioned_global_token(self) -> None:
         torch.manual_seed(47)

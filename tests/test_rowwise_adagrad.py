@@ -216,7 +216,7 @@ class PlannerAndConfigTest(unittest.TestCase):
         config = load_app_config(root / "configs" / "mdl_rankmixer.yaml")
         self.assertEqual(config.training.sparse_optimizer, "rowwise_adagrad")
         self.assertEqual(config.training.embedding_distribution, "sharded")
-        self.assertEqual(config.runtime.attention_backend, "sdpa")
+        self.assertEqual(config.runtime.attention_backend, "flash")
         self.assertEqual(config.runtime.nproc_per_node, 2)
 
         bad_decay = replace(

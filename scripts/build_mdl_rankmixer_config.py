@@ -2414,7 +2414,7 @@ def build_config(
             "require_compact_sequence_batches": False,
             "allow_tf32": True,
             "activation_checkpoint": "none",
-            "attention_backend": "sdpa",
+            "attention_backend": "flash",
             "distributed": "ddp",
             "nproc_per_node": gpu_count,
             "master_addr": "127.0.0.1",
@@ -2474,6 +2474,8 @@ def build_config(
             "dense_clip_norm": 1.0,
             "sparse_clip_norm": 1.0,
             "loss_reduction": "mean_per_task",
+            # Avoid a CUDA scalar readback on every production step.
+            "log_every_steps": 100,
             "quick_eval": {
                 "enabled": True,
                 "every_steps": 1000,

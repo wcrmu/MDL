@@ -37,7 +37,7 @@ from .modules.attention import (
     _sdpa_context,
     masked_scenario_pool,
     validate_varlen_inputs,
-    varlen_attn,
+    varlen_attention_available,
 )
 from .modules.mlp import (
     PerTokenFFN,
@@ -59,6 +59,83 @@ def _activation_checkpoint_enabled(
     if value not in {"none", "selective", "full"}:
         raise ValueError("activation checkpoint mode must be none, selective, or full")
     return value == "full" if full_only else value in {"selective", "full"}
+
+
+def _project_sequence_in_chunks(
+    module: nn.Module,
+    values: Tensor,
+    config: AppConfig | None,
+) -> Tensor:
+    """Checkpoint and chunk large event-wise MLPs to cap transient HBM.
+
+    A projection such as ``[512, 1024, input] -> hidden=1536`` creates a
+    multi-GiB GELU activation before attention begins. Full checkpointing alone
+    does not lower that forward-time peak, so the flattened event axis is also
+    split into bounded chunks. Concatenation preserves exact row/token order.
+    """
+
+    if config is None:
+        return module(values)
+    full_checkpoint = (
+        _activation_checkpoint_enabled(
+            config.runtime.activation_checkpoint,
+            full_only=True,
+        )
+        and module.training
+    )
+    if not full_checkpoint:
+        return module(values)
+    chunk_tokens = int(
+        getattr(config.runtime, "sequence_projection_chunk_tokens", 0)
+    )
+    if values.ndim < 2 or chunk_tokens <= 0:
+        return checkpoint(
+            module,
+            values,
+            use_reentrant=False,
+            preserve_rng_state=False,
+        )
+    flat_values = values.reshape(-1, values.size(-1))
+    if flat_values.size(0) <= chunk_tokens:
+        projected = checkpoint(
+            module,
+            flat_values,
+            use_reentrant=False,
+            preserve_rng_state=False,
+        )
+    else:
+        projected = torch.cat(
+            [
+                checkpoint(
+                    module,
+                    chunk,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+                for chunk in flat_values.split(chunk_tokens, dim=0)
+            ],
+            dim=0,
+        )
+    return projected.view(*values.shape[:-1], projected.size(-1))
+
+
+def _resolve_longer_chunk_rows(
+    batch_size: int,
+    padded_length: int,
+    *,
+    row_limit: int = 0,
+    token_limit: int = 0,
+) -> int:
+    """Choose balanced LONGER chunks while bounding padded event tokens."""
+
+    if batch_size <= 0:
+        return 1
+    chunk_rows = batch_size
+    if row_limit > 0:
+        chunk_rows = min(chunk_rows, row_limit)
+    if token_limit > 0 and padded_length > 0:
+        chunk_rows = min(chunk_rows, max(1, token_limit // padded_length))
+    return max(1, chunk_rows)
 
 
 @dataclass(frozen=True)
@@ -294,11 +371,27 @@ def _mean_pool_categorical_bag(
     if embedded.ndim == 2 and indices.ndim == 1:
         if embedded.size(0) != indices.size(0):
             raise ValueError("categorical bag flat values and embeddings are misaligned")
-        expected = int(lengths.sum().item()) if lengths.numel() else 0
-        if indices.numel() != expected:
+        if lengths.numel():
+            lengths_match = lengths.sum() == indices.numel()
+            message = (
+                "categorical bag flat length must equal sum(lengths); "
+                f"flat length is {indices.numel()}"
+            )
+            if lengths.device.type == "cuda" and hasattr(torch, "_assert_async"):
+                # This validation used to call .item() once for every bag
+                # feature in every forward, repeatedly draining the CUDA
+                # pipeline. Keep the safety check but report failures at the
+                # next ordinary synchronization point.
+                torch._assert_async(lengths_match, message)
+            elif not bool(lengths_match.item()):
+                expected = int(lengths.sum().item())
+                raise ValueError(
+                    "categorical bag flat length "
+                    f"{indices.numel()} != sum(lengths) {expected}"
+                )
+        elif indices.numel() != 0:
             raise ValueError(
-                "categorical bag flat length "
-                f"{indices.numel()} != sum(lengths) {expected}"
+                "categorical bag flat length must be zero when lengths is empty"
             )
         batch = int(lengths.numel())
         if null_policy == "exclude":
@@ -402,6 +495,7 @@ class LongerSelfLayerCache:
 class LongerSequenceCache:
     merged_tokens: Tensor
     merged_mask: Tensor
+    cross_user_input: Tensor
     cross_cacheable_key: Tensor
     cross_cacheable_value: Tensor
     cross_user_output: Tensor
@@ -425,6 +519,7 @@ def _index_longer_request_cache(
     return LongerSequenceCache(
         merged_tokens=select(cache.merged_tokens),
         merged_mask=select(cache.merged_mask),
+        cross_user_input=select(cache.cross_user_input),
         cross_cacheable_key=select(cache.cross_cacheable_key),
         cross_cacheable_value=select(cache.cross_cacheable_value),
         cross_user_output=select(cache.cross_user_output),
@@ -450,6 +545,7 @@ class LongerSequenceAttentionBlock(nn.Module):
         num_heads: int,
         hidden_dim: int,
         attention_backend: str = "auto",
+        varlen_packing: str = "fixed",
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -459,6 +555,9 @@ class LongerSequenceAttentionBlock(nn.Module):
         self.num_heads = num_heads
         self.head_dim = token_dim // num_heads
         self.attention_backend = attention_backend
+        if varlen_packing not in {"fixed", "compact"}:
+            raise ValueError("varlen_packing must be fixed or compact")
+        self.varlen_packing = varlen_packing
         self.query_norm = nn.LayerNorm(token_dim)
         self.key_norm = nn.LayerNorm(token_dim)
         self.query_projection = nn.Linear(token_dim, token_dim)
@@ -553,10 +652,12 @@ class LongerSequenceAttentionBlock(nn.Module):
         *,
         causal: bool,
         key_packing: _VarlenPacking | None = None,
+        packed_key: Tensor | None = None,
+        packed_value: Tensor | None = None,
     ) -> Tensor:
-        if varlen_attn is None:
+        if not varlen_attention_available():
             raise RuntimeError(
-                "runtime.attention_backend='flash' requires torch.nn.attention.varlen"
+                "runtime.attention_backend='flash' requires a Varlen Flash implementation"
             )
         validate_varlen_inputs(
             query,
@@ -575,24 +676,35 @@ class LongerSequenceAttentionBlock(nn.Module):
                 if query_valid_mask is key_valid_mask
                 else _VarlenPacking.from_mask(key_valid_mask)
             )
-        packed_query = query_packing.pack(query_tokens)
-        packed_key = key_packing.pack(key_tokens)
-        packed_value = key_packing.pack(value_tokens)
+        if (packed_key is None) != (packed_value is None):
+            raise ValueError("packed LONGER K/V must both be supplied or both be omitted")
+        compact = self.varlen_packing == "compact"
+        packed_query = query_packing.pack(query_tokens, compact=compact)
+        if packed_key is None:
+            packed_key = key_packing.pack(key_tokens, compact=compact).contiguous()
+            packed_value = key_packing.pack(
+                value_tokens, compact=compact
+            ).contiguous()
         if packed_query.numel() == 0:
             return torch.zeros_like(query)
         label = "causal" if causal else "full"
         with torch.profiler.record_function(f"longer::flash_varlen_{label}"):
             packed_output = _call_varlen_attention(
                 packed_query.contiguous(),
-                packed_key.contiguous(),
-                packed_value.contiguous(),
+                packed_key,
+                packed_value,
                 query_packing.cumulative_lengths,
                 key_packing.cumulative_lengths,
                 query_valid_mask.size(1),
                 key_valid_mask.size(1),
                 causal=causal,
+                fixed_capacity=not compact,
             )
-        output = query_packing.unpack(packed_output, query_tokens)
+        output = query_packing.unpack(
+            packed_output,
+            query_tokens,
+            compact=compact,
+        )
         return output.transpose(1, 2)
 
     def _finish_attention(self, query_tokens: Tensor, attended: Tensor) -> Tensor:
@@ -688,6 +800,19 @@ class LongerSequenceAttentionBlock(nn.Module):
             return self._finish_attention(query_tokens, attended)
 
         key_packing = _VarlenPacking.from_mask(key_valid_mask)
+        compact = self.varlen_packing == "compact"
+        key_tokens = key.transpose(1, 2)
+        value_tokens = value.transpose(1, 2)
+        # Global and recent queries have different causal contracts, but they
+        # attend to identical K/V. Pack that large history once and reuse it in
+        # both FlashAttention launches instead of gathering it twice.
+        with torch.profiler.record_function("longer::pack_mixed_kv"):
+            packed_key = key_packing.pack(
+                key_tokens, compact=compact
+            ).contiguous()
+            packed_value = key_packing.pack(
+                value_tokens, compact=compact
+            ).contiguous()
         parts: list[Tensor] = []
         if global_query_count:
             parts.append(
@@ -699,6 +824,8 @@ class LongerSequenceAttentionBlock(nn.Module):
                     key_valid_mask,
                     causal=False,
                     key_packing=key_packing,
+                    packed_key=packed_key,
+                    packed_value=packed_value,
                 )
             )
         if global_query_count < query_tokens.size(1):
@@ -711,6 +838,8 @@ class LongerSequenceAttentionBlock(nn.Module):
                     key_valid_mask,
                     causal=True,
                     key_packing=key_packing,
+                    packed_key=packed_key,
+                    packed_value=packed_value,
                 )
             )
         attended = torch.cat(parts, dim=2) if parts else torch.zeros_like(query)
@@ -745,6 +874,7 @@ class LongerTokenMerger(nn.Module):
         merge_size: int,
         inner_layers: int,
         attention_backend: str = "auto",
+        varlen_packing: str = "fixed",
     ) -> None:
         super().__init__()
         if merge_size <= 0:
@@ -760,6 +890,7 @@ class LongerTokenMerger(nn.Module):
                 num_heads,
                 hidden_dim,
                 attention_backend=attention_backend,
+                varlen_packing=varlen_packing,
             )
             for _ in range(inner_layers)
         )
@@ -821,7 +952,9 @@ class LongerTokenMerger(nn.Module):
             grouped = hidden.view(batch_size, group_count, self.merge_size, token_dim)
         grouped = grouped * group_mask.unsqueeze(-1).to(dtype=grouped.dtype)
         merged = grouped.reshape(batch_size, group_count, self.output_dim)
-        return merged * merged_mask.unsqueeze(-1).to(dtype=merged.dtype), merged_mask
+        # group_mask already zeroes every slot in an invalid group, so a second
+        # full-width multiply by merged_mask only burns memory bandwidth.
+        return merged, merged_mask
 
 
 class LongerSequenceEncoder(nn.Module):
@@ -837,8 +970,10 @@ class LongerSequenceEncoder(nn.Module):
         inner_layers: int,
         user_global_tokens: int = 0,
         attention_backend: str = "auto",
+        varlen_packing: str = "fixed",
         activation_checkpoint: bool = False,
         checkpoint_token_merger: bool | None = None,
+        drop_cached_kv: bool = False,
         summary_only: bool = False,
     ) -> None:
         super().__init__()
@@ -861,6 +996,7 @@ class LongerSequenceEncoder(nn.Module):
             if checkpoint_token_merger is None
             else checkpoint_token_merger
         )
+        self.drop_cached_kv = drop_cached_kv
         self.input_dim = token_dim
         self.token_merger = LongerTokenMerger(
             token_dim,
@@ -869,6 +1005,7 @@ class LongerSequenceEncoder(nn.Module):
             token_merge,
             inner_layers,
             attention_backend=attention_backend,
+            varlen_packing=varlen_packing,
         )
         self.token_dim = self.token_merger.output_dim
         self.output_dim = (
@@ -882,6 +1019,7 @@ class LongerSequenceEncoder(nn.Module):
             num_heads,
             merged_hidden_dim,
             attention_backend=attention_backend,
+            varlen_packing=varlen_packing,
         )
         self.self_blocks = nn.ModuleList(
             LongerSequenceAttentionBlock(
@@ -889,6 +1027,7 @@ class LongerSequenceEncoder(nn.Module):
                 num_heads,
                 merged_hidden_dim,
                 attention_backend=attention_backend,
+                varlen_packing=varlen_packing,
             )
             for _ in range(self_layers)
         )
@@ -939,32 +1078,71 @@ class LongerSequenceEncoder(nn.Module):
         cross_queries = torch.cat([user_global_tokens, recent_tokens], dim=1)
         cross_query_mask = torch.cat([user_mask, recent_mask], dim=1)
         cross_key_mask = torch.cat([user_mask, merged_mask], dim=1)
+        drop_cached_kv = self.drop_cached_kv and self.training
         if self.activation_checkpoint and self.training:
-            def cross_forward(
-                current_inputs: Tensor,
-                current_queries: Tensor,
-                current_query_mask: Tensor,
-                current_key_mask: Tensor,
-            ) -> tuple[Tensor, Tensor, Tensor]:
-                current_key, current_value = self.cross_block.project_kv(current_inputs)
-                current_output = self.cross_block.forward_mixed_projected_kv(
-                    current_queries,
-                    current_key,
-                    current_value,
-                    current_query_mask,
-                    current_key_mask,
-                    self.user_global_tokens,
-                )
-                return current_key, current_value, current_output
+            if drop_cached_kv:
+                def cross_output_forward(
+                    current_inputs: Tensor,
+                    current_queries: Tensor,
+                    current_query_mask: Tensor,
+                    current_key_mask: Tensor,
+                ) -> Tensor:
+                    current_key, current_value = self.cross_block.project_kv(
+                        current_inputs
+                    )
+                    return self.cross_block.forward_mixed_projected_kv(
+                        current_queries,
+                        current_key,
+                        current_value,
+                        current_query_mask,
+                        current_key_mask,
+                        self.user_global_tokens,
+                    )
 
-            cross_key, cross_value, cross_output = checkpoint(
-                cross_forward,
-                cross_inputs,
-                cross_queries,
-                cross_query_mask,
-                cross_key_mask,
-                use_reentrant=False,
-            )
+                cross_output = checkpoint(
+                    cross_output_forward,
+                    cross_inputs,
+                    cross_queries,
+                    cross_query_mask,
+                    cross_key_mask,
+                    use_reentrant=False,
+                )
+                empty_shape = (
+                    tokens.size(0),
+                    self.cross_block.num_heads,
+                    0,
+                    self.cross_block.head_dim,
+                )
+                cross_key = tokens.new_empty(empty_shape)
+                cross_value = tokens.new_empty(empty_shape)
+            else:
+                def cross_forward(
+                    current_inputs: Tensor,
+                    current_queries: Tensor,
+                    current_query_mask: Tensor,
+                    current_key_mask: Tensor,
+                ) -> tuple[Tensor, Tensor, Tensor]:
+                    current_key, current_value = self.cross_block.project_kv(
+                        current_inputs
+                    )
+                    current_output = self.cross_block.forward_mixed_projected_kv(
+                        current_queries,
+                        current_key,
+                        current_value,
+                        current_query_mask,
+                        current_key_mask,
+                        self.user_global_tokens,
+                    )
+                    return current_key, current_value, current_output
+
+                cross_key, cross_value, cross_output = checkpoint(
+                    cross_forward,
+                    cross_inputs,
+                    cross_queries,
+                    cross_query_mask,
+                    cross_key_mask,
+                    use_reentrant=False,
+                )
         else:
             cross_key, cross_value = self.cross_block.project_kv(cross_inputs)
             cross_output = self.cross_block.forward_mixed_projected_kv(
@@ -986,28 +1164,63 @@ class LongerSequenceEncoder(nn.Module):
             cacheable_inputs = torch.cat([current_user, current_recent], dim=1)
             cacheable_mask = torch.cat([user_mask, recent_mask], dim=1)
             if self.activation_checkpoint and self.training:
-                def self_forward(
-                    current_inputs: Tensor,
-                    current_mask: Tensor,
-                    current_block: LongerSequenceAttentionBlock = block,
-                ) -> tuple[Tensor, Tensor, Tensor]:
-                    current_key, current_value = current_block.project_kv(current_inputs)
-                    current_output = current_block.forward_mixed_projected_kv(
-                        current_inputs,
-                        current_key,
-                        current_value,
-                        current_mask,
-                        current_mask,
-                        self.user_global_tokens,
-                    )
-                    return current_key, current_value, current_output
+                if drop_cached_kv:
+                    def self_output_forward(
+                        current_inputs: Tensor,
+                        current_mask: Tensor,
+                        current_block: LongerSequenceAttentionBlock = block,
+                    ) -> Tensor:
+                        current_key, current_value = current_block.project_kv(
+                            current_inputs
+                        )
+                        return current_block.forward_mixed_projected_kv(
+                            current_inputs,
+                            current_key,
+                            current_value,
+                            current_mask,
+                            current_mask,
+                            self.user_global_tokens,
+                        )
 
-                cacheable_key, cacheable_value, cacheable_output = checkpoint(
-                    self_forward,
-                    cacheable_inputs,
-                    cacheable_mask,
-                    use_reentrant=False,
-                )
+                    cacheable_output = checkpoint(
+                        self_output_forward,
+                        cacheable_inputs,
+                        cacheable_mask,
+                        use_reentrant=False,
+                    )
+                    empty_shape = (
+                        tokens.size(0),
+                        block.num_heads,
+                        0,
+                        block.head_dim,
+                    )
+                    cacheable_key = tokens.new_empty(empty_shape)
+                    cacheable_value = tokens.new_empty(empty_shape)
+                else:
+                    def self_forward(
+                        current_inputs: Tensor,
+                        current_mask: Tensor,
+                        current_block: LongerSequenceAttentionBlock = block,
+                    ) -> tuple[Tensor, Tensor, Tensor]:
+                        current_key, current_value = current_block.project_kv(
+                            current_inputs
+                        )
+                        current_output = current_block.forward_mixed_projected_kv(
+                            current_inputs,
+                            current_key,
+                            current_value,
+                            current_mask,
+                            current_mask,
+                            self.user_global_tokens,
+                        )
+                        return current_key, current_value, current_output
+
+                    cacheable_key, cacheable_value, cacheable_output = checkpoint(
+                        self_forward,
+                        cacheable_inputs,
+                        cacheable_mask,
+                        use_reentrant=False,
+                    )
             else:
                 cacheable_key, cacheable_value = block.project_kv(cacheable_inputs)
                 cacheable_output = block.forward_mixed_projected_kv(
@@ -1034,6 +1247,7 @@ class LongerSequenceEncoder(nn.Module):
         return LongerSequenceCache(
             merged_tokens=merged_tokens,
             merged_mask=merged_mask,
+            cross_user_input=user_global_tokens,
             cross_cacheable_key=cross_key,
             cross_cacheable_value=cross_value,
             cross_user_output=cross_user_output,
@@ -1042,6 +1256,112 @@ class LongerSequenceEncoder(nn.Module):
             recent_mask=recent_mask,
             self_layers=tuple(layer_caches),
         )
+
+    def forward_request_summary(
+        self,
+        tokens: Tensor,
+        mask: Tensor,
+        user_global_tokens: Tensor,
+    ) -> Tensor:
+        """Evaluate a request-only summary without materializing a cache.
+
+        Full-checkpoint training consumes this result immediately and never
+        reuses sequence K/V. Avoiding ``LongerSequenceCache`` also lets the last
+        self layer evaluate only the global queries: its recent-query outputs
+        cannot influence the final summary and would otherwise launch another
+        causal FlashAttention plus a large FFN.
+        """
+
+        if not self.summary_only or self.candidate_global_tokens != 0:
+            raise ValueError(
+                "request summary fast path requires summary_only with zero candidate globals"
+            )
+        if tokens.ndim != 3 or mask.shape != tokens.shape[:2]:
+            raise ValueError(
+                "tokens/mask must have shapes [batch, length, dim] and [batch, length]"
+            )
+        expected_user_shape = (
+            tokens.size(0),
+            self.user_global_tokens,
+            self.token_dim,
+        )
+        if tuple(user_global_tokens.shape) != expected_user_shape:
+            raise ValueError(
+                f"user_global_tokens must have shape {expected_user_shape}, "
+                f"got {tuple(user_global_tokens.shape)}"
+            )
+
+        user_mask = torch.ones(
+            tokens.size(0),
+            self.user_global_tokens,
+            dtype=torch.bool,
+            device=tokens.device,
+        )
+        merged_tokens, merged_mask = self.token_merger(tokens, mask)
+        recent_tokens, recent_mask = self._recent_tokens(
+            merged_tokens, merged_mask
+        )
+        cross_inputs = torch.cat([user_global_tokens, merged_tokens], dim=1)
+        cross_queries = torch.cat([user_global_tokens, recent_tokens], dim=1)
+        cross_query_mask = torch.cat([user_mask, recent_mask], dim=1)
+        cross_key_mask = torch.cat([user_mask, merged_mask], dim=1)
+        cross_key, cross_value = self.cross_block.project_kv(cross_inputs)
+        cross_output = self.cross_block.forward_mixed_projected_kv(
+            cross_queries,
+            cross_key,
+            cross_value,
+            cross_query_mask,
+            cross_key_mask,
+            self.user_global_tokens,
+        )
+        current_user = cross_output[:, : self.user_global_tokens, :]
+        current_recent = cross_output[:, self.user_global_tokens :, :]
+        current_recent = current_recent * recent_mask.unsqueeze(-1).to(
+            current_recent.dtype
+        )
+        # The outer checkpoint discards saved tensors. Releasing the explicit
+        # history references here lowers the live forward peak before self layers.
+        del cross_inputs, cross_queries, cross_key, cross_value, cross_output
+        del merged_tokens, merged_mask, cross_query_mask, cross_key_mask
+
+        final_layer = len(self.self_blocks) - 1
+        for layer_index, block in enumerate(self.self_blocks):
+            cacheable_inputs = torch.cat(
+                [current_user, current_recent], dim=1
+            )
+            cacheable_mask = torch.cat([user_mask, recent_mask], dim=1)
+            key, value = block.project_kv(cacheable_inputs)
+            if layer_index == final_layer:
+                # Only global tokens are returned in summary mode. They have
+                # full visibility, so this is exactly the global slice of the
+                # mixed attention result without computing unused recent queries.
+                current_user = block.forward_full_projected_kv(
+                    current_user,
+                    key,
+                    value,
+                    user_mask,
+                    cacheable_mask,
+                )
+            else:
+                output = block.forward_mixed_projected_kv(
+                    cacheable_inputs,
+                    key,
+                    value,
+                    cacheable_mask,
+                    cacheable_mask,
+                    self.user_global_tokens,
+                )
+                current_user = output[:, : self.user_global_tokens, :]
+                current_recent = output[:, self.user_global_tokens :, :]
+                current_recent = current_recent * recent_mask.unsqueeze(-1).to(
+                    current_recent.dtype
+                )
+                del output
+            del cacheable_inputs, cacheable_mask, key, value
+
+        if current_user.size(1) != self.summary_tokens:
+            raise RuntimeError("LONGER summary output token count is inconsistent")
+        return current_user.flatten(start_dim=1)
 
     def _expand_cache(self, cache: LongerSequenceCache, batch_size: int) -> LongerSequenceCache:
         if cache.merged_tokens.size(0) == batch_size:
@@ -1060,6 +1380,7 @@ class LongerSequenceEncoder(nn.Module):
         return LongerSequenceCache(
             merged_tokens=cache.merged_tokens.expand(batch_size, -1, -1),
             merged_mask=cache.merged_mask.expand(batch_size, -1),
+            cross_user_input=cache.cross_user_input.expand(batch_size, -1, -1),
             cross_cacheable_key=cache.cross_cacheable_key.expand(batch_size, -1, -1, -1),
             cross_cacheable_value=cache.cross_cacheable_value.expand(batch_size, -1, -1, -1),
             cross_user_output=cache.cross_user_output.expand(batch_size, -1, -1),
@@ -1100,82 +1421,215 @@ class LongerSequenceEncoder(nn.Module):
         if len(sequence_cache.self_layers) != len(self.self_blocks):
             raise ValueError("LONGER cache depth does not match encoder depth")
 
+        # The common request-only LONGER profile has no candidate globals.  Its
+        # sequence-side outputs are already complete in the cache, so rebuilding
+        # the (potentially hundreds-of-MiB) merged K/V here would be pure waste.
+        if self.candidate_global_tokens == 0:
+            if sequence_cache.self_layers:
+                final_user = sequence_cache.self_layers[-1].user_output
+                final_recent = sequence_cache.self_layers[-1].recent_output
+            else:
+                final_user = sequence_cache.cross_user_output
+                final_recent = sequence_cache.cross_recent_output
+            if self.summary_only:
+                if final_user.size(1) != self.summary_tokens:
+                    raise RuntimeError("LONGER summary output token count is inconsistent")
+                return final_user.flatten(start_dim=1)
+            return torch.cat([final_user, final_recent], dim=1).flatten(start_dim=1)
+
         candidate_valid = torch.ones(
             candidate_global_tokens.size(0),
             self.candidate_global_tokens,
             dtype=torch.bool,
             device=candidate_global_tokens.device,
         )
-        candidate_key, candidate_value = self.cross_block.project_kv(
-            candidate_global_tokens
-        )
-        cross_key = torch.cat([candidate_key, sequence_cache.cross_cacheable_key], dim=2)
-        cross_value = torch.cat([candidate_value, sequence_cache.cross_cacheable_value], dim=2)
-        cross_key_mask = torch.cat(
-            [candidate_valid, sequence_cache.user_mask, sequence_cache.merged_mask],
-            dim=1,
-        )
-        if self.activation_checkpoint and self.training:
-            candidate_hidden = checkpoint(
-                self.cross_block.forward_full_projected_kv,
-                candidate_global_tokens,
-                cross_key,
-                cross_value,
-                candidate_valid,
-                cross_key_mask,
-                use_reentrant=False,
-            )
-        else:
-            candidate_hidden = self.cross_block.forward_full_projected_kv(
-                candidate_global_tokens,
-                cross_key,
-                cross_value,
-                candidate_valid,
-                cross_key_mask,
-            )
-        hidden = torch.cat(
-            [
-                sequence_cache.cross_user_output,
-                candidate_hidden,
-                sequence_cache.cross_recent_output,
-            ],
-            dim=1,
-        )
+        cross_kv_dropped = sequence_cache.cross_cacheable_key.size(2) == 0
+        if cross_kv_dropped != (sequence_cache.cross_cacheable_value.size(2) == 0):
+            raise ValueError("LONGER cross cache K/V must both be present or both be dropped")
+        if cross_kv_dropped:
+            def recompute_cross_candidate(
+                current_candidate: Tensor,
+                cached_user_input: Tensor,
+                cached_merged_tokens: Tensor,
+                current_candidate_mask: Tensor,
+                cached_user_mask: Tensor,
+                cached_merged_mask: Tensor,
+            ) -> Tensor:
+                candidate_key, candidate_value = self.cross_block.project_kv(
+                    current_candidate
+                )
+                cached_inputs = torch.cat(
+                    [cached_user_input, cached_merged_tokens], dim=1
+                )
+                cached_key, cached_value = self.cross_block.project_kv(cached_inputs)
+                cross_key = torch.cat([candidate_key, cached_key], dim=2)
+                cross_value = torch.cat([candidate_value, cached_value], dim=2)
+                cross_key_mask = torch.cat(
+                    [current_candidate_mask, cached_user_mask, cached_merged_mask],
+                    dim=1,
+                )
+                return self.cross_block.forward_full_projected_kv(
+                    current_candidate,
+                    cross_key,
+                    cross_value,
+                    current_candidate_mask,
+                    cross_key_mask,
+                )
 
-        for block, layer_cache in zip(self.self_blocks, sequence_cache.self_layers):
-            candidate_key, candidate_value = block.project_kv(candidate_hidden)
-            key = torch.cat([candidate_key, layer_cache.cacheable_key], dim=2)
-            value = torch.cat([candidate_value, layer_cache.cacheable_value], dim=2)
-            key_mask = torch.cat(
-                [candidate_valid, sequence_cache.user_mask, sequence_cache.recent_mask],
+            if self.activation_checkpoint and self.training:
+                candidate_hidden = checkpoint(
+                    recompute_cross_candidate,
+                    candidate_global_tokens,
+                    sequence_cache.cross_user_input,
+                    sequence_cache.merged_tokens,
+                    candidate_valid,
+                    sequence_cache.user_mask,
+                    sequence_cache.merged_mask,
+                    use_reentrant=False,
+                )
+            else:
+                candidate_hidden = recompute_cross_candidate(
+                    candidate_global_tokens,
+                    sequence_cache.cross_user_input,
+                    sequence_cache.merged_tokens,
+                    candidate_valid,
+                    sequence_cache.user_mask,
+                    sequence_cache.merged_mask,
+                )
+        else:
+            candidate_key, candidate_value = self.cross_block.project_kv(
+                candidate_global_tokens
+            )
+            cross_key = torch.cat(
+                [candidate_key, sequence_cache.cross_cacheable_key], dim=2
+            )
+            cross_value = torch.cat(
+                [candidate_value, sequence_cache.cross_cacheable_value], dim=2
+            )
+            cross_key_mask = torch.cat(
+                [candidate_valid, sequence_cache.user_mask, sequence_cache.merged_mask],
                 dim=1,
             )
             if self.activation_checkpoint and self.training:
                 candidate_hidden = checkpoint(
-                    block.forward_full_projected_kv,
-                    candidate_hidden,
-                    key,
-                    value,
+                    self.cross_block.forward_full_projected_kv,
+                    candidate_global_tokens,
+                    cross_key,
+                    cross_value,
                     candidate_valid,
-                    key_mask,
+                    cross_key_mask,
                     use_reentrant=False,
                 )
             else:
-                candidate_hidden = block.forward_full_projected_kv(
-                    candidate_hidden,
-                    key,
-                    value,
+                candidate_hidden = self.cross_block.forward_full_projected_kv(
+                    candidate_global_tokens,
+                    cross_key,
+                    cross_value,
                     candidate_valid,
-                    key_mask,
+                    cross_key_mask,
                 )
+        cacheable_user = sequence_cache.cross_user_output
+        cacheable_recent = sequence_cache.cross_recent_output
+        hidden = None
+        if not self.summary_only:
             hidden = torch.cat(
-                [layer_cache.user_output, candidate_hidden, layer_cache.recent_output],
+                [cacheable_user, candidate_hidden, cacheable_recent],
                 dim=1,
             )
+
+        for block, layer_cache in zip(self.self_blocks, sequence_cache.self_layers):
+            layer_kv_dropped = layer_cache.cacheable_key.size(2) == 0
+            if layer_kv_dropped != (layer_cache.cacheable_value.size(2) == 0):
+                raise ValueError("LONGER self cache K/V must both be present or both be dropped")
+            if layer_kv_dropped:
+                cacheable_inputs = torch.cat(
+                    [cacheable_user, cacheable_recent], dim=1
+                )
+                cacheable_mask = torch.cat(
+                    [sequence_cache.user_mask, sequence_cache.recent_mask], dim=1
+                )
+
+                def recompute_self_candidate(
+                    current_candidate: Tensor,
+                    current_cacheable_inputs: Tensor,
+                    current_candidate_mask: Tensor,
+                    current_cacheable_mask: Tensor,
+                    current_block: LongerSequenceAttentionBlock = block,
+                ) -> Tensor:
+                    candidate_key, candidate_value = current_block.project_kv(
+                        current_candidate
+                    )
+                    cached_key, cached_value = current_block.project_kv(
+                        current_cacheable_inputs
+                    )
+                    key = torch.cat([candidate_key, cached_key], dim=2)
+                    value = torch.cat([candidate_value, cached_value], dim=2)
+                    key_mask = torch.cat(
+                        [current_candidate_mask, current_cacheable_mask], dim=1
+                    )
+                    return current_block.forward_full_projected_kv(
+                        current_candidate,
+                        key,
+                        value,
+                        current_candidate_mask,
+                        key_mask,
+                    )
+
+                if self.activation_checkpoint and self.training:
+                    candidate_hidden = checkpoint(
+                        recompute_self_candidate,
+                        candidate_hidden,
+                        cacheable_inputs,
+                        candidate_valid,
+                        cacheable_mask,
+                        use_reentrant=False,
+                    )
+                else:
+                    candidate_hidden = recompute_self_candidate(
+                        candidate_hidden,
+                        cacheable_inputs,
+                        candidate_valid,
+                        cacheable_mask,
+                    )
+            else:
+                candidate_key, candidate_value = block.project_kv(candidate_hidden)
+                key = torch.cat([candidate_key, layer_cache.cacheable_key], dim=2)
+                value = torch.cat(
+                    [candidate_value, layer_cache.cacheable_value], dim=2
+                )
+                key_mask = torch.cat(
+                    [candidate_valid, sequence_cache.user_mask, sequence_cache.recent_mask],
+                    dim=1,
+                )
+                if self.activation_checkpoint and self.training:
+                    candidate_hidden = checkpoint(
+                        block.forward_full_projected_kv,
+                        candidate_hidden,
+                        key,
+                        value,
+                        candidate_valid,
+                        key_mask,
+                        use_reentrant=False,
+                    )
+                else:
+                    candidate_hidden = block.forward_full_projected_kv(
+                        candidate_hidden,
+                        key,
+                        value,
+                        candidate_valid,
+                        key_mask,
+                    )
+            cacheable_user = layer_cache.user_output
+            cacheable_recent = layer_cache.recent_output
+            if not self.summary_only:
+                hidden = torch.cat(
+                    [cacheable_user, candidate_hidden, cacheable_recent],
+                    dim=1,
+                )
         if self.summary_only:
             summary = torch.cat(
                 [
-                    hidden[:, : self.user_global_tokens, :],
+                    cacheable_user,
                     candidate_hidden,
                 ],
                 dim=1,
@@ -1183,6 +1637,8 @@ class LongerSequenceEncoder(nn.Module):
             if summary.size(1) != self.summary_tokens:
                 raise RuntimeError("LONGER summary output token count is inconsistent")
             return summary.flatten(start_dim=1)
+        if hidden is None:
+            raise RuntimeError("LONGER full output was not materialized")
         return hidden.flatten(start_dim=1)
 
 
@@ -1441,10 +1897,19 @@ class FeatureEncoderBank(nn.Module):
                     sequence.longer_inner_layers,
                     user_global_tokens=user_global_tokens,
                     attention_backend=config.runtime.attention_backend,
+                    varlen_packing=getattr(
+                        config.runtime,
+                        "varlen_packing",
+                        "fixed",
+                    ),
                     activation_checkpoint=_activation_checkpoint_enabled(
                         config.runtime.activation_checkpoint
                     ),
                     checkpoint_token_merger=_activation_checkpoint_enabled(
+                        config.runtime.activation_checkpoint,
+                        full_only=True,
+                    ),
+                    drop_cached_kv=_activation_checkpoint_enabled(
                         config.runtime.activation_checkpoint,
                         full_only=True,
                     ),
@@ -1832,42 +2297,31 @@ class FeatureEncoderBank(nn.Module):
         value: dict[str, Any],
         preencoded_inputs: dict[str, Tensor] | None = None,
     ) -> tuple[Tensor, Tensor]:
-        parts, lengths = self._embedded_sequence_parts(
-            sequence,
-            value,
-            preencoded_inputs,
-        )
         position_key = self._module_key(sequence.name)
         if sequence.encoder == "longer":
-            if sequence.time_delta_field is None:
-                raise ValueError(f"sequence {sequence.name!r} requires time_delta_field")
-            base_inputs = torch.cat(
-                [
-                    parts[field.name]
-                    for field in sequence.fields
-                    if field.name != sequence.time_delta_field
-                ],
-                dim=-1,
+            projector_inputs, mask = self._longer_sequence_projector_inputs(
+                sequence,
+                value,
+                preencoded_inputs,
             )
-            time_delta = parts[sequence.time_delta_field]
-            combined = torch.cat([base_inputs, time_delta], dim=-1)
-            combined, mask = self._align_sequence_inputs(sequence, combined, lengths)
-            base_dim = base_inputs.size(-1)
-            aligned_base = combined[:, :, :base_dim]
-            aligned_time_delta = combined[:, :, base_dim:]
-            if position_key in self.sequence_position_embeddings and combined.size(1) > 0:
-                positions = self._position_inputs(
-                    sequence,
-                    lengths,
-                    combined.size(1),
-                ).to(dtype=aligned_base.dtype)
-                aligned_base = aligned_base + positions
-            projector_inputs = torch.cat([aligned_base, aligned_time_delta], dim=-1)
-            tokens = self.sequence_step_projectors[position_key](projector_inputs)
+            tokens = _project_sequence_in_chunks(
+                self.sequence_step_projectors[position_key],
+                projector_inputs,
+                getattr(self, "config", None),
+            )
         else:
+            parts, lengths = self._embedded_sequence_parts(
+                sequence,
+                value,
+                preencoded_inputs,
+            )
             step_inputs = torch.cat([parts[field.name] for field in sequence.fields], dim=-1)
             step_inputs, mask = self._align_sequence_inputs(sequence, step_inputs, lengths)
-            tokens = self.sequence_step_projectors[position_key](step_inputs)
+            tokens = _project_sequence_in_chunks(
+                self.sequence_step_projectors[position_key],
+                step_inputs,
+                getattr(self, "config", None),
+            )
             if position_key in self.sequence_position_embeddings and tokens.size(1) > 0:
                 positions = self._position_inputs(
                     sequence,
@@ -1877,6 +2331,45 @@ class FeatureEncoderBank(nn.Module):
                 tokens = tokens + positions
         tokens = tokens * mask.unsqueeze(-1).to(dtype=tokens.dtype)
         return tokens, mask
+
+    def _longer_sequence_projector_inputs(
+        self,
+        sequence: SequenceConfig,
+        value: dict[str, Any],
+        preencoded_inputs: dict[str, Tensor] | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Build aligned LONGER event features without materializing 768-d tokens."""
+
+        if sequence.encoder != "longer" or sequence.time_delta_field is None:
+            raise ValueError(f"sequence {sequence.name!r} requires encoder=longer and time_delta_field")
+        parts, lengths = self._embedded_sequence_parts(
+            sequence,
+            value,
+            preencoded_inputs,
+        )
+        base_inputs = torch.cat(
+            [
+                parts[field.name]
+                for field in sequence.fields
+                if field.name != sequence.time_delta_field
+            ],
+            dim=-1,
+        )
+        time_delta = parts[sequence.time_delta_field]
+        combined = torch.cat([base_inputs, time_delta], dim=-1)
+        combined, mask = self._align_sequence_inputs(sequence, combined, lengths)
+        base_dim = base_inputs.size(-1)
+        aligned_base = combined[:, :, :base_dim]
+        aligned_time_delta = combined[:, :, base_dim:]
+        position_key = self._module_key(sequence.name)
+        if position_key in self.sequence_position_embeddings and combined.size(1) > 0:
+            positions = self._position_inputs(
+                sequence,
+                lengths,
+                combined.size(1),
+            ).to(dtype=aligned_base.dtype)
+            aligned_base = aligned_base + positions
+        return torch.cat([aligned_base, aligned_time_delta], dim=-1), mask
 
     def encode_sequence_tokens(
         self,
@@ -1962,6 +2455,82 @@ class FeatureEncoderBank(nn.Module):
         weights = torch.softmax(scores, dim=1) * mask.to(dtype=tokens.dtype)
         weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1.0e-9)
         return (tokens * weights.unsqueeze(-1)).sum(dim=1)
+
+    def _pool_checkpointed_longer_inputs(
+        self,
+        sequence: SequenceConfig,
+        projector_inputs: Tensor,
+        mask: Tensor,
+        user_globals: Tensor,
+    ) -> Tensor:
+        """Project and pool a request-only LONGER stream under one checkpoint.
+
+        The encoder's final summary is tiny, while its event tokens and merged
+        K/V are large.  Making the whole projector+encoder region the
+        recomputation unit prevents those internal tensors from surviving until
+        backward.  Row chunks are independent examples, so concatenating their
+        summaries is mathematically identical to one batch-wide invocation.
+        """
+
+        sequence_key = self._module_key(sequence.name)
+        encoder = self.sequence_longer_encoders[sequence_key]
+        if encoder.candidate_global_tokens != 0:
+            raise ValueError(
+                "checkpointed request-only LONGER pooling requires zero candidate globals"
+            )
+        projector = self.sequence_step_projectors[sequence_key]
+        configured_rows = int(
+            getattr(self.config.runtime, "sequence_encoder_chunk_rows", 0)
+        )
+        configured_tokens = int(
+            getattr(self.config.runtime, "sequence_encoder_chunk_tokens", 0)
+        )
+        chunk_rows = _resolve_longer_chunk_rows(
+            projector_inputs.size(0),
+            projector_inputs.size(1),
+            row_limit=configured_rows,
+            token_limit=configured_tokens,
+        )
+
+        def project_and_pool(
+            current_inputs: Tensor,
+            current_mask: Tensor,
+            current_user_globals: Tensor,
+        ) -> Tensor:
+            summaries: list[Tensor] = []
+            chunk_count = max(
+                1, math.ceil(current_inputs.size(0) / chunk_rows)
+            )
+            chunks = zip(
+                current_inputs.chunk(chunk_count, dim=0),
+                current_mask.chunk(chunk_count, dim=0),
+                current_user_globals.chunk(chunk_count, dim=0),
+            )
+            for chunk_inputs, chunk_mask, chunk_user_globals in chunks:
+                with torch.profiler.record_function(
+                    "longer::checkpointed_request_chunk"
+                ):
+                    chunk_tokens = projector(chunk_inputs)
+                    # LongerTokenMerger applies the validity mask once. An
+                    # additional full-width multiply here only duplicates HBM IO.
+                    summaries.append(
+                        encoder.forward_request_summary(
+                            chunk_tokens,
+                            chunk_mask,
+                            chunk_user_globals,
+                        )
+                    )
+            if summaries:
+                return torch.cat(summaries, dim=0)
+            return projector_inputs.new_zeros((0, encoder.output_dim))
+
+        return checkpoint(
+            project_and_pool,
+            projector_inputs,
+            mask,
+            user_globals,
+            use_reentrant=False,
+        )
 
     def _longer_user_global_tokens(
         self,
@@ -2180,7 +2749,39 @@ class FeatureEncoderBank(nn.Module):
         features: dict[str, Any],
         request_cache: dict[str, LongerSequenceCache] | None = None,
     ) -> dict[str, Tensor]:
-        if request_cache is None and self.config.model.use_request_cache:
+        full_checkpoint_training = (
+            _activation_checkpoint_enabled(
+                self.config.runtime.activation_checkpoint,
+                full_only=True,
+            )
+            and self.training
+        )
+        relevant_longer_sequences = [
+            sequence
+            for sequence in self.config.sequences
+            if sequence.encoder == "longer"
+            and (
+                self.sequence_summary_names is None
+                or sequence.name in self.sequence_summary_names
+            )
+        ]
+        inline_longer_names: set[str] = set()
+        if (
+            request_cache is None
+            and self.config.model.use_request_cache
+            and full_checkpoint_training
+            and all(
+                sequence.resolved_longer_candidate_global_tokens() == 0
+                for sequence in relevant_longer_sequences
+            )
+        ):
+            # Training consumes each request-only sequence immediately. Keeping
+            # a dictionary of all sequence caches would pin every merged stream
+            # until the last sequence has been pooled.
+            inline_longer_names = {
+                sequence.name for sequence in relevant_longer_sequences
+            }
+        elif request_cache is None and self.config.model.use_request_cache:
             request_cache = self.precompute_request_cache(features)
         active_sequence_names = (
             {
@@ -2195,6 +2796,7 @@ class FeatureEncoderBank(nn.Module):
                     and request_cache is not None
                     and sequence.name in request_cache
                 )
+                and sequence.name not in inline_longer_names
             }
             if self.build_sequence_summaries
             else set()
@@ -2219,6 +2821,46 @@ class FeatureEncoderBank(nn.Module):
             value = features[sequence.name]
             if not isinstance(value, dict):
                 raise ValueError(f"sequence {sequence.name!r} must be a payload dict")
+            if sequence.name in inline_longer_names:
+                user_input_names = set(sequence.longer_user_global_inputs)
+                sequence_preencoded = self._preencode_sharded_inputs(
+                    features,
+                    scalar_names=user_input_names,
+                    sequence_names={sequence.name},
+                )
+                request_features = dict(features)
+                for name in user_input_names:
+                    feature_value = request_features.get(name)
+                    if isinstance(feature_value, dict) and "row_indices" in feature_value:
+                        request_features[name] = {
+                            key: child
+                            for key, child in feature_value.items()
+                            if key != "row_indices"
+                        }
+                encoded_user = self.encode_scalar_features(
+                    request_features,
+                    user_input_names,
+                    sequence_preencoded,
+                )
+                projector_inputs, mask = self._longer_sequence_projector_inputs(
+                    sequence,
+                    value,
+                    sequence_preencoded,
+                )
+                user_globals = self._longer_user_global_tokens(
+                    sequence,
+                    encoded_user,
+                    projector_inputs.size(0),
+                    projector_inputs,
+                )
+                pooled = self._pool_checkpointed_longer_inputs(
+                    sequence,
+                    projector_inputs,
+                    mask,
+                    user_globals,
+                )
+                encoded[sequence.name] = _gather_indexed_rows(pooled, value)
+                continue
             sequence_cache = None if request_cache is None else request_cache.get(sequence.name)
             row_indices = _indexed_row_indices(value)
             if (
@@ -2694,7 +3336,11 @@ class OneTransTokenizer(nn.Module):
             parts.append(scalar.unsqueeze(1).expand(-1, max_length, -1))
         if mask is None:
             raise ValueError(f"sequence token group {group.name!r} produced no mask")
-        tokens = projection(torch.cat(parts, dim=-1))
+        tokens = _project_sequence_in_chunks(
+            projection,
+            torch.cat(parts, dim=-1),
+            self.config,
+        )
         tokens = tokens * mask.unsqueeze(-1).to(tokens.dtype)
         timestamps = (
             self._sequence_group_timestamps(group, features, mask)
@@ -2876,7 +3522,15 @@ class OneTransTokenizer(nn.Module):
 
 
 class MixedCausalAttention(nn.Module):
-    def __init__(self, token_dim: int, num_heads: int, ns_token_count: int, attention_backend: str = "auto") -> None:
+    def __init__(
+        self,
+        token_dim: int,
+        num_heads: int,
+        ns_token_count: int,
+        attention_backend: str = "auto",
+        varlen_packing: str = "fixed",
+        low_memory: bool = False,
+    ) -> None:
         super().__init__()
         if token_dim % num_heads != 0:
             raise ValueError("token_dim must be divisible by num_heads")
@@ -2884,6 +3538,10 @@ class MixedCausalAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = token_dim // num_heads
         self.attention_backend = attention_backend
+        if varlen_packing not in {"fixed", "compact"}:
+            raise ValueError("varlen_packing must be fixed or compact")
+        self.varlen_packing = varlen_packing
+        self.low_memory = low_memory
         self.s_query = nn.Linear(token_dim, token_dim)
         self.s_key = nn.Linear(token_dim, token_dim)
         self.s_value = nn.Linear(token_dim, token_dim)
@@ -2909,16 +3567,14 @@ class MixedCausalAttention(nn.Module):
         projected = projected + bias.unsqueeze(1).to(dtype=projected.dtype)
         return projected.transpose(0, 1)
 
-    @classmethod
-    def _project_ns(cls, tokens: Tensor, layers: nn.ModuleList) -> Tensor:
+    @staticmethod
+    def _project_ns_independent(tokens: Tensor, layers: nn.ModuleList) -> Tensor:
         if tokens.size(1) != len(layers):
             raise ValueError(
                 f"expected {len(layers)} NS tokens, got {tokens.size(1)}"
             )
         if not layers:
             return tokens
-        if tokens.device.type == "cuda":
-            return cls._project_ns_batched(tokens, layers)
         return torch.cat(
             [
                 layer(tokens[:, index, :]).unsqueeze(1)
@@ -2927,21 +3583,30 @@ class MixedCausalAttention(nn.Module):
             dim=1,
         )
 
+    def _project_ns(self, tokens: Tensor, layers: nn.ModuleList) -> Tensor:
+        if tokens.device.type == "cuda" and not self.low_memory:
+            return self._project_ns_batched(tokens, layers)
+        return self._project_ns_independent(tokens, layers)
+
     def _project_all(self, tokens: Tensor, s_count: int, s_layer: nn.Linear, ns_layers: nn.ModuleList) -> Tensor:
-        parts: list[Tensor] = []
-        if s_count > 0:
-            parts.append(s_layer(tokens[:, :s_count, :]))
-        parts.append(self._project_ns(tokens[:, s_count:, :], ns_layers))
-        return torch.cat(parts, dim=1)
+        ns_tokens = tokens[:, s_count:, :]
+        if s_count == 0:
+            return self._project_ns(ns_tokens, ns_layers)
+        s_tokens = s_layer(tokens[:, :s_count, :])
+        if ns_tokens.size(1) == 0:
+            return s_tokens
+        return torch.cat([s_tokens, self._project_ns(ns_tokens, ns_layers)], dim=1)
 
     def _project_query(self, tokens: Tensor, query_s_count: int) -> Tensor:
-        parts: list[Tensor] = []
-        if query_s_count > 0:
-            parts.append(self.s_query(tokens[:, :query_s_count, :]))
-        parts.append(
-            self._project_ns(tokens[:, query_s_count:, :], self.ns_query)
+        ns_tokens = tokens[:, query_s_count:, :]
+        if query_s_count == 0:
+            return self._project_ns(ns_tokens, self.ns_query)
+        s_tokens = self.s_query(tokens[:, :query_s_count, :])
+        if ns_tokens.size(1) == 0:
+            return s_tokens
+        return torch.cat(
+            [s_tokens, self._project_ns(ns_tokens, self.ns_query)], dim=1
         )
-        return torch.cat(parts, dim=1)
 
     def _split_heads(self, tokens: Tensor) -> Tensor:
         batch_size, token_count, _ = tokens.shape
@@ -3018,9 +3683,9 @@ class MixedCausalAttention(nn.Module):
                 )
             return self.output(self._merge_heads(attended))
 
-        if varlen_attn is None:
+        if not varlen_attention_available():
             raise RuntimeError(
-                "runtime.attention_backend='flash' requires torch.nn.attention.varlen"
+                "runtime.attention_backend='flash' requires a Varlen Flash implementation"
             )
         validate_varlen_inputs(
             query,
@@ -3038,9 +3703,10 @@ class MixedCausalAttention(nn.Module):
             if query_valid_mask is key_valid_mask
             else _VarlenPacking.from_mask(key_valid_mask)
         )
-        packed_query = query_packing.pack(query_tokens)
-        packed_key = key_packing.pack(key_tokens)
-        packed_value = key_packing.pack(value_tokens)
+        compact = self.varlen_packing == "compact"
+        packed_query = query_packing.pack(query_tokens, compact=compact)
+        packed_key = key_packing.pack(key_tokens, compact=compact)
+        packed_value = key_packing.pack(value_tokens, compact=compact)
         if packed_query.numel() == 0:
             return self.output(self._merge_heads(torch.zeros_like(query)))
         with torch.profiler.record_function("onetrans::flash_varlen_causal"):
@@ -3053,8 +3719,13 @@ class MixedCausalAttention(nn.Module):
                 query_valid_mask.size(1),
                 key_valid_mask.size(1),
                 causal=True,
+                fixed_capacity=not compact,
             )
-        attended_tokens = query_packing.unpack(packed_output, query_tokens)
+        attended_tokens = query_packing.unpack(
+            packed_output,
+            query_tokens,
+            compact=compact,
+        )
         attended = attended_tokens.transpose(1, 2)
         return self.output(self._merge_heads(attended))
 
@@ -3063,16 +3734,16 @@ class MixedCausalAttention(nn.Module):
         self,
         tokens: Tensor,
         s_count: int,
-        query_indices: Tensor,
         query_s_count: int,
         key_valid_mask: Tensor,
     ) -> Tensor:
-        query_tokens = tokens.index_select(1, query_indices)
+        query_start = s_count - query_s_count
+        query_tokens = tokens[:, query_start:, :]
         query = self._split_heads(self._project_query(query_tokens, query_s_count))
         key = self._split_heads(self._project_all(tokens, s_count, self.s_key, self.ns_key))
         value = self._split_heads(self._project_all(tokens, s_count, self.s_value, self.ns_value))
 
-        query_valid_mask = key_valid_mask.index_select(1, query_indices)
+        query_valid_mask = key_valid_mask[:, query_start:]
         return self.attend_causal_suffix(
             query,
             key,
@@ -3083,8 +3754,15 @@ class MixedCausalAttention(nn.Module):
 
 
 class MixedFFN(nn.Module):
-    def __init__(self, token_dim: int, hidden_dim: int, ns_token_count: int) -> None:
+    def __init__(
+        self,
+        token_dim: int,
+        hidden_dim: int,
+        ns_token_count: int,
+        low_memory: bool = False,
+    ) -> None:
         super().__init__()
+        self.low_memory = low_memory
         self.s_ffn = nn.Sequential(
             nn.Linear(token_dim, hidden_dim),
             nn.GELU(),
@@ -3114,26 +3792,31 @@ class MixedFFN(nn.Module):
             [network[0].bias for network in self.ns_ffn],
             dim=0,
         )
-        output_weight = torch.stack(
-            [network[2].weight for network in self.ns_ffn],
-            dim=0,
-        )
-        output_bias = torch.stack(
-            [network[2].bias for network in self.ns_ffn],
-            dim=0,
-        )
         token_major = ns_tokens.transpose(0, 1)
-        hidden = torch.bmm(
-            token_major,
-            input_weight.transpose(1, 2),
-        )
-        hidden = hidden + input_bias.unsqueeze(1).to(dtype=hidden.dtype)
-        hidden = torch.nn.functional.gelu(hidden)
-        output = torch.bmm(
-            hidden,
-            output_weight.transpose(1, 2),
-        )
-        output = output + output_bias.unsqueeze(1).to(dtype=output.dtype)
+        with torch.profiler.record_function("onetrans::batched_ns_ffn"):
+            hidden = torch.bmm(
+                token_major,
+                input_weight.transpose(1, 2),
+            )
+            hidden = hidden + input_bias.unsqueeze(1).to(dtype=hidden.dtype)
+            hidden = torch.nn.functional.gelu(hidden)
+            # Defer the second weight stack until its GEMM. Under activation
+            # checkpointing the first stack can then be released before the
+            # large output stack is materialized.
+            del input_weight, input_bias
+            output_weight = torch.stack(
+                [network[2].weight for network in self.ns_ffn],
+                dim=0,
+            )
+            output_bias = torch.stack(
+                [network[2].bias for network in self.ns_ffn],
+                dim=0,
+            )
+            output = torch.bmm(
+                hidden,
+                output_weight.transpose(1, 2),
+            )
+            output = output + output_bias.unsqueeze(1).to(dtype=output.dtype)
         return output.transpose(0, 1)
 
     def _forward_ns_independent(self, ns_tokens: Tensor) -> Tensor:
@@ -3152,15 +3835,19 @@ class MixedFFN(nn.Module):
         )
 
     def forward(self, tokens: Tensor, query_s_count: int) -> Tensor:
-        parts: list[Tensor] = []
-        if query_s_count > 0:
-            parts.append(self.s_ffn(tokens[:, :query_s_count, :]))
         ns_tokens = tokens[:, query_s_count:, :]
-        if ns_tokens.device.type == "cuda":
-            parts.append(self._forward_ns_batched(ns_tokens))
+        if query_s_count == 0:
+            if ns_tokens.device.type == "cuda" and not self.low_memory:
+                return self._forward_ns_batched(ns_tokens)
+            return self._forward_ns_independent(ns_tokens)
+        s_output = self.s_ffn(tokens[:, :query_s_count, :])
+        if ns_tokens.size(1) == 0:
+            return s_output
+        if ns_tokens.device.type == "cuda" and not self.low_memory:
+            ns_output = self._forward_ns_batched(ns_tokens)
         else:
-            parts.append(self._forward_ns_independent(ns_tokens))
-        return torch.cat(parts, dim=1)
+            ns_output = self._forward_ns_independent(ns_tokens)
+        return torch.cat([s_output, ns_output], dim=1)
 
 
 class OneTransBlock(nn.Module):
@@ -3172,9 +3859,20 @@ class OneTransBlock(nn.Module):
             config.model.num_heads,
             ns_token_count,
             config.runtime.attention_backend,
+            getattr(config.runtime, "varlen_packing", "fixed"),
+            low_memory=not getattr(
+                config.runtime, "onetrans_batched_ns", True
+            ),
         )
         self.norm_ffn = RMSNorm(config.model.token_dim)
-        self.ffn = MixedFFN(config.model.token_dim, config.model.hidden_dim, ns_token_count)
+        self.ffn = MixedFFN(
+            config.model.token_dim,
+            config.model.hidden_dim,
+            ns_token_count,
+            low_memory=not getattr(
+                config.runtime, "onetrans_batched_ns", True
+            ),
+        )
 
     def precompute_s(
         self,
@@ -3182,6 +3880,8 @@ class OneTransBlock(nn.Module):
         query_s_count: int,
         valid_mask: Tensor,
         input_start: int = 0,
+        *,
+        cache_kv: bool = True,
     ) -> OneTransLayerCache:
         normalized = self.norm_attention(s_tokens)
         s_key, s_value = self.attention.project_s_kv(normalized)
@@ -3201,12 +3901,24 @@ class OneTransBlock(nn.Module):
             residual = s_tokens[:, -query_s_count:, :]
             hidden = residual + attended
             output = hidden + self.ffn.s_ffn(self.norm_ffn(hidden))
+        if cache_kv:
+            cached_key = s_key
+            cached_value = s_value
+        else:
+            # A zero-length allocation must not be a view of s_key/s_value:
+            # retaining a zero-length view would still pin the full K/V storage.
+            cached_key = s_key.new_empty(
+                (s_key.size(0), s_key.size(1), 0, s_key.size(3))
+            )
+            cached_value = s_value.new_empty(
+                (s_value.size(0), s_value.size(1), 0, s_value.size(3))
+            )
         return OneTransLayerCache(
             s_input=s_tokens,
             s_input_start=input_start,
             s_reused_kv_tokens=0,
-            s_key=s_key,
-            s_value=s_value,
+            s_key=cached_key,
+            s_value=cached_value,
             s_output=output,
             s_key_valid_mask=valid_mask,
             s_output_valid_mask=output_mask,
@@ -3220,6 +3932,16 @@ class OneTransBlock(nn.Module):
         input_start: int,
         previous: OneTransLayerCache,
     ) -> OneTransLayerCache:
+        if previous.s_key.size(2) == 0 and previous.s_value.size(2) == 0:
+            # Full activation-checkpoint mode intentionally drops persistent
+            # K/V. Rebuild the layer while preserving that low-memory policy.
+            return self.precompute_s(
+                s_tokens,
+                query_s_count,
+                valid_mask,
+                input_start=input_start,
+                cache_kv=False,
+            )
         if s_tokens.size(0) != previous.s_input.size(0):
             raise ValueError("incremental OneTrans cache update requires the same request batch size")
         old_start = previous.s_input_start
@@ -3292,13 +4014,22 @@ class OneTransBlock(nn.Module):
             s_output_valid_mask=output_mask,
         )
 
-    def forward_cached_ns(self, ns_tokens: Tensor, cache: OneTransLayerCache) -> Tensor:
+    def forward_cached_ns_tensors(
+        self,
+        ns_tokens: Tensor,
+        s_input: Tensor,
+        s_key: Tensor,
+        s_value: Tensor,
+        s_mask: Tensor,
+    ) -> Tensor:
+        if s_key.size(2) == 0 and s_value.size(2) == 0:
+            normalized_s = self.norm_attention(s_input)
+            s_key, s_value = self.attention.project_s_kv(normalized_s)
+        elif s_key.size(2) != s_input.size(1) or s_value.size(2) != s_input.size(1):
+            raise ValueError("OneTrans cached S K/V length is inconsistent")
         normalized = self.norm_attention(ns_tokens)
         query = self.attention.project_ns_query(normalized)
         ns_key, ns_value = self.attention.project_ns_kv(normalized)
-        s_key = cache.s_key
-        s_value = cache.s_value
-        s_mask = cache.s_key_valid_mask
         if s_key.size(0) != ns_tokens.size(0):
             if s_key.size(0) != 1:
                 raise ValueError("OneTrans layer cache batch must be 1 or match candidate batch")
@@ -3321,6 +4052,15 @@ class OneTransBlock(nn.Module):
         hidden = ns_tokens + attended
         return hidden + self.ffn(self.norm_ffn(hidden), query_s_count=0)
 
+    def forward_cached_ns(self, ns_tokens: Tensor, cache: OneTransLayerCache) -> Tensor:
+        return self.forward_cached_ns_tensors(
+            ns_tokens,
+            cache.s_input,
+            cache.s_key,
+            cache.s_value,
+            cache.s_key_valid_mask,
+        )
+
 
     def forward(
         self,
@@ -3329,18 +4069,15 @@ class OneTransBlock(nn.Module):
         query_s_count: int,
         valid_mask: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        query_indices = torch.cat(
-            [
-                torch.arange(s_count - query_s_count, s_count, device=tokens.device),
-                torch.arange(s_count, tokens.size(1), device=tokens.device),
-            ]
-        )
+        query_start = s_count - query_s_count
         normalized = self.norm_attention(tokens)
-        residual = tokens.index_select(1, query_indices)
-        attended = self.attention(normalized, s_count, query_indices, query_s_count, valid_mask)
+        residual = tokens[:, query_start:, :]
+        attended = self.attention(
+            normalized, s_count, query_s_count, valid_mask
+        )
         hidden = residual + attended
         output = hidden + self.ffn(self.norm_ffn(hidden), query_s_count)
-        return output, valid_mask.index_select(1, query_indices)
+        return output, valid_mask[:, query_start:]
 
 
 def _mdl_onetrans_sequence_summary_names(config: AppConfig) -> set[str]:
@@ -3475,16 +4212,99 @@ class OneTransBackbone(nn.Module):
         initial_s_count = current_tokens.size(1)
         current_start = 0
         layer_caches: list[OneTransLayerCache] = []
+        checkpoint_layers = (
+            _activation_checkpoint_enabled(
+                self.config.runtime.activation_checkpoint
+            )
+            and self.training
+        )
+        drop_cached_kv = (
+            _activation_checkpoint_enabled(
+                self.config.runtime.activation_checkpoint,
+                full_only=True,
+            )
+            and self.training
+        )
         for layer_index, block in enumerate(self.blocks):
             query_s_count = self._layer_s_count(
                 initial_s_count, current_tokens.size(1), layer_index
             )
-            layer_cache = block.precompute_s(
-                current_tokens,
-                query_s_count,
-                current_mask,
-                input_start=current_start,
-            )
+            if checkpoint_layers:
+                if drop_cached_kv:
+                    def checkpointed_s_output(
+                        tokens: Tensor,
+                        mask: Tensor,
+                        current_block: OneTransBlock = block,
+                        current_query_s_count: int = query_s_count,
+                        current_input_start: int = current_start,
+                    ) -> Tensor:
+                        return current_block.precompute_s(
+                            tokens,
+                            current_query_s_count,
+                            mask,
+                            input_start=current_input_start,
+                            cache_kv=False,
+                        ).s_output
+
+                    s_output = checkpoint(
+                        checkpointed_s_output,
+                        current_tokens,
+                        current_mask,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                    head_dim = block.attention.head_dim
+                    empty_shape = (
+                        current_tokens.size(0),
+                        block.attention.num_heads,
+                        0,
+                        head_dim,
+                    )
+                    s_key = current_tokens.new_empty(empty_shape)
+                    s_value = current_tokens.new_empty(empty_shape)
+                else:
+                    def checkpointed_s_cache(
+                        tokens: Tensor,
+                        mask: Tensor,
+                        current_block: OneTransBlock = block,
+                        current_query_s_count: int = query_s_count,
+                        current_input_start: int = current_start,
+                    ) -> tuple[Tensor, Tensor, Tensor]:
+                        cache = current_block.precompute_s(
+                            tokens,
+                            current_query_s_count,
+                            mask,
+                            input_start=current_input_start,
+                        )
+                        return cache.s_key, cache.s_value, cache.s_output
+
+                    s_key, s_value, s_output = checkpoint(
+                        checkpointed_s_cache,
+                        current_tokens,
+                        current_mask,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                output_mask = current_mask[
+                    :, current_tokens.size(1) - query_s_count :
+                ]
+                layer_cache = OneTransLayerCache(
+                    s_input=current_tokens,
+                    s_input_start=current_start,
+                    s_reused_kv_tokens=0,
+                    s_key=s_key,
+                    s_value=s_value,
+                    s_output=s_output,
+                    s_key_valid_mask=current_mask,
+                    s_output_valid_mask=output_mask,
+                )
+            else:
+                layer_cache = block.precompute_s(
+                    current_tokens,
+                    query_s_count,
+                    current_mask,
+                    input_start=current_start,
+                )
             layer_caches.append(layer_cache)
             current_start += current_tokens.size(1) - query_s_count
             current_tokens = layer_cache.s_output
@@ -3614,12 +4434,26 @@ class OneTransBackbone(nn.Module):
             state.initial_s_count, state.s_count, layer_index
         )
         if layer_cache is not None:
-            if layer_cache.s_key.size(2) != state.s_count:
+            if layer_cache.s_key.size(2) not in {0, state.s_count}:
                 raise ValueError("OneTrans layer cache S-token count does not match backbone state")
             if layer_cache.s_output.size(1) != query_s_count:
                 raise ValueError("OneTrans layer cache pyramid output count is invalid")
             ns_tokens = state.tokens[:, state.s_count :, :]
-            ns_output = block.forward_cached_ns(ns_tokens, layer_cache)
+            if _activation_checkpoint_enabled(
+                self.config.runtime.activation_checkpoint
+            ) and self.training:
+                ns_output = checkpoint(
+                    block.forward_cached_ns_tensors,
+                    ns_tokens,
+                    layer_cache.s_input,
+                    layer_cache.s_key,
+                    layer_cache.s_value,
+                    layer_cache.s_key_valid_mask,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                ns_output = block.forward_cached_ns(ns_tokens, layer_cache)
             s_output = layer_cache.s_output
             s_output_mask = layer_cache.s_output_valid_mask
             if s_output.size(0) != ns_output.size(0):
@@ -4390,6 +5224,11 @@ class MDLDomainBlock(nn.Module):
                 token_dim,
                 config.model.num_heads,
                 attention_backend=config.runtime.attention_backend,
+                varlen_packing=getattr(
+                    config.runtime,
+                    "varlen_packing",
+                    "fixed",
+                ),
             )
             if use_sequence_attention and self.use_scenario_tokens
             else None
@@ -4404,6 +5243,11 @@ class MDLDomainBlock(nn.Module):
                 token_dim,
                 config.model.num_heads,
                 attention_backend=config.runtime.attention_backend,
+                varlen_packing=getattr(
+                    config.runtime,
+                    "varlen_packing",
+                    "fixed",
+                ),
             )
             if use_sequence_attention and self.use_task_tokens
             else None

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-import inspect
 import math
 from typing import Any
 
@@ -17,26 +16,29 @@ except ImportError:  # pragma: no cover - compatibility with older PyTorch build
     sdpa_kernel = None
 
 try:
-    from torch.nn.attention.varlen import varlen_attn
-except ImportError:  # pragma: no cover - older PyTorch compatibility.
-    varlen_attn = None
-
-_VARLEN_ATTN_USES_WINDOW_SIZE = (
-    varlen_attn is not None
-    and "window_size" in inspect.signature(varlen_attn).parameters
-)
+    from flash_attn import flash_attn_varlen_func
+except ImportError:  # pragma: no cover - optional Dao-AILab flash-attn dependency.
+    flash_attn_varlen_func = None
 
 from .mlp import PerTokenFFN
 
 
 def varlen_attention_available() -> bool:
-    """True iff ``torch.nn.attention.varlen.varlen_attn`` can be imported.
+    """True when Dao-AILab's Varlen Flash implementation is importable.
 
-    This only reports Python API availability (PyTorch >= 2.10), not that every
-    GPU/dtype/shape combination will successfully execute the kernel.
+    This only reports Python API availability, not that every GPU/dtype/shape
+    combination will successfully execute the kernel.
     """
 
-    return varlen_attn is not None
+    return flash_attn_varlen_func is not None
+
+
+def varlen_attention_backend() -> str | None:
+    """Return the only supported Varlen implementation."""
+
+    if flash_attn_varlen_func is not None:
+        return "flash_attn"
+    return None
 
 
 def validate_varlen_inputs(
@@ -47,7 +49,7 @@ def validate_varlen_inputs(
     dropout_p: float,
     training: bool,
 ) -> None:
-    """Reject Varlen Flash execution with unsupported device/dtype/dropout."""
+    """Reject Flash varlen execution with unsupported device/dtype/dropout."""
 
     if query.device.type != "cuda":
         raise RuntimeError("Flash varlen attention requires CUDA tensors")
@@ -83,36 +85,95 @@ def _call_varlen_attention(
     max_key_length: int,
     *,
     causal: bool,
+    fixed_capacity: bool = True,
 ) -> Tensor:
-    """Call supported PyTorch 2.10+ varlen API variants."""
+    """Execute Dao flash-attn Varlen in fixed-capacity or compact mode.
 
-    if varlen_attn is None:
-        raise RuntimeError("torch.nn.attention.varlen is unavailable")
-    if _VARLEN_ATTN_USES_WINDOW_SIZE:
-        output = varlen_attn(
-            query,
-            key,
-            value,
+    Fixed capacity exposes padding as dummy sequences and avoids dynamic CUDA
+    shapes. Compact mode passes only valid tokens, trading dynamic packing for
+    materially lower Q/K/V and FlashAttention workspace peaks.
+    """
+
+    if flash_attn_varlen_func is None:
+        raise RuntimeError(
+            "runtime.attention_backend='flash' requires "
+            "flash_attn.flash_attn_varlen_func"
+        )
+    if cu_query.numel() != cu_key.numel():
+        raise RuntimeError("query/key cumulative lengths must have equal batch size")
+    if query.size(0) == 0 or key.size(0) == 0:
+        return torch.zeros_like(query)
+    if fixed_capacity:
+        flash_cu_query = _fixed_capacity_cumulative_lengths(
             cu_query,
+            capacity=query.size(0),
+            max_length=max_query_length,
+        )
+        flash_cu_key = _fixed_capacity_cumulative_lengths(
             cu_key,
-            max_query_length,
-            max_key_length,
-            window_size=(-1, 0) if causal else (-1, -1),
+            capacity=key.size(0),
+            max_length=max_key_length,
         )
     else:
-        output = varlen_attn(
-            query,
-            key,
-            value,
-            cu_query,
-            cu_key,
-            max_query_length,
-            max_key_length,
-            is_causal=causal,
-        )
+        flash_cu_query = cu_query
+        flash_cu_key = cu_key
+    output = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        flash_cu_query,
+        flash_cu_key,
+        max_query_length,
+        max_key_length,
+        dropout_p=0.0,
+        causal=causal,
+    )
     if not isinstance(output, Tensor):
         raise RuntimeError("varlen attention unexpectedly returned auxiliary outputs")
+    if output.shape != query.shape:
+        raise RuntimeError(
+            "varlen attention must preserve the packed query shape"
+        )
     return output
+
+
+def _fixed_capacity_cumulative_lengths(
+    cumulative_lengths: Tensor,
+    *,
+    capacity: int,
+    max_length: int,
+) -> Tensor:
+    """Append per-row dummy sequences so cumulative lengths end at capacity.
+
+    Valid tokens are packed first and invalid slots follow in row-major order.
+    Appending one dummy sequence per row makes Dao flash-attn's documented
+    exact-total contract hold without a data-dependent slice or host readback.
+    Dummy outputs are discarded by :meth:`_VarlenPacking.unpack`.
+    """
+
+    if cumulative_lengths.ndim != 1 or cumulative_lengths.numel() < 1:
+        raise ValueError("cumulative lengths must be a non-empty vector")
+    batch_size = cumulative_lengths.numel() - 1
+    expected_capacity = batch_size * max_length
+    if capacity != expected_capacity:
+        raise RuntimeError(
+            "fixed-capacity varlen tensor size must equal batch_size * max_length"
+        )
+    if batch_size == 0:
+        return cumulative_lengths
+    lengths = cumulative_lengths[1:] - cumulative_lengths[:-1]
+    padding_lengths = max_length - lengths
+    valid = (lengths >= 0) & (padding_lengths >= 0)
+    message = "varlen sequence lengths must be inside [0, max_length]"
+    if cumulative_lengths.device.type == "cuda" and hasattr(torch, "_assert_async"):
+        torch._assert_async(valid.all(), message)
+    elif not bool(valid.all().item()):
+        raise RuntimeError(message)
+    dummy_ends = cumulative_lengths[-1] + padding_lengths.cumsum(
+        0,
+        dtype=cumulative_lengths.dtype,
+    )
+    return torch.cat((cumulative_lengths, dummy_ends))
 
 
 class _PermutationGather(torch.autograd.Function):
@@ -192,11 +253,13 @@ class _VarlenPacking:
             padded_length=mask.size(1),
         )
 
-    def pack(self, values: Tensor) -> Tensor:
+    def pack(self, values: Tensor, *, compact: bool = False) -> Tensor:
         if values.shape[:2] != (self.batch_size, self.padded_length):
             raise ValueError(
                 "packed values must match the packing mask batch and length"
             )
+        if compact:
+            return values.flatten(0, 1)[self.flat_mask]
         packed = _PermutationGather.apply(
             values.flatten(0, 1),
             self.packed_source_indices,
@@ -205,12 +268,28 @@ class _VarlenPacking:
         mask_shape = (self.packed_mask.numel(),) + (1,) * (values.ndim - 2)
         return packed * self.packed_mask.view(mask_shape).to(packed.dtype)
 
-    def unpack(self, packed: Tensor, reference: Tensor) -> Tensor:
+    def unpack(
+        self,
+        packed: Tensor,
+        reference: Tensor,
+        *,
+        compact: bool = False,
+    ) -> Tensor:
         if reference.shape[:2] != (self.batch_size, self.padded_length):
             raise ValueError(
                 "unpack reference must match the packing mask batch and length"
             )
         expected_capacity = self.batch_size * self.padded_length
+        if compact:
+            expected_valid = self.lengths.sum()
+            if packed.device.type != "cuda" and packed.size(0) != int(expected_valid.item()):
+                raise ValueError("compact varlen output must match the valid token count")
+            flat_reference = reference.flatten(0, 1)
+            output = torch.zeros_like(flat_reference).index_put(
+                (self.flat_mask,),
+                packed,
+            )
+            return output.view_as(reference)
         if packed.size(0) != expected_capacity:
             raise ValueError(
                 "fixed-capacity varlen output must match the padded token capacity"
@@ -408,6 +487,7 @@ class VariableLengthDomainAttention(nn.Module):
         token_dim: int,
         num_heads: int,
         attention_backend: str = "auto",
+        varlen_packing: str = "fixed",
     ) -> None:
         super().__init__()
         if token_dim % num_heads != 0:
@@ -417,6 +497,9 @@ class VariableLengthDomainAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = token_dim // num_heads
         self.attention_backend = attention_backend
+        if varlen_packing not in {"fixed", "compact"}:
+            raise ValueError("varlen_packing must be fixed or compact")
+        self.varlen_packing = varlen_packing
 
         self.query_norm = nn.LayerNorm(token_dim)
         self.memory_norm = nn.LayerNorm(token_dim)
@@ -441,9 +524,9 @@ class VariableLengthDomainAttention(nn.Module):
         value: Tensor,
         key_valid_mask: Tensor,
     ) -> Tensor:
-        if varlen_attn is None:
+        if not varlen_attention_available():
             raise RuntimeError(
-                "runtime.attention_backend='flash' requires torch.nn.attention.varlen"
+                "runtime.attention_backend='flash' requires a Varlen Flash implementation"
             )
         validate_varlen_inputs(
             query,
@@ -460,6 +543,7 @@ class VariableLengthDomainAttention(nn.Module):
             return torch.zeros_like(query)
 
         key_packing = _VarlenPacking.from_mask(key_valid_mask)
+        compact = self.varlen_packing == "compact"
         batch_size, query_length = query_tokens.shape[:2]
         cumulative_query_lengths = torch.arange(
             batch_size + 1,
@@ -469,13 +553,14 @@ class VariableLengthDomainAttention(nn.Module):
         with torch.profiler.record_function("mdl::flash_varlen_domain_sequence"):
             packed_output = _call_varlen_attention(
                 query_tokens.view(-1, self.num_heads, self.head_dim),
-                key_packing.pack(key_tokens).contiguous(),
-                key_packing.pack(value_tokens).contiguous(),
+                key_packing.pack(key_tokens, compact=compact).contiguous(),
+                key_packing.pack(value_tokens, compact=compact).contiguous(),
                 cumulative_query_lengths,
                 key_packing.cumulative_lengths,
                 query_length,
                 key_valid_mask.size(1),
                 causal=False,
+                fixed_capacity=not compact,
             )
         return packed_output.view_as(query_tokens).transpose(1, 2)
 

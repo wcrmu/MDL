@@ -1,5 +1,5 @@
-# Standalone 2×H100 production training config for mdl_rankmixer.
-# SDPA eager + Row-Wise Adagrad + Phase 2 shared_dim embedding profile.
+# Production training config for mdl_rankmixer; launcher defaults to 2×H100.
+# flash-attn varlen + Row-Wise Adagrad + Phase 2 shared_dim embedding profile.
 # Scenarios: fixed search/recommendation via coarse_scene_index (121 search scene_ids; others -> recommendation).
 # Adapter grouping: context_features=51 request-axis; item_features=118 candidate-axis.
 runtime:
@@ -9,12 +9,23 @@ runtime:
   compile_mode: default
   require_compact_sequence_batches: false
   allow_tf32: true
-  activation_checkpoint: none
-  attention_backend: sdpa
+  activation_checkpoint: full
+  attention_backend: flash
+  varlen_packing: compact
+  sequence_projection_chunk_tokens: 131072
+  # Bound LONGER by padded event tokens rather than fixed rows. At batch 1024
+  # this gives 128 rows for length 2048, 256 for length 1024, and the full batch
+  # for streams <=256, keeping Tensor Cores fed without unbounded HBM growth.
+  sequence_encoder_chunk_rows: 0
+  sequence_encoder_chunk_tokens: 262144
+  onetrans_batched_ns: true
   distributed: ddp
+  # Default local launch width only; training.batch_size remains per rank/GPU.
   nproc_per_node: 2
   master_addr: 127.0.0.1
   master_port: 29500
+  # Compact varlen packing already removes invalid tokens; avoid a CUDA scalar
+  # readback just to trim a common padded prefix.
   trim_all_invalid_sequence_prefix: false
   validate_scenario_ids: false
 data:
@@ -39,7 +50,9 @@ data:
       eager_schema_validation: sample
       schema_validation_samples: 64
       coalesce_pinned_tensors: true
-      device_prefetch_batches: 2
+      # One future device batch preserves H2D overlap without pinning two large
+      # sequence batches in HBM while the current batch is executing.
+      device_prefetch_batches: 1
       deduplicate_request_features: true
       validate_prehashed_nonzero: false
       trusted_input: true
@@ -57,15 +70,15 @@ data:
       length_bucket_metric: sum
       length_buckets:
       - max_length: 1024
-        batch_size: 72
+        batch_size: 1024
       - max_length: 2048
-        batch_size: 48
+        batch_size: 1024
       - max_length: 4096
-        batch_size: 32
+        batch_size: 1024
       - max_length: 6144
-        batch_size: 22
+        batch_size: 1024
       - max_length:
-        batch_size: 16
+        batch_size: 1024
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
       input_columns:
@@ -5212,7 +5225,10 @@ model:
   mdl_feature_interaction: direct_ffn
   use_request_cache: true
 training:
-  batch_size: 16
+  # Physical batch per rank/GPU. It is never divided by world size; the default
+  # two-rank launch therefore processes 2048 samples per forward collectively.
+  batch_size: 1024
+  gradient_accumulation_steps: 1
   embedding_distribution: sharded
   dense_distribution: ddp
   embedding_sharding:
@@ -5234,7 +5250,10 @@ training:
   lr_decay_steps:
   lr_min_ratio: 0.0
   dense_optimizer: rmsprop
-  fused_dense_optimizer: true
+  # Bounded foreach combines small parameter updates without allocating a
+  # full-model optimizer workspace.
+  fused_dense_optimizer: false
+  dense_optimizer_foreach_bucket_mb: 128
   rmsprop_alpha: 0.99999
   rmsprop_momentum: 0.0
   sparse_optimizer: rowwise_adagrad
@@ -5247,6 +5266,8 @@ training:
   dense_clip_norm: 1.0
   sparse_clip_norm: 1.0
   loss_reduction: mean_per_task
+  # Reading loss/token scalars every step drains the asynchronous CUDA queue.
+  log_every_steps: 100
   quick_eval:
     enabled: true
     every_steps: 1000

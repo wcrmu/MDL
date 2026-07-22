@@ -483,7 +483,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         ) + 9 * 768
         self.assertEqual(main_input_width % 32, 0)
         self.assertEqual(payload["runtime"]["nproc_per_node"], 2)
-        self.assertEqual(payload["runtime"]["attention_backend"], "sdpa")
+        self.assertEqual(payload["runtime"]["attention_backend"], "flash")
         self.assertEqual(payload["runtime"]["activation_checkpoint"], "none")
         self.assertEqual(payload["training"]["embedding_distribution"], "sharded")
         self.assertEqual(payload["training"]["embedding_weight_dtype"], "bf16")
@@ -922,11 +922,11 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
 
     def test_production_profiles_use_expected_runtime(self) -> None:
         expected_runtime = {
-            # Current platform: 2×H100 SDPA eager + Row-Wise Adagrad + Phase 2.
-            "rankmixer": ("sdpa", False, 2),
-            "onetrans": ("sdpa", False, 2),
-            "mdl_onetrans": ("sdpa", False, 2),
-            "mdl_rankmixer": ("sdpa", False, 2),
+            # Current platform: 2×H100 flash-attn varlen + Row-Wise Adagrad + Phase 2.
+            "rankmixer": ("flash", False, 2),
+            "onetrans": ("flash", False, 2),
+            "mdl_onetrans": ("flash", False, 2),
+            "mdl_rankmixer": ("flash", False, 2),
         }
         for model_name, (attention_backend, compile_enabled, nproc) in expected_runtime.items():
             with self.subTest(model=model_name):
@@ -936,8 +936,19 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertEqual(config.runtime.attention_backend, attention_backend)
                 self.assertEqual(config.runtime.compile, compile_enabled)
                 self.assertEqual(config.runtime.nproc_per_node, nproc)
-                self.assertEqual(config.runtime.activation_checkpoint, "none")
-                self.assertFalse(config.runtime.trim_all_invalid_sequence_prefix)
+                memory_optimized = model_name.startswith("mdl_")
+                self.assertEqual(
+                    config.runtime.activation_checkpoint,
+                    "full" if memory_optimized else "none",
+                )
+                self.assertEqual(
+                    config.runtime.varlen_packing,
+                    "compact" if memory_optimized else "fixed",
+                )
+                self.assertEqual(
+                    config.runtime.trim_all_invalid_sequence_prefix,
+                    False,
+                )
                 self.assertFalse(config.runtime.validate_scenario_ids)
                 self.assertEqual(config.training.embedding_weight_dtype, "bf16")
                 self.assertEqual(config.training.sparse_optimizer, "rowwise_adagrad")
@@ -979,6 +990,37 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertFalse(config.data.train.label_masks)
                 self.assertFalse(config.data.test.label_masks)
                 self.assertEqual(config.training.loss_reduction, "mean_per_task")
+                if memory_optimized:
+                    self.assertEqual(
+                        config.runtime.sequence_projection_chunk_tokens,
+                        131072,
+                    )
+                    self.assertEqual(
+                        config.runtime.sequence_encoder_chunk_rows,
+                        0,
+                    )
+                    self.assertEqual(
+                        config.runtime.sequence_encoder_chunk_tokens,
+                        262144 if model_name == "mdl_rankmixer" else 0,
+                    )
+                    self.assertTrue(config.runtime.onetrans_batched_ns)
+                    self.assertEqual(config.training.batch_size, 1024)
+                    self.assertEqual(
+                        config.training.gradient_accumulation_steps,
+                        1,
+                    )
+                    self.assertFalse(config.training.fused_dense_optimizer)
+                    self.assertEqual(
+                        config.training.dense_optimizer_foreach_bucket_mb,
+                        128,
+                    )
+                    self.assertEqual(
+                        [
+                            bucket.batch_size
+                            for bucket in config.data.train.reader.length_buckets
+                        ],
+                        [1024, 1024, 1024, 1024, 1024],
+                    )
                 self.assertTrue(config.training.quick_eval.enabled)
                 self.assertEqual(config.training.quick_eval.split, "train")
                 self.assertEqual(config.data.train.reader.shard_unit, "row_group")
@@ -1007,7 +1049,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertTrue(config.data.train.reader.coalesce_pinned_tensors)
                 self.assertEqual(
                     config.data.train.reader.device_prefetch_batches,
-                    2,
+                    1 if memory_optimized else 2,
                 )
                 self.assertEqual(config.data.train.reader.length_bucket_metric, "sum")
                 self.assertEqual(

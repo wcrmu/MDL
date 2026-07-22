@@ -1,5 +1,5 @@
 # Standalone 2×H100 production training config for onetrans.
-# SDPA eager + Row-Wise Adagrad + Phase 2 shared_dim embedding profile.
+# flash-attn varlen + Row-Wise Adagrad + Phase 2 shared_dim embedding profile.
 # Scenarios: fixed search/recommendation via coarse_scene_index (121 search scene_ids; others -> recommendation).
 # Adapter grouping: context_features=51 request-axis; item_features=118 candidate-axis.
 runtime:
@@ -10,7 +10,7 @@ runtime:
   require_compact_sequence_batches: false
   allow_tf32: true
   activation_checkpoint: none
-  attention_backend: sdpa
+  attention_backend: flash
   distributed: ddp
   nproc_per_node: 2
   master_addr: 127.0.0.1

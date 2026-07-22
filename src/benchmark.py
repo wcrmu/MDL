@@ -86,6 +86,8 @@ class BenchmarkOptions:
     # expand this many synthetic raw scene ids so MDL scenario-token cost
     # matches a production-sized routing table instead of a single __auto__.
     synthetic_scenario_count: int = 32
+    # Optional acceptance gate. Use 60 for the production utilization SLO.
+    min_gpu_utilization_percent: float | None = None
 
     def validate(self) -> None:
         if self.mode not in {"data", "embedding", "compute", "end-to-end"}:
@@ -129,6 +131,13 @@ class BenchmarkOptions:
             raise ValueError("candidates_per_request is supported only in compute mode")
         if self.synthetic_scenario_count <= 0:
             raise ValueError("synthetic_scenario_count must be positive")
+        if self.min_gpu_utilization_percent is not None:
+            if not 0.0 <= self.min_gpu_utilization_percent <= 100.0:
+                raise ValueError("min_gpu_utilization_percent must be in [0, 100]")
+            if self.mode not in {"compute", "end-to-end"}:
+                raise ValueError(
+                    "min_gpu_utilization_percent requires compute or end-to-end mode"
+                )
 
 
 @dataclass(frozen=True)
@@ -299,7 +308,9 @@ class _TraceCollector:
         self.traces: list[TrainStepTrace] = []
         self.host_batch_bytes_peak = 0
         self._measurement_started = False
+        self._measurement_stopped = False
         self._cpu_started = 0.0
+        self._cpu_elapsed = 0.0
         self._sampler = _GpuUtilizationSampler(device)
         self._gpu_utilization: float | None = None
         if warmup_steps == 0:
@@ -325,13 +336,27 @@ class _TraceCollector:
         self.traces.append(trace)
         self.host_batch_bytes_peak = max(self.host_batch_bytes_peak, host_batch_bytes)
 
-    def finish(self, rank: int, profiler: ProfilerSummary) -> LocalBenchmarkSummary:
+    def stop_measurement(self) -> None:
+        """Close the steady-state window before optional profiler overhead."""
+
         if not self._measurement_started:
             self._start_measurement()
+        if self._measurement_stopped:
+            return
+        if self.device.type == "cuda":
+            # Include all queued measured work, then stop before profiler
+            # initialization/export creates an artificial idle tail.
+            torch.cuda.synchronize(self.device)
         self._gpu_utilization = self._sampler.stop()
+        self._cpu_elapsed = process_time() - self._cpu_started
+        self._measurement_stopped = True
+
+    def finish(self, rank: int, profiler: ProfilerSummary) -> LocalBenchmarkSummary:
+        self.stop_measurement()
         elapsed = sum(trace.step_seconds for trace in self.traces)
-        cpu_elapsed = process_time() - self._cpu_started
-        cpu_percent = 100.0 * cpu_elapsed / elapsed if elapsed > 0.0 else None
+        cpu_percent = (
+            100.0 * self._cpu_elapsed / elapsed if elapsed > 0.0 else None
+        )
         if self.device.type == "cuda":
             peak_allocated = int(torch.cuda.max_memory_allocated(self.device))
             peak_reserved = int(torch.cuda.max_memory_reserved(self.device))
@@ -394,7 +419,23 @@ def _environment(config: AppConfig, context: DistributedContext) -> dict[str, An
         "world_size": context.world_size,
         "precision": config.runtime.precision,
         "attention_backend_requested": config.runtime.attention_backend,
+        "varlen_packing": config.runtime.varlen_packing,
+        "sequence_projection_chunk_tokens": (
+            config.runtime.sequence_projection_chunk_tokens
+        ),
+        "sequence_encoder_chunk_rows": config.runtime.sequence_encoder_chunk_rows,
+        "sequence_encoder_chunk_tokens": (
+            config.runtime.sequence_encoder_chunk_tokens
+        ),
+        "onetrans_batched_ns": config.runtime.onetrans_batched_ns,
         "activation_checkpoint": config.runtime.activation_checkpoint,
+        "gradient_accumulation_steps": (
+            config.training.gradient_accumulation_steps
+        ),
+        "fused_dense_optimizer": config.training.fused_dense_optimizer,
+        "dense_optimizer_foreach_bucket_mb": (
+            config.training.dense_optimizer_foreach_bucket_mb
+        ),
         "model_name": config.model.name,
         "embedding_distribution": config.training.embedding_distribution,
         "dense_distribution": config.training.dense_distribution,
@@ -1096,6 +1137,7 @@ def _benchmark_embedding(
     total_steps = options.warmup_steps + options.measured_steps
     for step in range(1, total_steps + 1):
         run_step(step, collect=True)
+    collector.stop_measurement()
     profiler = _profile_callable(
         lambda: run_step(total_steps + 1, collect=False),
         context.device,
@@ -1273,6 +1315,7 @@ def _benchmark_compute(
                     active_ranks=context.world_size,
                 )
             )
+    collector.stop_measurement()
     profiler = _profile_callable(
         execute_step,
         context.device,
@@ -1297,8 +1340,10 @@ def _benchmark_end_to_end(
         save_checkpoint=False,
         log_steps=False,
         step_observer=collector.observe,
+        synchronize_step_observer=False,
         run_quick_eval=False,
     )
+    collector.stop_measurement()
     profiler = _profile_callable(
         lambda: train_mdl(
             config,
@@ -1369,6 +1414,24 @@ def run_benchmark(config: AppConfig, options: BenchmarkOptions) -> BenchmarkRepo
         else:
             local = _benchmark_end_to_end(config, context, options)
         report = _build_report(config, context, options, local)
+        if options.min_gpu_utilization_percent is not None:
+            measured_utilization = [
+                value
+                for value in report.gpu_utilization_percent_per_rank
+                if value is not None
+            ]
+            if len(measured_utilization) != context.world_size:
+                raise RuntimeError(
+                    "GPU utilization SLO could not be verified on every rank; "
+                    "ensure nvidia-smi is installed and lengthen the measurement window"
+                )
+            observed_minimum = min(measured_utilization)
+            if observed_minimum < options.min_gpu_utilization_percent:
+                raise RuntimeError(
+                    "GPU utilization SLO failed: "
+                    f"minimum rank utilization={observed_minimum:.2f}% < "
+                    f"required={options.min_gpu_utilization_percent:.2f}%"
+                )
         if (
             config.runtime.attention_backend == "flash"
             and options.mode in {"compute", "end-to-end"}

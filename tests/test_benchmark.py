@@ -24,8 +24,13 @@ from src.benchmark import (
     _trace,
 )
 from src.config import load_app_config
+from src.dataloader import FeatureBatch
 from src.model import build_model
-from src.train import DistributedContext
+from src.train import (
+    DistributedContext,
+    _batch_input_token_count,
+    _batch_padded_token_slots,
+)
 
 
 class BenchmarkOptionsTest(unittest.TestCase):
@@ -68,6 +73,22 @@ class BenchmarkOptionsTest(unittest.TestCase):
         BenchmarkOptions(mode="compute", synthetic_scenario_count=1).validate()
         with self.assertRaisesRegex(ValueError, "synthetic_scenario_count"):
             BenchmarkOptions(mode="compute", synthetic_scenario_count=0).validate()
+
+    def test_gpu_utilization_slo_is_bounded_and_compute_only(self) -> None:
+        BenchmarkOptions(
+            mode="compute",
+            min_gpu_utilization_percent=60.0,
+        ).validate()
+        with self.assertRaisesRegex(ValueError, r"\[0, 100\]"):
+            BenchmarkOptions(
+                mode="compute",
+                min_gpu_utilization_percent=101.0,
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "compute or end-to-end"):
+            BenchmarkOptions(
+                mode="data",
+                min_gpu_utilization_percent=60.0,
+            ).validate()
 
 
 class BenchmarkScenarioResolutionTest(unittest.TestCase):
@@ -260,6 +281,29 @@ class TraceCollectorTest(unittest.TestCase):
         self.assertEqual(report.samples_per_second, 1.0)
         self.assertEqual(report.p95_step_seconds, 4.0)
         self.assertEqual(report.benchmark_options["measured_steps"], 2)
+
+    def test_sequence_token_metrics_exclude_categorical_bags(self) -> None:
+        row_indices = torch.tensor([0, 0, 1, 1])
+        batch = FeatureBatch(
+            features={
+                "bag": {
+                    "values": torch.ones(8, dtype=torch.long),
+                    "lengths": torch.full((4,), 2, dtype=torch.long),
+                },
+                "history": {
+                    "fields": {"item": torch.ones(2, 3, dtype=torch.long)},
+                    "lengths": torch.tensor([2, 1]),
+                    "row_indices": row_indices,
+                },
+            },
+            labels=None,
+            label_mask=None,
+            scenario_id=torch.zeros(4, dtype=torch.long),
+            group_id=[],
+        )
+
+        self.assertEqual(_batch_input_token_count(batch), 6)
+        self.assertEqual(_batch_padded_token_slots(batch), 12)
 
 
 class GpuUtilizationSamplerTest(unittest.TestCase):

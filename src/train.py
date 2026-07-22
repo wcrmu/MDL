@@ -51,7 +51,7 @@ from .embeddings import (
     sharded_embedding_modules,
 )
 from .model import build_model
-from .modules.attention import varlen_attention_available
+from .modules.attention import varlen_attention_available, varlen_attention_backend
 from .modules.mlp import SparseMoEPerTokenFFN
 from .optim import ShardedAdagrad, ShardedRowWiseAdagrad
 
@@ -66,7 +66,7 @@ _PROCESS_GROUP_TIMEOUT = timedelta(minutes=60)
 
 
 def _varlen_attention_reasons(config: AppConfig) -> tuple[str, ...]:
-    """Human-readable reasons this config needs ``torch.nn.attention.varlen``."""
+    """Human-readable reasons this config needs ``flash_attn`` varlen Flash."""
 
     reasons: list[str] = []
     if config.model.name in {"longer", "onetrans", "mdl_onetrans"}:
@@ -82,7 +82,7 @@ def _varlen_attention_reasons(config: AppConfig) -> tuple[str, ...]:
 
 
 def _requires_varlen_attention(config: AppConfig) -> bool:
-    """True when strict flash would execute the packed Varlen Flash path."""
+    """True when strict flash would execute the packed flash-attn varlen path."""
 
     return bool(_varlen_attention_reasons(config))
 
@@ -90,7 +90,7 @@ def _requires_varlen_attention(config: AppConfig) -> bool:
 def _needs_padded_sdpa_flash(config: AppConfig) -> bool:
     """True when strict flash would also exercise ordinary padded SDPA Flash.
 
-    LONGER / OneTrans S-streams use Varlen. Ordinary padded FlashAttention is
+    LONGER / OneTrans S-streams use flash-attn varlen. Ordinary padded FlashAttention is
     only required when MDL constructs ``DomainAwareAttention`` for enabled
     task/scenario feature interactions. Plain RankMixer token mixing does not
     use padded Flash, so both capabilities are independent.
@@ -130,11 +130,12 @@ def _attention_runtime_description(
     discovery, model construction, or synthetic data generation.
     """
 
-    requested = getattr(config.runtime, "attention_backend", "auto")
+    requested = getattr(config.runtime, "attention_backend", "flash")
     reasons = _varlen_attention_reasons(config)
     needs_varlen = _requires_varlen_attention(config)
     needs_padded = _needs_padded_sdpa_flash(config)
     varlen_api = varlen_attention_available()
+    varlen_backend = varlen_attention_backend() if varlen_api else None
     if requested == "flash":
         if device.type != "cuda":
             raise RuntimeError(
@@ -145,12 +146,10 @@ def _attention_runtime_description(
             detail = "; ".join(reasons) if reasons else "configured Varlen Flash paths"
             raise RuntimeError(
                 "runtime.attention_backend='flash' requires "
-                "torch.nn.attention.varlen.varlen_attn for "
-                f"{detail}, but the API is unavailable in "
-                f"torch={torch.__version__}. Use runtime.attention_backend='sdpa' "
-                "on this platform, or install a CUDA-enabled PyTorch build that "
-                "exposes torch.nn.attention.varlen.varlen_attn and validate it on "
-                "the target GPU (PyTorch 2.10+ is normally required)."
+                "flash_attn.flash_attn_varlen_func for "
+                f"{detail}, but that API is unavailable. Install a Dao-AILab "
+                "flash-attn build compatible with the deployed PyTorch/CUDA "
+                "runtime, or explicitly use runtime.attention_backend='sdpa'."
             )
         if needs_padded and not _ordinary_sdpa_flash_available():
             raise RuntimeError(
@@ -169,6 +168,7 @@ def _attention_runtime_description(
             f"flash_path_requires_varlen={needs_varlen} "
             f"flash_path_requires_padded_sdpa={needs_padded} "
             f"varlen_api_available={varlen_api} "
+            f"varlen_backend={varlen_backend or 'unavailable'} "
             f"strict=true device={device} precision={config.runtime.precision}"
         )
     return (
@@ -177,6 +177,7 @@ def _attention_runtime_description(
         f"flash_path_requires_varlen={needs_varlen} "
         f"flash_path_requires_padded_sdpa={needs_padded} "
         f"varlen_api_available={varlen_api} "
+        f"varlen_backend={varlen_backend or 'unavailable'} "
         f"strict=false device={device} precision={config.runtime.precision}"
     )
 
@@ -212,13 +213,13 @@ class TrainResult:
 
 @dataclass(frozen=True)
 class TrainStepTrace:
-    """Synchronized timings for one training step.
+    """Phase timings for one training step.
 
-    Tracing is opt-in because collecting phase timings synchronizes the device at
-    phase boundaries. Normal training therefore pays no synchronization or
-    callback overhead. Performance benchmarks use these traces for stable p95
-    and dataloader-wait measurements while aggregate throughput continues to be
-    reported separately by :class:`TrainResult`.
+    ``train_mdl`` defaults to synchronized phase boundaries for diagnostic
+    precision. Throughput benchmarks disable those synchronizations so the
+    observer cannot manufacture GPU bubbles; in that mode phase values are CPU
+    enqueue/wait times while aggregate throughput and GPU utilization remain
+    representative of normal training.
     """
 
     step: int
@@ -407,6 +408,28 @@ def _select_device(config: AppConfig, local_rank: int | None = None) -> torch.de
     return torch.device(requested)
 
 
+def _build_model_on_device(
+    config: AppConfig,
+    vocab_maps: dict[str, dict[str, int]],
+    device: torch.device,
+) -> nn.Module:
+    """Construct large models directly on their destination accelerator.
+
+    Industrial embedding shards can occupy tens of GiB per rank. Building them
+    on CPU and then calling ``to(cuda)`` leaves every GPU idle during CPU RNG
+    initialization, doubles transient host memory, and performs one enormous
+    serial H2D copy. The device context makes parameter initialization happen
+    independently on each rank's GPU while the final ``to`` catches any module
+    that explicitly requested CPU storage.
+    """
+
+    if device.type == "cuda":
+        with torch.device(device):
+            model = build_model(config, vocab_maps)
+        return model.to(device)
+    return build_model(config, vocab_maps).to(device)
+
+
 def _setup_distributed(config: AppConfig) -> DistributedContext:
     global _CONTROL_PROCESS_GROUP
     world_size = _env_int("WORLD_SIZE", 1)
@@ -522,8 +545,15 @@ def _resolve_distributed_cardinality_audit(
 ) -> AppConfig:
     """Sample scalar/bag cardinalities on each rank, merge, fail once if needed."""
 
-    split = config.data.train if split_name == "train" else config.data.test
-    if split is None:
+    # A few focused optimizer/DDP tests intentionally use a minimal config
+    # double and inject batches directly. Real AppConfig instances always have
+    # data splits and ReaderConfig objects, so skipping here only preserves that
+    # narrow dependency-injection boundary.
+    data = getattr(config, "data", None)
+    if data is None:
+        return config
+    split = data.train if split_name == "train" else data.test
+    if split is None or not hasattr(split, "reader"):
         return config
     if split.reader.effective_cardinality_audit_raw_rows() <= 0:
         return config
@@ -1381,12 +1411,36 @@ def _partition_embedding_parameters(model: nn.Module) -> tuple[list[nn.Parameter
     )
 
 
+def _bounded_optimizer_param_groups(
+    parameters: list[nn.Parameter],
+    bucket_bytes: int,
+) -> list[dict[str, list[nn.Parameter]]]:
+    """Keep foreach workspace bounded while preserving parameter order."""
+
+    if bucket_bytes <= 0:
+        raise ValueError("optimizer bucket_bytes must be positive")
+    groups: list[dict[str, list[nn.Parameter]]] = []
+    current: list[nn.Parameter] = []
+    current_bytes = 0
+    for parameter in parameters:
+        parameter_bytes = parameter.numel() * parameter.element_size()
+        if current and current_bytes + parameter_bytes > bucket_bytes:
+            groups.append({"params": current})
+            current = []
+            current_bytes = 0
+        current.append(parameter)
+        current_bytes += parameter_bytes
+    if current:
+        groups.append({"params": current})
+    return groups
+
+
 def _build_dense_optimizer(
     parameters: list[nn.Parameter],
     config: AppConfig,
     device: torch.device,
 ) -> torch.optim.Optimizer:
-    """Construct RMSprop and enable fused execution only when implemented."""
+    """Construct RMSprop with an explicit speed-vs-peak-memory policy."""
 
     kwargs: dict[str, Any] = {
         "lr": config.training.lr_dense,
@@ -1397,20 +1451,58 @@ def _build_dense_optimizer(
         getattr(config.training, "fused_dense_optimizer", False)
         and device.type == "cuda"
     )
+    foreach_bucket_mb = int(
+        getattr(config.training, "dense_optimizer_foreach_bucket_mb", 0)
+    )
+    bounded_foreach_requested = foreach_bucket_mb > 0 and device.type == "cuda"
     try:
-        fused_supported = (
-            "fused" in inspect.signature(torch.optim.RMSprop).parameters
-        )
+        optimizer_parameters = inspect.signature(torch.optim.RMSprop).parameters
     except (TypeError, ValueError):
-        fused_supported = False
+        optimizer_parameters = {}
+    fused_supported = "fused" in optimizer_parameters
+    foreach_supported = "foreach" in optimizer_parameters
+    optimizer_input: Any = parameters
     if fused_requested and fused_supported:
         kwargs["fused"] = True
-    elif fused_requested and is_main_process():
-        print(
-            "Dense optimizer | optimizer=RMSprop fused_requested=true "
-            "fused_supported=false"
+    elif fused_requested:
+        if foreach_supported:
+            # RMSprop has no fused CUDA implementation in supported PyTorch
+            # releases. Multi-tensor foreach avoids launching one optimizer
+            # kernel per dense parameter and is the fastest available path.
+            kwargs["foreach"] = True
+            if is_main_process():
+                print(
+                    "Dense optimizer | optimizer=RMSprop "
+                    "implementation=foreach fused_supported=false"
+                )
+        elif is_main_process():
+            print(
+                "Dense optimizer | optimizer=RMSprop implementation=scalar "
+                "fused_supported=false foreach_supported=false"
+            )
+    elif bounded_foreach_requested and foreach_supported:
+        bucket_bytes = foreach_bucket_mb * 1024 * 1024
+        optimizer_input = _bounded_optimizer_param_groups(
+            parameters,
+            bucket_bytes,
         )
-    return torch.optim.RMSprop(parameters, **kwargs)
+        kwargs["foreach"] = True
+        if is_main_process():
+            print(
+                "Dense optimizer | optimizer=RMSprop "
+                "implementation=bounded_foreach "
+                f"bucket_mb={foreach_bucket_mb} buckets={len(optimizer_input)}"
+            )
+    elif foreach_supported:
+        # Leaving foreach=None lets PyTorch silently auto-select the multi-tensor
+        # path on CUDA. Explicit False is required for the low-peak-memory mode.
+        kwargs["foreach"] = False
+        if device.type == "cuda" and is_main_process():
+            print(
+                "Dense optimizer | optimizer=RMSprop implementation=scalar "
+                "memory_efficient=true"
+            )
+    return torch.optim.RMSprop(optimizer_input, **kwargs)
 
 
 def _sparse_parameter_descriptors(
@@ -1844,6 +1936,33 @@ def _sync_device(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _gradient_sync_context(model: nn.Module, *, synchronize: bool):
+    """Suppress DDP dense reductions for intermediate accumulation passes."""
+
+    if synchronize:
+        return nullcontext()
+    no_sync = getattr(model, "no_sync", None)
+    if not callable(no_sync):
+        original = getattr(model, "_orig_mod", None)
+        no_sync = getattr(original, "no_sync", None)
+    if not callable(no_sync):
+        raise RuntimeError(
+            "gradient accumulation under DDP requires a model.no_sync() context"
+        )
+    return no_sync()
+
+
+def _coalesce_accumulated_sparse_gradients(
+    parameters: list[nn.Parameter],
+) -> None:
+    """Bound duplicate COO storage while several micro-batches accumulate."""
+
+    for parameter in parameters:
+        gradient = parameter.grad
+        if gradient is not None and gradient.is_sparse and not gradient.is_coalesced():
+            parameter.grad = gradient.coalesce()
+
+
 def _non_blocking_transfer(config: AppConfig, split_name: str, device: torch.device) -> bool:
     if device.type != "cuda":
         return False
@@ -1864,7 +1983,11 @@ def _batch_input_token_count(batch: FeatureBatch) -> int:
         if not isinstance(value, dict):
             continue
         lengths = value.get("lengths")
-        if not isinstance(lengths, Tensor):
+        fields = value.get("fields")
+        # Categorical bags also carry ``lengths`` but are feature lookups, not
+        # sequence events. Requiring the sequence ``fields`` mapping keeps the
+        # token numerator aligned with the padded-slot denominator.
+        if not isinstance(lengths, Tensor) or not isinstance(fields, dict):
             continue
         found_sequence = True
         row_indices = value.get("row_indices")
@@ -2328,6 +2451,7 @@ def train_mdl(
     save_checkpoint: bool = True,
     log_steps: bool = True,
     step_observer: TrainStepObserver | None = None,
+    synchronize_step_observer: bool = True,
     run_quick_eval: bool = True,
 ) -> TrainResult:
     if config.training.sparse_update_mode == "external_parameter_server":
@@ -2352,7 +2476,7 @@ def train_mdl(
         config = _resolve_distributed_auto_scenarios(config, context)
         config = _resolve_distributed_cardinality_audit(config, context, "train")
         vocab_maps = load_vocab_maps(config)
-        base_model = build_model(config, vocab_maps).to(device)
+        base_model = _build_model_on_device(config, vocab_maps, device)
         _validate_sharded_embedding_metadata(context, base_model)
         parameter_groups = _classify_model_parameters(base_model)
         _synchronize_sparse_parameter_replicas(
@@ -2450,6 +2574,27 @@ def train_mdl(
         scaler = _make_grad_scaler(config, device)
         non_blocking = _non_blocking_transfer(config, "train", device)
         quick_eval = getattr(config.training, "quick_eval", QuickEvalConfig())
+        gradient_accumulation_steps = int(
+            getattr(config.training, "gradient_accumulation_steps", 1)
+        )
+        if gradient_accumulation_steps <= 0:
+            raise ValueError(
+                "training.gradient_accumulation_steps must be a positive integer"
+            )
+        configured_batch_per_rank = int(getattr(config.training, "batch_size", 1))
+        runtime_effective_global_batch = (
+            configured_batch_per_rank
+            * context.world_size
+            * gradient_accumulation_steps
+        )
+        if log_steps and context.rank == 0:
+            print(
+                "Batching | "
+                f"configured_batch_per_rank={configured_batch_per_rank} "
+                f"runtime_world_size={context.world_size} "
+                f"gradient_accumulation_steps={gradient_accumulation_steps} "
+                f"runtime_effective_global_batch={runtime_effective_global_batch}"
+            )
 
         steps = 0
         rows = 0
@@ -2491,34 +2636,91 @@ def train_mdl(
         )
         pending_train_batches: deque[FeatureBatch | None] = deque()
         last_device_batch: FeatureBatch | None = None
+        last_trace_batch: FeatureBatch | None = None
+        accumulation_index = 0
+        window_rank_active = False
+        window_rows = 0
+        window_input_tokens = 0
+        window_padded_token_slots = 0
+        window_loss_numerator: Tensor | None = None
+        window_loss_denominator: Tensor | None = None
+        window_step_started = 0.0
+        window_dataloader_wait_seconds = 0.0
+        window_h2d_seconds = 0.0
+        window_forward_seconds = 0.0
+        window_backward_seconds = 0.0
         while max_steps is None or steps < max_steps:
-            tracing = step_observer is not None
+            observing = step_observer is not None
+            tracing = observing and synchronize_step_observer
             if tracing:
                 _sync_device(device)
-            step_started = perf_counter() if tracing else 0.0
-            dataloader_started = step_started
+            if accumulation_index == 0:
+                window_rank_active = False
+                window_rows = 0
+                window_input_tokens = 0
+                window_padded_token_slots = 0
+                window_loss_numerator = None
+                window_loss_denominator = None
+                window_step_started = perf_counter() if observing else 0.0
+                window_dataloader_wait_seconds = 0.0
+                window_h2d_seconds = 0.0
+                window_forward_seconds = 0.0
+                window_backward_seconds = 0.0
+            dataloader_started = perf_counter() if observing else 0.0
+            trace_batch: FeatureBatch | None = None
+            collect_batch_stats = observing or (
+                log_steps
+                and context.rank == 0
+                and (steps + 1) % config.training.log_every_steps == 0
+            )
             if pending_train_batches:
                 local_batch = pending_train_batches.popleft()
                 local_batch_on_device = False
+                if collect_batch_stats:
+                    trace_batch = local_batch
             else:
                 try:
-                    local_batch = next(batch_iterator)
+                    if (
+                        collect_batch_stats
+                        and batches_on_device
+                        and isinstance(batch_iterator, _DevicePrefetchIterator)
+                    ):
+                        trace_batch, local_batch = batch_iterator.next_with_host()
+                    else:
+                        local_batch = next(batch_iterator)
+                        if collect_batch_stats and not batches_on_device:
+                            trace_batch = local_batch
                 except StopIteration:
                     local_batch = None
                 local_batch_on_device = batches_on_device
             dataloader_wait_seconds = (
-                perf_counter() - dataloader_started if tracing else 0.0
+                perf_counter() - dataloader_started if observing else 0.0
             )
             rank_active = local_batch is not None
             active_ranks = _active_rank_count(context, rank_active)
             if active_ranks == 0:
+                if accumulation_index > 0:
+                    for optimizer in optimizers:
+                        optimizer.zero_grad(set_to_none=True)
+                    consume_sharded_embedding_stats(base_model)
+                    if log_steps and context.rank == 0:
+                        print(
+                            "Gradient accumulation | "
+                            f"dropped_incomplete_micro_batches={accumulation_index} "
+                            f"required={gradient_accumulation_steps}"
+                        )
                 break
-            if steps == 0 and context.enabled and active_ranks != context.world_size:
+            if (
+                steps == 0
+                and accumulation_index == 0
+                and context.enabled
+                and active_ranks != context.world_size
+            ):
                 raise RuntimeError(
                     "replicated sparse DDP requires every rank to provide an initial batch; "
                     "reduce world_size or choose a finer reader.shard_unit"
                 )
-            h2d_started = perf_counter() if tracing else 0.0
+            h2d_started = perf_counter() if observing else 0.0
             if rank_active:
                 if local_batch is None:
                     raise AssertionError("active rank is missing its training batch")
@@ -2532,43 +2734,113 @@ def train_mdl(
                     )
                 )
                 last_device_batch = batch
+                if trace_batch is not None:
+                    last_trace_batch = trace_batch
             else:
                 if last_device_batch is None:
                     raise RuntimeError("inactive rank has no batch available for zero-loss replay")
                 batch = last_device_batch
+                trace_batch = last_trace_batch
             if tracing:
                 _sync_device(device)
-            h2d_seconds = perf_counter() - h2d_started if tracing else 0.0
+            h2d_seconds = perf_counter() - h2d_started if observing else 0.0
 
-            lr_multiplier = _lr_schedule_multiplier(config, steps + 1, lr_decay_steps)
-            _set_optimizer_lrs(optimizers, optimizer_base_lrs, lr_multiplier)
-            for optimizer in optimizers:
-                optimizer.zero_grad(set_to_none=True)
-            forward_started = perf_counter() if tracing else 0.0
-            with _autocast_context(config, device):
-                output = model(batch.features, batch.scenario_id)
-                loss, loss_numerator, loss_denominator = _loss_terms_from_batch(
-                    output,
-                    batch,
-                    moe_loss_weight=config.model.sparse_moe_loss_weight,
-                    loss_reduction=config.training.loss_reduction,
-                    rank_active=rank_active,
-                    active_rank_count=active_ranks,
+            if accumulation_index == 0:
+                lr_multiplier = _lr_schedule_multiplier(
+                    config,
+                    steps + 1,
+                    lr_decay_steps,
                 )
-            if tracing:
-                _sync_device(device)
-            forward_seconds = perf_counter() - forward_started if tracing else 0.0
-            backward_started = perf_counter() if tracing else 0.0
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
+                _set_optimizer_lrs(optimizers, optimizer_base_lrs, lr_multiplier)
+                for optimizer in optimizers:
+                    optimizer.zero_grad(set_to_none=True)
+            synchronize_gradients = (
+                accumulation_index + 1 == gradient_accumulation_steps
+            )
+            # DDP's static-graph reducer must observe one fully synchronized
+            # iteration before no_sync() is safe; otherwise current PyTorch
+            # releases trip an internal expect_autograd_hooks assertion. Only
+            # the first optimizer window pays the extra reductions.
+            static_graph_warmup = (
+                context.enabled and ddp_config.static_graph and steps == 0
+            )
+            forward_started = perf_counter() if observing else 0.0
+            with _gradient_sync_context(
+                model,
+                synchronize=(
+                    not context.enabled
+                    or synchronize_gradients
+                    or static_graph_warmup
+                ),
+            ):
+                with _autocast_context(config, device):
+                    output = model(batch.features, batch.scenario_id)
+                    loss, loss_numerator, loss_denominator = _loss_terms_from_batch(
+                        output,
+                        batch,
+                        moe_loss_weight=config.model.sparse_moe_loss_weight,
+                        loss_reduction=config.training.loss_reduction,
+                        rank_active=rank_active,
+                        active_rank_count=active_ranks,
+                    )
+                    backward_loss = loss
+                    if config.training.loss_reduction != "sum":
+                        backward_loss = loss / float(gradient_accumulation_steps)
+                if tracing:
+                    _sync_device(device)
+                forward_seconds = (
+                    perf_counter() - forward_started if observing else 0.0
+                )
+                backward_started = perf_counter() if observing else 0.0
+                if scaler.is_enabled():
+                    scaler.scale(backward_loss).backward()
+                else:
+                    backward_loss.backward()
+                if tracing:
+                    _sync_device(device)
+                backward_seconds = (
+                    perf_counter() - backward_started if observing else 0.0
+                )
+            if gradient_accumulation_steps > 1 and sparse_params:
+                _coalesce_accumulated_sparse_gradients(sparse_params)
+
+            stats_batch = trace_batch if trace_batch is not None else batch
+            window_rank_active = window_rank_active or rank_active
+            if rank_active:
+                micro_batch_rows = int(batch.scenario_id.size(0))
+                window_rows += micro_batch_rows
+                if collect_batch_stats:
+                    window_input_tokens += _batch_input_token_count(stats_batch)
+                    window_padded_token_slots += _batch_padded_token_slots(stats_batch)
+            detached_numerator = loss_numerator.detach()
+            detached_denominator = loss_denominator.detach()
+            window_loss_numerator = (
+                detached_numerator
+                if window_loss_numerator is None
+                else window_loss_numerator + detached_numerator
+            )
+            if config.training.loss_reduction == "sum":
+                window_loss_denominator = detached_denominator
             else:
-                loss.backward()
+                window_loss_denominator = (
+                    detached_denominator
+                    if window_loss_denominator is None
+                    else window_loss_denominator + detached_denominator
+                )
+            window_dataloader_wait_seconds += dataloader_wait_seconds
+            window_h2d_seconds += h2d_seconds
+            window_forward_seconds += forward_seconds
+            window_backward_seconds += backward_seconds
+            accumulation_index += 1
+            if not synchronize_gradients:
+                continue
+
             ddp_auditor.observe()
-            if tracing:
-                _sync_device(device)
-            backward_seconds = perf_counter() - backward_started if tracing else 0.0
-            sparse_sync_started = perf_counter() if tracing else 0.0
-            sparse_sync_stats = sparse_synchronizer.synchronize(rank_active=rank_active)
+            window_active_ranks = _active_rank_count(context, window_rank_active)
+            sparse_sync_started = perf_counter() if observing else 0.0
+            sparse_sync_stats = sparse_synchronizer.synchronize(
+                rank_active=window_rank_active
+            )
             sharded_stats = consume_sharded_embedding_stats(base_model)
             if sharded_stats:
                 sparse_sync_stats = _SparseSyncStats(
@@ -2587,8 +2859,8 @@ def train_mdl(
                 )
             if tracing:
                 _sync_device(device)
-            sparse_sync_seconds = perf_counter() - sparse_sync_started if tracing else 0.0
-            optimizer_started = perf_counter() if tracing else 0.0
+            sparse_sync_seconds = perf_counter() - sparse_sync_started if observing else 0.0
+            optimizer_started = perf_counter() if observing else 0.0
             if scaler.is_enabled():
                 for optimizer in optimizers:
                     scaler.unscale_(optimizer)
@@ -2614,29 +2886,32 @@ def train_mdl(
                     optimizer.step()
             if tracing:
                 _sync_device(device)
-            optimizer_seconds = perf_counter() - optimizer_started if tracing else 0.0
+            optimizer_seconds = perf_counter() - optimizer_started if observing else 0.0
             steps += 1
-            if rank_active:
-                rows += int(batch.scenario_id.size(0))
-            last_loss_tensor = loss.detach()
-            last_loss_numerator_tensor = loss_numerator.detach()
-            last_loss_denominator_tensor = loss_denominator.detach()
+            rows += window_rows
+            if window_loss_numerator is None or window_loss_denominator is None:
+                raise AssertionError("completed accumulation window has no loss")
+            last_loss_numerator_tensor = window_loss_numerator
+            last_loss_denominator_tensor = window_loss_denominator
+            last_loss_tensor = (
+                last_loss_numerator_tensor
+                / last_loss_denominator_tensor.clamp_min(1.0)
+            )
+            accumulation_index = 0
             if step_observer is not None:
                 step_observer(
                     TrainStepTrace(
                         step=steps,
-                        rank_active=rank_active,
-                        active_ranks=active_ranks,
-                        rows=(int(batch.scenario_id.size(0)) if rank_active else 0),
-                        input_tokens=(_batch_input_token_count(batch) if rank_active else 0),
-                        padded_token_slots=(
-                            _batch_padded_token_slots(batch) if rank_active else 0
-                        ),
-                        step_seconds=perf_counter() - step_started,
-                        dataloader_wait_seconds=dataloader_wait_seconds,
-                        h2d_seconds=h2d_seconds,
-                        forward_seconds=forward_seconds,
-                        backward_seconds=backward_seconds,
+                        rank_active=window_rank_active,
+                        active_ranks=window_active_ranks,
+                        rows=window_rows,
+                        input_tokens=window_input_tokens,
+                        padded_token_slots=window_padded_token_slots,
+                        step_seconds=perf_counter() - window_step_started,
+                        dataloader_wait_seconds=window_dataloader_wait_seconds,
+                        h2d_seconds=window_h2d_seconds,
+                        forward_seconds=window_forward_seconds,
+                        backward_seconds=window_backward_seconds,
                         sparse_sync_seconds=sparse_sync_seconds,
                         optimizer_seconds=optimizer_seconds,
                         sparse_local_rows=sparse_sync_stats.local_rows,
@@ -2652,14 +2927,18 @@ def train_mdl(
             if should_log:
                 last_loss = float(last_loss_tensor.float().cpu().item())
                 payload_mib = sparse_sync_stats.logical_payload_bytes / (1024 ** 2)
-                valid_tokens = _batch_input_token_count(batch) if rank_active else 0
-                padded_slots = _batch_padded_token_slots(batch) if rank_active else 0
                 padding_ratio = (
-                    1.0 - valid_tokens / padded_slots if padded_slots > 0 else 0.0
+                    1.0 - window_input_tokens / window_padded_token_slots
+                    if window_padded_token_slots > 0
+                    else 0.0
                 )
                 print(
                     f"Train step | step={steps} | loss={last_loss:.6f} "
-                    f"active_ranks={active_ranks}/{context.world_size} "
+                    f"active_ranks={window_active_ranks}/{context.world_size} "
+                    f"micro_batches={gradient_accumulation_steps} "
+                    f"local_rows={window_rows} "
+                    f"runtime_effective_global_batch="
+                    f"{runtime_effective_global_batch} "
                     f"padding_ratio={padding_ratio:.4f} "
                     f"sparse_local_rows={sparse_sync_stats.local_rows} "
                     f"sparse_global_rows={sparse_sync_stats.global_rows} "
@@ -2683,7 +2962,7 @@ def train_mdl(
                 if quick_eval.split == "train" and max_steps is not None:
                     quick_eval_batch_limit = min(
                         quick_eval_batch_limit,
-                        max_steps - steps,
+                        (max_steps - steps) * gradient_accumulation_steps,
                     )
                 quick_eval_result, staged_batches = _run_training_quick_eval(
                     config,

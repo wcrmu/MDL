@@ -583,14 +583,18 @@ class ShardedEmbedding(nn.Module):
             std=self.init_std,
             generator=generator,
         )
-        if self.shard_spec.owner(
-            torch.tensor([self.padding_idx], dtype=torch.long)
-        ).item() == self.rank:
-            local_padding = int(
-                self.shard_spec.local_row_ids(
-                    torch.tensor([self.padding_idx], dtype=torch.long)
-                ).item()
-            )
+        # Model construction now happens directly on the destination GPU.
+        # Resolve this scalar ownership arithmetically so initializing hundreds
+        # of embedding tables does not perform two CUDA -> host reads per table.
+        if self.shard_spec.strategy == "table_wise":
+            padding_owner = self.shard_spec.table_owner
+            local_padding = self.padding_idx
+        else:
+            padding_owner = (
+                self.padding_idx + self.shard_spec.cyclic_offset
+            ) % self.world_size
+            local_padding = self.padding_idx // self.world_size
+        if padding_owner == self.rank:
             with torch.no_grad():
                 self.weight[local_padding].zero_()
 

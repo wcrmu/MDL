@@ -1687,7 +1687,26 @@ class RuntimeConfig:
     # checkpoints model-specific preprocessing/merge stages where supported.
     activation_checkpoint: Literal["none", "selective", "full"] = "none"
     # Attention backend selection is resolved by model modules at runtime.
-    attention_backend: Literal["auto", "sdpa", "flash"] = "auto"
+    attention_backend: Literal["auto", "sdpa", "flash"] = "flash"
+    # fixed avoids dynamic-shape synchronization; compact removes padded Q/K/V
+    # tokens and is the low-HBM production mode for variable-length workloads.
+    varlen_packing: Literal["fixed", "compact"] = "fixed"
+    # Full-checkpoint mode flattens long event axes and projects at most this
+    # many tokens at once. Zero keeps the unchunked projection.
+    sequence_projection_chunk_tokens: int = 0
+    # Full-checkpoint LONGER can evaluate independent batch rows in bounded
+    # chunks while keeping the optimizer's physical batch unchanged. Zero keeps
+    # all rows in one encoder invocation.
+    sequence_encoder_chunk_rows: int = 0
+    # Prefer a token budget over a fixed row count for heterogeneous LONGER
+    # streams. The effective chunk rows scale as budget / padded sequence length,
+    # keeping peak HBM bounded without starving short-sequence GEMMs. Zero
+    # disables the token budget; when both limits are set, the tighter wins.
+    sequence_encoder_chunk_tokens: int = 0
+    # OneTrans owns independent parameters for every NS token. Executing those
+    # projections as batched GEMMs removes thousands of tiny CUDA launches for
+    # production-sized token sets while preserving the historical state_dict.
+    onetrans_batched_ns: bool = True
     # DDP launch options. none means single process.
     distributed: Literal["none", "ddp"] = "none"
     nproc_per_node: int | None = None
@@ -1714,6 +1733,7 @@ class RuntimeConfig:
             "compile_mode",
             "activation_checkpoint",
             "attention_backend",
+            "varlen_packing",
             "distributed",
             "master_addr",
         ):
@@ -1725,6 +1745,7 @@ class RuntimeConfig:
             "require_compact_sequence_batches",
             "trim_all_invalid_sequence_prefix",
             "validate_scenario_ids",
+            "onetrans_batched_ns",
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise ValueError(f"runtime.{field_name} must be a boolean")
@@ -1732,6 +1753,27 @@ class RuntimeConfig:
             raise ValueError("runtime.nproc_per_node must be an integer or null")
         if type(self.master_port) is not int:
             raise ValueError("runtime.master_port must be an integer")
+        if (
+            type(self.sequence_projection_chunk_tokens) is not int
+            or self.sequence_projection_chunk_tokens < 0
+        ):
+            raise ValueError(
+                "runtime.sequence_projection_chunk_tokens must be a non-negative integer"
+            )
+        if (
+            type(self.sequence_encoder_chunk_rows) is not int
+            or self.sequence_encoder_chunk_rows < 0
+        ):
+            raise ValueError(
+                "runtime.sequence_encoder_chunk_rows must be a non-negative integer"
+            )
+        if (
+            type(self.sequence_encoder_chunk_tokens) is not int
+            or self.sequence_encoder_chunk_tokens < 0
+        ):
+            raise ValueError(
+                "runtime.sequence_encoder_chunk_tokens must be a non-negative integer"
+            )
         if self.precision not in {"fp32", "bf16", "fp16"}:
             raise ValueError("runtime.precision must be fp32, bf16, or fp16")
         if self.compile_mode not in {"default", "reduce-overhead"}:
@@ -1740,6 +1782,8 @@ class RuntimeConfig:
             )
         if self.attention_backend not in {"auto", "sdpa", "flash"}:
             raise ValueError("runtime.attention_backend must be auto, sdpa, or flash")
+        if self.varlen_packing not in {"fixed", "compact"}:
+            raise ValueError("runtime.varlen_packing must be fixed or compact")
         if self.activation_checkpoint not in {"none", "selective", "full"}:
             raise ValueError(
                 "runtime.activation_checkpoint must be none, selective, or full"
@@ -2048,8 +2092,11 @@ class QuickEvalConfig:
 class TrainingConfig:
     """Optimizer, batch, schedule, and checkpoint settings."""
 
-    # Batch size is per process when DDP is enabled.
+    # Physical samples per forward on each rank/GPU. This value is never divided
+    # by world size. The effective global batch is
+    # batch_size * runtime_world_size * gradient_accumulation_steps.
     batch_size: int = 2048
+    gradient_accumulation_steps: int = 1
     # Dense optimizer learning rate. Sparse lr falls back to this when None.
     lr_dense: float = 0.005
     lr_sparse: float | None = None
@@ -2060,7 +2107,13 @@ class TrainingConfig:
     lr_min_ratio: float = 0.0
     # Optimizer names are constrained for paper alignment and implementation scope.
     dense_optimizer: Literal["rmsprop"] = "rmsprop"
+    # True prefers fused/foreach throughput. False forces the scalar RMSprop
+    # path unless a bounded foreach bucket is configured below.
     fused_dense_optimizer: bool = True
+    # A positive value enables foreach RMSprop one bounded parameter group at a
+    # time. This amortizes per-parameter launch overhead without foreach's
+    # full-model peak workspace; zero preserves the legacy policy above.
+    dense_optimizer_foreach_bucket_mb: int = 0
     rmsprop_alpha: float = 0.99999
     rmsprop_momentum: float = 0.0
     sparse_optimizer: Literal["adagrad", "rowwise_adagrad"] = "adagrad"
@@ -2125,6 +2178,13 @@ class TrainingConfig:
     def validate(self) -> None:
         if self.batch_size <= 0:
             raise ValueError("training.batch_size must be positive")
+        if (
+            type(self.gradient_accumulation_steps) is not int
+            or self.gradient_accumulation_steps <= 0
+        ):
+            raise ValueError(
+                "training.gradient_accumulation_steps must be a positive integer"
+            )
         if self.lr_dense <= 0:
             raise ValueError("training.lr_dense must be positive")
         if self.lr_sparse is not None and self.lr_sparse <= 0:
@@ -2146,6 +2206,13 @@ class TrainingConfig:
             raise ValueError("training.rmsprop_alpha must be in [0, 1)")
         if self.rmsprop_momentum < 0.0:
             raise ValueError("training.rmsprop_momentum must be non-negative")
+        if (
+            type(self.dense_optimizer_foreach_bucket_mb) is not int
+            or self.dense_optimizer_foreach_bucket_mb < 0
+        ):
+            raise ValueError(
+                "training.dense_optimizer_foreach_bucket_mb must be a non-negative integer"
+            )
         if self.sparse_optimizer not in {"adagrad", "rowwise_adagrad"}:
             raise ValueError(
                 "training.sparse_optimizer must be adagrad or rowwise_adagrad"

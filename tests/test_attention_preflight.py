@@ -58,7 +58,7 @@ class AttentionCapabilityHelperTest(unittest.TestCase):
                 create=True,
             ),
         ):
-            with self.assertRaisesRegex(RuntimeError, r"varlen\.varlen_attn.*sdpa"):
+            with self.assertRaisesRegex(RuntimeError, r"flash_attn_varlen_func.*sdpa"):
                 attention_runtime_description(
                     _flash_config(config),
                     torch.device("cuda"),
@@ -66,15 +66,19 @@ class AttentionCapabilityHelperTest(unittest.TestCase):
 
     def test_sdpa_log_uses_flash_path_requires_fields(self) -> None:
         config = load_app_config(ROOT / "configs" / "mdl_rankmixer.yaml")
-        self.assertEqual(config.runtime.attention_backend, "sdpa")
+        self.assertEqual(config.runtime.attention_backend, "flash")
+        sdpa_config = replace(
+            config,
+            runtime=replace(config.runtime, attention_backend="sdpa"),
+        )
         with patch(
             "src.train.varlen_attention_available",
             return_value=False,
         ):
-            description = attention_runtime_description(config, torch.device("cuda"))
+            description = attention_runtime_description(sdpa_config, torch.device("cuda"))
             # train.py re-exports the same helper under a private alias.
             self.assertEqual(
-                _attention_runtime_description(config, torch.device("cuda")),
+                _attention_runtime_description(sdpa_config, torch.device("cuda")),
                 description,
             )
         self.assertIn("resolved=padded_sdpa", description)
@@ -83,10 +87,10 @@ class AttentionCapabilityHelperTest(unittest.TestCase):
         self.assertIn("varlen_api_available=False", description)
         self.assertNotRegex(description, r"(?<![_\w])requires_varlen=")
 
-    def test_mdl_rankmixer_targets_2xh100_sdpa(self) -> None:
+    def test_mdl_rankmixer_targets_2xh100_flash(self) -> None:
         config = load_app_config(ROOT / "configs" / "mdl_rankmixer.yaml")
         self.assertEqual(config.runtime.nproc_per_node, 2)
-        self.assertEqual(config.runtime.attention_backend, "sdpa")
+        self.assertEqual(config.runtime.attention_backend, "flash")
         self.assertFalse(config.runtime.compile)
         self.assertEqual(config.runtime.precision, "bf16")
         self.assertEqual(config.training.sparse_optimizer, "rowwise_adagrad")
@@ -289,11 +293,15 @@ class AttentionEntryMatrixTest(unittest.TestCase):
     """Control-flow matrix: SDPA passes; flash without varlen fails early."""
 
     def _assert_sdpa_ok(self, config) -> None:
+        sdpa_config = replace(
+            config,
+            runtime=replace(config.runtime, attention_backend="sdpa"),
+        )
         with patch(
             "src.train.varlen_attention_available",
             return_value=False,
         ):
-            description = attention_runtime_description(config, torch.device("cuda"))
+            description = attention_runtime_description(sdpa_config, torch.device("cuda"))
         self.assertIn("requested=sdpa", description)
         self.assertIn("strict=false", description)
 

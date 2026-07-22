@@ -11,12 +11,13 @@ import torch.distributed as torch_dist
 import torch.multiprocessing as torch_mp
 from torch import nn
 
-from src.config import QuickEvalConfig
+from src.config import DDPConfig, QuickEvalConfig
 from src.dataloader import FeatureBatch
 from src.train import (
     DistributedContext,
     _NamedSparseParameter,
     _ReplicatedSparseGradientSynchronizer,
+    _bounded_optimizer_param_groups,
     _classify_model_parameters,
     _clip_grad_norm,
     _clip_sparse_grad_norm,
@@ -198,6 +199,19 @@ class _RecordingToySparseModel(_ToySparseModel):
         return super().forward(features, scenario_id)
 
 
+class _AllUsedToySparseModel(_ToySparseModel):
+    def forward(
+        self,
+        features: dict[str, torch.Tensor],
+        scenario_id: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        del scenario_id
+        ids = features["ids"]
+        positions = torch.arange(ids.numel(), device=ids.device) % 4
+        values = self.embedding(ids) + self.position(positions)
+        return {"logits": self.output(values)}
+
+
 def _toy_model_config() -> SimpleNamespace:
     return SimpleNamespace(
         name="rankmixer",
@@ -332,6 +346,8 @@ def _uneven_train_worker(
     world_size: int,
     port: int,
     output_queue: object,
+    gradient_accumulation_steps: int = 1,
+    static_graph: bool = False,
 ) -> None:
     os.environ.update(
         MASTER_ADDR="127.0.0.1",
@@ -340,18 +356,43 @@ def _uneven_train_worker(
         LOCAL_RANK=str(rank),
         WORLD_SIZE=str(world_size),
     )
-    batches = (
-        [_feature_batch([1, 3]), _feature_batch([5])]
-        if rank == 0
-        else [_feature_batch([2, 3])]
-    )
+    if static_graph:
+        rank_zero_batches = [
+            _feature_batch([1]),
+            _feature_batch([3]),
+            _feature_batch([5]),
+            _feature_batch([7]),
+        ]
+        rank_one_batches = [
+            _feature_batch([2]),
+            _feature_batch([4]),
+            _feature_batch([6]),
+            _feature_batch([8]),
+        ]
+        batches = (
+            rank_zero_batches if rank == 0 else rank_one_batches
+        )
+    else:
+        batches = (
+            [_feature_batch([1, 3]), _feature_batch([5])]
+            if rank == 0
+            else [_feature_batch([2, 3])]
+        )
     model_holder: list[_ToySparseModel] = []
 
     def build_model(_config: object, _vocabs: object) -> _ToySparseModel:
-        model = _ToySparseModel()
+        model = _AllUsedToySparseModel() if static_graph else _ToySparseModel()
         model_holder.append(model)
         return model
 
+    config = _toy_config()
+    config.training.gradient_accumulation_steps = gradient_accumulation_steps
+    if static_graph:
+        config.training.ddp = DDPConfig(
+            static_graph=True,
+            find_unused_parameters=False,
+            validated_static_graph=True,
+        )
     with (
         patch("src.train.load_vocab_maps", return_value={}),
         patch("src.train.build_model", side_effect=build_model),
@@ -359,7 +400,7 @@ def _uneven_train_worker(
         patch("src.train._non_blocking_transfer", return_value=False),
     ):
         result = train_mdl(
-            _toy_config(),
+            config,
             save_checkpoint=False,
             log_steps=False,
         )
@@ -431,6 +472,80 @@ def _nccl_sparse_worker(rank: int, world_size: int, port: int) -> None:
 
 
 class SparseDDPTest(unittest.TestCase):
+    def test_dense_foreach_buckets_preserve_order_and_bound_small_parameters(self) -> None:
+        parameters = [
+            nn.Parameter(torch.zeros(8)),
+            nn.Parameter(torch.zeros(8)),
+            nn.Parameter(torch.zeros(40)),
+            nn.Parameter(torch.zeros(4)),
+        ]
+        groups = _bounded_optimizer_param_groups(parameters, bucket_bytes=64)
+
+        flattened = [parameter for group in groups for parameter in group["params"]]
+        self.assertEqual(
+            [id(parameter) for parameter in flattened],
+            [id(parameter) for parameter in parameters],
+        )
+        self.assertEqual([len(group["params"]) for group in groups], [2, 1, 1])
+
+    def test_gradient_accumulation_matches_one_combined_sparse_update(self) -> None:
+        accumulated_model = _ToySparseModel()
+        combined_model = _ToySparseModel()
+        combined_model.load_state_dict(accumulated_model.state_dict())
+
+        accumulated_config = _toy_config()
+        accumulated_config.training.gradient_accumulation_steps = 2
+        traces = []
+        with (
+            patch("src.train.load_vocab_maps", return_value={}),
+            patch("src.train.build_model", return_value=accumulated_model),
+            patch(
+                "src.train.iter_feature_batches",
+                return_value=iter([_feature_batch([1]), _feature_batch([2])]),
+            ),
+            patch("src.train._non_blocking_transfer", return_value=False),
+        ):
+            accumulated_result = train_mdl(
+                accumulated_config,
+                max_steps=1,
+                save_checkpoint=False,
+                log_steps=False,
+                step_observer=traces.append,
+                synchronize_step_observer=False,
+                run_quick_eval=False,
+            )
+
+        combined_config = _toy_config()
+        combined_config.training.gradient_accumulation_steps = 1
+        with (
+            patch("src.train.load_vocab_maps", return_value={}),
+            patch("src.train.build_model", return_value=combined_model),
+            patch(
+                "src.train.iter_feature_batches",
+                return_value=iter([_feature_batch([1, 2])]),
+            ),
+            patch("src.train._non_blocking_transfer", return_value=False),
+        ):
+            combined_result = train_mdl(
+                combined_config,
+                max_steps=1,
+                save_checkpoint=False,
+                log_steps=False,
+                run_quick_eval=False,
+            )
+
+        self.assertEqual(accumulated_result.steps, 1)
+        self.assertEqual(accumulated_result.rows, 2)
+        self.assertEqual(combined_result.rows, 2)
+        self.assertEqual(len(traces), 1)
+        self.assertEqual(traces[0].rows, 2)
+        self.assertEqual(traces[0].input_tokens, 2)
+        for accumulated, combined in zip(
+            accumulated_model.parameters(),
+            combined_model.parameters(),
+        ):
+            torch.testing.assert_close(accumulated, combined, rtol=1e-6, atol=1e-7)
+
     def test_quick_eval_trains_the_exact_staged_batches_in_order(self) -> None:
         config = _toy_config()
         config.data = SimpleNamespace(train=object(), test=None)
@@ -576,6 +691,27 @@ class SparseDDPTest(unittest.TestCase):
 
         self.assertEqual([item["steps"] for item in results], [2, 2])
         self.assertEqual([item["rows"] for item in results], [5, 5])
+        self.assertEqual(results[0]["embedding"], results[1]["embedding"])
+        self.assertEqual(results[0]["output_weight"], results[1]["output_weight"])
+        self.assertNotEqual(results[0]["embedding"][5], [0.0, 0.0])
+
+    def test_static_graph_ddp_accumulates_before_one_optimizer_step(self) -> None:
+        context = torch_mp.get_context("spawn")
+        output_queue = context.SimpleQueue()
+        torch_mp.start_processes(
+            _uneven_train_worker,
+            args=(2, _free_port(), output_queue, 2, True),
+            nprocs=2,
+            join=True,
+            start_method="spawn",
+        )
+        results = sorted(
+            [output_queue.get(), output_queue.get()],
+            key=lambda item: item["rank"],
+        )
+
+        self.assertEqual([item["steps"] for item in results], [2, 2])
+        self.assertEqual([item["rows"] for item in results], [8, 8])
         self.assertEqual(results[0]["embedding"], results[1]["embedding"])
         self.assertEqual(results[0]["output_weight"], results[1]["output_weight"])
         self.assertNotEqual(results[0]["embedding"][5], [0.0, 0.0])

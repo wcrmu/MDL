@@ -289,6 +289,16 @@ def _run_candidate(
             ],
             "mfu": report.get("mfu"),
         }
+        measured_gpu_utilization = [
+            float(value)
+            for value in trial["gpu_utilization_percent_per_rank"]
+            if value is not None
+        ]
+        trial["minimum_gpu_utilization_percent"] = (
+            min(measured_gpu_utilization)
+            if len(measured_gpu_utilization) == args.nproc_per_node
+            else None
+        )
         print(
             "trial_result "
             f"batch_size={batch_size} status=ok "
@@ -456,6 +466,8 @@ def _execute_tuning(
     reader_trials: Sequence[Mapping[str, Any]] = (),
     reader_samples_per_second: float | None = None,
 ) -> int:
+    base_config = load_app_config(args.config)
+    accumulation_steps = base_config.training.gradient_accumulation_steps
     trials: list[dict[str, Any]] = []
     saw_success = False
     assumed_hdfs_ceiling: float | None = None
@@ -506,9 +518,16 @@ def _execute_tuning(
         for trial in trials
         if trial["status"] == "ok"
         and trial["peak_hbm_reserved_gib"] <= args.hbm_limit_gib
+        and trial["minimum_gpu_utilization_percent"] is not None
+        and trial["minimum_gpu_utilization_percent"]
+        >= args.min_gpu_utilization_percent
     ]
     if not eligible:
-        print("No successful candidate stayed below the HBM limit.", file=sys.stderr)
+        print(
+            "No successful candidate satisfied both the HBM limit and the "
+            f"{args.min_gpu_utilization_percent:.1f}% per-rank GPU utilization SLO.",
+            file=sys.stderr,
+        )
         return 2
     best = max(
         eligible,
@@ -533,6 +552,7 @@ def _execute_tuning(
         "sequence_lengths": args.sequence_lengths,
         "raw_parquet_sequence_lengths": args.raw_sequence_lengths,
         "hbm_limit_gib": args.hbm_limit_gib,
+        "min_gpu_utilization_percent": args.min_gpu_utilization_percent,
         "assumed_hdfs_bandwidth_mib_s": (
             args.assumed_hdfs_bandwidth_mib_s
             if args.assumed_hdfs_bandwidth_mib_s > 0.0
@@ -547,7 +567,10 @@ def _execute_tuning(
         "reader_ceiling_samples_per_second": reader_samples_per_second,
         "synthetic_parquet": None if manifest is None else manifest.as_dict(),
         "recommended_batch_size_per_rank": best["batch_size"],
-        "recommended_global_batch_size": best["batch_size"] * args.nproc_per_node,
+        "gradient_accumulation_steps": accumulation_steps,
+        "recommended_effective_global_batch_size": (
+            best["batch_size"] * args.nproc_per_node * accumulation_steps
+        ),
         "tuned_length_bucket": tuned_bucket,
         "recommended_trial": best,
         "trials": trials,
@@ -591,7 +614,9 @@ def main() -> int:
     parser.add_argument(
         "--candidate-batches",
         type=_candidate_batches,
-        default=_candidate_batches("8,12,16,20,24,32,40,48,64,80,96,128"),
+        default=_candidate_batches(
+            "8,12,16,20,24,32,40,48,64,80,96,128,160,192,256,384,512"
+        ),
     )
     parser.add_argument(
         "--nproc-per-node",
@@ -637,6 +662,15 @@ def main() -> int:
         help=(
             "per-rank reserved-HBM safety ceiling used when selecting a batch; "
             "not a fixed A100 attribute (default 76 GiB leaves headroom on 80 GiB GPUs)"
+        ),
+    )
+    parser.add_argument(
+        "--min-gpu-utilization-percent",
+        type=float,
+        default=60.0,
+        help=(
+            "minimum average utilization required on every rank for a trial "
+            "to be eligible (default: 60)"
         ),
     )
     parser.add_argument("--omp-num-threads", type=int, default=4)
@@ -736,6 +770,8 @@ def main() -> int:
         parser.error("--reader-benchmark-batch-size must be positive")
     if args.reserve_hbm_gib < 0.0 or args.hbm_limit_gib <= 0.0:
         parser.error("HBM values must be non-negative/positive")
+    if not 0.0 <= args.min_gpu_utilization_percent <= 100.0:
+        parser.error("--min-gpu-utilization-percent must be in [0, 100]")
     if not 0.0 <= args.sequence_overlap <= 1.0:
         parser.error("--sequence-overlap must be in [0, 1]")
     if args.bag_length_scale <= 0.0:

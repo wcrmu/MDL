@@ -191,6 +191,7 @@ class PredictionIdentityTest(unittest.TestCase):
                 device="cpu",
                 precision="fp32",
                 compile=False,
+                attention_backend="sdpa",
             ),
             data=replace(base.data, test=test_split),
             sequences=(sequence,),

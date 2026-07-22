@@ -115,6 +115,7 @@ def _apply_data_input_overrides(config, args: argparse.Namespace):
 
 _TRAINING_OVERRIDE_FIELDS = (
     "batch_size",
+    "gradient_accumulation_steps",
     "lr_dense",
     "lr_sparse",
     "lr_warmup_steps",
@@ -301,6 +302,12 @@ def _add_training_override_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=None,
+        help="override training.gradient_accumulation_steps",
+    )
+    parser.add_argument(
         "--lr-dense",
         type=float,
         default=None,
@@ -366,7 +373,21 @@ def _cmd_validate_config(args: argparse.Namespace) -> int:
     print(f"train_inputs: {len(config.data.train.inputs)}")
     if config.data.test is not None:
         print(f"test_inputs: {len(config.data.test.inputs)}")
-    print(f"batch_size: {config.training.batch_size}")
+    print(f"batch_size_per_rank: {config.training.batch_size}")
+    print(
+        "gradient_accumulation_steps: "
+        f"{config.training.gradient_accumulation_steps}"
+    )
+    default_nproc_per_node = config.runtime.nproc_per_node
+    print(
+        "default_nproc_per_node: "
+        f"{default_nproc_per_node if default_nproc_per_node is not None else 'external'}"
+    )
+    if default_nproc_per_node is not None:
+        print(
+            "default_launch_global_batch_size: "
+            f"{config.training.batch_size * default_nproc_per_node * config.training.gradient_accumulation_steps}"
+        )
     print(f"lr_dense: {config.training.lr_dense}")
     print(f"lr_sparse: {config.training.lr_sparse}")
     print(f"activation_checkpoint: {config.runtime.activation_checkpoint}")
@@ -468,10 +489,14 @@ def _launch_ddp_command(args: argparse.Namespace, config) -> int:
     ]
     env = os.environ.copy()
     env["MDL_DDP_LAUNCHED"] = "1"
+    # Expandable segments let adjacent variable-length batches reuse one CUDA
+    # segment instead of failing with free-but-fragmented HBM near capacity.
+    env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     return subprocess.run(command, env=env, check=False).returncode
 
 
 def _cmd_train(args: argparse.Namespace) -> int:
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     config = _load_config(args)
     if _effective_distributed_mode(args, config) == "ddp" and not _in_distributed_launcher():
         return _launch_ddp_command(args, config)
@@ -489,6 +514,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
 
 
 def _cmd_benchmark(args: argparse.Namespace) -> int:
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     config = _load_config(args)
     if _effective_distributed_mode(args, config) == "ddp" and not _in_distributed_launcher():
         return _launch_ddp_command(args, config)
@@ -512,6 +538,7 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
             reserve_hbm_gib=args.reserve_hbm_gib,
             candidates_per_request=args.candidates_per_request,
             synthetic_scenario_count=args.synthetic_scenario_count,
+            min_gpu_utilization_percent=args.min_gpu_utilization_percent,
         ),
     )
     if is_main_process():
@@ -600,7 +627,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     train = subparsers.add_parser("train")
     train.add_argument("--config", required=True)
-    train.add_argument("--max-steps", type=int, default=None)
+    train.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="maximum optimizer updates (each may contain accumulated micro-batches)",
+    )
     train.add_argument("--distributed", choices=["none", "ddp"], default=None)
     train.add_argument("--nproc-per-node", type=int, default=None)
     train.add_argument("--master-addr", default=None)
@@ -659,6 +691,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "number of synthetic scenarios used by compute and embedding "
             "benchmark modes when scenarios.auto_discover is true"
+        ),
+    )
+    benchmark.add_argument(
+        "--min-gpu-utilization-percent",
+        type=float,
+        default=None,
+        help=(
+            "fail unless every rank reaches this average GPU utilization; "
+            "use 60 for the production SLO"
         ),
     )
     benchmark.add_argument("--output", default=None)

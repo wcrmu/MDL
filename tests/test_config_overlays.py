@@ -12,6 +12,7 @@ from src.config import (
     RuntimeConfig,
     ScenarioConfig,
     TokenGroupConfig,
+    TrainingConfig,
     load_app_config,
     resolve_categorical_base_input,
     validate_app_config,
@@ -243,6 +244,11 @@ class ModelConfigOverlayTest(unittest.TestCase):
                 r"training\.batch_size must be an integer",
             ),
             (
+                "boolean gradient accumulation",
+                "training:\n  gradient_accumulation_steps: true\n",
+                r"training\.gradient_accumulation_steps must be an integer",
+            ),
+            (
                 "quoted model boolean",
                 'model:\n  use_pyramid: "false"\n',
                 r"model\.use_pyramid must be a boolean",
@@ -334,6 +340,26 @@ class ModelConfigOverlayTest(unittest.TestCase):
             (
                 RuntimeConfig(master_port=True),
                 r"runtime\.master_port must be an integer",
+            ),
+            (
+                RuntimeConfig(sequence_projection_chunk_tokens=-1),
+                r"runtime\.sequence_projection_chunk_tokens must be a non-negative integer",
+            ),
+            (
+                RuntimeConfig(sequence_encoder_chunk_rows=-1),
+                r"runtime\.sequence_encoder_chunk_rows must be a non-negative integer",
+            ),
+            (
+                RuntimeConfig(sequence_encoder_chunk_tokens=-1),
+                r"runtime\.sequence_encoder_chunk_tokens must be a non-negative integer",
+            ),
+            (
+                RuntimeConfig(onetrans_batched_ns="true"),
+                r"runtime\.onetrans_batched_ns must be a boolean",
+            ),
+            (
+                TrainingConfig(dense_optimizer_foreach_bucket_mb=-1),
+                r"training\.dense_optimizer_foreach_bucket_mb must be a non-negative integer",
             ),
         )
         for config, expected_error in invalid_configs:

@@ -36,6 +36,7 @@ from src.model import (
     _embedding_size,
     _forward_domain_interaction,
     _mdl_logits,
+    _project_sequence_in_chunks,
     _scenario_mask_from_ids,
 )
 from src.modules.attention import (
@@ -44,7 +45,9 @@ from src.modules.attention import (
     VariableLengthDomainAttention,
     _VarlenPacking,
     _call_varlen_attention,
-    varlen_attn,
+    flash_attn_varlen_func,
+    varlen_attention_available,
+    varlen_attention_backend,
 )
 from src.modules.mlp import SparseMoEPerTokenFFN
 from src.train import _loss_terms_from_batch, _step_sparse_moe_controllers
@@ -80,6 +83,41 @@ def _rankmixer_config() -> SimpleNamespace:
 
 
 class RankMixerAlignmentTest(unittest.TestCase):
+    def test_chunked_checkpoint_projection_matches_dense_projection(self) -> None:
+        torch.manual_seed(13)
+        reference = nn.Sequential(nn.Linear(5, 9), nn.GELU(), nn.Linear(9, 4))
+        chunked = nn.Sequential(nn.Linear(5, 9), nn.GELU(), nn.Linear(9, 4))
+        chunked.load_state_dict(reference.state_dict())
+        reference.train()
+        chunked.train()
+        config = SimpleNamespace(
+            runtime=SimpleNamespace(
+                activation_checkpoint="full",
+                sequence_projection_chunk_tokens=3,
+            )
+        )
+        reference_values = torch.randn(2, 4, 5, requires_grad=True)
+        chunked_values = reference_values.detach().clone().requires_grad_(True)
+
+        reference_output = reference(reference_values)
+        chunked_output = _project_sequence_in_chunks(
+            chunked,
+            chunked_values,
+            config,
+        )
+        torch.testing.assert_close(chunked_output, reference_output)
+        reference_output.square().mean().backward()
+        chunked_output.square().mean().backward()
+        torch.testing.assert_close(chunked_values.grad, reference_values.grad)
+        for chunked_parameter, reference_parameter in zip(
+            chunked.parameters(),
+            reference.parameters(),
+        ):
+            torch.testing.assert_close(
+                chunked_parameter.grad,
+                reference_parameter.grad,
+            )
+
     def test_rms_norm_preserves_bf16_residual_dtype(self) -> None:
         norm = RMSNorm(4)
         values = torch.tensor(
@@ -874,9 +912,31 @@ class VarlenPackingTest(unittest.TestCase):
         expected.square().sum().backward()
         torch.testing.assert_close(values.grad, reference_values.grad)
 
+    def test_compact_pack_removes_padding_and_preserves_gradients(self) -> None:
+        mask = torch.tensor(
+            [[False, True, True, False], [True, False, True, True]]
+        )
+        values = torch.randn(2, 4, 3, requires_grad=True)
+        reference_values = values.detach().clone().requires_grad_(True)
+        packing = _VarlenPacking.from_mask(mask)
+
+        packed = packing.pack(values, compact=True)
+        output = packing.unpack(2.0 * packed, values, compact=True)
+        expected = torch.zeros_like(reference_values).index_put(
+            (mask,),
+            2.0 * reference_values[mask],
+        )
+
+        self.assertEqual(packed.size(0), int(mask.sum()))
+        torch.testing.assert_close(packed, values[mask])
+        torch.testing.assert_close(output, expected)
+        output.square().sum().backward()
+        expected.square().sum().backward()
+        torch.testing.assert_close(values.grad, reference_values.grad)
+
     @unittest.skipUnless(
-        torch.cuda.is_available() and varlen_attn is not None,
-        "fixed-capacity varlen Flash test requires CUDA varlen attention",
+        torch.cuda.is_available() and varlen_attention_available(),
+        "fixed-capacity Varlen Flash test requires CUDA support",
     )
     def test_fixed_capacity_flash_matches_exact_dynamic_packing(self) -> None:
         torch.manual_seed(23)
@@ -922,6 +982,7 @@ class VarlenPackingTest(unittest.TestCase):
             mask.size(1),
             mask.size(1),
             causal=False,
+            fixed_capacity=False,
         )
         exact_output = torch.zeros_like(exact_inputs[0])
         exact_output[mask] = exact_packed
@@ -965,6 +1026,10 @@ class FeatureEncoderShardedFusionTest(unittest.TestCase):
     def test_mdl_fuses_scalar_and_all_sequence_lookups_with_output_parity(self) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(root / "configs" / "reference" / "mdl_perf.yaml")
+        config = replace(
+            config,
+            runtime=replace(config.runtime, attention_backend="sdpa"),
+        )
         bank = FeatureEncoderBank(
             config,
             {},
@@ -1010,26 +1075,35 @@ class FeatureEncoderShardedFusionTest(unittest.TestCase):
         self.assertEqual(output.feature_tokens.size(0), 2)
 
 
-class VarlenAttentionCompatibilityTest(unittest.TestCase):
+class FlashAttnVarlenCompatibilityTest(unittest.TestCase):
     def _inputs(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         query = torch.randn(3, 2, 4)
         key = torch.randn(5, 2, 4)
         value = torch.randn(5, 2, 4)
         return query, key, value, torch.tensor([0, 3]), torch.tensor([0, 5])
 
-    def test_pytorch_210_is_causal_api(self) -> None:
+    def test_flash_attn_varlen_api(self) -> None:
         observed: list[bool] = []
 
-        def legacy(*args: Tensor | int, is_causal: bool = False) -> Tensor:
-            observed.append(is_causal)
-            assert isinstance(args[0], Tensor)
-            return args[0]
+        def fake_flash(
+            query: Tensor,
+            key: Tensor,
+            value: Tensor,
+            cu_seqlens_q: Tensor,
+            cu_seqlens_k: Tensor,
+            max_seqlen_q: int,
+            max_seqlen_k: int,
+            dropout_p: float = 0.0,
+            causal: bool = False,
+            **kwargs: object,
+        ) -> Tensor:
+            del key, value, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
+            del dropout_p, kwargs
+            observed.append(causal)
+            return query
 
         inputs = self._inputs()
-        with patch("src.modules.attention.varlen_attn", legacy), patch(
-            "src.modules.attention._VARLEN_ATTN_USES_WINDOW_SIZE",
-            False,
-        ):
+        with patch("src.modules.attention.flash_attn_varlen_func", fake_flash):
             output = _call_varlen_attention(
                 *inputs,
                 3,
@@ -1037,34 +1111,114 @@ class VarlenAttentionCompatibilityTest(unittest.TestCase):
                 causal=True,
             )
 
-        self.assertIs(output, inputs[0])
+        self.assertEqual(tuple(output.shape), tuple(inputs[0].shape))
+        torch.testing.assert_close(output, inputs[0])
         self.assertEqual(observed, [True])
 
-    def test_pytorch_212_window_size_api(self) -> None:
-        observed: list[tuple[int, int]] = []
+    def test_flash_attn_keeps_fixed_capacity_without_host_sized_slice(self) -> None:
+        query = torch.randn(8, 2, 4)
+        key = torch.randn(10, 2, 4)
+        value = torch.randn(10, 2, 4)
+        cu_query = torch.tensor([0, 3], dtype=torch.int32)
+        cu_key = torch.tensor([0, 5], dtype=torch.int32)
+        seen_shapes: list[tuple[int, ...]] = []
+        seen_cumulative: list[Tensor] = []
 
-        def modern(
-            *args: Tensor | int,
-            window_size: tuple[int, int] = (-1, -1),
+        def fake_flash(
+            packed_query: Tensor,
+            packed_key: Tensor,
+            packed_value: Tensor,
+            cu_seqlens_q: Tensor,
+            cu_seqlens_k: Tensor,
+            max_seqlen_q: int,
+            max_seqlen_k: int,
+            dropout_p: float = 0.0,
+            causal: bool = False,
+            **kwargs: object,
         ) -> Tensor:
-            observed.append(window_size)
-            assert isinstance(args[0], Tensor)
-            return args[0]
+            del packed_value, max_seqlen_q, max_seqlen_k
+            del dropout_p, causal, kwargs
+            seen_shapes.append(tuple(packed_query.shape))
+            seen_shapes.append(tuple(packed_key.shape))
+            seen_cumulative.extend(
+                (cu_seqlens_q.cpu(), cu_seqlens_k.cpu())
+            )
+            return packed_query + 1
 
-        inputs = self._inputs()
-        with patch("src.modules.attention.varlen_attn", modern), patch(
-            "src.modules.attention._VARLEN_ATTN_USES_WINDOW_SIZE",
-            True,
-        ):
+        with patch("src.modules.attention.flash_attn_varlen_func", fake_flash):
             output = _call_varlen_attention(
-                *inputs,
-                3,
-                5,
+                query,
+                key,
+                value,
+                cu_query,
+                cu_key,
+                8,
+                10,
                 causal=False,
             )
 
-        self.assertIs(output, inputs[0])
-        self.assertEqual(observed, [(-1, -1)])
+        self.assertEqual(seen_shapes, [(8, 2, 4), (10, 2, 4)])
+        torch.testing.assert_close(
+            seen_cumulative[0], torch.tensor([0, 3, 8], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            seen_cumulative[1], torch.tensor([0, 5, 10], dtype=torch.int32)
+        )
+        self.assertEqual(tuple(output.shape), tuple(query.shape))
+        torch.testing.assert_close(output, query + 1)
+
+    def test_flash_attn_compact_mode_keeps_exact_cumulative_lengths(self) -> None:
+        query = torch.randn(3, 2, 4)
+        key = torch.randn(5, 2, 4)
+        value = torch.randn(5, 2, 4)
+        cu_query = torch.tensor([0, 3], dtype=torch.int32)
+        cu_key = torch.tensor([0, 5], dtype=torch.int32)
+        seen_cumulative: list[Tensor] = []
+
+        def fake_flash(
+            packed_query: Tensor,
+            packed_key: Tensor,
+            packed_value: Tensor,
+            cu_seqlens_q: Tensor,
+            cu_seqlens_k: Tensor,
+            max_seqlen_q: int,
+            max_seqlen_k: int,
+            **_kwargs: object,
+        ) -> Tensor:
+            del packed_key, packed_value, max_seqlen_q, max_seqlen_k
+            seen_cumulative.extend((cu_seqlens_q.clone(), cu_seqlens_k.clone()))
+            return packed_query
+
+        with patch("src.modules.attention.flash_attn_varlen_func", fake_flash):
+            output = _call_varlen_attention(
+                query,
+                key,
+                value,
+                cu_query,
+                cu_key,
+                8,
+                10,
+                causal=False,
+                fixed_capacity=False,
+            )
+
+        torch.testing.assert_close(seen_cumulative[0], cu_query)
+        torch.testing.assert_close(seen_cumulative[1], cu_key)
+        torch.testing.assert_close(output, query)
+
+    def test_flash_attn_is_the_only_varlen_backend(self) -> None:
+        with patch(
+            "src.modules.attention.flash_attn_varlen_func",
+            lambda *args, **kwargs: args[0],
+        ):
+            self.assertTrue(varlen_attention_available())
+            self.assertEqual(varlen_attention_backend(), "flash_attn")
+
+    def test_missing_flash_attn_raises(self) -> None:
+        inputs = self._inputs()
+        with patch("src.modules.attention.flash_attn_varlen_func", None):
+            with self.assertRaisesRegex(RuntimeError, "flash_attn_varlen_func"):
+                _call_varlen_attention(*inputs, 3, 5, causal=False)
 
 
 class OneTransTokenizerAlignmentTest(unittest.TestCase):
@@ -1392,6 +1546,7 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
         group = TokenGroupConfig(name="compact", inputs=["compact"])
         config = replace(
             base,
+            runtime=replace(base.runtime, attention_backend="sdpa"),
             sequences=[sequence],
             tokenization=replace(base.tokenization, sequence_tokens=[group]),
             model=replace(base.model, token_dim=4),
@@ -1486,6 +1641,7 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
         ]
         config = replace(
             base,
+            runtime=replace(base.runtime, attention_backend="sdpa"),
             sequences=[sequence],
             tokenization=replace(
                 base.tokenization,
@@ -1569,8 +1725,8 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(actual).all()))
 
     @unittest.skipUnless(
-        torch.cuda.is_available() and varlen_attn is not None,
-        "strict Flash domain-sequence attention test requires CUDA varlen attention",
+        torch.cuda.is_available() and varlen_attention_available(),
+        "strict Flash domain-sequence attention test requires CUDA Varlen Flash",
     )
     def test_strict_flash_packs_masked_memory_and_has_finite_gradients(self) -> None:
         torch.manual_seed(42)
@@ -1876,6 +2032,8 @@ class OneTransCacheAlignmentTest(unittest.TestCase):
 
     def _backbone(self, use_pyramid: bool) -> OneTransBackbone:
         class Tokenizer(nn.Module):
+            num_ns_tokens = 2
+
             def precompute_request_cache(
                 self,
                 features: dict[str, Tensor],
@@ -1884,6 +2042,26 @@ class OneTransCacheAlignmentTest(unittest.TestCase):
                 return OneTransRequestCache(
                     s_tokens=tokens,
                     s_valid_mask=torch.ones(tokens.shape[:2], dtype=torch.bool),
+                )
+
+            def forward(
+                self,
+                features: dict[str, Tensor],
+                request_cache: OneTransRequestCache | None = None,
+                **_kwargs: object,
+            ) -> OneTransOutput:
+                cache = (
+                    self.precompute_request_cache(features)
+                    if request_cache is None
+                    else request_cache
+                )
+                ns_tokens = features["ns_tokens"]
+                return OneTransOutput(
+                    feature_tokens=torch.cat([cache.s_tokens, ns_tokens], dim=1),
+                    encoded_features={},
+                    s_token_count=cache.s_tokens.size(1),
+                    ns_token_count=ns_tokens.size(1),
+                    s_valid_mask=cache.s_valid_mask,
                 )
 
         config = SimpleNamespace(
@@ -1895,6 +2073,7 @@ class OneTransCacheAlignmentTest(unittest.TestCase):
                 use_pyramid=use_pyramid,
                 final_s_tokens=2,
                 pyramid_round_to=32,
+                use_request_cache=True,
             ),
             runtime=SimpleNamespace(
                 attention_backend="auto",
@@ -1911,6 +2090,56 @@ class OneTransCacheAlignmentTest(unittest.TestCase):
             OneTransBlock(config, ns_token_count=2) for _ in range(3)
         )
         return backbone.eval()
+
+    def test_full_checkpoint_drops_persistent_kv_and_preserves_gradients(self) -> None:
+        torch.manual_seed(23)
+        reference = self._backbone(use_pyramid=True).train()
+        memory_efficient = self._backbone(use_pyramid=True).train()
+        memory_efficient.load_state_dict(reference.state_dict())
+        reference.config.runtime.activation_checkpoint = "none"
+        memory_efficient.config.runtime.activation_checkpoint = "full"
+
+        reference_s = torch.randn(2, 5, 8, requires_grad=True)
+        reference_ns = torch.randn(2, 2, 8, requires_grad=True)
+        efficient_s = reference_s.detach().clone().requires_grad_(True)
+        efficient_ns = reference_ns.detach().clone().requires_grad_(True)
+        reference_features = {"s_tokens": reference_s, "ns_tokens": reference_ns}
+        efficient_features = {"s_tokens": efficient_s, "ns_tokens": efficient_ns}
+
+        reference_cache = reference.precompute_request_cache(reference_features)
+        efficient_cache = memory_efficient.precompute_request_cache(
+            efficient_features
+        )
+        self.assertTrue(efficient_cache.layers)
+        self.assertTrue(
+            all(
+                layer.s_key.numel() == 0 and layer.s_value.numel() == 0
+                for layer in efficient_cache.layers
+            )
+        )
+
+        reference_output = reference(
+            reference_features,
+            request_cache=reference_cache,
+        ).feature_tokens
+        efficient_output = memory_efficient(
+            efficient_features,
+            request_cache=efficient_cache,
+        ).feature_tokens
+        torch.testing.assert_close(efficient_output, reference_output)
+
+        reference_output.square().mean().backward()
+        efficient_output.square().mean().backward()
+        torch.testing.assert_close(efficient_s.grad, reference_s.grad)
+        torch.testing.assert_close(efficient_ns.grad, reference_ns.grad)
+        for efficient_parameter, reference_parameter in zip(
+            memory_efficient.parameters(),
+            reference.parameters(),
+        ):
+            torch.testing.assert_close(
+                efficient_parameter.grad,
+                reference_parameter.grad,
+            )
 
     def test_cross_request_append_cache_matches_full_recompute(self) -> None:
         torch.manual_seed(29)
