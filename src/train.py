@@ -642,7 +642,12 @@ def _request_group_tables(
     split: ParquetSplitConfig,
     table: object,
 ) -> Iterator[object]:
-    """Yield one table per request while preserving candidate order."""
+    """Yield one table per request while preserving candidate order.
+
+    Candidate-major agg output can interleave requests. Reordering the whole
+    Arrow table once is substantially cheaper than taking 169 wide columns
+    separately for every non-contiguous request.
+    """
 
     if not split.reader.deduplicate_request_features:
         yield table
@@ -664,12 +669,23 @@ def _request_group_tables(
                 f"request_id column {split.request_id!r} must contain hashable scalars"
             ) from error
 
-    for positions in positions_by_request.values():
-        first = positions[0]
-        if positions == list(range(first, first + len(positions))):
-            yield table.slice(first, len(positions))
-        else:
-            yield _safe_table_take(table, positions)
+    groups = list(positions_by_request.values())
+    if all(
+        positions == list(range(positions[0], positions[0] + len(positions)))
+        for positions in groups
+    ):
+        for positions in groups:
+            yield table.slice(positions[0], len(positions))
+        return
+
+    reordered = _safe_table_take(
+        table,
+        [position for positions in groups for position in positions],
+    )
+    offset = 0
+    for positions in groups:
+        yield reordered.slice(offset, len(positions))
+        offset += len(positions)
 
 
 def _shuffle_table_groups(
@@ -683,23 +699,122 @@ def _shuffle_table_groups(
 
 
 def _concat_batch_tables(pa: Any, tables: list[object]) -> object:
-    """Concatenate and coalesce chunks once before per-column tensorization.
+    """Concatenate and coalesce request slices before tensorization.
 
-    Request-preserving batching can otherwise create one Arrow chunk per
-    request. Hundreds of feature encoders would each repeat the same chunk
-    merge. Some Arrow releases cannot unify nested dictionaries, so retain a
-    lossless fallback to the original chunked table.
+    Slicing dictionary-encoded request lists keeps the source batch's complete
+    dictionary attached to every small request chunk. Concatenating dozens of
+    those chunks can make a 2 MiB logical batch appear hundreds of MiB wide and
+    forces every feature encoder to revisit the duplicated dictionaries.
+    Decode only the selected indices at this boundary; request deduplication
+    still happens before tensorization.
     """
 
     if not tables:
         raise ValueError("cannot concatenate an empty batch-table list")
-    combined = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
+    if len(tables) == 1:
+        return tables[0]
+
+    def dictionary_storage_key(dictionary: Any) -> tuple[Any, ...]:
+        return (
+            str(dictionary.type),
+            len(dictionary),
+            dictionary.offset,
+            tuple(
+                None if buffer is None else (buffer.address, buffer.size)
+                for buffer in dictionary.buffers()
+            ),
+        )
+
+    # Request slices produced from one adapted scanner table share the same
+    # dictionary buffers. Group those slices by source and decode one combined
+    # index vector per source/column instead of calling dictionary_decode for
+    # every tiny request slice (hundreds of calls per wide batch).
+    dictionary_column_index: int | None = None
+    for column_index in range(tables[0].num_columns):
+        if all(
+            table[column_index].num_chunks == 1
+            and pa.types.is_dictionary(table[column_index].chunk(0).type)
+            for table in tables
+        ):
+            dictionary_column_index = column_index
+            break
+
+    if dictionary_column_index is not None and all(
+        all(column.num_chunks == 1 for column in table.columns)
+        for table in tables
+    ):
+        source_groups: dict[tuple[Any, ...], list[int]] = {}
+        for table_index, table in enumerate(tables):
+            dictionary = table[dictionary_column_index].chunk(0).dictionary
+            storage_key = dictionary_storage_key(dictionary)
+            source_groups.setdefault(storage_key, []).append(table_index)
+
+        arrays: list[Any] = []
+        for column_index in range(tables[0].num_columns):
+            source_arrays: list[Any] = []
+            for table_indices in source_groups.values():
+                chunks = [
+                    tables[table_index][column_index].chunk(0)
+                    for table_index in table_indices
+                ]
+                if pa.types.is_dictionary(chunks[0].type):
+                    dictionary = chunks[0].dictionary
+                    # Source groups were built from slices of one adapted
+                    # table, so every column shares its dictionary within the
+                    # group. Check the last slice as a cheap defensive guard.
+                    if (
+                        len(chunks) == 1
+                        or dictionary_storage_key(chunks[-1].dictionary)
+                        == dictionary_storage_key(dictionary)
+                    ):
+                        indices = (
+                            chunks[0].indices
+                            if len(chunks) == 1
+                            else pa.concat_arrays([chunk.indices for chunk in chunks])
+                        )
+                        source_arrays.append(
+                            pa.DictionaryArray.from_arrays(
+                                indices,
+                                dictionary,
+                            ).dictionary_decode()
+                        )
+                    else:
+                        source_arrays.append(
+                            pa.concat_arrays(
+                                [chunk.dictionary_decode() for chunk in chunks]
+                            )
+                        )
+                else:
+                    source_arrays.append(
+                        chunks[0]
+                        if len(chunks) == 1
+                        else pa.concat_arrays(chunks)
+                    )
+            arrays.append(
+                source_arrays[0]
+                if len(source_arrays) == 1
+                else pa.concat_arrays(source_arrays)
+            )
+        return pa.Table.from_arrays(arrays, names=tables[0].column_names)
+
+    combined = pa.concat_tables(tables)
     if all(column.num_chunks <= 1 for column in combined.columns):
         return combined
-    try:
-        return combined.combine_chunks()
-    except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
-        return combined
+    arrays = []
+    for column in combined.columns:
+        if any(pa.types.is_dictionary(chunk.type) for chunk in column.chunks):
+            decoded = [
+                chunk.dictionary_decode()
+                if pa.types.is_dictionary(chunk.type)
+                else chunk
+                for chunk in column.chunks
+            ]
+            arrays.append(
+                decoded[0] if len(decoded) == 1 else pa.concat_arrays(decoded)
+            )
+        else:
+            arrays.append(column.combine_chunks())
+    return pa.Table.from_arrays(arrays, names=combined.column_names)
 
 
 def _iter_shuffled_candidate_tables(
@@ -782,18 +897,30 @@ def _iter_shuffled_candidate_tables(
     buffered_groups: list[object] = []
     buffered_rows = 0
     for table in source:
+        if table.num_rows > reader.shuffle_buffer_rows:
+            yield from _shuffle_table_groups(buffered_groups, generator)
+            buffered_groups = []
+            buffered_rows = 0
+            yield table
+            continue
+        while (
+            buffered_groups
+            and buffered_rows + table.num_rows > reader.shuffle_buffer_rows
+        ):
+            selected_index = int(
+                torch.randint(
+                    len(buffered_groups),
+                    (),
+                    generator=generator,
+                ).item()
+            )
+            selected = buffered_groups[selected_index]
+            buffered_groups[selected_index] = buffered_groups[-1]
+            buffered_groups.pop()
+            buffered_rows -= selected.num_rows
+            yield selected
         buffered_groups.append(table)
         buffered_rows += table.num_rows
-        if buffered_rows <= reader.shuffle_buffer_rows:
-            continue
-        shuffled = _shuffle_table_groups(buffered_groups, generator)
-        emitted: list[object] = []
-        while shuffled and buffered_rows > reader.shuffle_buffer_rows:
-            group = shuffled.pop(0)
-            emitted.append(group)
-            buffered_rows -= group.num_rows
-        yield from emitted
-        buffered_groups = shuffled
     yield from _shuffle_table_groups(buffered_groups, generator)
 
 
@@ -1065,15 +1192,20 @@ def _estimate_prepared_batch_bytes(config: AppConfig, table: object) -> int:
     bag_max_lengths: dict[str, int] = {}
     for feature in config.features:
         if feature.kind == "categorical" and feature.pooling == "mean":
-            max_length = bag_max_lengths.get(feature.source)
-            if max_length is None:
-                try:
-                    max_length = _max_bag_length(table, feature.source)
-                except (KeyError, TypeError, AttributeError):
-                    max_length = feature.max_length or 1
-                bag_max_lengths[feature.source] = max_length
             if feature.max_length is not None:
-                max_length = min(max_length, feature.max_length)
+                # The configured truncation limit is already a conservative
+                # tensor bound. Scanning every bag column with Arrow kernels
+                # just to discover a smaller value can cost more than
+                # tensorizing the batch itself on very wide schemas.
+                max_length = feature.max_length
+            else:
+                max_length = bag_max_lengths.get(feature.source)
+                if max_length is None:
+                    try:
+                        max_length = _max_bag_length(table, feature.source)
+                    except (KeyError, TypeError, AttributeError):
+                        max_length = 1
+                    bag_max_lengths[feature.source] = max_length
             tensor_bytes += rows * (8 + max_length * 8)
         else:
             tensor_bytes += rows * feature.dimension * (8 if feature.kind == "categorical" else 4)
@@ -1166,6 +1298,11 @@ def iter_feature_batches(
         return
 
     max_pending = max(1, reader.prefetch_batches)
+    # Build only a two-batch runway before the first yield. Filling a deep
+    # queue synchronously delayed the first optimizer step by several complete
+    # adapter/tensorization batches. After that first yield, device prefetch (or
+    # the next consumer call) ramps the queue to its configured steady depth.
+    target_pending = min(max_pending, 2)
     worker_count = min(max_pending, max(1, reader.num_workers))
     pending: deque[tuple[Future[FeatureBatch], int]] = deque()
     pending_bytes = 0
@@ -1174,7 +1311,7 @@ def iter_feature_batches(
     with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="mdl-reader") as executor:
         exhausted = False
         while pending or not exhausted or buffered_table is not None:
-            while len(pending) < max_pending and not exhausted:
+            while len(pending) < target_pending and not exhausted:
                 if buffered_table is None:
                     try:
                         table = next(table_iter)
@@ -1243,6 +1380,7 @@ def iter_feature_batches(
             if actual_bytes > reservation:
                 pending_bytes += actual_bytes - reservation
                 reservation = actual_bytes
+            target_pending = max_pending
             yield batch
             pending_bytes -= reservation
 
@@ -1381,7 +1519,13 @@ class _DevicePrefetchIterator:
     def close(self) -> None:
         self.stop_event.set()
         if self.thread is not threading.current_thread():
-            self.thread.join(timeout=5.0)
+            # The worker owns the host iterator and may still be inside Parquet
+            # decode/tensorization when training reaches max_steps. Do not let
+            # the interpreter tear down CUDA/Arrow while that work is live:
+            # doing so can abort the process after an otherwise successful
+            # final step. Scanner IO has its own timeouts, so a full join is
+            # the safe lifecycle boundary here.
+            self.thread.join()
 
 
 def _classify_model_parameters(model: nn.Module) -> _ParameterGroups:

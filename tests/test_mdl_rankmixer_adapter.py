@@ -280,6 +280,38 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         self.assertEqual(actual["candidate_position"], [0, 0, 1])
         self.assertEqual(actual["example_ids"], ["e0", "e1", "e2"])
 
+    def test_zero_payloads_do_not_compact_complete_agg_axes(self) -> None:
+        table = pa.table(
+            {
+                "context_indices": [[0, 1, 2, 3, 4]],
+                "target_indices": [[0, 1, 2, 3, 4, 0, 1]],
+                "ctx_scalar_hn": [[[101], [102], [0], [0], [0]]],
+                "ctx_bag_hn": [[[1], [2], [0], [0], [0]]],
+                "item_scalar_hn": [
+                    [[201], [202], [0], [0], [0], [0], [0]]
+                ],
+                "sku_a_hn": [[[11], [12], [0], [0], [0], [0], [0]]],
+                "sku_b_hn": [[[21], [22], [0], [0], [0], [0], [0]]],
+                "impr_x_goods_id_hn": [[-1, -2, 0, 0]],
+                "impr_x_time": [[4900, 4800, 4700, 4600]],
+                "impr_x_indices": [[[0], [1], [2], [3]]],
+                "scene_id": [[7, 8, 0, 0, 0]],
+                "search_id": [["r0", "r1", "r2", "r3", "r4"]],
+                "impr_time": [[5000, 5000, 5000, 5000, 5000]],
+                "label_a": [[0, 0, 0, 0, 0, 0, 0]],
+                "label_b": [[0, 0, 0, 0, 0, 0, 0]],
+                "label_c": [[0, 0, 0, 0, 0, 0, 0]],
+            }
+        )
+
+        actual = adapt(table, context=_context(REQUIRED)).to_pydict()
+
+        self.assertEqual(len(actual["search_id"]), 7)
+        self.assertEqual(actual["ctx_scalar_hn"], [101, 102, 0, 0, 0, 101, 102])
+        self.assertEqual(actual["item_scalar_hn"], [201, 202, 0, 0, 0, 0, 0])
+        self.assertEqual(actual["impr_x_goods_id_hn"][2], [0])
+        self.assertEqual(actual["label_a"], [0, 0, 0, 0, 0, 0, 0])
+
     def test_missing_labels_emit_independent_masks_and_aliases_are_exact(self) -> None:
         table = pa.table(
             {
@@ -1652,45 +1684,6 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "inner length 2"):
             adapt(table, context=context)
-
-    def test_fixed_padding_compacts_agg_axes_before_expansion(self) -> None:
-        table = pa.table(
-            {
-                "context_indices": [[0, 1, 0]],
-                "target_indices": [[0, 1, 0, 0]],
-                "ctx_scalar_hn": [[[101], [102], [0]]],
-                "ctx_bag_hn": [[[1, 2], [3], [0]]],
-                "item_scalar_hn": [[[201], [202], [0], [0]]],
-                "sku_a_hn": [[[11], [12], [0], [0]]],
-                "sku_b_hn": [[[21], [22], [0], [0]]],
-                "impr_x_goods_id_hn": [[-1, -2, 0, 0]],
-                "impr_x_time": [[4900, 4500, 0, 0]],
-                # Candidate padding repeats request zero in the physical
-                # memberships; compaction must filter and deduplicate it.
-                "impr_x_indices": [[[0, 0, 0], [1, 1], [0], [0]]],
-                "scene_id": [[7, 8, 0]],
-                "search_id": [["r0", "r1", "0"]],
-                "impr_time": [[5000, 6000, 0]],
-                "label_a": [[0, 1, 0, 0]],
-                "label_b": [[1, 0, 0, 0]],
-                "label_c": [[0, 1, 0, 0]],
-            }
-        )
-        context = _context(REQUIRED)
-        context.options["fixed_padding"] = {
-            "request_anchor": "search_id",
-            "candidate_anchor": "item_scalar_hn",
-            "sequence_anchor_suffix": "_x_time",
-        }
-
-        actual = adapt(table, context=context).to_pydict()
-
-        self.assertEqual(actual["search_id"], ["r0", "r1"])
-        self.assertEqual(actual["ctx_scalar_hn"], [101, 102])
-        self.assertEqual(actual["item_scalar_hn"], [201, 202])
-        self.assertEqual(actual["impr_x_goods_id_hn"], [[-1], [-2]])
-        self.assertEqual(actual["label_a"], [0, 1])
-
 
 if __name__ == "__main__":
     unittest.main()

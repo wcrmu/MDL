@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Expand one production-shaped mock agg row into benchmark Parquet files.
+"""Expand one anonymized production-shaped agg row into benchmark Parquet.
 
-The source JSON remains physically faithful: fixed-width request, candidate,
-and UPS arrays keep their zero-padded slots. Live IDs and labels are varied per
-row so compression and embedding lookup behavior do not collapse to one
-constant record. The configured adapter is expected to compact padding while
-reading (``adapter.options.fixed_padding``).
+Every physical request, candidate, and UPS slot in the source is real. Numeric
+zeros in feature payloads are anonymized values, not padding, so this generator
+materializes them as deterministic non-zero int64 values. Structural indices,
+timestamps, request IDs, and labels are generated separately to preserve their
+contracts.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import sys
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,7 +25,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.config import AppConfig, load_app_config
-from src.dataloader import _is_fixed_padding_cell
 
 
 MASK64 = (1 << 64) - 1
@@ -39,10 +38,10 @@ class MockParquetManifest:
     files: int
     rows_per_file: int
     raw_rows: int
-    live_requests_per_raw_row: int
-    live_candidates_per_raw_row: int
+    requests_per_raw_row: int
+    candidates_per_raw_row: int
     candidate_rows: int
-    live_sequence_tokens_per_raw_row: Mapping[str, int]
+    sequence_tokens_per_raw_row: Mapping[str, int]
     physical_columns: int
     row_group_size: int
     row_groups: int
@@ -86,77 +85,19 @@ def _load_one_row(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _active_positions(values: Any, *, column: str) -> list[int]:
+def _axis_length(values: Any, *, column: str) -> int:
     if not isinstance(values, list):
-        raise ValueError(f"mock anchor {column!r} must be list-valued")
-    positions = [
-        index
-        for index, value in enumerate(values)
-        if not _is_fixed_padding_cell(value)
-    ]
-    if not positions:
-        raise ValueError(f"mock anchor {column!r} has no live slots")
-    return positions
+        raise ValueError(f"mock axis {column!r} must be list-valued")
+    if not values:
+        raise ValueError(f"mock axis {column!r} must not be empty")
+    return len(values)
 
 
 def _adapter_options(config: AppConfig) -> Mapping[str, Any]:
     adapter = config.data.train.adapter
     if adapter is None:
         raise ValueError("mock generation requires data.train.adapter")
-    options = adapter.options
-    padding = options.get("fixed_padding")
-    if not isinstance(padding, Mapping):
-        raise ValueError(
-            "config must set data.train.adapter.options.fixed_padding"
-        )
-    return options
-
-
-def _padding_options(options: Mapping[str, Any]) -> tuple[str, str, str]:
-    padding = options["fixed_padding"]
-    request_anchor = str(padding["request_anchor"])
-    candidate_anchor = str(padding["candidate_anchor"])
-    sequence_suffix = str(padding.get("sequence_anchor_suffix", "_x_time"))
-    return request_anchor, candidate_anchor, sequence_suffix
-
-
-def _repair_request_times(
-    row: dict[str, Any],
-    options: Mapping[str, Any],
-) -> None:
-    """Ensure sanitized mock event times are not later than request time."""
-
-    request_anchor, _candidate_anchor, sequence_suffix = _padding_options(options)
-    request_positions = _active_positions(row[request_anchor], column=request_anchor)
-    context_indices = row.get("context_indices")
-    request_times = row.get(str(options.get("request_time_column", "impr_time")))
-    if not isinstance(context_indices, list) or not isinstance(request_times, list):
-        raise ValueError("mock row is missing list-valued context indices/request times")
-    request_position_by_id = {
-        context_indices[position]: position for position in request_positions
-    }
-    latest_by_request: dict[Any, int] = {}
-    for ups in options.get("ups_types", ()):
-        time_column = f"{ups}{sequence_suffix}"
-        index_column = f"{ups}_x_indices"
-        times = row.get(time_column)
-        memberships = row.get(index_column)
-        if not isinstance(times, list) or not isinstance(memberships, list):
-            continue
-        for event_time, raw_members in zip(times, memberships):
-            if _is_fixed_padding_cell(event_time):
-                continue
-            members = raw_members if isinstance(raw_members, list) else [raw_members]
-            for request in set(members):
-                if request not in request_position_by_id:
-                    continue
-                latest_by_request[request] = max(
-                    latest_by_request.get(request, 0), int(event_time)
-                )
-    for request, position in request_position_by_id.items():
-        latest = latest_by_request.get(request)
-        if latest is not None and int(request_times[position]) <= latest:
-            request_times[position] = latest + 1000
+    return adapter.options
 
 
 def _splitmix64(value: int) -> int:
@@ -172,20 +113,49 @@ def _column_seed(column: str) -> int:
     )
 
 
-def _vary_tree(value: Any, *, salt: int, position: list[int]) -> Any:
+def _materialize_feature_tree(
+    value: Any,
+    *,
+    salt: int,
+    position: list[int],
+    vary_existing_values: bool,
+) -> Any:
     if isinstance(value, list):
         return [
-            _vary_tree(item, salt=salt, position=position)
+            _materialize_feature_tree(
+                item,
+                salt=salt,
+                position=position,
+                vary_existing_values=vary_existing_values,
+            )
             for item in value
         ]
-    if isinstance(value, bool) or not isinstance(value, int) or value == 0:
+    if value is None or isinstance(value, bool):
         return value
-    leaf = position[0]
-    position[0] += 1
-    mixed = (value & MASK64) ^ _splitmix64(salt + leaf + 1)
-    if mixed == 0:
-        mixed = 1
-    return mixed if mixed < (1 << 63) else mixed - (1 << 64)
+    if isinstance(value, int):
+        leaf = position[0]
+        position[0] += 1
+        if value != 0 and not vary_existing_values:
+            return value
+        mixed = (value & MASK64) ^ _splitmix64(salt + leaf + 1)
+        if mixed == 0:
+            mixed = 1
+        return mixed if mixed < (1 << 63) else mixed - (1 << 64)
+    if isinstance(value, float):
+        leaf = position[0]
+        position[0] += 1
+        if value != 0.0 and not vary_existing_values:
+            return value
+        mixed = _splitmix64(salt + leaf + 1)
+        return float((mixed % 1_000_000) + 1) / 1000.0
+    if isinstance(value, str):
+        leaf = position[0]
+        position[0] += 1
+        if value not in {"", "0"} and not vary_existing_values:
+            return value
+        mixed = _splitmix64(salt + leaf + 1)
+        return f"mock-{mixed:016x}"
+    return value
 
 
 def _feature_value_columns(
@@ -222,30 +192,78 @@ def _make_variant(
     vary_feature_values: bool,
 ) -> dict[str, Any]:
     row = deepcopy(base_row)
-    request_anchor, candidate_anchor, _sequence_suffix = _padding_options(options)
-    request_positions = _active_positions(row[request_anchor], column=request_anchor)
-    candidate_positions = _active_positions(
-        row[candidate_anchor], column=candidate_anchor
-    )
+    request_count = _axis_length(row.get("context_indices"), column="context_indices")
+    candidate_count = _axis_length(row.get("target_indices"), column="target_indices")
 
-    for position in request_positions:
-        original = str(row[request_anchor][position])
-        row[request_anchor][position] = f"mock-{global_row}-{position}-{original}"
+    # Index zero is a valid request key. Repeated sanitized zeros are replaced
+    # with a complete, unique request axis and valid candidate references.
+    row["context_indices"] = list(range(request_count))
+    row["target_indices"] = [
+        (global_row + candidate_position) % request_count
+        for candidate_position in range(candidate_count)
+    ]
 
-    time_columns = {
-        str(options.get("request_time_column", "impr_time")),
-        *(f"{ups}_x_time" for ups in options.get("ups_types", ())),
-    }
-    time_offset = global_row * 10_000_000
-    for column in time_columns:
-        values = row.get(column)
-        if not isinstance(values, list):
-            continue
-        row[column] = [
-            value + time_offset
-            if isinstance(value, int) and not isinstance(value, bool) and value != 0
-            else value
-            for value in values
+    request_id_column = "search_id"
+    if request_id_column in row:
+        row[request_id_column] = [
+            f"mock-request-{global_row:08d}-{position}"
+            for position in range(request_count)
+        ]
+
+    if "scene_id" in row:
+        scene_ids = (1, 11, 2, 21, 23, 27, 31)
+        row["scene_id"] = [
+            scene_ids[(global_row + position) % len(scene_ids)]
+            for position in range(request_count)
+        ]
+
+    request_time_column = str(options.get("request_time_column", "impr_time"))
+    base_time_ms = 1_800_000_000_000 + global_row * 10_000_000
+    row[request_time_column] = [
+        base_time_ms + position * 1000 for position in range(request_count)
+    ]
+
+    for ups_index, ups in enumerate(options.get("ups_types", ())):
+        index_column = f"{ups}_x_indices"
+        time_column = f"{ups}_x_time"
+        memberships = row.get(index_column)
+        times = row.get(time_column)
+        if not isinstance(memberships, list) or not isinstance(times, list):
+            raise ValueError(
+                f"mock row must contain list-valued {index_column!r} and {time_column!r}"
+            )
+        if len(memberships) != len(times):
+            raise ValueError(
+                f"{index_column!r} length {len(memberships)} does not match "
+                f"{time_column!r} length {len(times)}"
+            )
+        generated_memberships: list[Any] = []
+        for token_position, raw_membership in enumerate(memberships):
+            is_list = isinstance(raw_membership, list)
+            membership_size = len(raw_membership) if is_list else 1
+            if membership_size <= 0:
+                raise ValueError(
+                    f"{index_column!r} token {token_position} has empty membership"
+                )
+            if membership_size > request_count:
+                raise ValueError(
+                    f"{index_column!r} token {token_position} has "
+                    f"{membership_size} memberships but only {request_count} requests"
+                )
+            first_request = (
+                global_row + ups_index + token_position
+            ) % request_count
+            generated = [
+                (first_request + offset) % request_count
+                for offset in range(membership_size)
+            ]
+            generated_memberships.append(generated if is_list else generated[0])
+        row[index_column] = generated_memberships
+        row[time_column] = [
+            base_time_ms
+            - (ups_index + 1) * 1_000_000
+            - (token_position + 1) * 1000
+            for token_position in range(len(times))
         ]
 
     labels = options.get("labels", {})
@@ -253,22 +271,27 @@ def _make_variant(
         values = row.get(str(column))
         if not isinstance(values, list):
             continue
-        for candidate_position in candidate_positions:
+        if len(values) != candidate_count:
+            raise ValueError(
+                f"label {column!r} has {len(values)} values, expected {candidate_count}"
+            )
+        for candidate_position in range(candidate_count):
             target = (global_row + candidate_position + task_index) & 1
             values[candidate_position] = _set_binary_label(
                 values[candidate_position], target
             )
 
-    if vary_feature_values:
-        for column in sorted(_feature_value_columns(row, options)):
-            if column not in row:
-                continue
-            salt = _column_seed(column) ^ _splitmix64(global_row + 1)
-            row[column] = _vary_tree(
-                row[column],
-                salt=salt,
-                position=[0],
-            )
+    for column in sorted(_feature_value_columns(row, options)):
+        if column not in row:
+            continue
+        row_salt = _splitmix64(global_row + 1) if vary_feature_values else 0
+        salt = _column_seed(column) ^ row_salt
+        row[column] = _materialize_feature_tree(
+            row[column],
+            salt=salt,
+            position=[0],
+            vary_existing_values=vary_feature_values,
+        )
     return row
 
 
@@ -301,24 +324,14 @@ def generate_mock_parquet_dataset(
     pa, pq = _require_pyarrow()
     options = _adapter_options(config)
     base_row = deepcopy(_load_one_row(source_json))
-    _repair_request_times(base_row, options)
-    request_anchor, candidate_anchor, sequence_suffix = _padding_options(options)
-    live_requests = len(_active_positions(base_row[request_anchor], column=request_anchor))
-    live_candidates = len(
-        _active_positions(base_row[candidate_anchor], column=candidate_anchor)
+    requests_per_row = _axis_length(
+        base_row.get("context_indices"), column="context_indices"
     )
-    live_sequence_tokens = {
-        str(ups): len(
-            _active_positions(
-                base_row[f"{ups}{sequence_suffix}"],
-                column=f"{ups}{sequence_suffix}",
-            )
-        )
-        if any(
-            not _is_fixed_padding_cell(value)
-            for value in base_row[f"{ups}{sequence_suffix}"]
-        )
-        else 0
+    candidates_per_row = _axis_length(
+        base_row.get("target_indices"), column="target_indices"
+    )
+    sequence_tokens = {
+        str(ups): len(base_row[f"{ups}_x_indices"])
         for ups in options.get("ups_types", ())
     }
 
@@ -387,10 +400,10 @@ def generate_mock_parquet_dataset(
         files=files,
         rows_per_file=rows_per_file,
         raw_rows=raw_rows,
-        live_requests_per_raw_row=live_requests,
-        live_candidates_per_raw_row=live_candidates,
-        candidate_rows=raw_rows * live_candidates,
-        live_sequence_tokens_per_raw_row=live_sequence_tokens,
+        requests_per_raw_row=requests_per_row,
+        candidates_per_raw_row=candidates_per_row,
+        candidate_rows=raw_rows * candidates_per_row,
+        sequence_tokens_per_raw_row=sequence_tokens,
         physical_columns=len(schema),
         row_group_size=row_group_size,
         row_groups=total_row_groups,

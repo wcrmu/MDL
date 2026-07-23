@@ -461,8 +461,10 @@ def _environment(config: AppConfig, context: DistributedContext) -> dict[str, An
         "dense_distribution": config.training.dense_distribution,
         "data_reader": {
             "num_workers": train_reader.num_workers,
+            "adapter_workers": train_reader.adapter_workers,
             "prefetch_batches": train_reader.prefetch_batches,
             "scanner_batch_rows": train_reader.scanner_batch_rows,
+            "shuffle_buffer_rows": train_reader.shuffle_buffer_rows,
             "pin_memory": train_reader.pin_memory,
             "coalesce_pinned_tensors": train_reader.coalesce_pinned_tensors,
             "device_prefetch_batches": train_reader.device_prefetch_batches,
@@ -1003,25 +1005,30 @@ def _benchmark_data(
     )
     collector = _TraceCollector(options.warmup_steps, options.measured_steps, context.device)
     total_steps = options.warmup_steps + options.measured_steps
-    for step in range(1, total_steps + 1):
-        started = perf_counter()
-        try:
-            batch = next(iterator)
-        except StopIteration:
-            break
-        elapsed = perf_counter() - started
-        collector.observe(
-            _trace(
-                step=step,
-                rows=int(batch.scenario_id.size(0)),
-                input_tokens=_batch_input_token_count(batch),
-                padded_token_slots=_batch_padded_token_slots(batch),
-                step_seconds=elapsed,
-                dataloader_wait_seconds=elapsed,
-                active_ranks=context.world_size,
-            ),
-            host_batch_bytes=_feature_batch_nbytes(batch),
-        )
+    try:
+        for step in range(1, total_steps + 1):
+            started = perf_counter()
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                break
+            elapsed = perf_counter() - started
+            collector.observe(
+                _trace(
+                    step=step,
+                    rows=int(batch.scenario_id.size(0)),
+                    input_tokens=_batch_input_token_count(batch),
+                    padded_token_slots=_batch_padded_token_slots(batch),
+                    step_seconds=elapsed,
+                    dataloader_wait_seconds=elapsed,
+                    active_ranks=context.world_size,
+                ),
+                host_batch_bytes=_feature_batch_nbytes(batch),
+            )
+    finally:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            close()
     return collector.finish(context.rank, ProfilerSummary())
 
 

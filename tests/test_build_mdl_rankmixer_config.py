@@ -1058,7 +1058,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertTrue(config.training.quick_eval.enabled)
                 self.assertEqual(config.training.quick_eval.split, "train")
                 self.assertEqual(config.data.train.reader.shard_unit, "row_group")
-                self.assertEqual(config.data.train.reader.shuffle_buffer_rows, 8192)
+                self.assertEqual(config.data.train.reader.shuffle_buffer_rows, 512)
                 self.assertEqual(config.data.train.reader.shuffle_seed, 2025)
                 self.assertFalse(config.data.train.prediction_keys)
                 self.assertEqual(
@@ -1081,7 +1081,8 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 for name, limit in adapter_limits.items():
                     self.assertGreaterEqual(limit, main_sequences[name])
                 self.assertTrue(config.data.train.reader.coalesce_pinned_tensors)
-                self.assertEqual(config.data.train.reader.num_workers, 8)
+                self.assertEqual(config.data.train.reader.num_workers, 4)
+                self.assertEqual(config.data.train.reader.adapter_workers, 4)
                 self.assertEqual(config.data.train.reader.scanner_batch_rows, 64)
                 self.assertEqual(
                     config.data.train.reader.device_prefetch_batches,

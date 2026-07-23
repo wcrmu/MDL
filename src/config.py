@@ -454,6 +454,10 @@ class ReaderConfig(_DeeplyImmutableConfig):
     columns_pruning: bool = True
     # PyArrow uses this to size CPU and IO thread pools. Zero means default behavior.
     num_workers: int = 0
+    # CPU-bound Python adapters can run in isolated child processes so agg-row
+    # expansion does not serialize on the training process's GIL. Zero keeps
+    # adapter execution in-process.
+    adapter_workers: int = 0
     # Dataset scanner readahead. Larger values can help throughput but use more memory.
     prefetch_batches: int = 2
     # Hard queue budget per rank. Count and bytes are both enforced.
@@ -543,6 +547,8 @@ class ReaderConfig(_DeeplyImmutableConfig):
             raise ValueError("reader.engine must be 'pyarrow_dataset'")
         if self.num_workers < 0:
             raise ValueError("reader.num_workers must be non-negative")
+        if self.adapter_workers < 0:
+            raise ValueError("reader.adapter_workers must be non-negative")
         if self.prefetch_batches < 0:
             raise ValueError("reader.prefetch_batches must be non-negative")
         if self.max_prefetch_bytes <= 0:

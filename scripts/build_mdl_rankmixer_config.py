@@ -1431,14 +1431,6 @@ def _adapter_options(
             name: f"{name}_x_{TIME_DELTA_FIELD}" for name in EXPECTED_UPS_TYPES
         },
         "time_delta_transform": "log1p_seconds",
-        # fgout agg rows use fixed-width request/candidate/UPS arrays with
-        # recursive zero padding. The adapter compacts those physical slots
-        # before candidate expansion and tensorization.
-        "fixed_padding": {
-            "request_anchor": "search_id",
-            "candidate_anchor": "goods_id_hn",
-            "sequence_anchor_suffix": "_x_time",
-        },
     }
     if coarse_scene:
         if search_scene_ids is None:
@@ -1476,7 +1468,8 @@ def _reader_config(*, training: bool) -> dict[str, Any]:
     result = {
         "engine": "pyarrow_dataset",
         "columns_pruning": True,
-        "num_workers": 8,
+        "num_workers": 4,
+        "adapter_workers": 4,
         "prefetch_batches": 4,
         "max_prefetch_bytes": 2 * 1024**3,
         "scanner_batch_rows": 64,
@@ -1488,7 +1481,7 @@ def _reader_config(*, training: bool) -> dict[str, Any]:
         "trusted_input": True,
     }
     if training:
-        result.update({"shuffle_buffer_rows": 8192, "shuffle_seed": 2025})
+        result.update({"shuffle_buffer_rows": 512, "shuffle_seed": 2025})
     return result
 
 

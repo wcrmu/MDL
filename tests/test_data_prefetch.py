@@ -38,6 +38,7 @@ from src.dataloader import (
 from src.features import _flatten_array_values
 from src.train import (
     _DevicePrefetchIterator,
+    _concat_batch_tables,
     _estimate_prepared_batch_bytes,
     _iter_batch_tables,
     _iter_shuffled_candidate_tables,
@@ -588,6 +589,23 @@ def _multi_chunk_dictionary_list_table(
 
 
 class NestedDictionarySafetyTest(unittest.TestCase):
+    def test_batch_concat_decodes_only_selected_dictionary_rows(self) -> None:
+        table = _multi_chunk_dictionary_list_table(
+            request_ids=["r0", "r0", "r1", "r1"],
+            bags=[[[1, 2], [1, 2]], [[3], [4, 5, 6]]],
+            request_column="search_id",
+            bag_column="bag",
+        )
+
+        combined = _concat_batch_tables(
+            pa,
+            [table.slice(0, 1), table.slice(3, 1)],
+        )
+
+        self.assertEqual(combined["bag"].to_pylist(), [[1, 2], [4, 5, 6]])
+        self.assertTrue(pa.types.is_list(combined.schema.field("bag").type))
+        self.assertEqual(combined["bag"].num_chunks, 1)
+
     def test_safe_table_take_preserves_alignment_under_permutation(self) -> None:
         table = _multi_chunk_dictionary_list_table(
             request_ids=["r0", "r0", "r1", "r1"],
@@ -733,6 +751,7 @@ class DevicePrefetchTest(unittest.TestCase):
         self.assertEqual(iterator.device, torch.device("cuda", 3))
         thread_type.return_value.start.assert_called_once_with()
         iterator.close()
+        thread_type.return_value.join.assert_called_once_with()
 
 
 class ByteBudgetTest(unittest.TestCase):

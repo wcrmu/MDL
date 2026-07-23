@@ -1,6 +1,6 @@
 # MDL HDFS and Parquet Data Contract
 
-Last consolidated: 2026-07-18
+Last consolidated: 2026-07-23
 
 This document describes the upstream HDFS dataset, the two supported Parquet
 layouts, and every physical or adapter-generated field consumed by the current
@@ -149,25 +149,25 @@ For each agg row:
 The adapter expands agg rows into candidate rows while caching normalized
 request payloads once per request.
 
-#### Fixed-width padded agg rows
+#### Anonymized full-width agg rows
 
-Some fgout writers retain fixed physical widths and fill unused request,
-candidate, and UPS slots recursively with `0`, `"0"`, or null. Production
-configs declare `adapter.options.fixed_padding` with `search_id` as the request
-anchor, `goods_id_hn` as the candidate anchor, and `_x_time` as the UPS anchor
-suffix. The adapter validates that live slots form a prefix, then removes the
-trailing padding before request expansion. Under `trusted_input`, one raw row
-is fully validated and later rows use the live-prefix fast path. Padding never
-becomes a candidate, sequence token, tensor element, or H2D transfer.
+In `sample_row_mock_json`, numeric `0` and string `"0"` values are anonymized
+payloads, not padding markers. Every physical request, candidate, and UPS slot
+therefore participates in decoding, candidate expansion, tensorization, and
+H2D transfer. In particular, the sample represents 5 requests, 7 candidates,
+161 impression events, 78 long-click events, and 75 long-view events per raw
+row. The adapter never infers liveness from feature values.
 
 The checked-in `sample_row_mock_json` can be expanded into production-shaped
-benchmark files while preserving these physical padded axes:
+benchmark files while preserving those full axes. The generator replaces
+anonymized feature zeros with deterministic non-zero int64 values, creates
+valid request/membership indices, and retains binary labels:
 
 ~~~bash
 python scripts/generate_mock_parquet.py \
   --source-json sample_row_mock_json \
   --config configs/rankmixer.yaml \
-  --output-dir artifacts/mock_parquet_2x2500_zstd \
+  --output-dir artifacts/mock_parquet_full_2x2500_zstd \
   --files 2 --rows-per-file 2500 --row-group-size 256
 ~~~
 
@@ -175,20 +175,93 @@ Use `benchmark --mode data` for decode/adapter/tensorization/pinning capacity
 and `benchmark --mode end-to-end` for the steady-state data wait, asynchronous
 H2D, GPU utilization, and peak HBM of the real training path. A nonzero warmup
 window is recommended so model initialization and cold file opens stay outside
-the measured interval.
-
-For this two-file mock, the pure-data sweep peaks at a 256-row scanner batch and
-one reader worker. The end-to-end optimum depends on compute overlap, file count,
-and remote-storage latency; production configs therefore keep their concurrent
-HDFS reader settings, coalesce pinned tensors, and disable the measured-negative
-background CUDA-prefetch thread. Re-run the data sweep for each storage layout:
+the measured interval. The optimum depends on sequence widths, compute overlap,
+file count, and remote-storage latency, so re-run the data sweep for each
+storage layout:
 
 ~~~bash
 python scripts/profile_cpu_datapath.py \
   --config configs/rankmixer.yaml \
-  --data-dir artifacts/mock_parquet_2x2500_zstd \
-  --scanner-batch-rows 256 --num-workers 1 --tensorize
+  --data-dir artifacts/mock_parquet_full_2x2500_zstd \
+  --scanner-batch-rows 64 --num-workers 4 --prefetch-batches 4 --tensorize
 ~~~
+
+#### Corrected local benchmark
+
+The corrected benchmark reads ZSTD Parquet directly; JSON is used only once to
+generate the files. The measured dataset has two files with 2,500 aggregate
+rows each, 20 row groups, 293 projected physical columns, 35,000 expanded
+candidate rows, and 539,005,194 compressed bytes. No value-based padding
+compaction is enabled.
+
+On one RTX 4090 with PyTorch 2.6/CUDA 12.4, the selected reader settings are
+four scanner/tensor workers, four process-isolated adapter workers, a
+64-raw-row scanner batch, a 512-row request shuffle buffer, four host-prefetch
+slots with a two-batch startup runway, and no device-prefetch batch. With a
+512-candidate benchmark batch and embedding tables capped to 65,536 rows so
+the model fits this 24-GiB test GPU, the corrected measurements are:
+
+| Measurement | Corrected result |
+|---|---:|
+| Data-only steady throughput | 335.61 candidate rows/s |
+| Data-only mean batch wait | 1.521 s |
+| End-to-end steady throughput | 309.54 candidate rows/s |
+| End-to-end mean step | 1.652 s |
+| End-to-end dataloader wait | 1.036 s (62.72%) |
+| End-to-end average GPU utilization | 10.98% |
+| End-to-end peak CUDA allocated / reserved | 9.88 / 11.52 GiB |
+| Process launch to first completed optimizer step | 16.12 s |
+| First step: data / forward / backward / optimizer | 6.99 / 0.74 / 0.13 / 0.15 s |
+
+The explicit dataloader-wait ratio is larger with device prefetch disabled, but
+throughput is 24.6% higher than the previous 8-tensor-worker,
+8-host-prefetch, 1-device-prefetch result (248.38 rows/s). On this workload,
+concurrent H2D and aggressive data production compete with the CPU-side CUDA
+launch path and slow the model more than the overlap saves.
+
+#### GPU-utilization factor ablation
+
+`scripts/profile_gpu_utilization_factors.py` reuses one real tensorized batch
+so no Parquet worker remains active, then ablates ordinary bag width, sequence
+width, and encoder sections without changing the 512-row batch or RankMixer
+topology:
+
+~~~bash
+CUDA_VISIBLE_DEVICES=0 python scripts/profile_gpu_utilization_factors.py \
+  --warmup-steps 2 --steps 6 --profile \
+  --output artifacts/gpu_util_factors_profiled.json
+~~~
+
+| Reused-batch variant | Mean step | Relative compute cost |
+|---|---:|---:|
+| Full real batch, no concurrent reader | 0.277 s | 100.0% |
+| Sequences cached; 169 ordinary encoders live | 0.129 s | 46.8% |
+| All feature encoders cached; backbone only | 0.0246 s | 8.9% |
+| All ordinary bags truncated to length 1 | 0.263 s | 95.1% |
+| All sequences truncated to length 1 | 0.253 s | 91.5% |
+| Bags and sequences both truncated to length 1 | 0.247 s | 89.1% |
+
+The differences attribute approximately 53.2% of model-side step time to the
+nine sequence encoders, 37.9% to the 169 ordinary feature encoders, and 8.9% to
+the RankMixer backbone and heads. Width alone is not the main problem:
+truncating every ordinary bag to one ID saves only 4.9%, while shortening every
+sequence saves 8.5%. The fixed number of independent encoders and their launch
+granularity dominate.
+
+One profiled full step emitted 17,650 CUDA device events. 90.3% were shorter
+than 10 microseconds and the median duration was 1.34 microseconds. Prominent
+high-count operations included 4,426 `to`, 2,230 `copy_`, 454 `index_add_`,
+264 `linear`, and 248 `mm` calls. Reusing the real batch without any concurrent
+reader raised average GPU utilization from the former 7.54% end-to-end result
+to 62.64%, confirming that CPU launch/memory contention from data production is
+the largest utilization loss on this host.
+
+The 512-row and capped-vocabulary settings above are benchmark-only controls,
+not a claim that the same batch fits every production model. Production H100
+batch sizes remain governed by the configured length buckets. The end-to-end
+GPU utilization is intentionally reported even though it is much lower than
+the compute-only benchmark: the latter does not pay Parquet, adapter,
+tensorization, and full-width bag-feature costs.
 
 ### 3.2 Request layout: req
 

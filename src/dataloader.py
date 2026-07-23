@@ -10,9 +10,9 @@ Remote HDFS/viewfs helpers live here as well (thread-local HadoopFileSystem,
 timed open/close, retry, flock, and pre_buffer Parquet reads).
 """
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Collection, Iterable as RuntimeIterable, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 import fcntl
@@ -24,6 +24,7 @@ import importlib
 import json
 import logging
 import math
+import multiprocessing
 from numbers import Integral, Real
 import os
 import queue
@@ -55,6 +56,11 @@ from .features import (
 )
 
 logger = logging.getLogger(__name__)
+
+_PROCESS_ADAPTER: Callable[..., Any] | None = None
+_PROCESS_ADAPTER_CONTEXT: "ParquetAdapterContext | None" = None
+_PROCESS_ADAPTER_NAME = ""
+_PROCESS_ADAPTER_SPLIT_NAME = ""
 
 # ---------------------------------------------------------------------------
 # Remote filesystem IO (HDFS/viewfs)
@@ -3250,255 +3256,6 @@ def _request_positions(
     return positions
 
 
-def _is_fixed_padding_cell(value: Any) -> bool:
-    """Return whether an explicitly anchored fixed-width slot is padding.
-
-    The production mock uses zero/``"0"``/null recursively for unused slots.
-    This predicate is only used when ``adapter.options.fixed_padding`` opts in,
-    so ordinary datasets retain their existing zero semantics.
-    """
-
-    if value is None:
-        return True
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, (Integral, Real)):
-        return value == 0
-    if isinstance(value, str):
-        return value in {"", "0"}
-    if isinstance(value, (list, tuple)):
-        return all(_is_fixed_padding_cell(item) for item in value)
-    return False
-
-
-def _fixed_padding_positions(
-    value: Any,
-    *,
-    column: str,
-    raw_row: int,
-    validate_contract: bool,
-) -> tuple[list[Any], list[int]]:
-    outer = _as_list(
-        value,
-        column=column,
-        row_index=raw_row,
-        validate_contract=True,
-    )
-    positions: list[int] = []
-    saw_padding = False
-    for position, item in enumerate(outer):
-        if _is_fixed_padding_cell(item):
-            saw_padding = True
-            if not validate_contract:
-                # trusted_input validates one representative row, then takes
-                # the common live-prefix fast path for the remaining rows.
-                break
-            continue
-        if saw_padding:
-            raise ValueError(
-                f"fixed-padding anchor {column!r} has a live slot after padding "
-                f"at raw row {raw_row}, position {position}"
-            )
-        positions.append(position)
-    return outer, positions
-
-
-def _select_fixed_axis(
-    value: Any,
-    positions: Sequence[int],
-    *,
-    expected_length: int,
-    column: str,
-    raw_row: int,
-) -> Any:
-    """Select live slots while keeping optional top-level null columns null."""
-
-    if value is None:
-        return None
-    outer = _as_list(
-        value,
-        column=column,
-        row_index=raw_row,
-        validate_contract=True,
-    )
-    if len(outer) != expected_length:
-        raise ValueError(
-            f"fixed-padding column {column!r} has length {len(outer)}, expected "
-            f"{expected_length} at raw row {raw_row}"
-        )
-    return [outer[position] for position in positions]
-
-
-def _compact_fixed_padding_agg_row(
-    row: Mapping[str, Any],
-    plan: "_MdlRankMixerAdapterPlan",
-    *,
-    raw_row: int,
-    validate_contract: bool,
-) -> dict[str, Any]:
-    """Remove padded request, candidate, and UPS slots from one agg row.
-
-    Request/candidate liveness comes from configured anchor columns. UPS token
-    liveness comes from one anchor per sequence (``<ups>`` plus the configured
-    suffix). Memberships are filtered to live requests and deduplicated because
-    fixed candidate padding can repeat request zero in the physical indices.
-    """
-
-    padding = plan.fixed_padding
-    if padding is None:
-        return dict(row)
-    if "context_indices" not in row or "target_indices" not in row:
-        # Req-layout files have no fixed agg axes and retain their old path.
-        return dict(row)
-    if padding.request_anchor not in row:
-        raise ValueError(
-            f"fixed-padding request anchor {padding.request_anchor!r} is missing"
-        )
-    if padding.candidate_anchor not in row:
-        raise ValueError(
-            f"fixed-padding candidate anchor {padding.candidate_anchor!r} is missing"
-        )
-
-    context_indices = _as_list(
-        row["context_indices"],
-        column="context_indices",
-        row_index=raw_row,
-        validate_contract=True,
-    )
-    target_indices = _as_list(
-        row["target_indices"],
-        column="target_indices",
-        row_index=raw_row,
-        validate_contract=True,
-    )
-    request_anchor, request_positions = _fixed_padding_positions(
-        row[padding.request_anchor],
-        column=padding.request_anchor,
-        raw_row=raw_row,
-        validate_contract=validate_contract,
-    )
-    candidate_anchor, candidate_positions = _fixed_padding_positions(
-        row[padding.candidate_anchor],
-        column=padding.candidate_anchor,
-        raw_row=raw_row,
-        validate_contract=validate_contract,
-    )
-    if len(request_anchor) != len(context_indices):
-        raise ValueError(
-            f"fixed-padding request anchor {padding.request_anchor!r} has length "
-            f"{len(request_anchor)}, expected {len(context_indices)} at raw row {raw_row}"
-        )
-    if len(candidate_anchor) != len(target_indices):
-        raise ValueError(
-            f"fixed-padding candidate anchor {padding.candidate_anchor!r} has length "
-            f"{len(candidate_anchor)}, expected {len(target_indices)} at raw row {raw_row}"
-        )
-    if not request_positions:
-        raise ValueError(f"fixed-padding agg row {raw_row} has no live requests")
-    if not candidate_positions:
-        raise ValueError(f"fixed-padding agg row {raw_row} has no live candidates")
-
-    compact = dict(row)
-    request_axis_columns = set(plan.context_features) | set(plan.request_columns)
-    candidate_axis_columns = (
-        set(plan.item_features)
-        | set(plan.label_columns)
-        | set(plan.label_mask_columns)
-        | set(plan.candidate_metadata_columns)
-    )
-    for canonical, aliases in plan.column_aliases.items():
-        if canonical in candidate_axis_columns:
-            candidate_axis_columns.update(aliases)
-    for column in request_axis_columns:
-        if column in compact:
-            compact[column] = _select_fixed_axis(
-                compact[column],
-                request_positions,
-                expected_length=len(context_indices),
-                column=column,
-                raw_row=raw_row,
-            )
-    for column in candidate_axis_columns:
-        if column in compact:
-            compact[column] = _select_fixed_axis(
-                compact[column],
-                candidate_positions,
-                expected_length=len(target_indices),
-                column=column,
-                raw_row=raw_row,
-            )
-    compact["context_indices"] = [context_indices[index] for index in request_positions]
-    compact["target_indices"] = [target_indices[index] for index in candidate_positions]
-    known_requests = set(compact["context_indices"])
-
-    for ups in plan.ups_types:
-        anchor_column = f"{ups}{padding.sequence_anchor_suffix}"
-        if anchor_column not in compact:
-            raise ValueError(
-                f"fixed-padding sequence anchor {anchor_column!r} is missing"
-            )
-        anchor_values, token_positions = _fixed_padding_positions(
-            compact[anchor_column],
-            column=anchor_column,
-            raw_row=raw_row,
-            validate_contract=validate_contract,
-        )
-        index_column = f"{ups}_x_indices"
-        normalized_memberships: dict[int, list[int]] = {}
-        if index_column in compact:
-            memberships = _as_list(
-                compact[index_column],
-                column=index_column,
-                row_index=raw_row,
-                validate_contract=True,
-            )
-            if len(memberships) != len(anchor_values):
-                raise ValueError(
-                    f"fixed-padding indices {index_column!r} has length "
-                    f"{len(memberships)}, expected {len(anchor_values)} at raw row {raw_row}"
-                )
-            live_positions: list[int] = []
-            for position in token_positions:
-                raw_members = memberships[position]
-                members = (
-                    list(raw_members)
-                    if isinstance(raw_members, (list, tuple))
-                    else [raw_members]
-                )
-                seen: set[int] = set()
-                normalized: list[int] = []
-                for member in members:
-                    request = _request_index(
-                        member,
-                        column=index_column,
-                        row_index=raw_row,
-                        validate_contract=True,
-                    )
-                    if request in known_requests and request not in seen:
-                        normalized.append(request)
-                        seen.add(request)
-                if normalized:
-                    live_positions.append(position)
-                    normalized_memberships[position] = normalized
-            token_positions = live_positions
-
-        for column in plan.raw_sequence_columns_by_type[ups]:
-            if column not in compact:
-                continue
-            compact[column] = _select_fixed_axis(
-                compact[column],
-                token_positions,
-                expected_length=len(anchor_values),
-                column=column,
-                raw_row=raw_row,
-            )
-        if index_column in compact:
-            compact[index_column] = [
-                normalized_memberships[position] for position in token_positions
-            ]
-    return compact
-
-
 def _request_level_value(
     value: Any,
     *,
@@ -4050,15 +3807,6 @@ def _candidate_metadata_arrow_type(pa: Any, raw_type: Any) -> Any:
 
 
 @dataclass(frozen=True)
-class _FixedPaddingPlan:
-    """Physical fixed-width agg axes that must be compacted before expansion."""
-
-    request_anchor: str
-    candidate_anchor: str
-    sequence_anchor_suffix: str
-
-
-@dataclass(frozen=True)
 class _MdlRankMixerAdapterPlan:
     context_features: tuple[str, ...]
     item_features: tuple[str, ...]
@@ -4078,7 +3826,6 @@ class _MdlRankMixerAdapterPlan:
     time_delta_transform: str
     sequence_max_lengths: Mapping[str, int]
     compact_request_lists: bool
-    fixed_padding: _FixedPaddingPlan | None
     request_time_column: str
     aligned_groups: tuple[tuple[str, ...], ...]
     required: tuple[str, ...]
@@ -4089,7 +3836,6 @@ class _MdlRankMixerAdapterPlan:
     label_columns: frozenset[str]
     label_mask_columns: frozenset[str]
     sequence_columns_by_type: Mapping[str, tuple[str, ...]]
-    raw_sequence_columns_by_type: Mapping[str, tuple[str, ...]]
     sequence_columns: frozenset[str]
     time_delta_columns: frozenset[str]
     label_output_columns: tuple[str, ...]
@@ -4157,35 +3903,6 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     compact_request_lists = options.get("compact_request_lists", False)
     if type(compact_request_lists) is not bool:
         raise ValueError("adapter option 'compact_request_lists' must be a boolean")
-    raw_fixed_padding = options.get("fixed_padding")
-    fixed_padding: _FixedPaddingPlan | None = None
-    if raw_fixed_padding is not None:
-        if not isinstance(raw_fixed_padding, Mapping):
-            raise ValueError("adapter option 'fixed_padding' must be an object")
-        unknown_padding_options = sorted(
-            set(raw_fixed_padding)
-            - {"request_anchor", "candidate_anchor", "sequence_anchor_suffix"}
-        )
-        if unknown_padding_options:
-            raise ValueError(
-                "adapter option 'fixed_padding' contains unknown keys: "
-                + ", ".join(unknown_padding_options)
-            )
-        request_anchor = str(raw_fixed_padding.get("request_anchor", ""))
-        candidate_anchor = str(raw_fixed_padding.get("candidate_anchor", ""))
-        sequence_anchor_suffix = str(
-            raw_fixed_padding.get("sequence_anchor_suffix", "_x_time")
-        )
-        if not request_anchor or not candidate_anchor or not sequence_anchor_suffix:
-            raise ValueError(
-                "adapter option 'fixed_padding' requires non-empty request_anchor, "
-                "candidate_anchor, and sequence_anchor_suffix"
-            )
-        fixed_padding = _FixedPaddingPlan(
-            request_anchor=request_anchor,
-            candidate_anchor=candidate_anchor,
-            sequence_anchor_suffix=sequence_anchor_suffix,
-        )
     if time_delta_transform not in {"raw_ms", "seconds", "log1p_seconds"}:
         raise ValueError(
             "adapter option 'time_delta_transform' must be raw_ms, seconds, "
@@ -4205,15 +3922,6 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     item_set = frozenset(item_features)
     if context_set & item_set:
         raise ValueError("context_features and item_features must be disjoint")
-    if fixed_padding is not None:
-        if fixed_padding.request_anchor not in context_set | set(request_columns):
-            raise ValueError(
-                "fixed_padding.request_anchor must be a context feature or request column"
-            )
-        if fixed_padding.candidate_anchor not in item_set:
-            raise ValueError(
-                "fixed_padding.candidate_anchor must be an item feature"
-            )
     known_alias_targets = (
         context_set
         | item_set
@@ -4280,18 +3988,6 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         for column in columns
     )
     time_delta_columns = frozenset(time_delta_outputs.values())
-    raw_sequence_columns_by_type = {
-        ups: tuple(
-            dict.fromkeys(
-                [
-                    *sequence_columns_by_type[ups],
-                    f"{ups}_x_time",
-                    f"{ups}_x_indices",
-                ]
-            )
-        )
-        for ups in ups_types
-    }
     derived_request_columns = (
         frozenset() if coarse_scene is None else coarse_scene.derived_columns
     )
@@ -4432,7 +4128,6 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         time_delta_transform=time_delta_transform,
         sequence_max_lengths=sequence_max_lengths,
         compact_request_lists=compact_request_lists,
-        fixed_padding=fixed_padding,
         request_time_column=request_time_column,
         aligned_groups=aligned_groups,
         required=required,
@@ -4443,7 +4138,6 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         label_columns=label_columns,
         label_mask_columns=label_mask_columns,
         sequence_columns_by_type=sequence_columns_by_type,
-        raw_sequence_columns_by_type=raw_sequence_columns_by_type,
         sequence_columns=sequence_columns,
         time_delta_columns=time_delta_columns,
         label_output_columns=label_output_columns,
@@ -4616,13 +4310,6 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
 
     for raw_row in range(table.num_rows):
         row = {column: values[raw_row] for column, values in raw.items()}
-        if is_agg and plan.fixed_padding is not None:
-            row = _compact_fixed_padding_agg_row(
-                row,
-                plan,
-                raw_row=raw_row,
-                validate_contract=not trusted_input,
-            )
         if is_agg:
             context_indices = _as_list(
                 row["context_indices"],
@@ -5423,6 +5110,119 @@ def _validate_flat_table_contract(
     _validate_complete_label_contract(split, table, required_columns)
 
 
+def _initialize_adapter_process(
+    adapter_name: str,
+    split_name: str,
+    required_columns: tuple[str, ...],
+    options: dict[str, Any],
+    trusted_input: bool,
+) -> None:
+    """Initialize one isolated adapter worker without touching CUDA state."""
+
+    global _PROCESS_ADAPTER
+    global _PROCESS_ADAPTER_CONTEXT
+    global _PROCESS_ADAPTER_NAME
+    global _PROCESS_ADAPTER_SPLIT_NAME
+
+    module_name, attribute_name = adapter_name.split(":", 1)
+    module = importlib.import_module(module_name)
+    target: Any = module
+    for part in attribute_name.split("."):
+        target = getattr(target, part)
+    if not callable(target):
+        raise TypeError(f"parquet adapter {adapter_name!r} is not callable")
+    _PROCESS_ADAPTER = target
+    _PROCESS_ADAPTER_CONTEXT = ParquetAdapterContext(
+        split_name=split_name,
+        required_columns=required_columns,
+        options=options,
+        trusted_input=trusted_input,
+    )
+    _PROCESS_ADAPTER_NAME = adapter_name
+    _PROCESS_ADAPTER_SPLIT_NAME = split_name
+
+
+def _adapt_table_in_process(raw_table: Any) -> list[Any]:
+    """Apply the process-local adapter and return materialized Arrow tables."""
+
+    if _PROCESS_ADAPTER is None or _PROCESS_ADAPTER_CONTEXT is None:
+        raise RuntimeError("Parquet adapter process was not initialized")
+    result = _PROCESS_ADAPTER(raw_table, context=_PROCESS_ADAPTER_CONTEXT)
+    return list(
+        _normalize_adapter_result(
+            result,
+            _PROCESS_ADAPTER_NAME,
+            _PROCESS_ADAPTER_SPLIT_NAME,
+        )
+    )
+
+
+def _iter_process_adapter_results(
+    raw_tables: Iterable[Any],
+    *,
+    adapter_name: str,
+    context: ParquetAdapterContext,
+    worker_count: int,
+    max_pending: int,
+) -> Iterator[tuple[int, list[Any]]]:
+    """Adapt raw Arrow tables concurrently in deterministic input order."""
+
+    pending: deque[tuple[int, Any]] = deque()
+    source = iter(raw_tables)
+    exhausted = False
+    previous_mkl_force = os.environ.get("MKL_SERVICE_FORCE_INTEL")
+    # Conda's mkl-service can otherwise abort a clean forkserver/spawn child
+    # when the launcher already imported a libgomp-using extension.
+    os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
+    executor: ProcessPoolExecutor | None = None
+    try:
+        executor = ProcessPoolExecutor(
+            max_workers=worker_count,
+            # Forkserver children inherit neither the CUDA-initialized training
+            # process nor its threads. Fall back to spawn off Linux.
+            mp_context=multiprocessing.get_context(
+                "forkserver"
+                if "forkserver" in multiprocessing.get_all_start_methods()
+                else "spawn"
+            ),
+            initializer=_initialize_adapter_process,
+            initargs=(
+                adapter_name,
+                context.split_name,
+                context.required_columns,
+                dict(context.options),
+                context.trusted_input,
+            ),
+        )
+        while pending or not exhausted:
+            while len(pending) < max_pending and not exhausted:
+                try:
+                    raw_table = next(source)
+                except StopIteration:
+                    exhausted = True
+                    break
+                pending.append(
+                    (
+                        int(raw_table.num_rows),
+                        executor.submit(_adapt_table_in_process, raw_table),
+                    )
+                )
+            if not pending:
+                break
+            raw_rows, future = pending.popleft()
+            yield raw_rows, future.result()
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        if previous_mkl_force is None:
+            os.environ.pop("MKL_SERVICE_FORCE_INTEL", None)
+        else:
+            os.environ["MKL_SERVICE_FORCE_INTEL"] = previous_mkl_force
+        close = getattr(source, "close", None)
+        if callable(close):
+            close()
+
+
 def _iter_adapted_flat_tables(
     config: AppConfig,
     split_name: str,
@@ -5434,46 +5234,90 @@ def _iter_adapted_flat_tables(
     counters: _FlatScanCounters | None = None,
     max_batches: int | None = None,
 ) -> Iterator[Any]:
-    raw_batch_index = 0
     validated_static_contract = False
     # Complete-label paths omit masks; every flat batch must still prove 0/1/no-null.
     complete_label_contract = not bool(scanner.split.label_masks)
-    for raw_table in scanner.iter_tables():
-        if max_batches is not None and raw_batch_index >= max_batches:
-            break
-        raw_batch_index += 1
-        if counters is not None:
-            counters.raw_record_batches += 1
-            counters.raw_rows += raw_table.num_rows
-        try:
-            result = adapter(raw_table, context=context)
-            flat_tables = _normalize_adapter_result(result, adapter_name, split_name)
-            for flat_table in flat_tables:
-                if not validated_static_contract:
-                    _validate_flat_table_static_contract(
-                        config,
-                        scanner.split,
-                        split_name,
-                        flat_table,
-                        required_columns,
-                    )
-                    validated_static_contract = flat_table.num_rows > 0
-                if complete_label_contract:
-                    _validate_complete_label_contract(
-                        scanner.split,
-                        flat_table,
-                        required_columns,
-                    )
-                if counters is not None:
-                    counters.flat_tables += 1
-                    counters.flat_rows += flat_table.num_rows
-                yield flat_table
-        except Exception as error:
-            if adapter_name == "identity":
-                raise
-            raise RuntimeError(
-                f"parquet adapter {adapter_name!r} failed for split {split_name!r}: {error}"
-            ) from error
+
+    def limited_raw_tables() -> Iterator[Any]:
+        for raw_batch_index, raw_table in enumerate(scanner.iter_tables()):
+            if max_batches is not None and raw_batch_index >= max_batches:
+                break
+            yield raw_table
+
+    adapter_workers = scanner.split.reader.adapter_workers
+    if adapter_workers > 0 and adapter_name != "identity":
+        adapted_results: Iterable[tuple[int, list[Any]]] = (
+            _iter_process_adapter_results(
+                limited_raw_tables(),
+                adapter_name=adapter_name,
+                context=context,
+                worker_count=adapter_workers,
+                max_pending=max(
+                    adapter_workers,
+                    min(
+                        max(adapter_workers, scanner.split.reader.prefetch_batches),
+                        adapter_workers * 2,
+                    ),
+                ),
+            )
+        )
+    else:
+        def sequential_results() -> Iterator[tuple[int, list[Any]]]:
+            for raw_table in limited_raw_tables():
+                result = adapter(raw_table, context=context)
+                yield int(raw_table.num_rows), list(
+                    _normalize_adapter_result(result, adapter_name, split_name)
+                )
+
+        adapted_results = sequential_results()
+
+    adapted_iterator = iter(adapted_results)
+    try:
+        while True:
+            try:
+                raw_rows, flat_tables = next(adapted_iterator)
+            except StopIteration:
+                break
+            except Exception as error:
+                if adapter_name == "identity":
+                    raise
+                raise RuntimeError(
+                    f"parquet adapter {adapter_name!r} failed for split {split_name!r}: {error}"
+                ) from error
+            if counters is not None:
+                counters.raw_record_batches += 1
+                counters.raw_rows += raw_rows
+            try:
+                for flat_table in flat_tables:
+                    if not validated_static_contract:
+                        _validate_flat_table_static_contract(
+                            config,
+                            scanner.split,
+                            split_name,
+                            flat_table,
+                            required_columns,
+                        )
+                        validated_static_contract = flat_table.num_rows > 0
+                    if complete_label_contract:
+                        _validate_complete_label_contract(
+                            scanner.split,
+                            flat_table,
+                            required_columns,
+                        )
+                    if counters is not None:
+                        counters.flat_tables += 1
+                        counters.flat_rows += flat_table.num_rows
+                    yield flat_table
+            except Exception as error:
+                if adapter_name == "identity":
+                    raise
+                raise RuntimeError(
+                    f"parquet adapter {adapter_name!r} failed for split {split_name!r}: {error}"
+                ) from error
+    finally:
+        close = getattr(adapted_iterator, "close", None)
+        if callable(close):
+            close()
 
 def iter_flat_tables(
     config: AppConfig,
