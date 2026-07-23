@@ -246,6 +246,7 @@ class TraceCollectorTest(unittest.TestCase):
         summary = collector.finish(0, ProfilerSummary())
         self.assertEqual([trace.step for trace in summary.traces], [2, 3])
         self.assertEqual(summary.host_batch_bytes_peak, 30)
+        self.assertTrue(collector._measurement_stopped)
 
     def test_report_uses_rank_max_step_and_global_samples(self) -> None:
         traces = (
@@ -281,6 +282,41 @@ class TraceCollectorTest(unittest.TestCase):
         self.assertEqual(report.samples_per_second, 1.0)
         self.assertEqual(report.p95_step_seconds, 4.0)
         self.assertEqual(report.benchmark_options["measured_steps"], 2)
+
+    def test_report_prefers_synchronized_measurement_wall_time(self) -> None:
+        traces = (
+            _trace(step=1, rows=3, input_tokens=6, step_seconds=2.0),
+            _trace(step=2, rows=3, input_tokens=6, step_seconds=4.0),
+        )
+        local = LocalBenchmarkSummary(
+            rank=0,
+            traces=traces,
+            peak_hbm_allocated_bytes=0,
+            peak_hbm_reserved_bytes=0,
+            process_peak_rss_bytes=100,
+            cpu_utilization_percent=50.0,
+            gpu_utilization_percent=None,
+            measurement_elapsed_seconds=8.0,
+        )
+        context = DistributedContext(
+            enabled=False,
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            device=torch.device("cpu"),
+        )
+
+        with patch("src.benchmark._environment", return_value={"device": "cpu"}):
+            report = _build_report(
+                SimpleNamespace(),
+                context,
+                BenchmarkOptions(mode="compute", warmup_steps=0, measured_steps=2),
+                local,
+            )
+
+        self.assertEqual(report.elapsed_seconds, 8.0)
+        self.assertEqual(report.mean_step_seconds, 4.0)
+        self.assertEqual(report.samples_per_second, 0.75)
 
     def test_sequence_token_metrics_exclude_categorical_bags(self) -> None:
         row_indices = torch.tensor([0, 0, 1, 1])

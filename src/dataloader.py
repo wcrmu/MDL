@@ -5,12 +5,17 @@ from __future__ import annotations  # Defer annotation evaluation for forward re
 This module owns the complete input path: it discovers and shards Parquet
 files, streams Arrow batches, encodes configured features, and builds the
 ``FeatureBatch`` objects consumed by training and inference.
+
+Remote HDFS/viewfs helpers live here as well (thread-local HadoopFileSystem,
+timed open/close, retry, flock, and pre_buffer Parquet reads).
 """
 
 from collections import defaultdict
 from collections.abc import Collection, Iterable as RuntimeIterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+import fcntl
 import fnmatch
 from hashlib import sha256
 from itertools import islice
@@ -22,11 +27,12 @@ import math
 from numbers import Integral, Real
 import os
 import queue
+import tempfile
 import threading
 import time
 from pathlib import Path
 from types import GeneratorType
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, TypeVar
 from urllib.parse import unquote, urlsplit
 
 import torch
@@ -47,18 +53,633 @@ from .features import (
     encode_categorical_value,
     encode_categorical_values,
 )
-from .remote_io import (
-    RemoteIoPolicy,
-    apply_worker_stagger,
-    close_hdfs_native_file,
-    iter_parquet_record_batches,
-    open_parquet_via_native,
-    run_under_file_lock,
-    scaled_hdfs_prefetch_workers,
-    thread_local_hdfs_filesystem,
-)
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Remote filesystem IO (HDFS/viewfs)
+#
+# Eason-equivalent model inside one DDP rank:
+# - each prefetch worker uses a thread-local HadoopFileSystem (own DFSClient)
+# - open via open_input_file with timeout / retry / defensive flock
+# - ParquetFile(native_file, pre_buffer=True) + iter_batches(use_threads=False)
+# - timed native_file.close() so a corrupted stream cannot hang forever
+# ---------------------------------------------------------------------------
+
+T = TypeVar("T")
+
+_RETRYABLE_NEEDLES = (
+    "filesystem closed",
+    "connection reset",
+    "connection refused",
+    "broken pipe",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "resource temporarily",
+    "namenode",
+    "datanode",
+    "errno 255",
+    "errno 110",
+    "econnreset",
+    "eagain",
+)
+
+_DEFAULT_NODE_CPU_COUNT = 64
+_THREAD_LOCAL = threading.local()
+
+
+class RemoteIoTimeoutError(TimeoutError):
+    """Raised when a remote IO call exceeds its configured timeout."""
+
+
+@dataclass(frozen=True)
+class RemoteIoPolicy:
+    """Resolved remote-IO policy for one Parquet scanner."""
+
+    enabled: bool
+    op_timeout: float
+    open_timeout: float
+    retry_count: int
+    retry_base_sec: float
+    file_lock: bool
+    on_failure: Literal["fail", "skip"]
+    worker_stagger_sec: float
+    pre_buffer: bool = True
+    close_timeout: float = 5.0
+
+    @classmethod
+    def disabled(cls) -> "RemoteIoPolicy":
+        return cls(
+            enabled=False,
+            op_timeout=30.0,
+            open_timeout=120.0,
+            retry_count=0,
+            retry_base_sec=0.5,
+            file_lock=False,
+            on_failure="fail",
+            worker_stagger_sec=0.0,
+            pre_buffer=False,
+            close_timeout=5.0,
+        )
+
+    @classmethod
+    def from_reader(cls, reader: Any, *, remote: bool) -> "RemoteIoPolicy":
+        if not remote:
+            return cls.disabled()
+        return cls(
+            enabled=True,
+            op_timeout=float(reader.hdfs_op_timeout),
+            open_timeout=float(reader.hdfs_open_timeout),
+            retry_count=int(reader.hdfs_retry_count),
+            retry_base_sec=float(reader.hdfs_retry_base_sec),
+            file_lock=bool(reader.hdfs_file_lock),
+            on_failure=reader.on_hdfs_failure,
+            worker_stagger_sec=float(reader.worker_stagger_sec),
+            pre_buffer=bool(getattr(reader, "hdfs_pre_buffer", True)),
+            close_timeout=float(getattr(reader, "hdfs_close_timeout", 5.0)),
+        )
+
+    @property
+    def skip_on_failure(self) -> bool:
+        return self.enabled and self.on_failure == "skip"
+
+
+class PerFileLock:
+    """Serialize access to one URI across threads and local processes.
+
+    Defensive only: root cause of DFSClient corruption is shared filesystem
+    objects across threads, fixed by thread-local clients. Flock still helps
+    when multiple ranks on one node touch the same URI (e.g. row_group LPT).
+    """
+
+    _thread_locks: dict[str, threading.RLock] = {}
+    _registry_guard = threading.Lock()
+
+    def __init__(self, key: str, *, enabled: bool) -> None:
+        self.key = key
+        self.enabled = enabled
+        self._thread_lock: threading.RLock | None = None
+        self._file_handle: Any | None = None
+        if enabled:
+            self._thread_lock = self._lock_for(key)
+
+    @classmethod
+    def _lock_for(cls, key: str) -> threading.RLock:
+        with cls._registry_guard:
+            lock = cls._thread_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                cls._thread_locks[key] = lock
+            return lock
+
+    def __enter__(self) -> "PerFileLock":
+        if not self.enabled:
+            return self
+        assert self._thread_lock is not None
+        self._thread_lock.acquire()
+        lock_dir = Path(tempfile.gettempdir()) / "mdl-hdfs-file-locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        digest = sha256(self.key.encode("utf-8")).hexdigest()
+        lock_path = lock_dir / digest
+        handle = open(lock_path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            handle.close()
+            self._thread_lock.release()
+            raise
+        self._file_handle = handle
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if not self.enabled:
+            return
+        handle = self._file_handle
+        self._file_handle = None
+        if handle is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+        if self._thread_lock is not None:
+            self._thread_lock.release()
+
+
+def is_retryable_remote_error(error: BaseException) -> bool:
+    """Return True for transient remote IO failures worth retrying."""
+
+    if isinstance(error, (RemoteIoTimeoutError, TimeoutError, InterruptedError)):
+        return True
+    if isinstance(error, (BlockingIOError, ConnectionError, BrokenPipeError, OSError)):
+        return True
+    text = f"{type(error).__name__}: {error}".lower()
+    return any(needle in text for needle in _RETRYABLE_NEEDLES)
+
+
+def call_with_timeout(
+    fn: Callable[[], T],
+    timeout_sec: float,
+    *,
+    description: str = "remote IO",
+) -> T:
+    """Run ``fn`` in a daemon thread and raise if it exceeds ``timeout_sec``."""
+
+    if timeout_sec <= 0:
+        return fn()
+
+    result_box: list[T] = []
+    error_box: list[BaseException] = []
+    done = threading.Event()
+
+    def runner() -> None:
+        try:
+            result_box.append(fn())
+        except BaseException as error:  # noqa: BLE001 - surface to caller
+            error_box.append(error)
+        finally:
+            done.set()
+
+    thread = threading.Thread(
+        target=runner,
+        name=f"remote-io-timeout:{description[:48]}",
+        daemon=True,
+    )
+    thread.start()
+    if not done.wait(timeout_sec):
+        raise RemoteIoTimeoutError(
+            f"{description} timed out after {timeout_sec:.1f}s"
+        )
+    if error_box:
+        raise error_box[0]
+    return result_box[0]
+
+
+def retry_with_backoff(
+    fn: Callable[[], T],
+    *,
+    retries: int,
+    base_sec: float,
+    description: str,
+    is_retryable: Callable[[BaseException], bool] = is_retryable_remote_error,
+) -> T:
+    """Invoke ``fn`` with exponential backoff on transient failures."""
+
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except BaseException as error:
+            if attempt >= retries or not is_retryable(error):
+                raise
+            delay = base_sec * (2**attempt)
+            logger.warning(
+                "%s failed (%s); retry %d/%d in %.2fs",
+                description,
+                error,
+                attempt + 1,
+                retries,
+                delay,
+            )
+            time.sleep(delay)
+            attempt += 1
+
+
+def apply_worker_stagger(rank: int, stagger_sec: float) -> None:
+    """Sleep so DDP ranks open remote files at staggered times."""
+
+    if stagger_sec <= 0 or rank <= 0:
+        return
+    delay = float(stagger_sec) * int(rank)
+    logger.info(
+        "staggering remote parquet scanner start by %.2fs for shard_rank=%d",
+        delay,
+        rank,
+    )
+    time.sleep(delay)
+
+
+def run_remote_op(
+    fn: Callable[[], T],
+    policy: RemoteIoPolicy,
+    *,
+    description: str,
+    timeout_sec: float | None = None,
+) -> T:
+    """Run a remote op with timeout + retry when the policy is enabled."""
+
+    if not policy.enabled:
+        return fn()
+    effective_timeout = policy.op_timeout if timeout_sec is None else timeout_sec
+
+    def once() -> T:
+        return call_with_timeout(
+            fn,
+            effective_timeout,
+            description=description,
+        )
+
+    return retry_with_backoff(
+        once,
+        retries=policy.retry_count,
+        base_sec=policy.retry_base_sec,
+        description=description,
+    )
+
+
+def maybe_skip_or_raise(
+    error: BaseException,
+    policy: RemoteIoPolicy,
+    *,
+    description: str,
+) -> bool:
+    """Log and return True when the policy says to skip; otherwise re-raise."""
+
+    if policy.skip_on_failure:
+        logger.warning("skipping %s after failure: %s", description, error)
+        return True
+    raise error
+
+
+def run_under_file_lock(
+    fn: Callable[[], T],
+    *,
+    lock_key: str,
+    policy: RemoteIoPolicy,
+    description: str,
+    timeout_sec: float | None = None,
+) -> T:
+    """Hold the per-URI lock while running a timeout/retry protected call."""
+
+    with PerFileLock(lock_key, enabled=policy.file_lock):
+        return run_remote_op(
+            fn,
+            policy,
+            description=description,
+            timeout_sec=timeout_sec,
+        )
+
+
+def scaled_hdfs_prefetch_workers(
+    *,
+    world_size: int,
+    num_workers: int,
+    prefetch_batches: int,
+    work_item_count: int,
+    remote: bool,
+    cpu_count: int = _DEFAULT_NODE_CPU_COUNT,
+) -> int:
+    """Bound concurrent readers; on HDFS scale with GPU count up to 4/rank."""
+
+    if prefetch_batches <= 0 or work_item_count <= 0:
+        return 0
+    if not remote:
+        worker_budget = num_workers if num_workers > 0 else 4
+        return min(work_item_count, prefetch_batches, worker_budget, 4)
+
+    auto = min(4, max(1, int(cpu_count) // (2 * max(1, int(world_size)))))
+    if num_workers <= 0:
+        configured = auto
+    elif num_workers >= 4:
+        configured = min(auto, num_workers)
+    else:
+        configured = num_workers
+    return min(work_item_count, prefetch_batches, max(1, configured))
+
+
+def is_hdfs_filesystem(filesystem: Any) -> bool:
+    """Best-effort type/name check for pyarrow HadoopFileSystem."""
+
+    if filesystem is None:
+        return False
+    type_name = type(filesystem).__name__.lower()
+    module_name = type(filesystem).__module__.lower()
+    return "hadoop" in type_name or "hadoop" in module_name or "hdfs" in type_name
+
+
+def _filesystem_from_uri(filesystem_key: str) -> Any:
+    """Create a filesystem from a URI; isolated for tests to patch."""
+
+    import pyarrow.fs as pafs
+
+    filesystem, _parsed = pafs.FileSystem.from_uri(filesystem_key)
+    return filesystem
+
+
+def thread_local_hdfs_filesystem(
+    filesystem_key: str,
+    *,
+    prototype: Any | None = None,
+) -> Any:
+    """Return a per-thread filesystem for ``filesystem_key``.
+
+    Reuses ``prototype`` only on the first call for that key in this thread when
+    cloning via ``from_uri`` is unnecessary (local FS). For remote keys, always
+    builds a fresh ``FileSystem.from_uri(filesystem_key)`` so each worker owns
+    an independent DFSClient.
+    """
+
+    cache: dict[str, Any] | None = getattr(_THREAD_LOCAL, "filesystems", None)
+    if cache is None:
+        cache = {}
+        _THREAD_LOCAL.filesystems = cache
+    cached = cache.get(filesystem_key)
+    if cached is not None:
+        return cached
+
+    if filesystem_key.startswith("file://") or filesystem_key == "file://":
+        if prototype is not None:
+            cache[filesystem_key] = prototype
+            return prototype
+        import pyarrow.fs as pafs
+
+        filesystem = pafs.LocalFileSystem()
+        cache[filesystem_key] = filesystem
+        return filesystem
+
+    filesystem = _filesystem_from_uri(filesystem_key)
+    cache[filesystem_key] = filesystem
+    return filesystem
+
+
+def close_hdfs_native_file(
+    native_file: Any,
+    *,
+    timeout_sec: float = 5.0,
+    description: str = "close hdfs native file",
+) -> None:
+    """Close a native input stream with a short timeout; abandon on hang."""
+
+    if native_file is None:
+        return
+    close = getattr(native_file, "close", None)
+    if not callable(close):
+        return
+    try:
+        call_with_timeout(close, timeout_sec, description=description)
+    except RemoteIoTimeoutError:
+        logger.warning("%s timed out after %.1fs; abandoning handle", description, timeout_sec)
+    except BaseException as error:
+        logger.warning("%s failed: %s", description, error)
+
+
+def open_hdfs_input_with_protection(
+    filesystem: Any,
+    fs_path: str,
+    *,
+    lock_key: str,
+    policy: RemoteIoPolicy,
+    description: str | None = None,
+) -> Any:
+    """Open ``fs_path`` under flock + timeout + retry; return native file."""
+
+    label = description or f"open_input_file {lock_key}"
+
+    def open_fn() -> Any:
+        return filesystem.open_input_file(fs_path)
+
+    with PerFileLock(lock_key, enabled=policy.file_lock):
+        return run_remote_op(
+            open_fn,
+            policy,
+            description=label,
+            timeout_sec=policy.open_timeout if policy.enabled else policy.op_timeout,
+        )
+
+
+def open_parquet_via_native(
+    *,
+    filesystem: Any,
+    fs_path: str,
+    lock_key: str,
+    policy: RemoteIoPolicy,
+    pq_module: Any,
+    description: str | None = None,
+) -> tuple[Any, Any | None]:
+    """Open a ``ParquetFile``, using native_file + pre_buffer on remote FS.
+
+    Returns ``(parquet_file, native_file_or_none)``. Caller must close the
+    native file with ``close_hdfs_native_file`` when not None.
+    """
+
+    label = description or f"open parquet {lock_key}"
+    if not policy.enabled:
+        return pq_module.ParquetFile(fs_path, filesystem=filesystem), None
+
+    native_file = open_hdfs_input_with_protection(
+        filesystem,
+        fs_path,
+        lock_key=lock_key,
+        policy=policy,
+        description=f"{label} (native open)",
+    )
+
+    def build() -> Any:
+        return pq_module.ParquetFile(
+            native_file,
+            pre_buffer=policy.pre_buffer,
+        )
+
+    try:
+        parquet_file = run_remote_op(
+            build,
+            policy,
+            description=f"{label} (ParquetFile)",
+            timeout_sec=policy.open_timeout,
+        )
+    except BaseException:
+        close_hdfs_native_file(
+            native_file,
+            timeout_sec=policy.close_timeout,
+            description=f"{label} (close after open failure)",
+        )
+        raise
+    return parquet_file, native_file
+
+
+@contextmanager
+def parquet_native_session(
+    *,
+    filesystem_key: str,
+    fs_path: str,
+    lock_key: str,
+    policy: RemoteIoPolicy,
+    pq_module: Any,
+    prototype: Any | None = None,
+    description: str | None = None,
+) -> Iterator[tuple[Any, Any | None]]:
+    """Thread-local FS + protected open; always timed-close the native handle."""
+
+    filesystem = thread_local_hdfs_filesystem(
+        filesystem_key,
+        prototype=prototype,
+    )
+    parquet_file, native_file = open_parquet_via_native(
+        filesystem=filesystem,
+        fs_path=fs_path,
+        lock_key=lock_key,
+        policy=policy,
+        pq_module=pq_module,
+        description=description,
+    )
+    try:
+        yield parquet_file, native_file
+    finally:
+        close_hdfs_native_file(
+            native_file,
+            timeout_sec=policy.close_timeout,
+            description=f"{description or lock_key} (native close)",
+        )
+
+
+def iter_parquet_record_batches(
+    *,
+    fs_path: str,
+    filesystem: Any,
+    lock_key: str,
+    policy: RemoteIoPolicy,
+    pq_module: Any,
+    filesystem_key: str | None = None,
+    stop_event: threading.Event | None = None,
+    description: str | None = None,
+    **iter_kwargs: Any,
+) -> Iterator[Any]:
+    """Open and stream ``iter_batches`` under one remote IO session.
+
+    Remote path uses thread-local FS + native_file + pre_buffer. Local path
+    keeps a plain ``ParquetFile`` open. ``on_hdfs_failure: skip`` applies to
+    body reads only.
+    """
+
+    label = description or f"read parquet {lock_key}"
+    kwargs = dict(iter_kwargs)
+    if policy.enabled:
+        kwargs["use_threads"] = False
+
+    resolved_key = filesystem_key
+    if resolved_key is None and filesystem is not None:
+        # Best-effort: callers should pass filesystem_key for TLS cloning.
+        resolved_key = "hdfs://" if policy.enabled else "file://"
+
+    try:
+        if policy.enabled:
+            fs = thread_local_hdfs_filesystem(
+                resolved_key or "hdfs://",
+                prototype=filesystem,
+            )
+            parquet_file, native_file = open_parquet_via_native(
+                filesystem=fs,
+                fs_path=fs_path,
+                lock_key=lock_key,
+                policy=policy,
+                pq_module=pq_module,
+                description=label,
+            )
+        else:
+            native_file = None
+            with PerFileLock(lock_key, enabled=False):
+                parquet_file = pq_module.ParquetFile(fs_path, filesystem=filesystem)
+    except BaseException as error:
+        if maybe_skip_or_raise(error, policy, description=f"{label} (open)"):
+            return
+        raise
+
+    batch_iterator: Any = None
+    try:
+        try:
+            batch_iterator = run_remote_op(
+                lambda: iter(parquet_file.iter_batches(**kwargs)),
+                policy,
+                description=f"{label} (start)",
+                timeout_sec=policy.open_timeout if policy.enabled else policy.op_timeout,
+            )
+        except BaseException as error:
+            if maybe_skip_or_raise(error, policy, description=f"{label} (start)"):
+                return
+            raise
+
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return
+
+            def next_batch(iterator: Any = batch_iterator) -> Any:
+                return next(iterator)
+
+            try:
+                yield run_remote_op(
+                    next_batch,
+                    policy,
+                    description=f"{label} (batch)",
+                    timeout_sec=policy.op_timeout,
+                )
+            except StopIteration:
+                return
+            except BaseException as error:
+                if maybe_skip_or_raise(
+                    error,
+                    policy,
+                    description=f"{label} (batch)",
+                ):
+                    return
+                raise
+    finally:
+        if batch_iterator is not None:
+            close = getattr(batch_iterator, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except BaseException as error:
+                    logger.warning(
+                        "failed to close batch iterator for %s: %s",
+                        label,
+                        error,
+                    )
+        close_hdfs_native_file(
+            native_file,
+            timeout_sec=policy.close_timeout,
+            description=f"{label} (native close)",
+        )
+
 
 # Changing the planner algorithm changes which distributed rank sees each row
 # group, so the version participates in the persisted diagnostic fingerprint.
@@ -2629,6 +3250,255 @@ def _request_positions(
     return positions
 
 
+def _is_fixed_padding_cell(value: Any) -> bool:
+    """Return whether an explicitly anchored fixed-width slot is padding.
+
+    The production mock uses zero/``"0"``/null recursively for unused slots.
+    This predicate is only used when ``adapter.options.fixed_padding`` opts in,
+    so ordinary datasets retain their existing zero semantics.
+    """
+
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (Integral, Real)):
+        return value == 0
+    if isinstance(value, str):
+        return value in {"", "0"}
+    if isinstance(value, (list, tuple)):
+        return all(_is_fixed_padding_cell(item) for item in value)
+    return False
+
+
+def _fixed_padding_positions(
+    value: Any,
+    *,
+    column: str,
+    raw_row: int,
+    validate_contract: bool,
+) -> tuple[list[Any], list[int]]:
+    outer = _as_list(
+        value,
+        column=column,
+        row_index=raw_row,
+        validate_contract=True,
+    )
+    positions: list[int] = []
+    saw_padding = False
+    for position, item in enumerate(outer):
+        if _is_fixed_padding_cell(item):
+            saw_padding = True
+            if not validate_contract:
+                # trusted_input validates one representative row, then takes
+                # the common live-prefix fast path for the remaining rows.
+                break
+            continue
+        if saw_padding:
+            raise ValueError(
+                f"fixed-padding anchor {column!r} has a live slot after padding "
+                f"at raw row {raw_row}, position {position}"
+            )
+        positions.append(position)
+    return outer, positions
+
+
+def _select_fixed_axis(
+    value: Any,
+    positions: Sequence[int],
+    *,
+    expected_length: int,
+    column: str,
+    raw_row: int,
+) -> Any:
+    """Select live slots while keeping optional top-level null columns null."""
+
+    if value is None:
+        return None
+    outer = _as_list(
+        value,
+        column=column,
+        row_index=raw_row,
+        validate_contract=True,
+    )
+    if len(outer) != expected_length:
+        raise ValueError(
+            f"fixed-padding column {column!r} has length {len(outer)}, expected "
+            f"{expected_length} at raw row {raw_row}"
+        )
+    return [outer[position] for position in positions]
+
+
+def _compact_fixed_padding_agg_row(
+    row: Mapping[str, Any],
+    plan: "_MdlRankMixerAdapterPlan",
+    *,
+    raw_row: int,
+    validate_contract: bool,
+) -> dict[str, Any]:
+    """Remove padded request, candidate, and UPS slots from one agg row.
+
+    Request/candidate liveness comes from configured anchor columns. UPS token
+    liveness comes from one anchor per sequence (``<ups>`` plus the configured
+    suffix). Memberships are filtered to live requests and deduplicated because
+    fixed candidate padding can repeat request zero in the physical indices.
+    """
+
+    padding = plan.fixed_padding
+    if padding is None:
+        return dict(row)
+    if "context_indices" not in row or "target_indices" not in row:
+        # Req-layout files have no fixed agg axes and retain their old path.
+        return dict(row)
+    if padding.request_anchor not in row:
+        raise ValueError(
+            f"fixed-padding request anchor {padding.request_anchor!r} is missing"
+        )
+    if padding.candidate_anchor not in row:
+        raise ValueError(
+            f"fixed-padding candidate anchor {padding.candidate_anchor!r} is missing"
+        )
+
+    context_indices = _as_list(
+        row["context_indices"],
+        column="context_indices",
+        row_index=raw_row,
+        validate_contract=True,
+    )
+    target_indices = _as_list(
+        row["target_indices"],
+        column="target_indices",
+        row_index=raw_row,
+        validate_contract=True,
+    )
+    request_anchor, request_positions = _fixed_padding_positions(
+        row[padding.request_anchor],
+        column=padding.request_anchor,
+        raw_row=raw_row,
+        validate_contract=validate_contract,
+    )
+    candidate_anchor, candidate_positions = _fixed_padding_positions(
+        row[padding.candidate_anchor],
+        column=padding.candidate_anchor,
+        raw_row=raw_row,
+        validate_contract=validate_contract,
+    )
+    if len(request_anchor) != len(context_indices):
+        raise ValueError(
+            f"fixed-padding request anchor {padding.request_anchor!r} has length "
+            f"{len(request_anchor)}, expected {len(context_indices)} at raw row {raw_row}"
+        )
+    if len(candidate_anchor) != len(target_indices):
+        raise ValueError(
+            f"fixed-padding candidate anchor {padding.candidate_anchor!r} has length "
+            f"{len(candidate_anchor)}, expected {len(target_indices)} at raw row {raw_row}"
+        )
+    if not request_positions:
+        raise ValueError(f"fixed-padding agg row {raw_row} has no live requests")
+    if not candidate_positions:
+        raise ValueError(f"fixed-padding agg row {raw_row} has no live candidates")
+
+    compact = dict(row)
+    request_axis_columns = set(plan.context_features) | set(plan.request_columns)
+    candidate_axis_columns = (
+        set(plan.item_features)
+        | set(plan.label_columns)
+        | set(plan.label_mask_columns)
+        | set(plan.candidate_metadata_columns)
+    )
+    for canonical, aliases in plan.column_aliases.items():
+        if canonical in candidate_axis_columns:
+            candidate_axis_columns.update(aliases)
+    for column in request_axis_columns:
+        if column in compact:
+            compact[column] = _select_fixed_axis(
+                compact[column],
+                request_positions,
+                expected_length=len(context_indices),
+                column=column,
+                raw_row=raw_row,
+            )
+    for column in candidate_axis_columns:
+        if column in compact:
+            compact[column] = _select_fixed_axis(
+                compact[column],
+                candidate_positions,
+                expected_length=len(target_indices),
+                column=column,
+                raw_row=raw_row,
+            )
+    compact["context_indices"] = [context_indices[index] for index in request_positions]
+    compact["target_indices"] = [target_indices[index] for index in candidate_positions]
+    known_requests = set(compact["context_indices"])
+
+    for ups in plan.ups_types:
+        anchor_column = f"{ups}{padding.sequence_anchor_suffix}"
+        if anchor_column not in compact:
+            raise ValueError(
+                f"fixed-padding sequence anchor {anchor_column!r} is missing"
+            )
+        anchor_values, token_positions = _fixed_padding_positions(
+            compact[anchor_column],
+            column=anchor_column,
+            raw_row=raw_row,
+            validate_contract=validate_contract,
+        )
+        index_column = f"{ups}_x_indices"
+        normalized_memberships: dict[int, list[int]] = {}
+        if index_column in compact:
+            memberships = _as_list(
+                compact[index_column],
+                column=index_column,
+                row_index=raw_row,
+                validate_contract=True,
+            )
+            if len(memberships) != len(anchor_values):
+                raise ValueError(
+                    f"fixed-padding indices {index_column!r} has length "
+                    f"{len(memberships)}, expected {len(anchor_values)} at raw row {raw_row}"
+                )
+            live_positions: list[int] = []
+            for position in token_positions:
+                raw_members = memberships[position]
+                members = (
+                    list(raw_members)
+                    if isinstance(raw_members, (list, tuple))
+                    else [raw_members]
+                )
+                seen: set[int] = set()
+                normalized: list[int] = []
+                for member in members:
+                    request = _request_index(
+                        member,
+                        column=index_column,
+                        row_index=raw_row,
+                        validate_contract=True,
+                    )
+                    if request in known_requests and request not in seen:
+                        normalized.append(request)
+                        seen.add(request)
+                if normalized:
+                    live_positions.append(position)
+                    normalized_memberships[position] = normalized
+            token_positions = live_positions
+
+        for column in plan.raw_sequence_columns_by_type[ups]:
+            if column not in compact:
+                continue
+            compact[column] = _select_fixed_axis(
+                compact[column],
+                token_positions,
+                expected_length=len(anchor_values),
+                column=column,
+                raw_row=raw_row,
+            )
+        if index_column in compact:
+            compact[index_column] = [
+                normalized_memberships[position] for position in token_positions
+            ]
+    return compact
+
+
 def _request_level_value(
     value: Any,
     *,
@@ -2924,6 +3794,48 @@ def _arrow_array_to_pylist(pa: Any, array: Any) -> list[Any]:
         return array.to_pylist()
     child = array.values
     child_type = child.type
+    if pa.types.is_list(child_type) or pa.types.is_large_list(child_type):
+        grandchild = child.values
+        if (
+            pa.types.is_integer(grandchild.type)
+            or pa.types.is_floating(grandchild.type)
+        ) and not grandchild.null_count:
+            try:
+                outer_offsets = array.offsets.to_numpy()
+                inner_offsets = child.offsets.to_numpy()
+                values = grandchild.to_numpy(zero_copy_only=False)
+                outer_null = (
+                    array.is_null().to_numpy(zero_copy_only=False)
+                    if array.null_count
+                    else None
+                )
+                inner_null = (
+                    child.is_null().to_numpy(zero_copy_only=False)
+                    if child.null_count
+                    else None
+                )
+            except (TypeError, ValueError, NotImplementedError):
+                return array.to_pylist()
+            result: list[Any] = []
+            for row_index in range(len(array)):
+                if outer_null is not None and outer_null[row_index]:
+                    result.append(None)
+                    continue
+                nested: list[Any] = []
+                for inner_index in range(
+                    int(outer_offsets[row_index]),
+                    int(outer_offsets[row_index + 1]),
+                ):
+                    if inner_null is not None and inner_null[inner_index]:
+                        nested.append(None)
+                    else:
+                        nested.append(
+                            values[
+                                inner_offsets[inner_index] : inner_offsets[inner_index + 1]
+                            ].tolist()
+                        )
+                result.append(nested)
+            return result
     if not (
         pa.types.is_integer(child_type)
         or pa.types.is_floating(child_type)
@@ -3138,6 +4050,15 @@ def _candidate_metadata_arrow_type(pa: Any, raw_type: Any) -> Any:
 
 
 @dataclass(frozen=True)
+class _FixedPaddingPlan:
+    """Physical fixed-width agg axes that must be compacted before expansion."""
+
+    request_anchor: str
+    candidate_anchor: str
+    sequence_anchor_suffix: str
+
+
+@dataclass(frozen=True)
 class _MdlRankMixerAdapterPlan:
     context_features: tuple[str, ...]
     item_features: tuple[str, ...]
@@ -3157,6 +4078,7 @@ class _MdlRankMixerAdapterPlan:
     time_delta_transform: str
     sequence_max_lengths: Mapping[str, int]
     compact_request_lists: bool
+    fixed_padding: _FixedPaddingPlan | None
     request_time_column: str
     aligned_groups: tuple[tuple[str, ...], ...]
     required: tuple[str, ...]
@@ -3167,6 +4089,7 @@ class _MdlRankMixerAdapterPlan:
     label_columns: frozenset[str]
     label_mask_columns: frozenset[str]
     sequence_columns_by_type: Mapping[str, tuple[str, ...]]
+    raw_sequence_columns_by_type: Mapping[str, tuple[str, ...]]
     sequence_columns: frozenset[str]
     time_delta_columns: frozenset[str]
     label_output_columns: tuple[str, ...]
@@ -3234,6 +4157,35 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     compact_request_lists = options.get("compact_request_lists", False)
     if type(compact_request_lists) is not bool:
         raise ValueError("adapter option 'compact_request_lists' must be a boolean")
+    raw_fixed_padding = options.get("fixed_padding")
+    fixed_padding: _FixedPaddingPlan | None = None
+    if raw_fixed_padding is not None:
+        if not isinstance(raw_fixed_padding, Mapping):
+            raise ValueError("adapter option 'fixed_padding' must be an object")
+        unknown_padding_options = sorted(
+            set(raw_fixed_padding)
+            - {"request_anchor", "candidate_anchor", "sequence_anchor_suffix"}
+        )
+        if unknown_padding_options:
+            raise ValueError(
+                "adapter option 'fixed_padding' contains unknown keys: "
+                + ", ".join(unknown_padding_options)
+            )
+        request_anchor = str(raw_fixed_padding.get("request_anchor", ""))
+        candidate_anchor = str(raw_fixed_padding.get("candidate_anchor", ""))
+        sequence_anchor_suffix = str(
+            raw_fixed_padding.get("sequence_anchor_suffix", "_x_time")
+        )
+        if not request_anchor or not candidate_anchor or not sequence_anchor_suffix:
+            raise ValueError(
+                "adapter option 'fixed_padding' requires non-empty request_anchor, "
+                "candidate_anchor, and sequence_anchor_suffix"
+            )
+        fixed_padding = _FixedPaddingPlan(
+            request_anchor=request_anchor,
+            candidate_anchor=candidate_anchor,
+            sequence_anchor_suffix=sequence_anchor_suffix,
+        )
     if time_delta_transform not in {"raw_ms", "seconds", "log1p_seconds"}:
         raise ValueError(
             "adapter option 'time_delta_transform' must be raw_ms, seconds, "
@@ -3253,6 +4205,15 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     item_set = frozenset(item_features)
     if context_set & item_set:
         raise ValueError("context_features and item_features must be disjoint")
+    if fixed_padding is not None:
+        if fixed_padding.request_anchor not in context_set | set(request_columns):
+            raise ValueError(
+                "fixed_padding.request_anchor must be a context feature or request column"
+            )
+        if fixed_padding.candidate_anchor not in item_set:
+            raise ValueError(
+                "fixed_padding.candidate_anchor must be an item feature"
+            )
     known_alias_targets = (
         context_set
         | item_set
@@ -3319,6 +4280,18 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         for column in columns
     )
     time_delta_columns = frozenset(time_delta_outputs.values())
+    raw_sequence_columns_by_type = {
+        ups: tuple(
+            dict.fromkeys(
+                [
+                    *sequence_columns_by_type[ups],
+                    f"{ups}_x_time",
+                    f"{ups}_x_indices",
+                ]
+            )
+        )
+        for ups in ups_types
+    }
     derived_request_columns = (
         frozenset() if coarse_scene is None else coarse_scene.derived_columns
     )
@@ -3459,6 +4432,7 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         time_delta_transform=time_delta_transform,
         sequence_max_lengths=sequence_max_lengths,
         compact_request_lists=compact_request_lists,
+        fixed_padding=fixed_padding,
         request_time_column=request_time_column,
         aligned_groups=aligned_groups,
         required=required,
@@ -3469,6 +4443,7 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         label_columns=label_columns,
         label_mask_columns=label_mask_columns,
         sequence_columns_by_type=sequence_columns_by_type,
+        raw_sequence_columns_by_type=raw_sequence_columns_by_type,
         sequence_columns=sequence_columns,
         time_delta_columns=time_delta_columns,
         label_output_columns=label_output_columns,
@@ -3641,6 +4616,13 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
 
     for raw_row in range(table.num_rows):
         row = {column: values[raw_row] for column, values in raw.items()}
+        if is_agg and plan.fixed_padding is not None:
+            row = _compact_fixed_padding_agg_row(
+                row,
+                plan,
+                raw_row=raw_row,
+                validate_contract=not trusted_input,
+            )
         if is_agg:
             context_indices = _as_list(
                 row["context_indices"],

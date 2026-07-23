@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
@@ -63,6 +64,7 @@ _CONTROL_PROCESS_GROUP: torch_dist.ProcessGroup | None = None
 # before the first collective. Keep process-group timeouts generous so peers
 # survive a slow rank-0 metadata pass; discovery itself is also optimized.
 _PROCESS_GROUP_TIMEOUT = timedelta(minutes=60)
+_BATCH_SEQUENCE_WORK_COLUMN = "__mdl_batch_sequence_work"
 
 
 def _varlen_attention_reasons(config: AppConfig) -> tuple[str, ...]:
@@ -680,6 +682,26 @@ def _shuffle_table_groups(
     return [tables[index] for index in permutation]
 
 
+def _concat_batch_tables(pa: Any, tables: list[object]) -> object:
+    """Concatenate and coalesce chunks once before per-column tensorization.
+
+    Request-preserving batching can otherwise create one Arrow chunk per
+    request. Hundreds of feature encoders would each repeat the same chunk
+    merge. Some Arrow releases cannot unify nested dictionaries, so retain a
+    lossless fallback to the original chunked table.
+    """
+
+    if not tables:
+        raise ValueError("cannot concatenate an empty batch-table list")
+    combined = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
+    if all(column.num_chunks <= 1 for column in combined.columns):
+        return combined
+    try:
+        return combined.combine_chunks()
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+        return combined
+
+
 def _iter_shuffled_candidate_tables(
     config: AppConfig,
     split_name: str,
@@ -700,12 +722,37 @@ def _iter_shuffled_candidate_tables(
         shard_world_size=shard_world_size,
         require_labels=require_labels,
     )
-    source = (
-        group
-        for table in candidate_source
-        if table.num_rows
-        for group in _request_group_tables(split, table)
-    )
+    def request_groups() -> Iterator[object]:
+        for table in candidate_source:
+            if not table.num_rows:
+                continue
+            if (
+                reader.deduplicate_request_features
+                and reader.length_buckets
+                and config.sequences
+                and all(
+                    not sequence.fields
+                    or sequence.fields[0].source in table.column_names
+                    for sequence in config.sequences
+                )
+            ):
+                if _BATCH_SEQUENCE_WORK_COLUMN in table.column_names:
+                    raise ValueError(
+                        f"input data uses reserved column {_BATCH_SEQUENCE_WORK_COLUMN!r}"
+                    )
+                pa, _pc, _ds, _pq = _require_pyarrow()
+                lengths = _table_effective_sequence_lengths(
+                    config,
+                    table,
+                    metric=reader.length_bucket_metric,
+                )
+                table = table.append_column(
+                    _BATCH_SEQUENCE_WORK_COLUMN,
+                    pa.array(lengths.numpy(), type=pa.int64()),
+                )
+            yield from _request_group_tables(split, table)
+
+    source = request_groups()
     if reader.shuffle_buffer_rows == 0:
         yield from source
         return
@@ -763,7 +810,7 @@ def _iter_group_preserving_batches(
         table = original
         while table.num_rows > batch_size:
             if buffered_rows:
-                yield pa.concat_tables(buffered)
+                yield _concat_batch_tables(pa, buffered)
                 buffered = []
                 buffered_rows = 0
             yield table.slice(0, batch_size)
@@ -771,17 +818,17 @@ def _iter_group_preserving_batches(
         if not table.num_rows:
             continue
         if buffered_rows and buffered_rows + table.num_rows > batch_size:
-            yield pa.concat_tables(buffered)
+            yield _concat_batch_tables(pa, buffered)
             buffered = []
             buffered_rows = 0
         buffered.append(table)
         buffered_rows += table.num_rows
         if buffered_rows == batch_size:
-            yield pa.concat_tables(buffered)
+            yield _concat_batch_tables(pa, buffered)
             buffered = []
             buffered_rows = 0
     if buffered_rows:
-        yield pa.concat_tables(buffered)
+        yield _concat_batch_tables(pa, buffered)
 
 
 def _table_sequence_lengths(config: AppConfig, sequence: Any, table: object) -> Tensor:
@@ -871,21 +918,26 @@ def _iter_length_bucketed_tables(
     ):
         if preserve_request_groups:
             # Context and UPS are identical across one request group. Reading
-            # the first row avoids repeating the same nine sequence lengths for
-            # every candidate.
-            lengths = _table_effective_sequence_lengths(
-                config,
-                table.slice(0, 1),
-                metric=reader.length_bucket_metric,
-            )
-            bucket_index = int(
-                torch.bucketize(lengths, boundaries, right=False).item()
-            )
+            # the vectorized metric attached before grouping avoids repeating
+            # nine Arrow length kernels for every individual request.
+            if _BATCH_SEQUENCE_WORK_COLUMN in table.column_names:
+                effective_length = int(
+                    table[_BATCH_SEQUENCE_WORK_COLUMN][0].as_py()
+                )
+            else:
+                effective_length = int(
+                    _table_effective_sequence_lengths(
+                        config,
+                        table.slice(0, 1),
+                        metric=reader.length_bucket_metric,
+                    ).item()
+                )
+            bucket_index = bisect_left(finite_boundaries, effective_length)
             bucket = buckets[bucket_index]
             remaining = table
             while remaining.num_rows > bucket.batch_size:
                 if buffered_rows[bucket_index]:
-                    yield pa.concat_tables(buffered[bucket_index])
+                    yield _concat_batch_tables(pa, buffered[bucket_index])
                     buffered[bucket_index] = []
                     buffered_rows[bucket_index] = 0
                 yield remaining.slice(0, bucket.batch_size)
@@ -897,13 +949,13 @@ def _iter_length_bucketed_tables(
                 and buffered_rows[bucket_index] + remaining.num_rows
                 > bucket.batch_size
             ):
-                yield pa.concat_tables(buffered[bucket_index])
+                yield _concat_batch_tables(pa, buffered[bucket_index])
                 buffered[bucket_index] = []
                 buffered_rows[bucket_index] = 0
             buffered[bucket_index].append(remaining)
             buffered_rows[bucket_index] += remaining.num_rows
             if buffered_rows[bucket_index] == bucket.batch_size:
-                yield pa.concat_tables(buffered[bucket_index])
+                yield _concat_batch_tables(pa, buffered[bucket_index])
                 buffered[bucket_index] = []
                 buffered_rows[bucket_index] = 0
             continue
@@ -925,7 +977,7 @@ def _iter_length_bucketed_tables(
             buffered_rows[bucket_index] += selected_table.num_rows
             if buffered_rows[bucket_index] < bucket.batch_size:
                 continue
-            combined = pa.concat_tables(buffered[bucket_index])
+            combined = _concat_batch_tables(pa, buffered[bucket_index])
             offset = 0
             while combined.num_rows - offset >= bucket.batch_size:
                 yield combined.slice(offset, bucket.batch_size)
@@ -937,7 +989,7 @@ def _iter_length_bucketed_tables(
     for bucket_index in range(len(buckets)):
         if not buffered_rows[bucket_index]:
             continue
-        yield pa.concat_tables(buffered[bucket_index])
+        yield _concat_batch_tables(pa, buffered[bucket_index])
 
 
 def _iter_batch_tables(
@@ -947,13 +999,16 @@ def _iter_batch_tables(
     shard_world_size: int,
     require_labels: bool = True,
 ) -> Iterator[object]:
-    yield from _iter_length_bucketed_tables(
+    for table in _iter_length_bucketed_tables(
         config,
         split_name,
         shard_rank,
         shard_world_size,
         require_labels,
-    )
+    ):
+        if _BATCH_SEQUENCE_WORK_COLUMN in table.column_names:
+            table = table.drop_columns([_BATCH_SEQUENCE_WORK_COLUMN])
+        yield table
 
 
 def _feature_batch_tensor_bytes(batch: FeatureBatch) -> int:
@@ -1234,7 +1289,11 @@ class _DevicePrefetchIterator:
         if device.type != "cuda" or depth <= 0:
             raise ValueError("device prefetch requires CUDA and positive depth")
         self.iterator = iterator
-        self.device = device
+        self.device = (
+            device
+            if device.index is not None
+            else torch.device("cuda", torch.cuda.current_device())
+        )
         self.stop_event = threading.Event()
         self.queue: queue.Queue[_DevicePrefetchItem] = queue.Queue(maxsize=depth)
         self.thread = threading.Thread(
@@ -2451,6 +2510,7 @@ def train_mdl(
     save_checkpoint: bool = True,
     log_steps: bool = True,
     step_observer: TrainStepObserver | None = None,
+    training_started_observer: Callable[[], None] | None = None,
     synchronize_step_observer: bool = True,
     run_quick_eval: bool = True,
 ) -> TrainResult:
@@ -2606,6 +2666,8 @@ def train_mdl(
         last_loss_denominator_tensor: Tensor | None = None
         model.train()
         _sync_device(device)
+        if training_started_observer is not None:
+            training_started_observer()
         start = perf_counter()
         host_batch_iterator = iter(
             iter_feature_batches(

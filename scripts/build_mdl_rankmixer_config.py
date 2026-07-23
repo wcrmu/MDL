@@ -125,18 +125,40 @@ ITEM_BAG_FIELDS = {
     "sku_sales_hn",
     "sku_spec_hash_hn",
     "sku_spec_hn",
+    "sku_spec_vids_hn",
     "sku_cart_cnt_7d_hn",
     "sku_ordr_cnt_1m_hn",
     "sku_price_dis_hn",
     "sku_sales_dis_hn",
     "goods_name_bigram_hn",
     "goods_ner_infos_hn",
+    "goods_scene_clk_cnt_15d_hn",
     "goods_title_tfidf_term_hash_list_hn",
     "g_prpty_val_id_list_hn",
     "g_sku_spec_unit_list_hn",
     "g_sku_spec_hn",
     "g_sku_spec_hash_hn",
     "rev_ratings_cnt_crs_pos_hn",
+    "price_after_promotion_div_hn",
+    "scene_adj_cartcvr_15d_hn",
+    "scene_adj_ctr_15d_hn",
+    "scene_adj_cvr_15d_hn",
+    "scene_cart_cnt_15d_hn",
+    "mid_goods_prc_list_dis",
+    "mid_cmprc_diff_list_dis",
+    # Candidate-outer multivalue fields confirmed by the 10k-row profile.
+    "clk_cnt_1d_hn",
+    "clk_3d_cnt_hn",
+    "clk_1d_cat_cnt_hn",
+    "cart_cnt_1d_hn",
+    "cart_cnt_3d_hn",
+    "q_hit_good_correct_unigram_hn",
+    "impr_long_goods_abs_timegap_1d_hn",
+    "tit_in_top_query_cnt_hn",
+    "cart_hit_i2i_idx_hn",
+    "clk_long_goods_abs_timegap_1d_hn",
+    "clk_hit_i2i_idx_hn",
+    "query_cat_hn",
 }
 CANDIDATE_ITEM_BAG_FIELDS = frozenset(
     {
@@ -156,33 +178,119 @@ CANDIDATE_ITEM_SCALAR_FIELDS = frozenset(
     {
         "multimodal_i2i_hit_clk_size_hn",
         "multimodal_i2i_hit_cart_size_hn",
-        # Candidate-axis scalars previously misgrouped as context.
-        "clk_cnt_1d_hn",
-        "clk_3d_cnt_hn",
-        "clk_1d_cat_cnt_hn",
-        "cart_cnt_1d_hn",
-        "cart_cnt_3d_hn",
     }
 )
 ITEM_BAG_FIELDS |= CANDIDATE_ITEM_BAG_FIELDS
-RELATED_ITEM_BAG_MAX_LENGTHS = {
-    "offline_outside_goods_id_list_hn_share": 256,
-    "site_q2i_good_list_hn_share": 64,
-    "main_goods_ids_hn_share": 32,
-    "buy_long_spec_vids_hn": 32,
-    "cart_long_spec_vids_hn": 32,
-    "impr_3h_tg_hn": 32,
-    "impr_all_tg_hn": 32,
-    "i2i_coclk_hn_share": 32,
-    "i2i_list_amazoni2ifullgmv_hn_share": 32,
-    "i2i_list_swingv3gmv_hn_share": 32,
-    "i2i2cat2_swing_hn": 32,
-    "semi_swingi2i_cut30_hn_share": 32,
-    "i2i_list_multimodal_hn_share": 32,
-    "i2i_hit_site_q2i_idx_hn": 32,
-    "only_semi_swingi2i_cut60_hn_share": 32,
-    "cart_long_hit_samestyle_i2i_idx_hn": 32,
+# Field-level maxima observed from the 10k-row sample.  These describe the
+# distribution tail; they are not training allocations or truncation targets.
+OBSERVED_MULTIVALUE_MAX_LENGTHS = {
+    # Extremely short (max <= 6).
+    "clk_cnt_1d_hn": 1,
+    "clk_3d_cnt_hn": 1,
+    "clk_1d_cat_cnt_hn": 1,
+    "cart_cnt_1d_hn": 1,
+    "cart_cnt_3d_hn": 1,
+    "u_fst_ordr_cnt_mix_d_hn": 3,
+    "rev_ratings_cnt_crs_pos_hn": 5,
+    "price_after_promotion_div_hn": 5,
+    "ups_incart_cat1_id_nc_hn": 5,
+    "sess_q2q_hash_list_hn": 6,
+    "goods_title_tfidf_term_hash_list_hn": 6,
+    "scene_adj_cartcvr_15d_hn": 6,
+    "scene_adj_ctr_15d_hn": 6,
+    "scene_adj_cvr_15d_hn": 6,
+    "scene_cart_cnt_15d_hn": 6,
+    "goods_scene_clk_cnt_15d_hn": 6,
+    # Medium (max 7-60).
+    "cart_long_hit_samestyle_i2i_idx_hn": 10,
+    "q_hit_good_correct_unigram_hn": 11,
+    "impr_long_goods_abs_timegap_1d_hn": 14,
+    "g_sku_spec_unit_list_hn": 15,
+    "tit_in_top_query_cnt_hn": 15,
+    "query_extend_translation_hash_hn": 19,
+    "cart_hit_i2i_idx_hn": 20,
+    "clk_long_goods_abs_timegap_1d_hn": 21,
+    "recall_merge_cate1_ids_hn": 23,
+    "g_sku_spec_hn": 25,
+    "g_sku_spec_hash_hn": 25,
+    "i2i_hit_site_q2i_idx_hn": 26,
+    "clk_hit_i2i_idx_hn": 28,
+    "query_tfidf_term_hash_list_hn": 30,
+    "scene_impr_cnt_15d_hn": 30,
+    "i2i_coclk_hn_share": 30,
+    "i2i_list_amazoni2ifullgmv_hn_share": 30,
+    "i2i_list_multimodal_hn_share": 30,
+    "i2i_list_swingv3gmv_hn_share": 30,
+    "semi_swingi2i_cut30_hn_share": 30,
+    "query_terms_hash_hn": 33,
+    "main_goods_ids_hn_share": 34,
+    "i2i2cat2_swing_hn": 37,
+    "goods_ner_infos_hn": 39,
+    "query_hash_hn": 41,
+    "query_cat_hn": 41,
+    "origin_query_hash_hn": 42,
+    "g_prpty_val_id_list_hn": 45,
+    "site_q2i_good_list_hn_share": 49,
+    "query_arr_hn": 51,
+    "mid_cmprc_diff_list_dis": 60,
+    "mid_goods_prc_list_dis": 60,
+    "only_semi_swingi2i_cut60_hn_share": 60,
+    # Long (max 61-1000).
+    "goods_name_bigram_hn": 68,
+    "view_30m_cat1_ids_hn": 95,
+    "list_clk_cat1_ids_hn": 126,
+    "list_clk_cat_ids_hn": 126,
+    "ups_in_cart_2h_sku_cur_prices_hn": 168,
+    "ups_query_term_hash_v2_hn": 200,
+    "ups_query_tg_hn": 200,
+    "ups_search_method_hash_hn": 200,
+    "sku_id_hn": 384,
+    "sku_price_v2_hn": 384,
+    "sku_sales_hn": 384,
+    "sku_spec_hash_hn": 384,
+    "sku_spec_hn": 384,
+    "sku_cart_cnt_7d_hn": 384,
+    "sku_ordr_cnt_1m_hn": 384,
+    "sku_price_dis_hn": 384,
+    "sku_sales_dis_hn": 384,
+    "ups_in_cart_goods_hn_share": 600,
+    "ups_in_cart_tg_hn": 600,
+    "offline_outside_goods_id_list_hn_share": 711,
+    "sku_spec_vids_hn": 768,
+    "cart_7d_cat1_ids_hn": 996,
+    "impr_3h_tg_hn": 1000,
+    "impr_all_tg_hn": 1000,
+    # Extremely long (max > 1000).
+    "recall_merge_cate_levels_hn": 1623,
+    "recall_merge_cate_ids_hn": 1623,
+    "view_7d_page_sns_hn": 2201,
+    "view_7d_page_elsns_hn": 2201,
+    "clk_7d_page_sns_hn": 2246,
+    "clk_7d_page_elsns_hn": 2246,
+    "flip_mall_ids_hn": 3579,
+    "buy_long_spec_vids_hn": 4860,
+    "cart_long_spec_vids_hn": 8120,
 }
+
+
+def _cap_multivalue_observed_max(observed_max: int) -> int:
+    """Convert an observed tail maximum into a sublinear training cap."""
+
+    if observed_max <= 128:
+        return observed_max
+    if observed_max <= 512:
+        return 128
+    if observed_max <= 2048:
+        return 256
+    return 512
+
+
+MULTIVALUE_MAX_LENGTHS = {
+    name: _cap_multivalue_observed_max(observed_max)
+    for name, observed_max in OBSERVED_MULTIVALUE_MAX_LENGTHS.items()
+}
+# Backward-compatible alias for callers that imported the old, partial map.
+RELATED_ITEM_BAG_MAX_LENGTHS = MULTIVALUE_MAX_LENGTHS
 CORE_ITEM_FIELDS = ("goods_id_hn", "cat1_id_hn", "price_hn")
 SCENARIO_IMPORTANT_FIELDS = (
     "currency_hn",
@@ -441,8 +549,8 @@ def _estimated_dimension(bucket: int) -> int:
 
 
 def _estimated_bag_length(source: str) -> int:
-    if source in RELATED_ITEM_BAG_MAX_LENGTHS:
-        return int(RELATED_ITEM_BAG_MAX_LENGTHS[source])
+    if source in MULTIVALUE_MAX_LENGTHS:
+        return int(MULTIVALUE_MAX_LENGTHS[source])
     name = source.lower()
     if name.startswith("sku_"):
         return 128
@@ -915,7 +1023,15 @@ def _feature_bag_fields(sample_features: Sequence[Mapping[str, Any]]) -> set[str
             "sample fixture is missing expected item bag fields: "
             + ", ".join(sorted(missing_item_bags))
         )
-    return context_bags | ITEM_BAG_FIELDS
+    bag_fields = context_bags | ITEM_BAG_FIELDS
+    if bag_fields != set(MULTIVALUE_MAX_LENGTHS):
+        missing_lengths = sorted(bag_fields - set(MULTIVALUE_MAX_LENGTHS))
+        stale_lengths = sorted(set(MULTIVALUE_MAX_LENGTHS) - bag_fields)
+        raise ValueError(
+            "multivalue max-length map disagrees with declared bags: "
+            f"missing={missing_lengths}, stale={stale_lengths}"
+        )
+    return bag_fields
 
 
 def _estimated_length_summary(value: int) -> dict[str, int]:
@@ -1037,7 +1153,7 @@ def _main_features(
 ) -> tuple[list[dict[str, Any]], set[str]]:
     bag_fields = _feature_bag_fields(sample_features)
     sku_length = max(
-        values.bag_length(source, length_quantile)
+        MULTIVALUE_MAX_LENGTHS[source]
         for source in DEFAULT_SKU_FIELDS
     )
     if max_bag_length is not None:
@@ -1059,7 +1175,7 @@ def _main_features(
             max_length = (
                 sku_length
                 if source in DEFAULT_SKU_FIELDS
-                else RELATED_ITEM_BAG_MAX_LENGTHS.get(
+                else MULTIVALUE_MAX_LENGTHS.get(
                     source,
                     values.bag_length(source, length_quantile),
                 )
@@ -1315,6 +1431,14 @@ def _adapter_options(
             name: f"{name}_x_{TIME_DELTA_FIELD}" for name in EXPECTED_UPS_TYPES
         },
         "time_delta_transform": "log1p_seconds",
+        # fgout agg rows use fixed-width request/candidate/UPS arrays with
+        # recursive zero padding. The adapter compacts those physical slots
+        # before candidate expansion and tensorization.
+        "fixed_padding": {
+            "request_anchor": "search_id",
+            "candidate_anchor": "goods_id_hn",
+            "sequence_anchor_suffix": "_x_time",
+        },
     }
     if coarse_scene:
         if search_scene_ids is None:
@@ -1357,6 +1481,8 @@ def _reader_config(*, training: bool) -> dict[str, Any]:
         "max_prefetch_bytes": 2 * 1024**3,
         "scanner_batch_rows": 64,
         "pin_memory": True,
+        "coalesce_pinned_tensors": True,
+        "device_prefetch_batches": 0,
         "shard_unit": "row_group",
         "validate_prehashed_nonzero": False,
         "trusted_input": True,

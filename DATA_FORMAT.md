@@ -149,6 +149,47 @@ For each agg row:
 The adapter expands agg rows into candidate rows while caching normalized
 request payloads once per request.
 
+#### Fixed-width padded agg rows
+
+Some fgout writers retain fixed physical widths and fill unused request,
+candidate, and UPS slots recursively with `0`, `"0"`, or null. Production
+configs declare `adapter.options.fixed_padding` with `search_id` as the request
+anchor, `goods_id_hn` as the candidate anchor, and `_x_time` as the UPS anchor
+suffix. The adapter validates that live slots form a prefix, then removes the
+trailing padding before request expansion. Under `trusted_input`, one raw row
+is fully validated and later rows use the live-prefix fast path. Padding never
+becomes a candidate, sequence token, tensor element, or H2D transfer.
+
+The checked-in `sample_row_mock_json` can be expanded into production-shaped
+benchmark files while preserving these physical padded axes:
+
+~~~bash
+python scripts/generate_mock_parquet.py \
+  --source-json sample_row_mock_json \
+  --config configs/rankmixer.yaml \
+  --output-dir artifacts/mock_parquet_2x2500_zstd \
+  --files 2 --rows-per-file 2500 --row-group-size 256
+~~~
+
+Use `benchmark --mode data` for decode/adapter/tensorization/pinning capacity
+and `benchmark --mode end-to-end` for the steady-state data wait, asynchronous
+H2D, GPU utilization, and peak HBM of the real training path. A nonzero warmup
+window is recommended so model initialization and cold file opens stay outside
+the measured interval.
+
+For this two-file mock, the pure-data sweep peaks at a 256-row scanner batch and
+one reader worker. The end-to-end optimum depends on compute overlap, file count,
+and remote-storage latency; production configs therefore keep their concurrent
+HDFS reader settings, coalesce pinned tensors, and disable the measured-negative
+background CUDA-prefetch thread. Re-run the data sweep for each storage layout:
+
+~~~bash
+python scripts/profile_cpu_datapath.py \
+  --config configs/rankmixer.yaml \
+  --data-dir artifacts/mock_parquet_2x2500_zstd \
+  --scanner-batch-rows 256 --num-workers 1 --tensorize
+~~~
+
 ### 3.2 Request layout: req
 
 One physical Parquet row represents one request and all of its candidates.

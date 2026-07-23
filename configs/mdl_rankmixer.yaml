@@ -52,7 +52,7 @@ data:
       coalesce_pinned_tensors: true
       # One future device batch preserves H2D overlap without pinning two large
       # sequence batches in HBM while the current batch is executing.
-      device_prefetch_batches: 1
+      device_prefetch_batches: 0
       deduplicate_request_features: true
       validate_prehashed_nonzero: false
       trusted_input: true
@@ -551,10 +551,18 @@ data:
         multivalue_features:
         - buy_long_spec_vids_hn
         - cart_7d_cat1_ids_hn
+        - cart_cnt_1d_hn
+        - cart_cnt_3d_hn
+        - cart_hit_i2i_idx_hn
         - cart_long_hit_samestyle_i2i_idx_hn
         - cart_long_spec_vids_hn
+        - clk_1d_cat_cnt_hn
+        - clk_3d_cnt_hn
         - clk_7d_page_elsns_hn
         - clk_7d_page_sns_hn
+        - clk_cnt_1d_hn
+        - clk_hit_i2i_idx_hn
+        - clk_long_goods_abs_timegap_1d_hn
         - flip_mall_ids_hn
         - g_prpty_val_id_list_hn
         - g_sku_spec_hash_hn
@@ -562,6 +570,7 @@ data:
         - g_sku_spec_unit_list_hn
         - goods_name_bigram_hn
         - goods_ner_infos_hn
+        - goods_scene_clk_cnt_15d_hn
         - goods_title_tfidf_term_hash_list_hn
         - i2i2cat2_swing_hn
         - i2i_coclk_hn_share
@@ -571,13 +580,19 @@ data:
         - i2i_list_swingv3gmv_hn_share
         - impr_3h_tg_hn
         - impr_all_tg_hn
+        - impr_long_goods_abs_timegap_1d_hn
         - list_clk_cat1_ids_hn
         - list_clk_cat_ids_hn
         - main_goods_ids_hn_share
+        - mid_cmprc_diff_list_dis
+        - mid_goods_prc_list_dis
         - offline_outside_goods_id_list_hn_share
         - only_semi_swingi2i_cut60_hn_share
         - origin_query_hash_hn
+        - price_after_promotion_div_hn
+        - q_hit_good_correct_unigram_hn
         - query_arr_hn
+        - query_cat_hn
         - query_extend_translation_hash_hn
         - query_hash_hn
         - query_terms_hash_hn
@@ -586,6 +601,10 @@ data:
         - recall_merge_cate_ids_hn
         - recall_merge_cate_levels_hn
         - rev_ratings_cnt_crs_pos_hn
+        - scene_adj_cartcvr_15d_hn
+        - scene_adj_ctr_15d_hn
+        - scene_adj_cvr_15d_hn
+        - scene_cart_cnt_15d_hn
         - scene_impr_cnt_15d_hn
         - semi_swingi2i_cut30_hn_share
         - sess_q2q_hash_list_hn
@@ -599,6 +618,8 @@ data:
         - sku_sales_hn
         - sku_spec_hash_hn
         - sku_spec_hn
+        - sku_spec_vids_hn
+        - tit_in_top_query_cnt_hn
         - u_fst_ordr_cnt_mix_d_hn
         - ups_in_cart_2h_sku_cur_prices_hn
         - ups_in_cart_goods_hn_share
@@ -666,6 +687,10 @@ data:
           flatten_query_hash: flatten_query_hash_x_time_delta_log1p_seconds
         time_delta_transform: log1p_seconds
         compact_request_lists: true
+        fixed_padding:
+          request_anchor: search_id
+          candidate_anchor: goods_id_hn
+          sequence_anchor_suffix: _x_time
         search_scene_ids:
         - 2
         - 21
@@ -816,7 +841,7 @@ data:
       eager_schema_validation: sample
       schema_validation_samples: 64
       coalesce_pinned_tensors: true
-      device_prefetch_batches: 2
+      device_prefetch_batches: 0
       deduplicate_request_features: true
       validate_prehashed_nonzero: false
       trusted_input: true
@@ -1314,10 +1339,18 @@ data:
         multivalue_features:
         - buy_long_spec_vids_hn
         - cart_7d_cat1_ids_hn
+        - cart_cnt_1d_hn
+        - cart_cnt_3d_hn
+        - cart_hit_i2i_idx_hn
         - cart_long_hit_samestyle_i2i_idx_hn
         - cart_long_spec_vids_hn
+        - clk_1d_cat_cnt_hn
+        - clk_3d_cnt_hn
         - clk_7d_page_elsns_hn
         - clk_7d_page_sns_hn
+        - clk_cnt_1d_hn
+        - clk_hit_i2i_idx_hn
+        - clk_long_goods_abs_timegap_1d_hn
         - flip_mall_ids_hn
         - g_prpty_val_id_list_hn
         - g_sku_spec_hash_hn
@@ -1325,6 +1358,7 @@ data:
         - g_sku_spec_unit_list_hn
         - goods_name_bigram_hn
         - goods_ner_infos_hn
+        - goods_scene_clk_cnt_15d_hn
         - goods_title_tfidf_term_hash_list_hn
         - i2i2cat2_swing_hn
         - i2i_coclk_hn_share
@@ -1334,13 +1368,19 @@ data:
         - i2i_list_swingv3gmv_hn_share
         - impr_3h_tg_hn
         - impr_all_tg_hn
+        - impr_long_goods_abs_timegap_1d_hn
         - list_clk_cat1_ids_hn
         - list_clk_cat_ids_hn
         - main_goods_ids_hn_share
+        - mid_cmprc_diff_list_dis
+        - mid_goods_prc_list_dis
         - offline_outside_goods_id_list_hn_share
         - only_semi_swingi2i_cut60_hn_share
         - origin_query_hash_hn
+        - price_after_promotion_div_hn
+        - q_hit_good_correct_unigram_hn
         - query_arr_hn
+        - query_cat_hn
         - query_extend_translation_hash_hn
         - query_hash_hn
         - query_terms_hash_hn
@@ -1349,6 +1389,10 @@ data:
         - recall_merge_cate_ids_hn
         - recall_merge_cate_levels_hn
         - rev_ratings_cnt_crs_pos_hn
+        - scene_adj_cartcvr_15d_hn
+        - scene_adj_ctr_15d_hn
+        - scene_adj_cvr_15d_hn
+        - scene_cart_cnt_15d_hn
         - scene_impr_cnt_15d_hn
         - semi_swingi2i_cut30_hn_share
         - sess_q2q_hash_list_hn
@@ -1362,6 +1406,8 @@ data:
         - sku_sales_hn
         - sku_spec_hash_hn
         - sku_spec_hn
+        - sku_spec_vids_hn
+        - tit_in_top_query_cnt_hn
         - u_fst_ordr_cnt_mix_d_hn
         - ups_in_cart_2h_sku_cur_prices_hn
         - ups_in_cart_goods_hn_share
@@ -1429,6 +1475,10 @@ data:
           flatten_query_hash: flatten_query_hash_x_time_delta_log1p_seconds
         time_delta_transform: log1p_seconds
         compact_request_lists: true
+        fixed_padding:
+          request_anchor: search_id
+          candidate_anchor: goods_id_hn
+          sequence_anchor_suffix: _x_time
         search_scene_ids:
         - 2
         - 21
@@ -1662,7 +1712,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 42
   truncation: head
 - name: query_arr_hn
   kind: categorical
@@ -1675,7 +1725,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 51
   truncation: head
 - name: query_hash_hn
   kind: categorical
@@ -1688,7 +1738,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 41
   truncation: head
 - name: query_terms_hash_hn
   kind: categorical
@@ -1701,7 +1751,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 33
   truncation: head
 - name: query_tfidf_term_hash_list_hn
   kind: categorical
@@ -1714,7 +1764,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 30
   truncation: head
 - name: query_extend_translation_hash_hn
   kind: categorical
@@ -1727,7 +1777,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 19
   truncation: head
 - name: search_method_hn
   kind: categorical
@@ -1749,7 +1799,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 64
+  max_length: 6
   truncation: head
 - name: recall_merge_cate_levels_hn
   kind: categorical
@@ -1775,7 +1825,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 256
+  max_length: 23
   truncation: head
 - name: recall_merge_cate_ids_hn
   kind: categorical
@@ -1810,7 +1860,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 30
   truncation: head
 - name: scene_impr_cnt_15d_hit_hn
   kind: categorical
@@ -1841,7 +1891,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 3
   truncation: head
 - name: clk_7d_page_sns_hn
   kind: categorical
@@ -1906,7 +1956,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 64
+  max_length: 126
   truncation: head
 - name: list_clk_cat_ids_hn
   kind: categorical
@@ -1919,7 +1969,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 64
+  max_length: 126
   truncation: head
 - name: ups_in_cart_2h_sku_cur_prices_hn
   kind: categorical
@@ -1932,7 +1982,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 200
+  max_length: 128
   truncation: head
 - name: ups_in_cart_goods_hn_share
   kind: categorical
@@ -1958,7 +2008,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 200
+  max_length: 5
   truncation: head
 - name: ups_in_cart_tg_hn
   kind: categorical
@@ -1984,7 +2034,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 200
+  max_length: 128
   truncation: head
 - name: ups_query_tg_hn
   kind: categorical
@@ -1997,7 +2047,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 200
+  max_length: 128
   truncation: head
 - name: ups_search_method_hash_hn
   kind: categorical
@@ -2010,7 +2060,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 200
+  max_length: 128
   truncation: head
 - name: view_30m_cat1_ids_hn
   kind: categorical
@@ -2023,7 +2073,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 128
+  max_length: 95
   truncation: head
 - name: view_7d_page_sns_hn
   kind: categorical
@@ -2075,7 +2125,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 64
+  max_length: 49
   truncation: head
 - name: main_goods_ids_hn_share
   kind: categorical
@@ -2088,7 +2138,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 34
   truncation: head
 - name: buy_long_spec_vids_hn
   kind: categorical
@@ -2101,7 +2151,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 512
   truncation: head
 - name: cart_long_spec_vids_hn
   kind: categorical
@@ -2114,7 +2164,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 512
   truncation: head
 - name: opt_id_hn
   kind: categorical
@@ -2136,7 +2186,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 256
   truncation: head
 - name: impr_all_tg_hn
   kind: categorical
@@ -2149,7 +2199,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 256
   truncation: head
 - name: query_pay_cnt_15d_hn
   kind: categorical
@@ -2225,7 +2275,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 64
+  max_length: 68
   truncation: head
 - name: goods_ner_infos_hn
   kind: categorical
@@ -2238,7 +2288,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 39
   truncation: head
 - name: goods_scene_clk_cnt_15d_hn
   kind: categorical
@@ -2249,6 +2299,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 6
+  truncation: head
 - name: goods_title_tfidf_term_hash_list_hn
   kind: categorical
   source: goods_title_tfidf_term_hash_list_hn
@@ -2260,7 +2314,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 6
   truncation: head
 - name: goods_avlb_sku_num_dis_hn
   kind: categorical
@@ -2300,7 +2354,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 8
+  max_length: 5
   truncation: head
 - name: g_sku_spec_hn
   kind: categorical
@@ -2313,7 +2367,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 25
   truncation: head
 - name: g_sku_spec_hash_hn
   kind: categorical
@@ -2326,7 +2380,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 25
   truncation: head
 - name: g_sku_spec_unit_list_hn
   kind: categorical
@@ -2339,7 +2393,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 15
   truncation: head
 - name: g_prpty_val_id_list_hn
   kind: categorical
@@ -2352,7 +2406,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 48
+  max_length: 45
   truncation: head
 - name: sku_id_hn
   kind: categorical
@@ -2428,6 +2482,10 @@ features:
     type: pre_hashed
     num_buckets: 8388608
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 256
+  truncation: head
 - name: sku_cart_cnt_7d_hn
   kind: categorical
   source: sku_cart_cnt_7d_hn
@@ -2516,6 +2574,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 5
+  truncation: head
 - name: mkt_prc_hn
   kind: categorical
   source: mkt_prc_hn
@@ -2822,6 +2884,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 6
+  truncation: head
 - name: scene_adj_ctr_15d_hn
   kind: categorical
   source: scene_adj_ctr_15d_hn
@@ -2831,6 +2897,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 6
+  truncation: head
 - name: scene_adj_cvr_15d_hn
   kind: categorical
   source: scene_adj_cvr_15d_hn
@@ -2840,6 +2910,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 6
+  truncation: head
 - name: scene_cart_cnt_15d_hn
   kind: categorical
   source: scene_cart_cnt_15d_hn
@@ -2849,6 +2923,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 6
+  truncation: head
 - name: nfk_sales_14d_hn
   kind: categorical
   source: nfk_sales_14d_hn
@@ -2887,7 +2965,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 37
   truncation: head
 - name: i2i_coclk_hn_share
   kind: categorical
@@ -2900,7 +2978,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 30
   truncation: head
 - name: i2i_list_amazoni2ifullgmv_hn_share
   kind: categorical
@@ -2913,7 +2991,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 30
   truncation: head
 - name: i2i_list_multimodal_hn_share
   kind: categorical
@@ -2926,7 +3004,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 30
   truncation: head
 - name: i2i_list_swingv3gmv_hn_share
   kind: categorical
@@ -2939,7 +3017,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 30
   truncation: head
 - name: i2i_hit_site_q2i_idx_hn
   kind: categorical
@@ -2952,7 +3030,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 26
   truncation: head
 - name: only_semi_swingi2i_cut60_hn_share
   kind: categorical
@@ -2965,7 +3043,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 60
   truncation: head
 - name: semi_swingi2i_cut30_hn_share
   kind: categorical
@@ -2978,7 +3056,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 30
   truncation: head
 - name: multimodal_i2i_hit_cart_size_hn
   kind: categorical
@@ -3097,6 +3175,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 21
+  truncation: head
 - name: impr_long_goods_abs_timegap_1d_hn
   kind: categorical
   source: impr_long_goods_abs_timegap_1d_hn
@@ -3106,6 +3188,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 14
+  truncation: head
 - name: mid_goods_prc_list_dis
   kind: categorical
   source: mid_goods_prc_list_dis
@@ -3115,6 +3201,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 60
+  truncation: head
 - name: mid_cmprc_diff_list_dis
   kind: categorical
   source: mid_cmprc_diff_list_dis
@@ -3124,6 +3214,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 60
+  truncation: head
 - name: rel_score_hn
   kind: categorical
   source: rel_score_hn
@@ -3151,6 +3245,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 11
+  truncation: head
 - name: q2c_cart_15d_hit_val_hn
   kind: categorical
   source: q2c_cart_15d_hit_val_hn
@@ -3169,6 +3267,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 15
+  truncation: head
 - name: goods_query_emb32v3_cos_hn
   kind: categorical
   source: goods_query_emb32v3_cos_hn
@@ -3187,6 +3289,10 @@ features:
     type: pre_hashed
     num_buckets: 262144
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 41
+  truncation: head
 - name: clk_hit_i2i_idx_hn
   kind: categorical
   source: clk_hit_i2i_idx_hn
@@ -3196,6 +3302,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 28
+  truncation: head
 - name: cart_hit_i2i_idx_hn
   kind: categorical
   source: cart_hit_i2i_idx_hn
@@ -3205,6 +3315,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 20
+  truncation: head
 - name: cart_long_hit_samestyle_i2i_idx_hn
   kind: categorical
   source: cart_long_hit_samestyle_i2i_idx_hn
@@ -3216,7 +3330,7 @@ features:
     padding_id: 0
   pooling: mean
   pooling_null_policy: exclude
-  max_length: 32
+  max_length: 10
   truncation: head
 - name: ups_clkv2_i2i_goods_ids_hit_size
   kind: categorical
@@ -3290,6 +3404,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 1
+  truncation: head
 - name: clk_3d_cnt_hn
   kind: categorical
   source: clk_3d_cnt_hn
@@ -3299,6 +3417,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 1
+  truncation: head
 - name: clk_1d_cat_cnt_hn
   kind: categorical
   source: clk_1d_cat_cnt_hn
@@ -3308,6 +3430,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 1
+  truncation: head
 - name: cart_cnt_1d_hn
   kind: categorical
   source: cart_cnt_1d_hn
@@ -3317,6 +3443,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 1
+  truncation: head
 - name: cart_cnt_3d_hn
   kind: categorical
   source: cart_cnt_3d_hn
@@ -3326,6 +3456,10 @@ features:
     type: pre_hashed
     num_buckets: 4096
     padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 1
+  truncation: head
 - name: scenario_important_currency_hn
   kind: categorical
   source: currency_hn

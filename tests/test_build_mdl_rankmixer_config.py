@@ -16,12 +16,15 @@ from scripts.build_mdl_rankmixer_config import (
     EXPECTED_LABELS,
     EXPECTED_UPS_TYPES,
     ITEM_BAG_FIELDS,
+    MULTIVALUE_MAX_LENGTHS,
+    OBSERVED_MULTIVALUE_MAX_LENGTHS,
     ONETRANS_SEQUENCE_LENGTH_CAPS,
     REQUEST_CONTEXT_BAG_FIELDS,
     REQUEST_CONTEXT_SCALAR_FIELDS,
     apply_embedding_profile,
     build_config,
     build_name_estimate_report,
+    _cap_multivalue_observed_max,
     _find_sequence_field,
     _resolve_share_root,
     _categorical_entries_by_name,
@@ -288,8 +291,33 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             by_name["sku_id_hn"]["pooling_null_policy"],
             "include_as_padding",
         )
-        self.assertNotIn("pooling", by_name["sku_spec_vids_hn"])
-        self.assertEqual(summary["bag_feature_count"], 61)
+        self.assertEqual(by_name["sku_spec_vids_hn"]["pooling"], "mean")
+        self.assertEqual(by_name["sku_spec_vids_hn"]["max_length"], 256)
+        self.assertEqual(summary["bag_feature_count"], 82)
+        self.assertEqual(
+            set(MULTIVALUE_MAX_LENGTHS),
+            set(OBSERVED_MULTIVALUE_MAX_LENGTHS),
+        )
+        self.assertTrue(
+            all(
+                MULTIVALUE_MAX_LENGTHS[name] <= observed
+                for name, observed in OBSERVED_MULTIVALUE_MAX_LENGTHS.items()
+            )
+        )
+        self.assertLessEqual(max(MULTIVALUE_MAX_LENGTHS.values()), 512)
+        self.assertEqual(sum(MULTIVALUE_MAX_LENGTHS.values()), 9086)
+        self.assertEqual(
+            OBSERVED_MULTIVALUE_MAX_LENGTHS["cart_long_spec_vids_hn"],
+            8120,
+        )
+        self.assertEqual(MULTIVALUE_MAX_LENGTHS["cart_long_spec_vids_hn"], 512)
+        self.assertEqual(
+            [
+                _cap_multivalue_observed_max(value)
+                for value in (128, 129, 512, 513, 2048, 2049)
+            ],
+            [128, 128, 128, 256, 256, 512],
+        )
 
         main_sequences = payload["sequences"][:9]
         self.assertEqual([item["name"] for item in main_sequences], [
@@ -428,20 +456,26 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             self.assertEqual(by_name[name]["pooling"], "mean")
         self.assertEqual(
             by_name["cart_long_hit_samestyle_i2i_idx_hn"]["max_length"],
-            32,
+            10,
         )
         expected_bags = (
             set(adapter_options["context_features"]) - CONTEXT_SCALAR_FIELDS
         ) | ITEM_BAG_FIELDS
         self.assertEqual(set(adapter_options["multivalue_features"]), expected_bags)
         self.assertEqual(summary["bag_feature_count"], len(expected_bags))
+        self.assertEqual(
+            {
+                feature["source"]: feature["max_length"]
+                for feature in payload["features"][:169]
+                if feature.get("pooling") == "mean"
+            },
+            MULTIVALUE_MAX_LENGTHS,
+        )
         for name in (
             "multimodal_i2i_hit_clk_size_hn",
             "multimodal_i2i_hit_cart_size_hn",
             "query_pay_cnt_15d_hn",
             "opt_id_hn",
-            "clk_cnt_1d_hn",
-            "cart_cnt_3d_hn",
         ):
             self.assertNotIn(name, adapter_options["multivalue_features"])
             self.assertNotIn("pooling", by_name[name])
@@ -1047,9 +1081,11 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 for name, limit in adapter_limits.items():
                     self.assertGreaterEqual(limit, main_sequences[name])
                 self.assertTrue(config.data.train.reader.coalesce_pinned_tensors)
+                self.assertEqual(config.data.train.reader.num_workers, 8)
+                self.assertEqual(config.data.train.reader.scanner_batch_rows, 64)
                 self.assertEqual(
                     config.data.train.reader.device_prefetch_batches,
-                    1 if memory_optimized else 2,
+                    0,
                 )
                 self.assertEqual(config.data.train.reader.length_bucket_metric, "sum")
                 self.assertEqual(
@@ -1156,7 +1192,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             )
 
         report = _synthetic_report(self.sample)
-        report["fields"]["sku_spec_vids_hn"]["list_lengths_by_depth"]["1"][
+        report["fields"]["goods_id_hn"]["list_lengths_by_depth"]["1"][
             "max"
         ] = 2
         with self.assertRaisesRegex(ValueError, "configured scalar"):
@@ -1371,6 +1407,14 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         ):
             with self.subTest(config=config_name):
                 config = load_app_config(ROOT / "configs" / config_name)
+                self.assertEqual(
+                    {
+                        feature.source: feature.max_length
+                        for feature in config.features[:169]
+                        if feature.pooling == "mean"
+                    },
+                    MULTIVALUE_MAX_LENGTHS,
+                )
                 for split_name, split in (
                     ("train", config.data.train),
                     ("test", config.data.test),
@@ -1403,7 +1447,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         ):
                             self.assertIn(name, options["item_features"])
                             self.assertNotIn(name, options["context_features"])
-                            self.assertNotIn(name, options["multivalue_features"])
+                            self.assertIn(name, options["multivalue_features"])
                         for name in REQUEST_CONTEXT_BAG_FIELDS | REQUEST_CONTEXT_SCALAR_FIELDS:
                             self.assertIn(name, options["context_features"])
                             self.assertNotIn(name, options["item_features"])

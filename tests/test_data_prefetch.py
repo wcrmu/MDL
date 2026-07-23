@@ -37,6 +37,7 @@ from src.dataloader import (
 )
 from src.features import _flatten_array_values
 from src.train import (
+    _DevicePrefetchIterator,
     _estimate_prepared_batch_bytes,
     _iter_batch_tables,
     _iter_shuffled_candidate_tables,
@@ -246,10 +247,8 @@ class LengthBucketTest(unittest.TestCase):
             [batch["row_id"].to_pylist() for batch in batches],
             [[0, 2, 4], [1, 3]],
         )
-        self.assertTrue(lengths.call_args_list)
-        self.assertTrue(
-            all(call.args[1].num_rows == 1 for call in lengths.call_args_list)
-        )
+        self.assertEqual(len(lengths.call_args_list), 1)
+        self.assertEqual(lengths.call_args_list[0].args[1].num_rows, 5)
 
 
 class EagerSchemaValidationTest(unittest.TestCase):
@@ -454,7 +453,7 @@ class EagerSchemaValidationTest(unittest.TestCase):
         self.assertFalse(scanner._filesystem_is_remote())
 
     def test_remote_filesystem_scales_prefetch_workers(self) -> None:
-        from src.remote_io import RemoteIoPolicy
+        from src.dataloader import RemoteIoPolicy
 
         scanner = ParquetScanner.__new__(ParquetScanner)
         scanner.paths = self._refs(2)
@@ -718,6 +717,22 @@ class CoalescedBatchTest(unittest.TestCase):
         moved = move_feature_batch(packed, torch.device("cpu"))
         self.assertEqual(moved.labels.tolist(), [[1.0], [0.0], [1.0]])
         self.assertEqual(moved.scenario_id.tolist(), [0, 1, 0])
+
+
+class DevicePrefetchTest(unittest.TestCase):
+    def test_resolves_implicit_cuda_device_before_starting_worker(self) -> None:
+        with patch("src.train.torch.cuda.current_device", return_value=3), patch(
+            "src.train.threading.Thread"
+        ) as thread_type:
+            iterator = _DevicePrefetchIterator(
+                iter(()),
+                torch.device("cuda"),
+                depth=1,
+            )
+
+        self.assertEqual(iterator.device, torch.device("cuda", 3))
+        thread_type.return_value.start.assert_called_once_with()
+        iterator.close()
 
 
 class ByteBudgetTest(unittest.TestCase):

@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from src.config import ReaderConfig
-from src.remote_io import (
+from src.dataloader import (
     PerFileLock,
     RemoteIoPolicy,
     RemoteIoTimeoutError,
@@ -101,7 +101,7 @@ class RemoteIoHelperTest(unittest.TestCase):
         self.assertEqual(order, ["a-enter", "a-exit", "b-enter", "b-exit"])
 
     def test_worker_stagger_sleeps_for_nonzero_rank(self) -> None:
-        with patch("src.remote_io.time.sleep") as sleep:
+        with patch("src.dataloader.time.sleep") as sleep:
             apply_worker_stagger(2, 1.0)
         sleep.assert_called_once_with(2.0)
 
@@ -129,7 +129,7 @@ class RemoteIoHelperTest(unittest.TestCase):
 
         def worker(name: str) -> None:
             with patch(
-                "src.remote_io._filesystem_from_uri",
+                "src.dataloader._filesystem_from_uri",
                 side_effect=lambda uri: object(),
             ):
                 fs = thread_local_hdfs_filesystem("hdfs://ns")
@@ -180,7 +180,7 @@ class RemoteIoHelperTest(unittest.TestCase):
         filesystem.open_input_file.side_effect = OSError("Filesystem closed")
         policy = _remote_policy(on_failure="skip")
         with patch(
-            "src.remote_io.thread_local_hdfs_filesystem",
+            "src.dataloader.thread_local_hdfs_filesystem",
             return_value=filesystem,
         ):
             batches = list(
@@ -201,7 +201,7 @@ class RemoteIoHelperTest(unittest.TestCase):
         filesystem.open_input_file.side_effect = OSError("Filesystem closed")
         policy = _remote_policy(on_failure="fail")
         with patch(
-            "src.remote_io.thread_local_hdfs_filesystem",
+            "src.dataloader.thread_local_hdfs_filesystem",
             return_value=filesystem,
         ):
             with self.assertRaises(OSError):

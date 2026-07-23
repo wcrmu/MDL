@@ -159,6 +159,7 @@ class LocalBenchmarkSummary:
     cpu_utilization_percent: float | None
     gpu_utilization_percent: float | None
     host_batch_bytes_peak: int = 0
+    measurement_elapsed_seconds: float | None = None
     profiler: ProfilerSummary = field(default_factory=ProfilerSummary)
 
 
@@ -301,6 +302,8 @@ class _TraceCollector:
         warmup_steps: int,
         measured_steps: int,
         device: torch.device,
+        *,
+        defer_zero_warmup: bool = False,
     ) -> None:
         self.warmup_steps = warmup_steps
         self.measured_steps = measured_steps
@@ -311,19 +314,29 @@ class _TraceCollector:
         self._measurement_stopped = False
         self._cpu_started = 0.0
         self._cpu_elapsed = 0.0
+        self._wall_started = 0.0
+        self._wall_elapsed = 0.0
         self._sampler = _GpuUtilizationSampler(device)
         self._gpu_utilization: float | None = None
-        if warmup_steps == 0:
+        if warmup_steps == 0 and not defer_zero_warmup:
             self._start_measurement()
 
     def _start_measurement(self) -> None:
         if self._measurement_started:
             return
         self._measurement_started = True
-        self._cpu_started = process_time()
         if self.device.type == "cuda":
+            # One boundary synchronization excludes queued warmup kernels while
+            # preserving overlap throughout the measured window itself.
+            torch.cuda.synchronize(self.device)
             torch.cuda.reset_peak_memory_stats(self.device)
+        self._wall_started = perf_counter()
+        self._cpu_started = process_time()
         self._sampler.start()
+
+    def start_if_zero_warmup(self) -> None:
+        if self.warmup_steps == 0:
+            self._start_measurement()
 
     def observe(self, trace: TrainStepTrace, host_batch_bytes: int = 0) -> None:
         if trace.step == self.warmup_steps:
@@ -335,6 +348,10 @@ class _TraceCollector:
             return
         self.traces.append(trace)
         self.host_batch_bytes_peak = max(self.host_batch_bytes_peak, host_batch_bytes)
+        if len(self.traces) == self.measured_steps:
+            # Close the window at the last requested step, before callers do
+            # final metric reductions or tear down background prefetchers.
+            self.stop_measurement()
 
     def stop_measurement(self) -> None:
         """Close the steady-state window before optional profiler overhead."""
@@ -347,13 +364,14 @@ class _TraceCollector:
             # Include all queued measured work, then stop before profiler
             # initialization/export creates an artificial idle tail.
             torch.cuda.synchronize(self.device)
-        self._gpu_utilization = self._sampler.stop()
+        self._wall_elapsed = perf_counter() - self._wall_started
         self._cpu_elapsed = process_time() - self._cpu_started
+        self._gpu_utilization = self._sampler.stop()
         self._measurement_stopped = True
 
     def finish(self, rank: int, profiler: ProfilerSummary) -> LocalBenchmarkSummary:
         self.stop_measurement()
-        elapsed = sum(trace.step_seconds for trace in self.traces)
+        elapsed = self._wall_elapsed
         cpu_percent = (
             100.0 * self._cpu_elapsed / elapsed if elapsed > 0.0 else None
         )
@@ -372,6 +390,7 @@ class _TraceCollector:
             cpu_utilization_percent=cpu_percent,
             gpu_utilization_percent=self._gpu_utilization,
             host_batch_bytes_peak=self.host_batch_bytes_peak,
+            measurement_elapsed_seconds=self._wall_elapsed,
             profiler=profiler,
         )
 
@@ -407,6 +426,7 @@ def _environment(config: AppConfig, context: DistributedContext) -> dict[str, An
     device_name = None
     if context.device.type == "cuda":
         device_name = torch.cuda.get_device_name(context.device)
+    train_reader = config.data.train.reader
     return {
         "git_revision": revision or None,
         "python": platform.python_version(),
@@ -439,6 +459,17 @@ def _environment(config: AppConfig, context: DistributedContext) -> dict[str, An
         "model_name": config.model.name,
         "embedding_distribution": config.training.embedding_distribution,
         "dense_distribution": config.training.dense_distribution,
+        "data_reader": {
+            "num_workers": train_reader.num_workers,
+            "prefetch_batches": train_reader.prefetch_batches,
+            "scanner_batch_rows": train_reader.scanner_batch_rows,
+            "pin_memory": train_reader.pin_memory,
+            "coalesce_pinned_tensors": train_reader.coalesce_pinned_tensors,
+            "device_prefetch_batches": train_reader.device_prefetch_batches,
+            "deduplicate_request_features": (
+                train_reader.deduplicate_request_features
+            ),
+        },
         "vocab_strategy_hash": vocab_strategy_fingerprint(config),
     }
 
@@ -488,11 +519,20 @@ def _build_report(
         _rank_max_phase(summaries, index, "step_seconds")
         for index in range(measured_steps)
     ]
+    measured_wall_seconds = [
+        float(summary.measurement_elapsed_seconds)
+        for summary in summaries
+        if summary.measurement_elapsed_seconds is not None
+    ]
     wait_seconds = [
         _rank_max_phase(summaries, index, "dataloader_wait_seconds")
         for index in range(measured_steps)
     ]
-    elapsed = sum(step_seconds)
+    elapsed = (
+        max(measured_wall_seconds)
+        if len(measured_wall_seconds) == len(summaries)
+        else sum(step_seconds)
+    )
     samples = sum(trace.rows for summary in summaries for trace in summary.traces)
     input_tokens = sum(
         trace.input_tokens for summary in summaries for trace in summary.traces
@@ -564,7 +604,7 @@ def _build_report(
         elapsed_seconds=elapsed,
         samples_per_second=(samples / elapsed if elapsed > 0.0 else 0.0),
         tokens_per_second=(input_tokens / elapsed if elapsed > 0.0 else 0.0),
-        mean_step_seconds=_mean(step_seconds),
+        mean_step_seconds=(elapsed / measured_steps),
         p95_step_seconds=_percentile(step_seconds, 0.95),
         mean_dataloader_wait_seconds=_mean(wait_seconds),
         p95_dataloader_wait_seconds=_percentile(wait_seconds, 0.95),
@@ -1332,7 +1372,12 @@ def _benchmark_end_to_end(
     context: DistributedContext,
     options: BenchmarkOptions,
 ) -> LocalBenchmarkSummary:
-    collector = _TraceCollector(options.warmup_steps, options.measured_steps, context.device)
+    collector = _TraceCollector(
+        options.warmup_steps,
+        options.measured_steps,
+        context.device,
+        defer_zero_warmup=True,
+    )
     total_steps = options.warmup_steps + options.measured_steps
     train_mdl(
         config,
@@ -1340,6 +1385,7 @@ def _benchmark_end_to_end(
         save_checkpoint=False,
         log_steps=False,
         step_observer=collector.observe,
+        training_started_observer=collector.start_if_zero_warmup,
         synchronize_step_observer=False,
         run_quick_eval=False,
     )

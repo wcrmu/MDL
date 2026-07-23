@@ -12,6 +12,7 @@ from src.dataloader import (
     COARSE_SCENE_PRIOR_ID_COLUMN,
     FeatureCardinalityAuditor,
     _adapter_table_to_python,
+    _arrow_array_to_pylist,
     _column_array,
     _normalize_optional_outer_list,
     _normalized_list_array,
@@ -70,6 +71,14 @@ REQUIRED = [
 
 
 class MDLRankMixerParquetAdapterTest(unittest.TestCase):
+    def test_nested_numeric_arrow_fast_path_preserves_nulls_and_empty_lists(self) -> None:
+        array = pa.array(
+            [[[1, 2], None, []], None, [[3]]],
+            type=pa.list_(pa.list_(pa.int64())),
+        )
+
+        self.assertEqual(_arrow_array_to_pylist(pa, array), array.to_pylist())
+
     def test_trusted_adapter_validates_one_raw_row_then_uses_fast_path(self) -> None:
         one_row = pa.table(
             {
@@ -760,7 +769,7 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "inner length 5"):
             _scalarize(
                 [1, 2, 3, 4, 5],
-                column="goods_scene_clk_cnt_15d_hn",
+                column="goods_id_hn",
                 raw_row=0,
                 logical_row=0,
             )
@@ -768,7 +777,7 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "inner length 2"):
             _scalarize(
                 [9, 8],
-                column="sku_spec_vids_hn",
+                column="price_hn",
                 raw_row=1,
                 logical_row=0,
                 validate_contract=False,
@@ -788,7 +797,7 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         self.assertIsNone(
             _scalarize(
                 [1, 2, 3, 4, 5],
-                column="goods_scene_clk_cnt_15d_hn",
+                column="goods_id_hn",
                 raw_row=0,
                 logical_row=0,
                 auditor=auditor,
@@ -797,7 +806,7 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         self.assertIsNone(
             _scalarize(
                 [11, 12, 13],
-                column="sku_spec_vids_hn",
+                column="price_hn",
                 raw_row=0,
                 logical_row=1,
                 auditor=auditor,
@@ -817,20 +826,18 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         self.assertEqual(auditor.scalar_stats["search_method_hn"].empty_count, 1)
         self.assertEqual(auditor.scalar_stats["search_method_hn"].singleton_count, 1)
         self.assertEqual(auditor.scalar_stats["search_method_hn"].multi_count, 0)
-        self.assertEqual(
-            auditor.scalar_stats["goods_scene_clk_cnt_15d_hn"].multi_count, 1
-        )
-        self.assertEqual(auditor.scalar_stats["sku_spec_vids_hn"].multi_count, 1)
+        self.assertEqual(auditor.scalar_stats["goods_id_hn"].multi_count, 1)
+        self.assertEqual(auditor.scalar_stats["price_hn"].multi_count, 1)
         report = auditor.format_report()
-        self.assertIn("goods_scene_clk_cnt_15d_hn", report)
-        self.assertIn("sku_spec_vids_hn", report)
+        self.assertIn("goods_id_hn", report)
+        self.assertIn("price_hn", report)
 
         peer = FeatureCardinalityAuditor(soft=False)
-        peer.observe_scalar("mid_goods_prc_list_dis", [4, 5])
+        peer.observe_scalar("cat1_id_hn", [4, 5])
         peer.note_raw_rows(3)
         auditor.merge_payload(peer.to_payload())
         self.assertEqual(auditor.raw_rows_seen, 3)
-        self.assertEqual(auditor.scalar_stats["mid_goods_prc_list_dis"].multi_count, 1)
+        self.assertEqual(auditor.scalar_stats["cat1_id_hn"].multi_count, 1)
 
     def test_soft_auditor_on_adapter_does_not_fail_fast_on_first_multi(self) -> None:
         table = pa.table(
@@ -1151,7 +1158,7 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
             [[101, 102], [101, 102], [201]],
         )
 
-    def test_candidate_item_scalar_not_request_cached(self) -> None:
+    def test_candidate_item_bag_not_request_cached(self) -> None:
         required = [*REQUIRED, "clk_cnt_1d_hn"]
         table = pa.table(
             {
@@ -1179,8 +1186,12 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
             *context.options["item_features"],
             "clk_cnt_1d_hn",
         ]
+        context.options["multivalue_features"] = [
+            *context.options["multivalue_features"],
+            "clk_cnt_1d_hn",
+        ]
         actual = adapt(table, context=context).to_pydict()
-        self.assertEqual(actual["clk_cnt_1d_hn"], [3, None, 8])
+        self.assertEqual(actual["clk_cnt_1d_hn"], [[3], [], [8]])
         self.assertEqual(actual["ctx_scalar_hn"], [101, 101, 102])
 
     def test_all_request_context_scalars_expand(self) -> None:
@@ -1257,8 +1268,8 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
                 actual = adapt(table, context=context).to_pydict()
                 self.assertEqual(actual[field], [[101, 102], [101, 102], [201]])
 
-    def test_all_candidate_item_clk_cart_scalars_stay_candidate_aligned(self) -> None:
-        candidate_item_scalars = {
+    def test_all_candidate_item_clk_cart_bags_stay_candidate_aligned(self) -> None:
+        candidate_item_bags = {
             "clk_cnt_1d_hn",
             "clk_3d_cnt_hn",
             "clk_1d_cat_cnt_hn",
@@ -1266,7 +1277,7 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
             "cart_cnt_3d_hn",
         }
 
-        for field in sorted(candidate_item_scalars):
+        for field in sorted(candidate_item_bags):
             with self.subTest(field=field):
                 required = [*REQUIRED, field]
                 table = pa.table(
@@ -1295,8 +1306,12 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
                     *context.options["item_features"],
                     field,
                 ]
+                context.options["multivalue_features"] = [
+                    *context.options["multivalue_features"],
+                    field,
+                ]
                 actual = adapt(table, context=context).to_pydict()
-                self.assertEqual(actual[field], [3, None, 8])
+                self.assertEqual(actual[field], [[3], [], [8]])
                 self.assertEqual(actual["ctx_scalar_hn"], [101, 101, 102])
 
     def test_obsolete_axis_override_options_rejected(self) -> None:
@@ -1637,6 +1652,44 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "inner length 2"):
             adapt(table, context=context)
+
+    def test_fixed_padding_compacts_agg_axes_before_expansion(self) -> None:
+        table = pa.table(
+            {
+                "context_indices": [[0, 1, 0]],
+                "target_indices": [[0, 1, 0, 0]],
+                "ctx_scalar_hn": [[[101], [102], [0]]],
+                "ctx_bag_hn": [[[1, 2], [3], [0]]],
+                "item_scalar_hn": [[[201], [202], [0], [0]]],
+                "sku_a_hn": [[[11], [12], [0], [0]]],
+                "sku_b_hn": [[[21], [22], [0], [0]]],
+                "impr_x_goods_id_hn": [[-1, -2, 0, 0]],
+                "impr_x_time": [[4900, 4500, 0, 0]],
+                # Candidate padding repeats request zero in the physical
+                # memberships; compaction must filter and deduplicate it.
+                "impr_x_indices": [[[0, 0, 0], [1, 1], [0], [0]]],
+                "scene_id": [[7, 8, 0]],
+                "search_id": [["r0", "r1", "0"]],
+                "impr_time": [[5000, 6000, 0]],
+                "label_a": [[0, 1, 0, 0]],
+                "label_b": [[1, 0, 0, 0]],
+                "label_c": [[0, 1, 0, 0]],
+            }
+        )
+        context = _context(REQUIRED)
+        context.options["fixed_padding"] = {
+            "request_anchor": "search_id",
+            "candidate_anchor": "item_scalar_hn",
+            "sequence_anchor_suffix": "_x_time",
+        }
+
+        actual = adapt(table, context=context).to_pydict()
+
+        self.assertEqual(actual["search_id"], ["r0", "r1"])
+        self.assertEqual(actual["ctx_scalar_hn"], [101, 102])
+        self.assertEqual(actual["item_scalar_hn"], [201, 202])
+        self.assertEqual(actual["impr_x_goods_id_hn"], [[-1], [-2]])
+        self.assertEqual(actual["label_a"], [0, 1])
 
 
 if __name__ == "__main__":

@@ -28,8 +28,27 @@ from src.dataloader import (
 )
 
 
-def _override_inputs(config, data_dir: str):
-    train = replace(config.data.train, inputs=(data_dir,))
+def _override_inputs(
+    config,
+    data_dir: str,
+    *,
+    scanner_batch_rows: int | None = None,
+    num_workers: int | None = None,
+    prefetch_batches: int | None = None,
+):
+    reader_updates = {}
+    if scanner_batch_rows is not None:
+        reader_updates["scanner_batch_rows"] = scanner_batch_rows
+    if num_workers is not None:
+        reader_updates["num_workers"] = num_workers
+    if prefetch_batches is not None:
+        reader_updates["prefetch_batches"] = prefetch_batches
+    reader = (
+        replace(config.data.train.reader, **reader_updates)
+        if reader_updates
+        else config.data.train.reader
+    )
+    train = replace(config.data.train, inputs=(data_dir,), reader=reader)
     return replace(config, data=replace(config.data, train=train))
 
 
@@ -40,11 +59,20 @@ def main() -> int:
         "--data-dir", default="artifacts/4090_bench/synthetic_parquet"
     )
     parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--scanner-batch-rows", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--prefetch-batches", type=int, default=None)
     parser.add_argument("--tensorize", action="store_true")
     parser.add_argument("--pylist-breakdown", action="store_true")
     args = parser.parse_args()
 
-    config = _override_inputs(load_app_config(args.config), args.data_dir)
+    config = _override_inputs(
+        load_app_config(args.config),
+        args.data_dir,
+        scanner_batch_rows=args.scanner_batch_rows,
+        num_workers=args.num_workers,
+        prefetch_batches=args.prefetch_batches,
+    )
     if args.tensorize and config.scenarios.auto_discover:
         # Tensorization needs concrete scenario tokens; production resolves
         # these once before training. Do the same here for a faithful path.
@@ -54,6 +82,12 @@ def main() -> int:
     print(f"config={args.config} model={config.model.name}")
     print(f"features={len(config.features)} sequences={len(config.sequences)}")
     print(f"required_columns={len(required)}")
+    print(
+        "reader="
+        f"scanner_batch_rows={split.reader.scanner_batch_rows} "
+        f"num_workers={split.reader.num_workers} "
+        f"prefetch_batches={split.reader.prefetch_batches}"
+    )
 
     # Optional: measure to_pylist cost per column category on the raw table.
     if args.pylist_breakdown:
