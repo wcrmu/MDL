@@ -348,7 +348,7 @@ class AttentionEntryMatrixTest(unittest.TestCase):
 
 class TunerDefaultsAndPreflightTest(unittest.TestCase):
     def test_nproc_defaults_from_yaml_and_cli_overrides(self) -> None:
-        from scripts import tune_a100_batch_size as tuner
+        from scripts import tune_batch_size as tuner
 
         config_path = ROOT / "configs" / "mdl_rankmixer.yaml"
         with (
@@ -367,7 +367,7 @@ class TunerDefaultsAndPreflightTest(unittest.TestCase):
             with patch(
                 "sys.argv",
                 [
-                    "tune_a100_batch_size.py",
+                    "tune_batch_size.py",
                     "--config",
                     str(config_path),
                     "--compute-only",
@@ -389,7 +389,7 @@ class TunerDefaultsAndPreflightTest(unittest.TestCase):
             with patch(
                 "sys.argv",
                 [
-                    "tune_a100_batch_size.py",
+                    "tune_batch_size.py",
                     "--config",
                     str(config_path),
                     "--compute-only",
@@ -407,7 +407,7 @@ class TunerDefaultsAndPreflightTest(unittest.TestCase):
             self.assertEqual(execute.call_args.args[0].nproc_per_node, 1)
 
     def test_tuner_preflight_blocks_synthetic_generation(self) -> None:
-        from scripts import tune_a100_batch_size as tuner
+        from scripts import tune_batch_size as tuner
 
         config_path = ROOT / "configs" / "mdl_rankmixer.yaml"
         with (
@@ -427,7 +427,7 @@ class TunerDefaultsAndPreflightTest(unittest.TestCase):
             with patch(
                 "sys.argv",
                 [
-                    "tune_a100_batch_size.py",
+                    "tune_batch_size.py",
                     "--config",
                     str(config_path),
                     "--candidate-batches",
@@ -446,7 +446,7 @@ class TunerDefaultsAndPreflightTest(unittest.TestCase):
         execute.assert_not_called()
 
     def test_peak_tflops_defaults_to_none(self) -> None:
-        from scripts import tune_a100_batch_size as tuner
+        from scripts import tune_batch_size as tuner
 
         config_path = ROOT / "configs" / "mdl_rankmixer.yaml"
         with (
@@ -456,7 +456,7 @@ class TunerDefaultsAndPreflightTest(unittest.TestCase):
             with patch(
                 "sys.argv",
                 [
-                    "tune_a100_batch_size.py",
+                    "tune_batch_size.py",
                     "--config",
                     str(config_path),
                     "--compute-only",
@@ -472,7 +472,7 @@ class TunerDefaultsAndPreflightTest(unittest.TestCase):
             self.assertIsNone(execute.call_args.args[0].peak_tflops)
 
     def test_compute_only_forwards_synthetic_scenario_count(self) -> None:
-        from scripts import tune_a100_batch_size as tuner
+        from scripts import tune_batch_size as tuner
 
         args = SimpleNamespace(
             config=ROOT / "configs" / "mdl_rankmixer.yaml",

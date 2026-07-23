@@ -12,7 +12,7 @@ from scripts.generate_synthetic_agg_parquet import (
     SyntheticAggManifest,
     generate_synthetic_agg_dataset,
 )
-from scripts.tune_a100_batch_size import (
+from scripts.tune_batch_size import (
     _default_sequence_lengths,
     _hdfs_sensitivity,
     _recommended_yaml_override,

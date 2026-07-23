@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tune A100 batch size with a local production-shaped Parquet pipeline.
+"""Tune training batch size with a local production-shaped Parquet pipeline.
 
 By default each trial runs the full path: gzip Parquet projection/decode, agg
 request filtering, adapter conversion, feature tensorization, pinned-memory
@@ -175,7 +175,7 @@ def _run_candidate(
     workspace: Path,
     parquet_dir: Path | None,
 ) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="mdl-a100-tune-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="mdl-batch-tune-") as temporary:
         report_path = Path(temporary) / "report.json"
         benchmark_mode = "compute" if args.compute_only else "end-to-end"
         if args.compute_only:
@@ -325,7 +325,7 @@ def _run_reader_trial(
         batch_size=args.reader_benchmark_batch_size,
         scanner_batch_rows=scanner_batch_rows,
     )
-    with tempfile.TemporaryDirectory(prefix="mdl-a100-reader-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="mdl-batch-reader-") as temporary:
         report_path = Path(temporary) / "report.json"
         command = [
             sys.executable,
@@ -650,7 +650,7 @@ def main() -> int:
         default=None,
         help=(
             "optional device peak TFLOPS used only for MFU reporting; omit to "
-            "skip MFU instead of assuming an A100 default"
+            "skip MFU instead of assuming a GPU-specific default"
         ),
     )
     parser.add_argument(
@@ -661,7 +661,7 @@ def main() -> int:
         dest="hbm_limit_gib",
         help=(
             "per-rank reserved-HBM safety ceiling used when selecting a batch; "
-            "not a fixed A100 attribute (default 76 GiB leaves headroom on 80 GiB GPUs)"
+            "not a fixed GPU attribute (default 76 GiB leaves headroom on 80 GiB cards)"
         ),
     )
     parser.add_argument(
@@ -779,7 +779,7 @@ def main() -> int:
     if args.hdfs_open_latency_ms < 0.0 or args.assumed_hdfs_bandwidth_mib_s < 0.0:
         parser.error("HDFS latency/bandwidth assumptions must be non-negative")
 
-    with tempfile.TemporaryDirectory(prefix="mdl-a100-full-tune-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="mdl-batch-full-tune-") as temporary:
         workspace = Path(temporary)
         if args.compute_only:
             return _execute_tuning(
