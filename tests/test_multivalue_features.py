@@ -64,6 +64,34 @@ class MultiValueCategoricalFeatureTest(unittest.TestCase):
         )
         self.assertEqual(actual["values"].ndim, 1)
 
+    def test_pre_hashed_bag_tail_truncation(self) -> None:
+        feature = FeatureConfig(
+            name="tokens",
+            kind="categorical",
+            source="tokens",
+            pooling="mean",
+            pooling_null_policy="include_as_padding",
+            max_length=3,
+            truncation="tail",
+        )
+        table = pa.table(
+            {
+                "tokens": pa.array(
+                    [[1, None, -1, 4], [7], [-8, 3, 5, 9]],
+                    type=pa.list_(pa.int64()),
+                )
+            }
+        )
+
+        actual = _tensorize_categorical_bag(self._config(), feature, table, {})
+
+        torch.testing.assert_close(actual["lengths"], torch.tensor([3, 1, 3]))
+        # Tail keeps last three of row0 ([None,-1,4]) and row2 ([3,5,9]).
+        torch.testing.assert_close(
+            actual["values"],
+            torch.tensor([0, 8, 5, 8, 4, 6, 2]),
+        )
+
     def test_pooling_null_policies_have_distinct_denominators(self) -> None:
         indices = torch.tensor([2, 0, 8])
         lengths = torch.tensor([3, 0])

@@ -518,6 +518,38 @@ class RequestDeduplicationTest(unittest.TestCase):
         self.assertEqual(selected["value"].to_pylist(), [10, 20, 30])
         self.assertEqual(row_indices.tolist(), [0, 0, 1, 0, 2])
 
+    def test_dedup_can_project_request_columns_only(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "rankmixer.yaml")
+        split = replace(
+            config.data.train,
+            reader=replace(
+                config.data.train.reader,
+                deduplicate_request_features=True,
+            ),
+        )
+        request_column = split.request_id or "search_id"
+        table = pa.table(
+            {
+                request_column: ["r0", "r0", "r1"],
+                "ctx": [100, 101, 200],
+                "item": [1, 2, 3],
+                "label": [0, 1, 0],
+            }
+        )
+
+        selected, row_indices = _request_deduplication_plan(
+            split,
+            table,
+            columns=[request_column, "ctx"],
+        )
+
+        self.assertEqual(selected.column_names, [request_column, "ctx"])
+        self.assertEqual(selected["ctx"].to_pylist(), [100, 200])
+        self.assertEqual(row_indices.tolist(), [0, 0, 1])
+        self.assertNotIn("item", selected.column_names)
+        self.assertNotIn("label", selected.column_names)
+
     def test_dedup_survives_multi_chunk_dictionary_list_columns(self) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(root / "configs" / "rankmixer.yaml")

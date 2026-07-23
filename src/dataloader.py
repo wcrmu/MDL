@@ -4209,6 +4209,19 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
     compact_list_columns = plan.compact_list_columns
     runtime_cache = getattr(context, "_runtime_cache", None)
     trusted_input = bool(getattr(context, "trusted_input", False))
+    axis_separated = bool(
+        isinstance(runtime_cache, dict) and runtime_cache.get("axis_separated")
+    )
+    axis_request_id_column = (
+        runtime_cache.get("axis_request_id_column")
+        if isinstance(runtime_cache, dict)
+        else None
+    )
+    if axis_separated and not axis_request_id_column:
+        raise ValueError(
+            "axis_separated adapt requires runtime_cache['axis_request_id_column']"
+        )
+
     cardinality_auditor: FeatureCardinalityAuditor | None = None
     if isinstance(runtime_cache, dict):
         cached_auditor = runtime_cache.get("cardinality_auditor")
@@ -4257,6 +4270,30 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
     validate_structure = True
     validate_row_contract = validate_structure
     output: dict[str, list[Any]] = {column: [] for column in required}
+    # Axis-separated accumulators (direct path). First-wins on request_id.
+    axis_request_id_to_slot: dict[Any, int] = {}
+    axis_request_ids: list[Any] = []
+    axis_request_raw_rows: list[int] = []
+    axis_candidate_to_request: list[int] = []
+    axis_candidate_raw_rows: list[int] = []
+    axis_request_features: dict[str, list[Any]] = {
+        column: [] for column in request_output_columns
+    }
+    axis_sequence_features: dict[str, list[Any]] = {
+        column: [] for column in sequence_output_columns
+    }
+    axis_item_features: dict[str, list[Any]] = {
+        column: [] for column in item_output_columns
+    }
+    axis_label_features: dict[str, list[Any]] = {
+        column: [] for column in label_output_columns
+    }
+    axis_label_mask_features: dict[str, list[Any]] = {
+        column: [] for column in label_mask_output_columns
+    }
+    axis_candidate_metadata: dict[str, list[Any]] = {
+        column: [] for column in candidate_metadata_output_columns
+    }
     raw, validated_flat_sequence_columns = _adapter_table_to_python(
         table,
         plan.raw_sequence_columns,
@@ -4720,24 +4757,100 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             if mask_column is not None:
                 normalized_label_masks[mask_column] = task_masks
 
-        for column in request_output_columns:
-            output[column].extend(
-                request_cache[request_index][column]
-                for request_index in candidate_requests
-            )
-        for column in item_output_columns:
-            output[column].extend(normalized_items[column])
-        for column in candidate_metadata_output_columns:
-            output[column].extend(candidate_metadata[column])
-        for column in sequence_output_columns:
-            output[column].extend(
-                sequence_cache[request_index][column]
-                for request_index in candidate_requests
-            )
-        for column in label_output_columns:
-            output[column].extend(normalized_labels[column])
-        for column in label_mask_output_columns:
-            output[column].extend(normalized_label_masks[column])
+        if axis_separated:
+            for candidate_index, request_index in enumerate(candidate_requests):
+                request_id = request_cache[request_index][axis_request_id_column]
+                if request_id is None:
+                    raise ValueError(
+                        f"request_id column {axis_request_id_column!r} contains null "
+                        f"at raw row {raw_row}, candidate {candidate_index}"
+                    )
+                try:
+                    slot = axis_request_id_to_slot.get(request_id)
+                except TypeError as error:
+                    raise ValueError(
+                        f"request_id column {axis_request_id_column!r} must contain "
+                        "hashable scalars"
+                    ) from error
+                if slot is None:
+                    slot = len(axis_request_ids)
+                    axis_request_id_to_slot[request_id] = slot
+                    axis_request_ids.append(request_id)
+                    axis_request_raw_rows.append(raw_row)
+                    for column in request_output_columns:
+                        axis_request_features[column].append(
+                            request_cache[request_index][column]
+                        )
+                    for column in sequence_output_columns:
+                        axis_sequence_features[column].append(
+                            sequence_cache[request_index][column]
+                        )
+                axis_candidate_to_request.append(slot)
+                axis_candidate_raw_rows.append(raw_row)
+            for column in item_output_columns:
+                axis_item_features[column].extend(normalized_items[column])
+            for column in candidate_metadata_output_columns:
+                axis_candidate_metadata[column].extend(candidate_metadata[column])
+            for column in label_output_columns:
+                axis_label_features[column].extend(normalized_labels[column])
+            for column in label_mask_output_columns:
+                axis_label_mask_features[column].extend(
+                    normalized_label_masks[column]
+                )
+        else:
+            for column in request_output_columns:
+                output[column].extend(
+                    request_cache[request_index][column]
+                    for request_index in candidate_requests
+                )
+            for column in item_output_columns:
+                output[column].extend(normalized_items[column])
+            for column in candidate_metadata_output_columns:
+                output[column].extend(candidate_metadata[column])
+            for column in sequence_output_columns:
+                output[column].extend(
+                    sequence_cache[request_index][column]
+                    for request_index in candidate_requests
+                )
+            for column in label_output_columns:
+                output[column].extend(normalized_labels[column])
+            for column in label_mask_output_columns:
+                output[column].extend(normalized_label_masks[column])
+
+    if axis_separated:
+        from .agg_direct import AdaptedAxisBundle
+        import numpy as np
+
+        if isinstance(runtime_cache, dict) and table.num_rows > 0:
+            runtime_cache["mdl_rankmixer_first_batch_adapted"] = True
+        return AdaptedAxisBundle(
+            n_candidates=len(axis_candidate_to_request),
+            n_requests=len(axis_request_ids),
+            request_ids=tuple(axis_request_ids),
+            candidate_to_request=np.asarray(axis_candidate_to_request, dtype=np.int64),
+            request_features={
+                name: tuple(values) for name, values in axis_request_features.items()
+            },
+            sequence_features={
+                name: tuple(values) for name, values in axis_sequence_features.items()
+            },
+            item_features={
+                name: tuple(values) for name, values in axis_item_features.items()
+            },
+            label_features={
+                name: tuple(values) for name, values in axis_label_features.items()
+            },
+            label_mask_features={
+                name: tuple(values)
+                for name, values in axis_label_mask_features.items()
+            },
+            candidate_metadata={
+                name: tuple(values)
+                for name, values in axis_candidate_metadata.items()
+            },
+            request_raw_rows=np.asarray(axis_request_raw_rows, dtype=np.int64),
+            candidate_raw_rows=np.asarray(axis_candidate_raw_rows, dtype=np.int64),
+        )
 
     arrays: dict[str, Any] = {}
     for column, values in output.items():
@@ -4935,12 +5048,17 @@ def run_feature_cardinality_audit(
 
 def _normalize_adapter_result(result: Any, adapter_name: str, split_name: str) -> Iterator[Any]:
     pa, _pc, _ds, _pq = _require_pyarrow()
+    from .agg_direct import AdaptedAxisBundle
+
+    if isinstance(result, AdaptedAxisBundle):
+        yield result
+        return
     if isinstance(result, pa.Table):
         yield result
         return
     if isinstance(result, RuntimeIterable):
         for index, table in enumerate(result):
-            if not isinstance(table, pa.Table):
+            if not isinstance(table, (pa.Table, AdaptedAxisBundle)):
                 raise TypeError(
                     f"parquet adapter {adapter_name!r} for split {split_name!r} returned "
                     f"item {index} of type {type(table).__name__}; expected pyarrow.Table"
@@ -5364,6 +5482,112 @@ def iter_flat_tables(
     )
 
 
+def iter_adapted_axis_bundles(
+    config: AppConfig,
+    split_name: str,
+    *,
+    shard_rank: int = 0,
+    shard_world_size: int = 1,
+    require_labels: bool = True,
+    producer_queue_size: int = 2,
+) -> Iterator[Any]:
+    """Yield axis-separated adapted payloads (no candidate-flat Arrow).
+
+    ``producer_queue_size`` bounds a shallow in-process queue so adaptation of
+    the next raw batch overlaps descriptor/batch work on the consumer side.
+    Size ``<= 1`` disables prefetch (purely synchronous).
+    """
+
+    from .agg_direct import AdaptedAxisBundle
+
+    split = _split_for_name(config, split_name)
+    if split.request_id is None:
+        raise ValueError("iter_adapted_axis_bundles requires split.request_id")
+    if split.format != "adapter_parquet":
+        raise ValueError(
+            "iter_adapted_axis_bundles requires adapter_parquet "
+            f"(got {split.format!r})"
+        )
+    required_columns = required_columns_for_split(
+        config,
+        split,
+        require_labels=require_labels,
+    )
+    scan_columns = _scan_columns_for_split(split, required_columns)
+    scanner = ParquetScanner(
+        split,
+        scan_columns,
+        shard_rank=shard_rank,
+        shard_world_size=shard_world_size,
+        optional_columns=(
+            set(_optional_scan_columns_for_split(split)) & set(scan_columns)
+        ),
+    )
+    adapter_name, adapter = _load_parquet_adapter(split)
+    context = _adapter_context(split_name, split, required_columns)
+    context._runtime_cache["axis_separated"] = True
+    context._runtime_cache["axis_request_id_column"] = split.request_id
+
+    def produce() -> Iterator[AdaptedAxisBundle]:
+        for raw_table in scanner.iter_tables():
+            if not raw_table.num_rows:
+                continue
+            try:
+                result = adapter(raw_table, context=context)
+            except Exception as error:
+                raise RuntimeError(
+                    f"parquet adapter {adapter_name!r} failed for split "
+                    f"{split_name!r}: {error}"
+                ) from error
+            for bundle in _normalize_adapter_result(result, adapter_name, split_name):
+                if not isinstance(bundle, AdaptedAxisBundle):
+                    raise TypeError(
+                        "axis_separated adapter must return AdaptedAxisBundle, "
+                        f"got {type(bundle).__name__}"
+                    )
+                if bundle.n_candidates == 0:
+                    continue
+                yield bundle
+
+    if producer_queue_size <= 1:
+        yield from produce()
+        return
+
+    import queue as queue_mod
+    import threading
+
+    out_queue: queue_mod.Queue[AdaptedAxisBundle | None | BaseException] = (
+        queue_mod.Queue(maxsize=int(producer_queue_size))
+    )
+    error_holder: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            for bundle in produce():
+                out_queue.put(bundle)
+            out_queue.put(None)
+        except BaseException as error:  # noqa: BLE001 - propagate to consumer
+            error_holder.append(error)
+            out_queue.put(error)
+
+    thread = threading.Thread(
+        target=worker,
+        name=f"mdl-axis-producer-{split_name}",
+        daemon=True,
+    )
+    thread.start()
+    while True:
+        item = out_queue.get()
+        if item is None:
+            break
+        if isinstance(item, BaseException):
+            raise item
+        yield item
+    thread.join()
+    if error_holder:
+        raise error_holder[0]
+
+
 def scan_flat_table_stats(
     config: AppConfig,
     split_name: str,
@@ -5675,6 +5899,46 @@ def _tensorize_categorical(
     return torch.tensor(encoded, dtype=torch.long)
 
 
+def _list_truncate_array(array: Any, max_length: int, *, truncation: str) -> Any:
+    """Truncate list elements without building a padded ``[N, max_length]`` table.
+
+    Head uses Arrow ``list_slice``. Tail rebuilds offsets (PyArrow 14
+    ``list_slice`` rejects negative ``start``).
+    """
+
+    if max_length < 0:
+        raise ValueError(f"max_length must be non-negative, got {max_length}")
+    pa, pc, _ds, _pq = _require_pyarrow()
+    if isinstance(array, pa.ChunkedArray):
+        array = array.combine_chunks()
+    if truncation == "head":
+        return pc.list_slice(array, 0, int(max_length))
+    if truncation != "tail":
+        raise ValueError(f"unsupported list truncation {truncation!r}")
+
+    import numpy as np
+
+    offsets = array.offsets.to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+    lengths = offsets[1:] - offsets[:-1]
+    take_n = np.minimum(lengths, int(max_length)).astype(np.int64, copy=False)
+    starts = offsets[:-1] + (lengths - take_n)
+    total = int(take_n.sum())
+    if total == 0:
+        flat = array.values.slice(0, 0)
+    else:
+        row_ids = np.repeat(np.arange(len(take_n), dtype=np.int64), take_n)
+        within = np.arange(total, dtype=np.int64) - np.repeat(
+            np.cumsum(take_n) - take_n, take_n
+        )
+        flat = pc.take(array.values, pa.array(starts[row_ids] + within, type=pa.int64()))
+    new_offsets = np.empty(len(take_n) + 1, dtype=np.int64)
+    new_offsets[0] = 0
+    np.cumsum(take_n, out=new_offsets[1:])
+    if pa.types.is_large_list(array.type):
+        return pa.LargeListArray.from_arrays(new_offsets, flat)
+    return pa.ListArray.from_arrays(new_offsets, flat)
+
+
 def _tensorize_categorical_bag(
     config: AppConfig,
     feature: FeatureConfig,
@@ -5685,8 +5949,9 @@ def _tensorize_categorical_bag(
 ) -> dict[str, Tensor]:
     """Encode one list-valued categorical feature as flat values + lengths.
 
-    Truncation follows ``feature.max_length`` / ``truncation``. The returned
-    ``values`` tensor is CSR-like ``[sum(lengths)]`` (no pad slots); mean-pool
+    Truncation follows ``feature.max_length`` / ``truncation`` via Arrow-native
+    list ops + ``list_flatten`` (no temporary ``[N, max_length]`` pad).
+    The returned ``values`` tensor is CSR-like ``[sum(lengths)]``; mean-pool
     reconstructs per-row segments from ``lengths``.
     """
 
@@ -5696,26 +5961,24 @@ def _tensorize_categorical_bag(
         config,
         config.resolved.categorical_input_by_name[feature.name],
     )
+    pa, pc, _ds, _pq = _require_pyarrow()
     array = _normalized_list_array(table, feature.source)
-    offsets = _list_offsets_tensor(array)
-    base = int(offsets[0].item()) if offsets.numel() else 0
-    normalized_offsets = offsets - base
-    raw_lengths = normalized_offsets[1:] - normalized_offsets[:-1]
-    lengths = raw_lengths
     if feature.max_length is not None:
-        lengths = torch.clamp(raw_lengths, max=feature.max_length)
-    if feature.truncation == "tail":
-        starts = normalized_offsets[1:] - lengths
-    else:
-        starts = normalized_offsets[:-1]
-    max_length = int(lengths.max().item()) if lengths.numel() else 0
-    total_values = int(offsets[-1].item()) - base if offsets.numel() else 0
-    flat = array.values.slice(base, total_values)
+        array = _list_truncate_array(
+            array,
+            int(feature.max_length),
+            truncation=feature.truncation,
+        )
+    length_array = pc.list_value_length(array)
+    if length_array.null_count:
+        length_array = pc.fill_null(length_array, 0)
+    lengths = _numpy_backed_tensor(length_array, torch.long)
+    flat_array = pc.list_flatten(array)
     if isinstance(categorical_input.encoding, ResolvedIdentityEncoding):
-        encoded = _identity_array_tensor(flat, categorical_input)
+        encoded = _identity_array_tensor(flat_array, categorical_input)
     elif isinstance(categorical_input.encoding, ResolvedPreHashedEncoding):
         encoded = _pre_hashed_array_tensor(
-            flat,
+            flat_array,
             categorical_input,
             validate_nonzero=validate_prehashed_nonzero,
         )
@@ -5730,25 +5993,11 @@ def _tensorize_categorical_bag(
                     vocab_map,
                     unseen_policy,
                 )
-                for value in flat.to_pylist()
+                for value in flat_array.to_pylist()
             ],
             dtype=torch.long,
         )
-    # Truncate via the padded gather, then compact to CSR-like flat values so
-    # embedding lookup skips pad slots and mean-pool uses offsets/lengths.
-    padded = _gather_padded_sequence(
-        encoded,
-        starts,
-        lengths,
-        max_length,
-        0,
-    )
-    if max_length == 0 or not lengths.numel():
-        flat = encoded.new_empty((0,), dtype=encoded.dtype)
-    else:
-        positions = torch.arange(max_length, dtype=torch.long)
-        flat = padded[positions.unsqueeze(0) < lengths.unsqueeze(1)]
-    return {"values": flat, "lengths": lengths}
+    return {"values": encoded, "lengths": lengths}
 
 
 # --- Dense features ---
@@ -6761,8 +7010,14 @@ def _prediction_keys(split: ParquetSplitConfig, table: Any) -> dict[str, list[An
 def _request_deduplication_plan(
     split: ParquetSplitConfig,
     table: Any,
+    *,
+    columns: Sequence[str] | None = None,
 ) -> tuple[Any, Tensor] | None:
-    """Select one physical row per request and map candidates back to it."""
+    """Select one physical row per request and map candidates back to it.
+
+    When ``columns`` is set, only those columns are taken (request/context/
+    sequence sources). Candidate/item/label columns stay on the full table.
+    """
 
     if not split.reader.deduplicate_request_features:
         return None
@@ -6800,7 +7055,18 @@ def _request_deduplication_plan(
             candidate_to_request.append(existing)
     if len(unique_positions) == table.num_rows:
         return None
-    selected = _safe_table_take(table, unique_positions)
+    take_table = table
+    if columns is not None:
+        names = set(table.column_names)
+        selected_columns = [name for name in columns if name in names]
+        if split.request_id not in selected_columns and split.request_id in names:
+            selected_columns.insert(0, split.request_id)
+        if not selected_columns:
+            raise ValueError(
+                "request feature deduplication projected an empty column set"
+            )
+        take_table = table.select(selected_columns)
+    selected = _safe_table_take(take_table, unique_positions)
     return selected, torch.tensor(candidate_to_request, dtype=torch.long)
 
 
@@ -6810,6 +7076,9 @@ def _indexed_request_value(value: Any, row_indices: Tensor) -> dict[str, Any]:
     return {"values": value, "row_indices": row_indices}
 
 
+_REQUEST_DEDUP_AUTO = object()
+
+
 def table_to_feature_batch(
     config: AppConfig,
     table: Any,
@@ -6817,6 +7086,7 @@ def table_to_feature_batch(
     require_labels: bool = True,
     include_group_id: bool = True,
     split: ParquetSplitConfig | None = None,
+    request_deduplication: tuple[Any, Tensor] | None | object = _REQUEST_DEDUP_AUTO,
 ) -> FeatureBatch:
     """Convert one Arrow table into the exact structure consumed by the model.
 
@@ -6824,19 +7094,51 @@ def table_to_feature_batch(
     not, every label is treated as observed. Feature and label ordering follows
     configuration order so it remains stable across training and evaluation.
     Callers processing a non-training split must pass it explicitly.
+
+    ``request_deduplication`` may supply a precomputed
+    ``(request_table, row_indices)`` pair from the direct pack path. Pass
+    ``None`` to disable dedup for this call.
     """
     active_split = config.data.train if split is None else split
     batch_size = table.num_rows
-    deduplication = _request_deduplication_plan(active_split, table)
-    request_table, request_row_indices = (
-        (table, None) if deduplication is None else deduplication
-    )
     adapter_options = (
         {} if active_split.adapter is None else active_split.adapter.options
     )
     context_sources = {
         str(source) for source in adapter_options.get("context_features", ())
     }
+    if request_deduplication is _REQUEST_DEDUP_AUTO:
+        request_take_columns: list[str] | None = None
+        if active_split.reader.deduplicate_request_features:
+            sequence_sources = {
+                field.source
+                for sequence in config.sequences
+                for field in sequence.fields
+            }
+            request_take_columns = sorted(
+                {
+                    *(
+                        [active_split.request_id]
+                        if active_split.request_id is not None
+                        else []
+                    ),
+                    *context_sources,
+                    *sequence_sources,
+                }
+            )
+        deduplication = _request_deduplication_plan(
+            active_split,
+            table,
+            columns=request_take_columns,
+        )
+        request_table, request_row_indices = (
+            (table, None) if deduplication is None else deduplication
+        )
+    elif request_deduplication is None:
+        request_table, request_row_indices = table, None
+    else:
+        request_table, request_row_indices = request_deduplication
+
     validate_prehashed_nonzero = active_split.reader.validate_prehashed_nonzero
     validate_sequence_alignment = not active_split.reader.trusted_input
     features: dict[str, Any] = {}

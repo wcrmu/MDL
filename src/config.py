@@ -501,6 +501,10 @@ class ReaderConfig(_DeeplyImmutableConfig):
     # sequence-length calculation. Zero preserves physical request order.
     shuffle_buffer_rows: int = 0
     shuffle_seed: int = 0
+    # Direct agg→FeatureBatch producer. ``legacy`` keeps candidate-flat Arrow.
+    # ``direct`` uses RequestGroupBlock descriptors (rollout). ``compare`` runs
+    # both on small batches for oracle checks without training on direct output.
+    agg_direct_mode: Literal["legacy", "direct", "compare"] = "legacy"
     # Remote (HDFS/viewfs) IO resilience. Timeouts wrap blocking libhdfs calls
     # in a daemon thread so hung opens cannot stall the trainer forever.
     hdfs_op_timeout: float = 30.0
@@ -575,6 +579,10 @@ class ReaderConfig(_DeeplyImmutableConfig):
             raise ValueError("reader.shard_unit must be file, row_group, or record_batch")
         if self.length_bucket_metric not in {"max", "sum"}:
             raise ValueError("reader.length_bucket_metric must be max or sum")
+        if self.agg_direct_mode not in {"legacy", "direct", "compare"}:
+            raise ValueError(
+                "reader.agg_direct_mode must be legacy, direct, or compare"
+            )
         if type(self.shuffle_buffer_rows) is not int or self.shuffle_buffer_rows < 0:
             raise ValueError("reader.shuffle_buffer_rows must be a non-negative integer")
         if type(self.shuffle_seed) is not int or self.shuffle_seed < 0:

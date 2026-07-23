@@ -31,6 +31,17 @@ from .config import (
     QuickEvalConfig,
     ReaderConfig,
 )
+from .agg_direct import (
+    PreparedBatchTable,
+    SourceRegistry,
+    build_packed_request_plan,
+    build_request_deduplication_from_pack,
+    iter_length_bucketed_packs,
+    materialize_packed_axis_bundles,
+    materialize_packed_blocks,
+    request_group_blocks_from_adapted_table,
+    request_group_blocks_from_axis_bundle,
+)
 from .checkpoint import load_model_checkpoint, save_model_checkpoint
 from .dataloader import (
     FeatureBatch,
@@ -38,6 +49,7 @@ from .dataloader import (
     _require_pyarrow,
     _safe_table_take,
     discover_scenario_values,
+    iter_adapted_axis_bundles,
     iter_flat_tables,
     move_feature_batch,
     pin_feature_batch,
@@ -1119,6 +1131,202 @@ def _iter_length_bucketed_tables(
         yield _concat_batch_tables(pa, buffered[bucket_index])
 
 
+def _iter_batch_tables_direct(
+    config: AppConfig,
+    split_name: str,
+    shard_rank: int,
+    shard_world_size: int,
+    require_labels: bool = True,
+) -> Iterator[object]:
+    """Axis-separated adapt → descriptor pack → narrow pack-boundary Arrow.
+
+    Skips candidate-flat materialization of whole scanner tables. Adapted
+    payloads stay as :class:`AdaptedAxisBundle` under a :class:`SourceRegistry`
+    until every referencing block has been packed; then the source is released.
+    """
+
+    reader = _split_reader(config, split_name)
+    split = config.data.train if split_name == "train" else config.data.test
+    if split is None:
+        raise ValueError(f"split {split_name!r} is not configured")
+    if not reader.deduplicate_request_features:
+        raise ValueError(
+            "reader.agg_direct_mode requires reader.deduplicate_request_features=true"
+        )
+    if split.request_id is None:
+        raise ValueError("reader.agg_direct_mode requires split.request_id")
+
+    adapter_options = {} if split.adapter is None else split.adapter.options
+    context_sources = {
+        str(source) for source in adapter_options.get("context_features", ())
+    }
+    sequence_sources = {
+        field.source
+        for sequence in config.sequences
+        for field in sequence.fields
+    }
+
+    use_axis = split.format == "adapter_parquet"
+    registry = SourceRegistry()
+
+    def blocks() -> Iterator[Any]:
+        if use_axis:
+            producer_queue = 2 if reader.prefetch_batches > 0 else 1
+            bundle_iter = iter_adapted_axis_bundles(
+                config,
+                split_name,
+                shard_rank=shard_rank,
+                shard_world_size=shard_world_size,
+                require_labels=require_labels,
+                producer_queue_size=producer_queue,
+            )
+            for bundle in bundle_iter:
+                source_id = registry.put(bundle)
+                group_blocks = request_group_blocks_from_axis_bundle(
+                    bundle,
+                    source_id=source_id,
+                    sequences=config.sequences,
+                    length_bucket_metric=reader.length_bucket_metric,
+                )
+                if not group_blocks:
+                    # put() leaves refcount 0; release(0) drops the empty payload.
+                    registry.release(source_id, 0)
+                    continue
+                registry.acquire(source_id, len(group_blocks))
+                yield from group_blocks
+            return
+
+        # Transitional fallback for flat_parquet: still uses adapted tables.
+        for source_id, table in enumerate(
+            iter_candidate_tables(
+                config,
+                split_name,
+                shard_rank=shard_rank,
+                shard_world_size=shard_world_size,
+                require_labels=require_labels,
+            )
+        ):
+            if not table.num_rows:
+                continue
+            source_id = registry.put(table)
+            group_blocks = request_group_blocks_from_adapted_table(
+                table,
+                source_id=source_id,
+                request_id_column=split.request_id,
+                sequences=config.sequences,
+                length_bucket_metric=reader.length_bucket_metric,
+            )
+            registry.acquire(source_id, len(group_blocks))
+            yield from group_blocks
+
+    for pack in iter_length_bucketed_packs(
+        blocks(),
+        buckets=reader.length_buckets,
+        default_batch_size=config.training.batch_size,
+        shuffle_buffer_rows=reader.shuffle_buffer_rows,
+        shuffle_seed=reader.shuffle_seed,
+        shard_rank=shard_rank,
+    ):
+        packed = build_packed_request_plan(pack)
+        sources_in_pack: dict[int, int] = {}
+        for block in packed.blocks:
+            sources_in_pack[block.source_id] = (
+                sources_in_pack.get(block.source_id, 0) + 1
+            )
+
+        if use_axis:
+            bundles = {
+                source_id: registry.get(source_id)
+                for source_id in sources_in_pack
+            }
+            # Discover column sets from the first bundle in the pack.
+            sample = next(iter(bundles.values()))
+            request_columns = sorted(sample.request_features.keys())
+            sequence_columns = sorted(sample.sequence_features.keys())
+            candidate_columns = sorted(
+                {
+                    *sample.item_features.keys(),
+                    *sample.label_features.keys(),
+                    *sample.label_mask_features.keys(),
+                    *sample.candidate_metadata.keys(),
+                    *(
+                        [split.request_id]
+                        if split.request_id is not None
+                        else []
+                    ),
+                    *(
+                        [split.group_id]
+                        if split.group_id is not None
+                        else []
+                    ),
+                    *(
+                        [config.scenarios.source]
+                        if config.scenarios.source is not None
+                        else []
+                    ),
+                    *split.prediction_keys.values(),
+                }
+            )
+            # Keep only columns that exist on at least one axis of the bundle.
+            filtered_candidate_columns = []
+            for name in candidate_columns:
+                if (
+                    name in sample.item_features
+                    or name in sample.label_features
+                    or name in sample.label_mask_features
+                    or name in sample.candidate_metadata
+                    or name in sample.request_features
+                    or name == split.request_id
+                ):
+                    filtered_candidate_columns.append(name)
+            candidate_table, request_table, row_indices = (
+                materialize_packed_axis_bundles(
+                    bundles,
+                    packed,
+                    request_columns=request_columns,
+                    sequence_columns=sequence_columns,
+                    candidate_columns=filtered_candidate_columns,
+                    request_id_column=split.request_id,
+                )
+            )
+            prepared = PreparedBatchTable(
+                table=candidate_table,
+                request_deduplication=(request_table, row_indices),
+            )
+        else:
+            source_tables = {
+                source_id: registry.get(source_id)
+                for source_id in sources_in_pack
+            }
+            candidate_table = materialize_packed_blocks(
+                source_tables, packed.blocks
+            )
+            request_columns = sorted(
+                {
+                    *(
+                        [split.request_id]
+                        if split.request_id is not None
+                        else []
+                    ),
+                    *context_sources,
+                    *sequence_sources,
+                }
+            )
+            request_dedup = build_request_deduplication_from_pack(
+                packed,
+                source_tables,
+                columns=request_columns,
+            )
+            prepared = PreparedBatchTable(
+                table=candidate_table,
+                request_deduplication=request_dedup,
+            )
+
+        yield prepared
+        for source_id, count in sources_in_pack.items():
+            registry.release(source_id, count)
+
+
 def _iter_batch_tables(
     config: AppConfig,
     split_name: str,
@@ -1126,6 +1334,18 @@ def _iter_batch_tables(
     shard_world_size: int,
     require_labels: bool = True,
 ) -> Iterator[object]:
+    reader = _split_reader(config, split_name)
+    if reader.agg_direct_mode in {"direct", "compare"}:
+        # compare currently shares the direct batcher; FeatureBatch oracle
+        # checks are covered by unit tests until phase 7 runtime compare lands.
+        yield from _iter_batch_tables_direct(
+            config,
+            split_name,
+            shard_rank,
+            shard_world_size,
+            require_labels,
+        )
+        return
     for table in _iter_length_bucketed_tables(
         config,
         split_name,
@@ -1187,6 +1407,9 @@ def _max_bag_length(table: object, source: str) -> int:
 def _estimate_prepared_batch_bytes(config: AppConfig, table: object) -> int:
     """Conservative Arrow-plus-tensor reservation for the prefetch queue."""
 
+    if isinstance(table, PreparedBatchTable):
+        table = table.table
+
     rows = int(table.num_rows)
     tensor_bytes = 0
     bag_max_lengths: dict[str, int] = {}
@@ -1234,13 +1457,23 @@ def _prepare_feature_batch(
     coalesce_pinned_tensors: bool,
     include_group_id: bool,
 ) -> FeatureBatch:
+    request_deduplication = None
+    candidate_table = table
+    if isinstance(table, PreparedBatchTable):
+        candidate_table = table.table
+        request_deduplication = table.request_deduplication
     batch = table_to_feature_batch(
         config,
-        table,
+        candidate_table,
         vocab_maps,
         require_labels=require_labels,
         include_group_id=include_group_id,
         split=split,
+        **(
+            {"request_deduplication": request_deduplication}
+            if isinstance(table, PreparedBatchTable)
+            else {}
+        ),
     )
     return (
         pin_feature_batch(
