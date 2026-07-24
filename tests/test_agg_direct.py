@@ -10,6 +10,7 @@ import pyarrow as pa
 import torch
 
 from src.agg_direct import (
+    AdaptedAxisBundle,
     RequestGroupBlock,
     build_packed_request_plan,
     build_sequence_selection_plan,
@@ -17,7 +18,10 @@ from src.agg_direct import (
     iter_packed_request_groups,
     iter_shuffled_request_groups,
     length_bucket_index,
+    materialize_packed_axis_bundles,
+    prepare_packed_axis_batch,
     request_group_blocks_from_adapted_table,
+    request_group_blocks_from_axis_bundle,
     row_sequence_selection_after_truncate_then_compact,
     table_pre_compaction_sequence_lengths,
 )
@@ -267,6 +271,52 @@ class PackedPlanAndBatcherTest(unittest.TestCase):
             packs[2][0].active_candidate_positions(),
             [4],
         )
+        self.assertFalse(packs[0][0].releases_source_reference)
+        self.assertFalse(packs[1][0].releases_source_reference)
+        self.assertTrue(packs[2][0].releases_source_reference)
+
+    def test_oversized_group_keeps_source_until_final_slice(self) -> None:
+        from dataclasses import replace
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from src.config import load_app_config
+        from src.train import _iter_batch_tables
+
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
+        sequence_source = config.sequences[0].fields[0].source
+        train_split = replace(
+            config.data.train,
+            request_id="request_id",
+            reader=replace(
+                config.data.train.reader,
+                deduplicate_request_features=True,
+                shuffle_buffer_rows=0,
+                length_buckets=(),
+                agg_direct_mode="direct",
+            ),
+        )
+        config = replace(
+            config,
+            data=replace(config.data, train=train_split),
+            training=replace(config.training, batch_size=2),
+        )
+        table = pa.table(
+            {
+                "request_id": ["A"] * 5,
+                "row_id": list(range(5)),
+                sequence_source: [[1, 2]] * 5,
+            }
+        )
+
+        with patch("src.train.iter_candidate_tables", return_value=iter([table])):
+            batches = list(_iter_batch_tables(config, "train", 0, 1, True))
+
+        self.assertEqual(
+            [batch.table["row_id"].to_pylist() for batch in batches],
+            [[0, 1], [2, 3], [4]],
+        )
 
     def test_length_bucket_index_matches_bisect(self) -> None:
         boundaries = [128, 256, 512]
@@ -274,6 +324,40 @@ class PackedPlanAndBatcherTest(unittest.TestCase):
         self.assertEqual(length_bucket_index(128, boundaries), 0)
         self.assertEqual(length_bucket_index(129, boundaries), 1)
         self.assertEqual(length_bucket_index(1000, boundaries), 3)
+
+    def test_direct_mode_falls_back_to_legacy_without_request_dedup(self) -> None:
+        from dataclasses import replace
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from src.config import load_app_config
+        from src.train import _iter_batch_tables
+
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
+        train_split = replace(
+            config.data.train,
+            reader=replace(
+                config.data.train.reader,
+                deduplicate_request_features=False,
+                agg_direct_mode="direct",
+                length_buckets=(),
+                shuffle_buffer_rows=0,
+            ),
+        )
+        config = replace(
+            config,
+            data=replace(config.data, train=train_split),
+            sequences=(),
+            training=replace(config.training, batch_size=2),
+        )
+        table = pa.table({"row_id": [0, 1, 2]})
+        with patch("src.train.iter_candidate_tables", return_value=iter([table])):
+            batches = list(_iter_batch_tables(config, "train", 0, 1, True))
+        self.assertEqual(
+            [batch["row_id"].to_pylist() for batch in batches],
+            [[0, 1], [2]],
+        )
 
     def test_length_bucketed_packs_match_legacy_row_coverage(self) -> None:
         from dataclasses import replace
@@ -613,6 +697,323 @@ class SourceRegistryTest(unittest.TestCase):
 
 
 class AxisSeparatedAdaptTest(unittest.TestCase):
+    def test_direct_feature_batch_matches_legacy_narrow_arrow(self) -> None:
+        from dataclasses import replace
+        from pathlib import Path
+
+        from src.config import ParquetAdapterConfig, load_app_config
+        from src.dataloader import (
+            axis_batch_to_feature_batch,
+            table_to_feature_batch,
+        )
+
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
+        sequence = replace(
+            config.sequences[0],
+            max_length=3,
+            truncation="head",
+            null_anchor_field="item_id",
+        )
+        adapter = ParquetAdapterConfig(
+            callable="unused:test",
+            options={
+                "context_features": [
+                    "user_id",
+                    "rankmixer_context_dense",
+                ],
+            },
+        )
+        train_split = replace(
+            config.data.train,
+            request_id="request_id",
+            group_id="request_id",
+            adapter=adapter,
+            reader=replace(
+                config.data.train.reader,
+                deduplicate_request_features=True,
+            ),
+        )
+        config = replace(
+            config,
+            data=replace(config.data, train=train_split),
+            sequences=(sequence,),
+        )
+
+        bundle = AdaptedAxisBundle(
+            n_candidates=3,
+            n_requests=2,
+            request_ids=("r0", "r1"),
+            candidate_to_request=np.asarray([0, 1, 0], dtype=np.int64),
+            request_features={
+                "user_id": ("u0", "u1"),
+                "rankmixer_context_dense": (
+                    tuple(float(index) for index in range(16)),
+                    tuple(float(index + 20) for index in range(16)),
+                ),
+            },
+            sequence_features={
+                "hist_item_id": (
+                    ("i0", None, "i2"),
+                    ("i3", "i4"),
+                ),
+                "hist_shop_id": (
+                    ("s0", "s1", "s2"),
+                    ("s3", "s4"),
+                ),
+                "hist_action": (
+                    ("a0", "a1", "a2"),
+                    ("a3", "a4"),
+                ),
+                "hist_age": (
+                    (0.1, 0.2, 0.3),
+                    (0.4, 0.5),
+                ),
+                "hist_time_delta": (
+                    (1.0, 2.0, 3.0),
+                    (4.0, 5.0),
+                ),
+            },
+            item_features={
+                "item_id": ("c0", "c1", "c2"),
+                "shop_id": ("cs0", "cs1", "cs2"),
+            },
+            label_features={"click": (0, 1, 0)},
+            label_mask_features={},
+            candidate_metadata={},
+            request_raw_rows=np.asarray([0, 0], dtype=np.int64),
+            candidate_raw_rows=np.asarray([0, 0, 0], dtype=np.int64),
+        )
+        blocks = request_group_blocks_from_axis_bundle(
+            bundle,
+            source_id=0,
+            sequences=config.sequences,
+        )
+        packed = build_packed_request_plan(blocks)
+        direct_input = prepare_packed_axis_batch(
+            {0: bundle},
+            packed,
+            sequences=config.sequences,
+            request_id_column="request_id",
+            candidate_request_columns=("request_id",),
+        )
+        selection = direct_input.sequence_plans["hist"]
+        np.testing.assert_array_equal(
+            selection.pre_compaction_lengths,
+            [3, 2],
+        )
+        np.testing.assert_array_equal(selection.compacted_lengths, [2, 2])
+
+        candidate_table, request_table, row_indices = (
+            materialize_packed_axis_bundles(
+                {0: bundle},
+                packed,
+                request_columns=tuple(bundle.request_features),
+                sequence_columns=tuple(bundle.sequence_features),
+                candidate_columns=("item_id", "shop_id", "click", "request_id"),
+                request_id_column="request_id",
+            )
+        )
+        all_item_values = {
+            value
+            for values in (
+                ("c0", "c1", "c2"),
+                ("i0", "i2", "i3", "i4"),
+            )
+            for value in values
+        }
+        user_vocab = {"u0": 1, "u1": 2}
+        item_vocab = {
+            value: index + 1
+            for index, value in enumerate(sorted(all_item_values))
+        }
+        vocab_maps = {
+            "user_id": user_vocab,
+            "scenario_user_id": user_vocab,
+            "task_user_id": user_vocab,
+            "item_id": item_vocab,
+            "scenario_item_id": item_vocab,
+            "task_item_id": item_vocab,
+            "hist.item_id": item_vocab,
+        }
+        legacy = table_to_feature_batch(
+            config,
+            candidate_table,
+            vocab_maps,
+            split=train_split,
+            request_deduplication=(request_table, row_indices),
+        )
+        direct = axis_batch_to_feature_batch(
+            config,
+            direct_input,
+            vocab_maps,
+            split=train_split,
+        )
+
+        def assert_equal(left: object, right: object, path: str) -> None:
+            if isinstance(left, torch.Tensor):
+                self.assertIsInstance(right, torch.Tensor, path)
+                assert isinstance(right, torch.Tensor)
+                self.assertEqual(left.dtype, right.dtype, path)
+                self.assertEqual(left.shape, right.shape, path)
+                torch.testing.assert_close(
+                    left,
+                    right,
+                    rtol=0,
+                    atol=0,
+                    equal_nan=True,
+                    msg=path,
+                )
+                return
+            if isinstance(left, dict):
+                self.assertIsInstance(right, dict, path)
+                assert isinstance(right, dict)
+                self.assertEqual(set(left), set(right), path)
+                for key in left:
+                    assert_equal(left[key], right[key], f"{path}.{key}")
+                return
+            self.assertEqual(left, right, path)
+
+        for attribute in (
+            "features",
+            "labels",
+            "label_mask",
+            "scenario_id",
+            "group_id",
+            "prediction_keys",
+        ):
+            assert_equal(
+                getattr(legacy, attribute),
+                getattr(direct, attribute),
+                attribute,
+            )
+
+    def test_axis_oversized_group_survives_all_packed_slices(self) -> None:
+        from dataclasses import replace
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from src.config import ParquetAdapterConfig, load_app_config
+        from src.train import _iter_batch_tables
+
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
+        split = replace(
+            config.data.train,
+            format="adapter_parquet",
+            request_id="request_id",
+            group_id="request_id",
+            adapter=ParquetAdapterConfig(callable="unused:test"),
+            reader=replace(
+                config.data.train.reader,
+                deduplicate_request_features=True,
+                agg_direct_mode="direct",
+                prefetch_batches=0,
+                shuffle_buffer_rows=0,
+                length_buckets=(),
+            ),
+        )
+        config = replace(
+            config,
+            data=replace(config.data, train=split),
+            features=(),
+            sequences=(),
+            training=replace(config.training, batch_size=2),
+        )
+        bundle = AdaptedAxisBundle(
+            n_candidates=5,
+            n_requests=1,
+            request_ids=("A",),
+            candidate_to_request=np.zeros(5, dtype=np.int64),
+            request_features={},
+            sequence_features={},
+            item_features={"row_id": tuple(range(5))},
+            label_features={},
+            label_mask_features={},
+            candidate_metadata={},
+            request_raw_rows=np.asarray([0], dtype=np.int64),
+            candidate_raw_rows=np.zeros(5, dtype=np.int64),
+        )
+        with patch(
+            "src.train.iter_adapted_axis_bundles",
+            return_value=iter([bundle]),
+        ):
+            batches = list(_iter_batch_tables(config, "train", 0, 1, False))
+        self.assertEqual(
+            [list(batch.candidate_values["row_id"]) for batch in batches],
+            [[0, 1], [2, 3], [4]],
+        )
+
+    def test_runtime_compare_runs_legacy_and_direct_oracles(self) -> None:
+        from dataclasses import replace
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from src.config import load_app_config
+        from src.train import iter_feature_batches
+
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "reference" / "default.yaml")
+        train_split = replace(
+            config.data.train,
+            reader=replace(
+                config.data.train.reader,
+                deduplicate_request_features=True,
+                agg_direct_mode="compare",
+                prefetch_batches=0,
+                length_buckets=(),
+            ),
+        )
+        config = replace(config, data=replace(config.data, train=train_split))
+        table = pa.table(
+            {
+                "request_id": ["r0", "r1"],
+                "user_id": ["u0", "u1"],
+                "item_id": ["i0", "i1"],
+                "shop_id": ["s0", "s1"],
+                "rankmixer_context_dense": [
+                    [float(index) for index in range(16)],
+                    [float(index + 20) for index in range(16)],
+                ],
+                "hist_item_id": [["i0"], ["i1"]],
+                "hist_shop_id": [["s0"], ["s1"]],
+                "hist_action": [["a0"], ["a1"]],
+                "hist_age": [[0.1], [0.2]],
+                "hist_time_delta": [[1.0], [2.0]],
+                "click": [0, 1],
+            }
+        )
+        user_vocab = {"u0": 1, "u1": 2}
+        item_vocab = {"i0": 1, "i1": 2}
+        vocab_maps = {
+            "user_id": user_vocab,
+            "scenario_user_id": user_vocab,
+            "task_user_id": user_vocab,
+            "item_id": item_vocab,
+            "scenario_item_id": item_vocab,
+            "task_item_id": item_vocab,
+            "hist.item_id": item_vocab,
+        }
+        modes: list[str] = []
+
+        def batch_tables(active_config: object, *_args: object, **_kwargs: object):
+            modes.append(active_config.data.train.reader.agg_direct_mode)
+            return iter([table])
+
+        with patch("src.train._iter_batch_tables", side_effect=batch_tables):
+            batches = list(
+                iter_feature_batches(
+                    config,
+                    "train",
+                    vocab_maps,
+                    require_labels=True,
+                    pin_memory=False,
+                )
+            )
+        self.assertEqual(modes, ["legacy", "direct"])
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0].labels.tolist(), [[0.0], [1.0]])
+
     def test_axis_bundle_skips_candidate_flat_and_matches_legacy_axes(self) -> None:
         from types import SimpleNamespace
 

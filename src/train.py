@@ -4,7 +4,7 @@ from bisect import bisect_left
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from importlib import import_module
 import inspect
@@ -32,13 +32,14 @@ from .config import (
     ReaderConfig,
 )
 from .agg_direct import (
+    PreparedAxisBatch,
     PreparedBatchTable,
     SourceRegistry,
     build_packed_request_plan,
     build_request_deduplication_from_pack,
     iter_length_bucketed_packs,
-    materialize_packed_axis_bundles,
     materialize_packed_blocks,
+    prepare_packed_axis_batch,
     request_group_blocks_from_adapted_table,
     request_group_blocks_from_axis_bundle,
 )
@@ -48,6 +49,7 @@ from .dataloader import (
     _column_array,
     _require_pyarrow,
     _safe_table_take,
+    axis_batch_to_feature_batch,
     discover_scenario_values,
     iter_adapted_axis_bundles,
     iter_flat_tables,
@@ -1138,11 +1140,13 @@ def _iter_batch_tables_direct(
     shard_world_size: int,
     require_labels: bool = True,
 ) -> Iterator[object]:
-    """Axis-separated adapt → descriptor pack → narrow pack-boundary Arrow.
+    """Axis-separated adapt → descriptor pack → direct FeatureBatch payload.
 
     Skips candidate-flat materialization of whole scanner tables. Adapted
     payloads stay as :class:`AdaptedAxisBundle` under a :class:`SourceRegistry`
     until every referencing block has been packed; then the source is released.
+    The adapter-parquet path yields :class:`PreparedAxisBatch` without rebuilding
+    Arrow. ``flat_parquet`` remains a transitional narrow-Arrow fallback.
     """
 
     reader = _split_reader(config, split_name)
@@ -1229,69 +1233,46 @@ def _iter_batch_tables_direct(
     ):
         packed = build_packed_request_plan(pack)
         sources_in_pack: dict[int, int] = {}
+        source_releases_in_pack: dict[int, int] = {}
         for block in packed.blocks:
             sources_in_pack[block.source_id] = (
                 sources_in_pack.get(block.source_id, 0) + 1
             )
+            if block.releases_source_reference:
+                source_releases_in_pack[block.source_id] = (
+                    source_releases_in_pack.get(block.source_id, 0) + 1
+                )
 
         if use_axis:
             bundles = {
                 source_id: registry.get(source_id)
                 for source_id in sources_in_pack
             }
-            # Discover column sets from the first bundle in the pack.
-            sample = next(iter(bundles.values()))
-            request_columns = sorted(sample.request_features.keys())
-            sequence_columns = sorted(sample.sequence_features.keys())
-            candidate_columns = sorted(
-                {
-                    *sample.item_features.keys(),
-                    *sample.label_features.keys(),
-                    *sample.label_mask_features.keys(),
-                    *sample.candidate_metadata.keys(),
-                    *(
-                        [split.request_id]
-                        if split.request_id is not None
-                        else []
-                    ),
-                    *(
-                        [split.group_id]
-                        if split.group_id is not None
-                        else []
-                    ),
-                    *(
-                        [config.scenarios.source]
-                        if config.scenarios.source is not None
-                        else []
-                    ),
-                    *split.prediction_keys.values(),
-                }
-            )
-            # Keep only columns that exist on at least one axis of the bundle.
-            filtered_candidate_columns = []
-            for name in candidate_columns:
-                if (
-                    name in sample.item_features
-                    or name in sample.label_features
-                    or name in sample.label_mask_features
-                    or name in sample.candidate_metadata
-                    or name in sample.request_features
-                    or name == split.request_id
-                ):
-                    filtered_candidate_columns.append(name)
-            candidate_table, request_table, row_indices = (
-                materialize_packed_axis_bundles(
-                    bundles,
-                    packed,
-                    request_columns=request_columns,
-                    sequence_columns=sequence_columns,
-                    candidate_columns=filtered_candidate_columns,
-                    request_id_column=split.request_id,
-                )
-            )
-            prepared = PreparedBatchTable(
-                table=candidate_table,
-                request_deduplication=(request_table, row_indices),
+            prepared = prepare_packed_axis_batch(
+                bundles,
+                packed,
+                sequences=config.sequences,
+                request_id_column=split.request_id,
+                candidate_request_columns=sorted(
+                    {
+                        *(
+                            [split.request_id]
+                            if split.request_id is not None
+                            else []
+                        ),
+                        *(
+                            [split.group_id]
+                            if split.group_id is not None
+                            else []
+                        ),
+                        *(
+                            [config.scenarios.source]
+                            if config.scenarios.source is not None
+                            else []
+                        ),
+                        *split.prediction_keys.values(),
+                    }
+                ),
             )
         else:
             source_tables = {
@@ -1322,9 +1303,11 @@ def _iter_batch_tables_direct(
                 request_deduplication=request_dedup,
             )
 
-        yield prepared
-        for source_id, count in sources_in_pack.items():
-            registry.release(source_id, count)
+        try:
+            yield prepared
+        finally:
+            for source_id, count in source_releases_in_pack.items():
+                registry.release(source_id, count)
 
 
 def _iter_batch_tables(
@@ -1335,9 +1318,10 @@ def _iter_batch_tables(
     require_labels: bool = True,
 ) -> Iterator[object]:
     reader = _split_reader(config, split_name)
-    if reader.agg_direct_mode in {"direct", "compare"}:
-        # compare currently shares the direct batcher; FeatureBatch oracle
-        # checks are covered by unit tests until phase 7 runtime compare lands.
+    if (
+        reader.agg_direct_mode in {"direct", "compare"}
+        and reader.deduplicate_request_features
+    ):
         yield from _iter_batch_tables_direct(
             config,
             split_name,
@@ -1376,6 +1360,118 @@ def _feature_batch_tensor_bytes(batch: FeatureBatch) -> int:
     )
 
 
+def _assert_feature_batch_equal(
+    legacy: FeatureBatch,
+    direct: FeatureBatch,
+    *,
+    batch_index: int,
+) -> None:
+    """Strict runtime oracle with a path and first differing tensor element."""
+
+    def compare(left: Any, right: Any, path: str) -> None:
+        if isinstance(left, Tensor):
+            if not isinstance(right, Tensor):
+                raise AssertionError(
+                    f"{path}: legacy is Tensor, direct is "
+                    f"{type(right).__name__}"
+                )
+            if left.dtype != right.dtype:
+                raise AssertionError(
+                    f"{path}: dtype legacy={left.dtype}, direct={right.dtype}"
+                )
+            if left.shape != right.shape:
+                raise AssertionError(
+                    f"{path}: shape legacy={tuple(left.shape)}, "
+                    f"direct={tuple(right.shape)}"
+                )
+            if left.dtype.is_floating_point:
+                equal = torch.isclose(
+                    left,
+                    right,
+                    rtol=0,
+                    atol=0,
+                    equal_nan=True,
+                )
+            else:
+                equal = left == right
+            if bool(equal.all().item()):
+                return
+            first = torch.nonzero(~equal, as_tuple=False)[0].tolist()
+            index = tuple(int(item) for item in first)
+            raise AssertionError(
+                f"{path}{index}: legacy={left[index].item()!r}, "
+                f"direct={right[index].item()!r}"
+            )
+        if isinstance(left, dict):
+            if not isinstance(right, dict):
+                raise AssertionError(
+                    f"{path}: legacy is dict, direct is "
+                    f"{type(right).__name__}"
+                )
+            if set(left) != set(right):
+                raise AssertionError(
+                    f"{path}: key difference "
+                    f"{sorted(set(left).symmetric_difference(right))}"
+                )
+            for key in left:
+                compare(left[key], right[key], f"{path}.{key}")
+            return
+        if isinstance(left, (list, tuple)):
+            if not isinstance(right, type(left)):
+                raise AssertionError(
+                    f"{path}: container type legacy={type(left).__name__}, "
+                    f"direct={type(right).__name__}"
+                )
+            if len(left) != len(right):
+                raise AssertionError(
+                    f"{path}: length legacy={len(left)}, direct={len(right)}"
+                )
+            for index, (left_item, right_item) in enumerate(zip(left, right)):
+                compare(left_item, right_item, f"{path}[{index}]")
+            return
+        if left != right:
+            raise AssertionError(f"{path}: legacy={left!r}, direct={right!r}")
+
+    try:
+        for attribute in (
+            "features",
+            "labels",
+            "label_mask",
+            "scenario_id",
+            "group_id",
+            "prediction_keys",
+        ):
+            compare(
+                getattr(legacy, attribute),
+                getattr(direct, attribute),
+                attribute,
+            )
+    except AssertionError as error:
+        raise AssertionError(
+            f"agg_direct compare mismatch in batch {batch_index}: {error}"
+        ) from error
+
+
+def _config_with_reader_mode(
+    config: AppConfig,
+    split_name: str,
+    mode: str,
+) -> AppConfig:
+    split = config.data.train if split_name == "train" else config.data.test
+    if split is None:
+        raise ValueError(f"split {split_name!r} is not configured")
+    updated_split = replace(
+        split,
+        reader=replace(split.reader, agg_direct_mode=mode),
+    )
+    updated_data = (
+        replace(config.data, train=updated_split)
+        if split_name == "train"
+        else replace(config.data, test=updated_split)
+    )
+    return replace(config, data=updated_data)
+
+
 def _max_bag_length(table: object, source: str) -> int:
     """Conservative per-column bag length without unifying dictionaries.
 
@@ -1407,7 +1503,67 @@ def _max_bag_length(table: object, source: str) -> int:
 def _estimate_prepared_batch_bytes(config: AppConfig, table: object) -> int:
     """Conservative Arrow-plus-tensor reservation for the prefetch queue."""
 
+    if isinstance(table, PreparedAxisBatch):
+        tensor_bytes = table.request_row_indices.numel() * 8
+        for feature in config.features:
+            # Metadata columns may be broadcast onto candidates as well as
+            # retained on requests. Treat those as candidate-major here; the
+            # overestimate is intentional for queue admission.
+            request_level = (
+                feature.source in table.request_values
+                and feature.source not in table.candidate_values
+            )
+            axis_rows = table.n_requests if request_level else table.n_candidates
+            if feature.kind == "categorical" and feature.pooling == "mean":
+                values = (
+                    table.request_values
+                    if request_level
+                    else table.candidate_values
+                ).get(feature.source, ())
+                max_length = (
+                    int(feature.max_length)
+                    if feature.max_length is not None
+                    else max(
+                        (
+                            len(value)
+                            for value in values
+                            if isinstance(value, (list, tuple))
+                        ),
+                        default=0,
+                    )
+                )
+                tensor_bytes += axis_rows * (8 + max_length * 8)
+            else:
+                element_bytes = 8 if feature.kind == "categorical" else 4
+                tensor_bytes += axis_rows * feature.dimension * element_bytes
+        for sequence in config.sequences:
+            plan = table.sequence_plans.get(sequence.name)
+            padded_length = (
+                int(plan.compacted_lengths.max())
+                if plan is not None and plan.compacted_lengths.size
+                else 0
+            )
+            tensor_bytes += table.n_requests * 8
+            for field in sequence.fields:
+                element_bytes = 8 if field.kind == "categorical" else 4
+                tensor_bytes += (
+                    table.n_requests
+                    * padded_length
+                    * field.dimension
+                    * element_bytes
+                )
+        tensor_bytes += table.n_candidates * (
+            4 * max(1, len(config.task_names)) + 16
+        )
+        # Axis payload consists of Python scalar/list references retained until
+        # tensorization. Two tensor footprints plus 25% allocator headroom is a
+        # conservative queue reservation without rescanning every nested value.
+        return max(1, tensor_bytes * 2 + tensor_bytes // 4)
+
+    request_table = None
     if isinstance(table, PreparedBatchTable):
+        if table.request_deduplication is not None:
+            request_table = table.request_deduplication[0]
         table = table.table
 
     rows = int(table.num_rows)
@@ -1424,8 +1580,14 @@ def _estimate_prepared_batch_bytes(config: AppConfig, table: object) -> int:
             else:
                 max_length = bag_max_lengths.get(feature.source)
                 if max_length is None:
+                    source_table = table
+                    if (
+                        request_table is not None
+                        and feature.source in request_table.column_names
+                    ):
+                        source_table = request_table
                     try:
-                        max_length = _max_bag_length(table, feature.source)
+                        max_length = _max_bag_length(source_table, feature.source)
                     except (KeyError, TypeError, AttributeError):
                         max_length = 1
                     bag_max_lengths[feature.source] = max_length
@@ -1435,7 +1597,11 @@ def _estimate_prepared_batch_bytes(config: AppConfig, table: object) -> int:
     for sequence in config.sequences:
         if not sequence.fields:
             continue
-        lengths = _table_sequence_lengths(config, sequence, table)
+        source = sequence.fields[0].source
+        length_table = table
+        if request_table is not None and source in request_table.column_names:
+            length_table = request_table
+        lengths = _table_sequence_lengths(config, sequence, length_table)
         padded_length = int(lengths.max().item()) if lengths.numel() else 0
         tensor_bytes += rows * 8
         for field in sequence.fields:
@@ -1444,6 +1610,8 @@ def _estimate_prepared_batch_bytes(config: AppConfig, table: object) -> int:
     # Labels, masks, scenario IDs, and a margin for Python/allocator metadata.
     tensor_bytes += rows * (4 * max(1, len(config.task_names)) + 16)
     arrow_bytes = int(getattr(table, "nbytes", 0))
+    if request_table is not None:
+        arrow_bytes += int(getattr(request_table, "nbytes", 0))
     return max(1, arrow_bytes + tensor_bytes + tensor_bytes // 8)
 
 
@@ -1457,6 +1625,24 @@ def _prepare_feature_batch(
     coalesce_pinned_tensors: bool,
     include_group_id: bool,
 ) -> FeatureBatch:
+    if isinstance(table, PreparedAxisBatch):
+        batch = axis_batch_to_feature_batch(
+            config,
+            table,
+            vocab_maps,
+            require_labels=require_labels,
+            include_group_id=include_group_id,
+            split=split,
+        )
+        return (
+            pin_feature_batch(
+                batch,
+                coalesce_tensors=coalesce_pinned_tensors,
+            )
+            if pin_memory
+            else batch
+        )
+
     request_deduplication = None
     candidate_table = table
     if isinstance(table, PreparedBatchTable):
@@ -1506,6 +1692,75 @@ def iter_feature_batches(
     if split is None:
         raise ValueError(f"split {split_name!r} is not configured")
     reader = _split_reader(config, split_name)
+    if reader.agg_direct_mode == "compare":
+        # Direct v1 deliberately falls back to legacy when request-axis
+        # deduplication is disabled. There is no distinct direct result to
+        # compare in that mode.
+        if not reader.deduplicate_request_features:
+            yield from iter_feature_batches(
+                _config_with_reader_mode(config, split_name, "legacy"),
+                split_name,
+                vocab_maps,
+                require_labels,
+                shard_rank=shard_rank,
+                shard_world_size=shard_world_size,
+                pin_memory=pin_memory,
+                include_group_id=include_group_id,
+            )
+            return
+
+        legacy_iter = iter_feature_batches(
+            _config_with_reader_mode(config, split_name, "legacy"),
+            split_name,
+            vocab_maps,
+            require_labels,
+            shard_rank=shard_rank,
+            shard_world_size=shard_world_size,
+            pin_memory=pin_memory,
+            include_group_id=include_group_id,
+        )
+        direct_iter = iter_feature_batches(
+            _config_with_reader_mode(config, split_name, "direct"),
+            split_name,
+            vocab_maps,
+            require_labels,
+            shard_rank=shard_rank,
+            shard_world_size=shard_world_size,
+            pin_memory=pin_memory,
+            include_group_id=include_group_id,
+        )
+        sentinel = object()
+        batch_index = 0
+        try:
+            while True:
+                legacy_batch = next(legacy_iter, sentinel)
+                direct_batch = next(direct_iter, sentinel)
+                if legacy_batch is sentinel and direct_batch is sentinel:
+                    break
+                if legacy_batch is sentinel or direct_batch is sentinel:
+                    exhausted = (
+                        "legacy" if legacy_batch is sentinel else "direct"
+                    )
+                    raise AssertionError(
+                        "agg_direct compare batch-count mismatch: "
+                        f"{exhausted} ended before batch {batch_index}"
+                    )
+                assert isinstance(legacy_batch, FeatureBatch)
+                assert isinstance(direct_batch, FeatureBatch)
+                _assert_feature_batch_equal(
+                    legacy_batch,
+                    direct_batch,
+                    batch_index=batch_index,
+                )
+                # Compare mode is an oracle gate; train/evaluate on the legacy
+                # result until the caller explicitly selects direct.
+                yield legacy_batch
+                batch_index += 1
+        finally:
+            legacy_iter.close()
+            direct_iter.close()
+        return
+
     pin_memory = reader.pin_memory and pin_memory
     coalesce_pinned_tensors = reader.coalesce_pinned_tensors and pin_memory
     table_iter = _iter_batch_tables(

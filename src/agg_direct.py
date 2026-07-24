@@ -1,8 +1,9 @@
-"""Direct agg Arrow → FeatureBatch producer (descriptor stage).
+"""Direct agg Arrow → FeatureBatch producer.
 
-Phase-2+ rollout: RequestGroupBlock holds only axis descriptors. Payload
-tensorization happens after shuffle/bucket/pack. Controlled by
-``reader.agg_direct_mode`` (default ``legacy``).
+``RequestGroupBlock`` holds only axis descriptors before shuffle/bucket/pack.
+After packing, ``PreparedAxisBatch`` and ``SequenceSelectionPlan`` feed the
+Arrow-free FeatureBatch tensorizer. Controlled by ``reader.agg_direct_mode``
+(default ``legacy``).
 
 Historical ranking logs do not place the same ``request_id`` in two scanned
 tables at once. Pack-time request plans are therefore identity maps over
@@ -63,6 +64,21 @@ class RequestGroupBlock:
         stop = self.candidate_offset + self.candidate_count
         return self.candidate_positions[start:stop]
 
+    @property
+    def releases_source_reference(self) -> bool:
+        """Whether consuming this descriptor finishes its original group.
+
+        The registry owns one reference per *original* request group.  An
+        oversized group may be emitted as several descriptor-only slices, so
+        only the slice covering the tail of ``candidate_positions`` is allowed
+        to release that reference.
+        """
+
+        return (
+            self.candidate_offset + self.candidate_count
+            == len(self.candidate_positions)
+        )
+
 
 @dataclass(frozen=True)
 class PackedRequestPlan:
@@ -92,6 +108,27 @@ class SequenceSelectionPlan:
     pre_compaction_lengths: Any
     compacted_lengths: Any
     token_to_request: Any
+
+
+@dataclass(frozen=True)
+class PreparedAxisBatch:
+    """Pack-boundary, Arrow-free payload for direct FeatureBatch construction.
+
+    Values remain separated on request and candidate axes. Sequence plans are
+    built only after shuffle/bucket/pack and are shared by every aligned field
+    of the same sequence.
+    """
+
+    request_values: Mapping[str, tuple[Any, ...]]
+    candidate_values: Mapping[str, tuple[Any, ...]]
+    request_row_indices: Any
+    sequence_plans: Mapping[str, SequenceSelectionPlan]
+    n_requests: int
+    n_candidates: int
+
+    @property
+    def num_rows(self) -> int:
+        return self.n_candidates
 
 
 def _truncation_window(
@@ -231,6 +268,118 @@ def build_sequence_selection_plan(
         selections=tuple(selections),
         pre_compaction_lengths=np.asarray(pre_lengths, dtype=np.int64),
         compacted_lengths=np.asarray(compacted, dtype=np.int64),
+        token_to_request=np.asarray(token_to_request, dtype=np.int64),
+    )
+
+
+def build_axis_sequence_selection_plan(
+    sequence: Any,
+    *,
+    packed: PackedRequestPlan,
+    bundles: Mapping[int, "AdaptedAxisBundle"],
+) -> SequenceSelectionPlan:
+    """Build one truncate-then-compact plan over axis-separated payloads.
+
+    The adapter may already apply its configured UPS limit. Reapplying the
+    sequence window is idempotent and makes this boundary correct for adapters
+    that return the full membership selection.
+    """
+
+    if not sequence.fields:
+        empty = np.asarray([], dtype=np.int64)
+        return SequenceSelectionPlan(
+            sequence_name=sequence.name,
+            selections=tuple(),
+            pre_compaction_lengths=empty,
+            compacted_lengths=empty,
+            token_to_request=empty,
+        )
+
+    anchor_source = None
+    if sequence.null_anchor_field is not None:
+        for field in sequence.fields:
+            if field.name == sequence.null_anchor_field:
+                anchor_source = field.source
+                break
+        if anchor_source is None:
+            raise ValueError(
+                f"sequence {sequence.name!r} null_anchor_field "
+                f"{sequence.null_anchor_field!r} is not one of its fields"
+            )
+
+    primary_source = sequence.fields[0].source
+    selections: list[np.ndarray] = []
+    pre_lengths: list[int] = []
+    compacted_lengths: list[int] = []
+    token_to_request: list[int] = []
+
+    for request_index, block_index in enumerate(packed.unique_block_indices):
+        block = packed.blocks[int(block_index)]
+        bundle = bundles[block.source_id]
+        request_slot = int(block.representative_request_position)
+        try:
+            primary_row = bundle.sequence_features[primary_source][request_slot]
+        except KeyError as error:
+            raise ValueError(
+                f"sequence source {primary_source!r} missing from axis bundle"
+            ) from error
+        list_length = 0 if primary_row is None else len(primary_row)
+
+        for field in sequence.fields[1:]:
+            try:
+                aligned_row = bundle.sequence_features[field.source][request_slot]
+            except KeyError as error:
+                raise ValueError(
+                    f"sequence source {field.source!r} missing from axis bundle"
+                ) from error
+            aligned_length = 0 if aligned_row is None else len(aligned_row)
+            if aligned_length != list_length:
+                raise ValueError(
+                    f"sequence {sequence.name!r} field {field.name!r} has length "
+                    f"{aligned_length}, expected {list_length} for request "
+                    f"{block.request_id!r}"
+                )
+
+        anchor_is_null = None
+        if anchor_source is not None:
+            anchor_row = bundle.sequence_features[anchor_source][request_slot]
+            anchor_values = () if anchor_row is None else anchor_row
+            anchor_is_null = np.fromiter(
+                (value is None for value in anchor_values),
+                dtype=bool,
+                count=list_length,
+            )
+
+        kept, pre_length, compacted_length = (
+            row_sequence_selection_after_truncate_then_compact(
+                list_length=list_length,
+                anchor_is_null=anchor_is_null,
+                max_length=sequence.max_length,
+                truncation=sequence.truncation,
+            )
+        )
+        expected_pre_length = block.pre_compaction_sequence_lengths.get(
+            sequence.name
+        )
+        if (
+            expected_pre_length is not None
+            and int(expected_pre_length) != pre_length
+        ):
+            raise RuntimeError(
+                f"sequence {sequence.name!r} pre-compaction length changed "
+                f"between bucket and pack for request {block.request_id!r}: "
+                f"bucket={expected_pre_length}, pack={pre_length}"
+            )
+        selections.append(kept)
+        pre_lengths.append(pre_length)
+        compacted_lengths.append(compacted_length)
+        token_to_request.extend([request_index] * compacted_length)
+
+    return SequenceSelectionPlan(
+        sequence_name=sequence.name,
+        selections=tuple(selections),
+        pre_compaction_lengths=np.asarray(pre_lengths, dtype=np.int64),
+        compacted_lengths=np.asarray(compacted_lengths, dtype=np.int64),
         token_to_request=np.asarray(token_to_request, dtype=np.int64),
     )
 
@@ -722,6 +871,163 @@ def request_group_blocks_from_axis_bundle(
     return tuple(blocks)
 
 
+def _arrow_array_from_python_values(values: Sequence[Any]) -> Any:
+    """Build an Arrow array without collapsing empty lists to null type."""
+
+    pa, _pc = _require_pyarrow()
+    array = pa.array(list(values))
+    if pa.types.is_list(array.type) or pa.types.is_large_list(array.type):
+        value_type = array.type.value_type
+        if pa.types.is_null(value_type):
+            # All-empty lists infer list<null>; pin a concrete value type.
+            sample = next((value for value in values if value), None)
+            if sample and isinstance(sample[0], float):
+                return pa.array(list(values), type=pa.list_(pa.float32()))
+            return pa.array(list(values), type=pa.list_(pa.int64()))
+        return array
+    if not pa.types.is_null(array.type):
+        return array
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            return pa.array(list(values), type=pa.bool_())
+        if isinstance(value, int):
+            return pa.array(list(values), type=pa.int64())
+        if isinstance(value, float):
+            return pa.array(list(values), type=pa.float32())
+        if isinstance(value, str):
+            return pa.array(list(values), type=pa.string())
+        if isinstance(value, (list, tuple)):
+            if value and isinstance(value[0], float):
+                return pa.array(list(values), type=pa.list_(pa.float32()))
+            return pa.array(list(values), type=pa.list_(pa.int64()))
+        break
+    return pa.array(list(values), type=pa.int64())
+
+
+def prepare_packed_axis_batch(
+    bundles: Mapping[int, AdaptedAxisBundle],
+    packed: PackedRequestPlan,
+    *,
+    sequences: Sequence[Any],
+    request_id_column: str | None = None,
+    candidate_request_columns: Sequence[str] = (),
+) -> PreparedAxisBatch:
+    """Gather one packed batch without constructing candidate/request Arrow.
+
+    Candidate payload is copied only as references to the already-normalized
+    Python scalars/lists owned by each axis bundle. Request and sequence values
+    remain unique per request; ``request_row_indices`` performs the only
+    candidate-to-request broadcast required by the model.
+    """
+
+    if not packed.blocks:
+        raise ValueError("cannot prepare an empty packed axis batch")
+
+    source_ids = {block.source_id for block in packed.blocks}
+    missing_sources = sorted(source_ids - set(bundles))
+    if missing_sources:
+        raise KeyError(f"axis bundles missing source IDs {missing_sources}")
+
+    request_names: set[str] = set()
+    candidate_names: set[str] = set()
+    for source_id in source_ids:
+        bundle = bundles[source_id]
+        request_names.update(bundle.request_features)
+        request_names.update(bundle.sequence_features)
+        candidate_names.update(bundle.item_features)
+        candidate_names.update(bundle.label_features)
+        candidate_names.update(bundle.label_mask_features)
+        candidate_names.update(bundle.candidate_metadata)
+    if request_id_column is not None:
+        request_names.add(request_id_column)
+
+    request_rows: dict[str, list[Any]] = {
+        name: [] for name in sorted(request_names)
+    }
+    candidate_rows: dict[str, list[Any]] = {
+        name: [] for name in sorted(candidate_names)
+    }
+    broadcast_names = tuple(dict.fromkeys(candidate_request_columns))
+    for name in broadcast_names:
+        candidate_rows.setdefault(name, [])
+
+    def request_value(
+        bundle: AdaptedAxisBundle,
+        name: str,
+        slot: int,
+    ) -> Any:
+        if name in bundle.request_features:
+            return bundle.request_features[name][slot]
+        if name in bundle.sequence_features:
+            return bundle.sequence_features[name][slot]
+        if request_id_column is not None and name == request_id_column:
+            return bundle.request_ids[slot]
+        raise KeyError(f"request column {name!r} missing from axis bundle")
+
+    for block_index in packed.unique_block_indices:
+        block = packed.blocks[int(block_index)]
+        bundle = bundles[block.source_id]
+        slot = int(block.representative_request_position)
+        for name in request_rows:
+            request_rows[name].append(request_value(bundle, name, slot))
+
+    for block in packed.blocks:
+        bundle = bundles[block.source_id]
+        request_slot = int(block.representative_request_position)
+        for candidate_position in block.active_candidate_positions():
+            candidate_slot = int(candidate_position)
+            for name in candidate_rows:
+                if name in bundle.item_features:
+                    value = bundle.item_features[name][candidate_slot]
+                elif name in bundle.label_features:
+                    value = bundle.label_features[name][candidate_slot]
+                elif name in bundle.label_mask_features:
+                    value = bundle.label_mask_features[name][candidate_slot]
+                elif name in bundle.candidate_metadata:
+                    value = bundle.candidate_metadata[name][candidate_slot]
+                elif name in broadcast_names:
+                    value = request_value(bundle, name, request_slot)
+                else:
+                    raise KeyError(
+                        f"candidate column {name!r} missing from axis bundle "
+                        f"source {block.source_id}"
+                    )
+                candidate_rows[name].append(value)
+
+    sequence_plans = {
+        sequence.name: build_axis_sequence_selection_plan(
+            sequence,
+            packed=packed,
+            bundles=bundles,
+        )
+        for sequence in sequences
+    }
+    n_candidates = int(sum(block.candidate_count for block in packed.blocks))
+    n_requests = len(packed.unique_block_indices)
+    if any(len(values) != n_requests for values in request_rows.values()):
+        raise RuntimeError("packed request-axis column lengths are inconsistent")
+    if any(len(values) != n_candidates for values in candidate_rows.values()):
+        raise RuntimeError("packed candidate-axis column lengths are inconsistent")
+
+    return PreparedAxisBatch(
+        request_values={
+            name: tuple(values) for name, values in request_rows.items()
+        },
+        candidate_values={
+            name: tuple(values) for name, values in candidate_rows.items()
+        },
+        request_row_indices=torch.as_tensor(
+            packed.candidate_to_request,
+            dtype=torch.long,
+        ),
+        sequence_plans=sequence_plans,
+        n_requests=n_requests,
+        n_candidates=n_candidates,
+    )
+
+
 def materialize_packed_axis_bundles(
     bundles: Mapping[int, AdaptedAxisBundle],
     packed: PackedRequestPlan,
@@ -791,10 +1097,16 @@ def materialize_packed_axis_bundles(
             row_indices.append(request_slot)
 
     request_table = pa.table(
-        {name: pa.array(values) for name, values in request_rows.items()}
+        {
+            name: _arrow_array_from_python_values(values)
+            for name, values in request_rows.items()
+        }
     )
     candidate_table = pa.table(
-        {name: pa.array(values) for name, values in candidate_rows.items()}
+        {
+            name: _arrow_array_from_python_values(values)
+            for name, values in candidate_rows.items()
+        }
     )
     return (
         candidate_table,

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, replace
 import fcntl
 import fnmatch
 from hashlib import sha256
-from itertools import islice
+from itertools import chain, islice
 import glob
 import importlib
 import json
@@ -38,6 +38,7 @@ from urllib.parse import unquote, urlsplit
 
 import torch
 from torch import Tensor
+import numpy as np
 
 from .config import (
     AppConfig,
@@ -5234,6 +5235,7 @@ def _initialize_adapter_process(
     required_columns: tuple[str, ...],
     options: dict[str, Any],
     trusted_input: bool,
+    runtime_cache_options: dict[str, Any] | None,
 ) -> None:
     """Initialize one isolated adapter worker without touching CUDA state."""
 
@@ -5256,6 +5258,8 @@ def _initialize_adapter_process(
         options=options,
         trusted_input=trusted_input,
     )
+    if runtime_cache_options:
+        _PROCESS_ADAPTER_CONTEXT._runtime_cache.update(runtime_cache_options)
     _PROCESS_ADAPTER_NAME = adapter_name
     _PROCESS_ADAPTER_SPLIT_NAME = split_name
 
@@ -5282,6 +5286,7 @@ def _iter_process_adapter_results(
     context: ParquetAdapterContext,
     worker_count: int,
     max_pending: int,
+    runtime_cache_options: Mapping[str, Any] | None = None,
 ) -> Iterator[tuple[int, list[Any]]]:
     """Adapt raw Arrow tables concurrently in deterministic input order."""
 
@@ -5310,6 +5315,11 @@ def _iter_process_adapter_results(
                 context.required_columns,
                 dict(context.options),
                 context.trusted_input,
+                (
+                    None
+                    if runtime_cache_options is None
+                    else dict(runtime_cache_options)
+                ),
             ),
         )
         while pending or not exhausted:
@@ -5529,27 +5539,71 @@ def iter_adapted_axis_bundles(
     context._runtime_cache["axis_request_id_column"] = split.request_id
 
     def produce() -> Iterator[AdaptedAxisBundle]:
-        for raw_table in scanner.iter_tables():
-            if not raw_table.num_rows:
-                continue
-            try:
-                result = adapter(raw_table, context=context)
-            except Exception as error:
-                raise RuntimeError(
-                    f"parquet adapter {adapter_name!r} failed for split "
-                    f"{split_name!r}: {error}"
-                ) from error
-            for bundle in _normalize_adapter_result(result, adapter_name, split_name):
-                if not isinstance(bundle, AdaptedAxisBundle):
-                    raise TypeError(
-                        "axis_separated adapter must return AdaptedAxisBundle, "
-                        f"got {type(bundle).__name__}"
+        adapter_workers = split.reader.adapter_workers
+        if adapter_workers > 0 and adapter_name != "identity":
+            adapted_results: Iterable[tuple[int, list[Any]]] = (
+                _iter_process_adapter_results(
+                    scanner.iter_tables(),
+                    adapter_name=adapter_name,
+                    context=context,
+                    worker_count=adapter_workers,
+                    max_pending=max(
+                        adapter_workers,
+                        min(
+                            max(adapter_workers, split.reader.prefetch_batches),
+                            adapter_workers * 2,
+                        ),
+                    ),
+                    runtime_cache_options={
+                        "axis_separated": True,
+                        "axis_request_id_column": split.request_id,
+                    },
+                )
+            )
+        else:
+            def sequential_results() -> Iterator[tuple[int, list[Any]]]:
+                for raw_table in scanner.iter_tables():
+                    if not raw_table.num_rows:
+                        continue
+                    result = adapter(raw_table, context=context)
+                    yield int(raw_table.num_rows), list(
+                        _normalize_adapter_result(
+                            result,
+                            adapter_name,
+                            split_name,
+                        )
                     )
-                if bundle.n_candidates == 0:
-                    continue
-                yield bundle
 
-    if producer_queue_size <= 1:
+            adapted_results = sequential_results()
+
+        adapted_iterator = iter(adapted_results)
+        try:
+            for _raw_rows, outputs in adapted_iterator:
+                for bundle in outputs:
+                    if not isinstance(bundle, AdaptedAxisBundle):
+                        raise TypeError(
+                            "axis_separated adapter must return AdaptedAxisBundle, "
+                            f"got {type(bundle).__name__}"
+                        )
+                    if bundle.n_candidates == 0:
+                        continue
+                    yield bundle
+        except Exception as error:
+            if adapter_name == "identity":
+                raise
+            raise RuntimeError(
+                f"parquet adapter {adapter_name!r} failed for split "
+                f"{split_name!r}: {error}"
+            ) from error
+        finally:
+            close = getattr(adapted_iterator, "close", None)
+            if callable(close):
+                close()
+
+    # Process workers already maintain an ordered bounded runway. Creating a
+    # second producer thread around a forkserver pool adds no overlap and makes
+    # process startup/teardown less predictable.
+    if producer_queue_size <= 1 or split.reader.adapter_workers > 0:
         yield from produce()
         return
 
@@ -7074,6 +7128,538 @@ def _indexed_request_value(value: Any, row_indices: Tensor) -> dict[str, Any]:
     if isinstance(value, dict):
         return {**value, "row_indices": row_indices}
     return {"values": value, "row_indices": row_indices}
+
+
+def _tensorize_python_categorical_values(
+    config: AppConfig,
+    categorical_input: ResolvedCategoricalInput,
+    values: Sequence[Any],
+    vocab_maps: dict[str, dict[str, int]],
+    *,
+    validate_prehashed_nonzero: bool,
+) -> Tensor:
+    """Encode normalized Python values without rebuilding an Arrow array."""
+
+    categorical_input = _effective_categorical_input(config, categorical_input)
+    encoding = categorical_input.encoding
+
+    def int64_values() -> tuple[np.ndarray, np.ndarray]:
+        if not values:
+            return (
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=bool),
+            )
+        array = np.asarray(values)
+        if array.dtype.kind == "i" and array.dtype.itemsize <= 8:
+            return array.astype(np.int64, copy=False), np.zeros(
+                array.size,
+                dtype=bool,
+            )
+        if array.dtype.kind == "u" and array.dtype.itemsize <= 8:
+            if array.size and int(array.max()) >= (1 << 63):
+                raise OverflowError(
+                    f"categorical input {categorical_input.name!r} contains "
+                    "a value outside signed int64"
+                )
+            return array.astype(np.int64, copy=False), np.zeros(
+                array.size,
+                dtype=bool,
+            )
+
+        normalized = np.empty(len(values), dtype=np.int64)
+        nulls = np.zeros(len(values), dtype=bool)
+        for index, value in enumerate(values):
+            if value is None:
+                nulls[index] = True
+                normalized[index] = 0
+                continue
+            if isinstance(value, bool) or not isinstance(
+                value,
+                (int, np.integer),
+            ):
+                raise TypeError(
+                    f"categorical input {categorical_input.name!r} must contain "
+                    f"int64 values, got {type(value).__name__}"
+                )
+            integer = int(value)
+            if integer < -(1 << 63) or integer >= (1 << 63):
+                raise OverflowError(
+                    f"categorical input {categorical_input.name!r} contains "
+                    f"a value outside signed int64: {integer}"
+                )
+            normalized[index] = integer
+        return normalized, nulls
+
+    if isinstance(encoding, ResolvedIdentityEncoding):
+        normalized, nulls = int64_values()
+        present = normalized[~nulls]
+        minimum = int(present.min()) if present.size else None
+        maximum = int(present.max()) if present.size else None
+        invalid_bounds = (
+            (minimum is not None and minimum < 0)
+            or (maximum is not None and maximum >= encoding.num_buckets)
+        )
+        if invalid_bounds and encoding.out_of_range == "error":
+            raise ValueError(
+                f"identity input {categorical_input.name!r} contains IDs outside "
+                f"[0, {encoding.num_buckets}): min={minimum}, max={maximum}"
+            )
+        if invalid_bounds:
+            valid = (normalized >= 0) & (
+                normalized < encoding.num_buckets
+            )
+            normalized = np.where(
+                valid,
+                normalized,
+                int(encoding.padding_id),
+            )
+        elif nulls.any():
+            normalized = normalized.copy()
+        if nulls.any():
+            normalized[nulls] = int(encoding.padding_id)
+        return torch.from_numpy(normalized)
+
+    if isinstance(encoding, ResolvedPreHashedEncoding):
+        normalized, nulls = int64_values()
+        if (
+            validate_prehashed_nonzero
+            and normalized.size
+            and bool(np.any((normalized == 0) & ~nulls))
+        ):
+            raise ValueError(
+                f"pre_hashed input {categorical_input.name!r} contains "
+                "non-null zero values"
+            )
+        encoded_values = (
+            np.bitwise_and(normalized, encoding.num_buckets - 1) + 1
+        )
+        if nulls.any():
+            encoded_values[nulls] = int(encoding.padding_id)
+        return torch.from_numpy(encoded_values)
+
+    unseen_policy = config.vocab_strategy.defaults.unseen_policy
+    return torch.tensor(
+        encode_categorical_values(
+            values,
+            categorical_input,
+            vocab_maps,
+            unseen_policy,
+        ),
+        dtype=torch.long,
+    )
+
+
+def _tensorize_python_categorical_bag(
+    config: AppConfig,
+    feature: FeatureConfig,
+    values: Sequence[Any],
+    vocab_maps: dict[str, dict[str, int]],
+    *,
+    validate_prehashed_nonzero: bool,
+) -> dict[str, Tensor]:
+    """Encode list-valued Python rows as flat values plus row lengths."""
+
+    if feature.pooling != "mean":
+        raise TypeError("_tensorize_python_categorical_bag requires pooling=mean")
+    rows: list[Sequence[Any]] = []
+    lengths: list[int] = []
+    for row_index, value in enumerate(values):
+        if value is None:
+            row: Sequence[Any] = ()
+        elif isinstance(value, (list, tuple)):
+            row = value
+        else:
+            raise TypeError(
+                f"categorical bag {feature.source!r} row {row_index} must be "
+                f"list-valued, got {type(value).__name__}"
+            )
+        if feature.max_length is not None and len(row) > feature.max_length:
+            if feature.truncation == "tail":
+                row = row[-feature.max_length :]
+            elif feature.truncation == "head":
+                row = row[: feature.max_length]
+            else:
+                raise ValueError(
+                    f"unsupported list truncation {feature.truncation!r}"
+                )
+        rows.append(row)
+        lengths.append(len(row))
+    flat = [item for row in rows for item in row]
+    categorical_input = config.resolved.categorical_input_by_name[feature.name]
+    return {
+        "values": _tensorize_python_categorical_values(
+            config,
+            categorical_input,
+            flat,
+            vocab_maps,
+            validate_prehashed_nonzero=validate_prehashed_nonzero,
+        ),
+        "lengths": torch.tensor(lengths, dtype=torch.long),
+    }
+
+
+def _tensorize_axis_sequence(
+    config: AppConfig,
+    sequence: SequenceConfig,
+    request_values: Mapping[str, Sequence[Any]],
+    selection_plan: Any,
+    vocab_maps: dict[str, dict[str, int]],
+    *,
+    validate_prehashed_nonzero: bool,
+) -> dict[str, Any]:
+    """Tensorize every aligned field using one shared pack-time selection."""
+
+    lengths = torch.as_tensor(
+        selection_plan.compacted_lengths.copy(),
+        dtype=torch.long,
+    )
+    starts = torch.zeros_like(lengths)
+    if lengths.numel() > 1:
+        starts[1:] = torch.cumsum(lengths[:-1], dim=0)
+    max_length = int(lengths.max().item()) if lengths.numel() else 0
+    tensor_fields: dict[str, Tensor] = {}
+    use_direct_shapes = _direct_sequence_supported(config, sequence)
+
+    for field in sequence.fields:
+        if field.source not in request_values:
+            raise ValueError(
+                f"sequence source {field.source!r} missing from direct request axis"
+            )
+        rows = request_values[field.source]
+        if len(rows) != len(selection_plan.selections):
+            raise RuntimeError(
+                f"sequence {sequence.name!r} source {field.source!r} has "
+                f"{len(rows)} request rows, expected "
+                f"{len(selection_plan.selections)}"
+            )
+        normalized_rows: list[Sequence[Any]] = []
+        full_rows = True
+        for row_index, (row, indices) in enumerate(
+            zip(rows, selection_plan.selections)
+        ):
+            items = () if row is None else row
+            if not isinstance(items, (list, tuple)):
+                raise TypeError(
+                    f"sequence {sequence.name!r} field {field.name!r} row "
+                    f"{row_index} must be list-valued"
+                )
+            normalized_rows.append(items)
+            if len(indices) != len(items) or (
+                len(items)
+                and (
+                    int(indices[0]) != 0
+                    or int(indices[-1]) != len(items) - 1
+                )
+            ):
+                full_rows = False
+        if full_rows:
+            selected = list(chain.from_iterable(normalized_rows))
+        else:
+            selected = [
+                items[int(index)]
+                for items, indices in zip(
+                    normalized_rows,
+                    selection_plan.selections,
+                )
+                for index in indices
+            ]
+
+        if field.kind == "categorical":
+            qualified = field.qualified_name(sequence.name)
+            categorical_input = config.resolved.categorical_input_by_name[
+                qualified
+            ]
+            flat_values = _tensorize_python_categorical_values(
+                config,
+                categorical_input,
+                selected,
+                vocab_maps,
+                validate_prehashed_nonzero=validate_prehashed_nonzero,
+            )
+            effective_input = _effective_categorical_input(
+                config,
+                categorical_input,
+            )
+            padding_value: int | float = int(
+                getattr(effective_input.encoding, "padding_id", 0)
+            )
+        else:
+            if field.dimension == 1:
+                scalar_values = [
+                    0.0 if value is None else float(value)
+                    for value in selected
+                ]
+                flat_values = torch.tensor(
+                    (
+                        scalar_values
+                        if use_direct_shapes
+                        else [[value] for value in scalar_values]
+                    ),
+                    dtype=torch.float32,
+                )
+                if not scalar_values and not use_direct_shapes:
+                    flat_values = torch.empty((0, 1), dtype=torch.float32)
+            else:
+                dense_rows = [
+                    _dense_vector(value, field.dimension) for value in selected
+                ]
+                flat_values = (
+                    torch.tensor(dense_rows, dtype=torch.float32)
+                    if dense_rows
+                    else torch.empty((0, field.dimension), dtype=torch.float32)
+                )
+            padding_value = 0.0
+        tensor_fields[field.name] = _gather_padded_sequence(
+            flat_values,
+            starts,
+            lengths,
+            max_length,
+            padding_value,
+        )
+
+    return {
+        "fields": tensor_fields,
+        "lengths": lengths,
+        "has_sequence": lengths > 0,
+    }
+
+
+def _scenario_values_tensor(
+    config: AppConfig,
+    values: Sequence[Any] | None,
+    batch_size: int,
+) -> Tensor:
+    """Python-axis equivalent of ``_scenario_tensor``."""
+
+    scenario_count = len(config.scenarios.names)
+    if config.scenarios.source is None:
+        if scenario_count != 1:
+            raise ValueError(
+                "scenarios.source is required when multiple scenarios are configured"
+            )
+        return torch.zeros(batch_size, dtype=torch.long)
+    if values is None:
+        raise ValueError(
+            f"missing configured scenario column {config.scenarios.source!r}"
+        )
+
+    scenario_to_id = {
+        name: index for index, name in enumerate(config.scenarios.names)
+    }
+    row_indices: list[list[int]] = []
+    saw_list_value = False
+    for row_index, value in enumerate(values):
+        if isinstance(value, (list, tuple)):
+            saw_list_value = True
+            if not value:
+                raise ValueError(f"scenario list is empty at row {row_index}")
+            items = value
+        else:
+            items = [value]
+        row_indices.append(
+            [
+                _encode_scenario_item(
+                    item,
+                    scenario_to_id,
+                    scenario_count,
+                    row_index,
+                    config.scenarios.source_encoding,
+                )
+                for item in items
+            ]
+        )
+    if saw_list_value:
+        mask = torch.zeros(batch_size, scenario_count, dtype=torch.float32)
+        for row_index, indices in enumerate(row_indices):
+            for index in indices:
+                mask[row_index, index] = 1.0
+        return mask
+    return torch.tensor([indices[0] for indices in row_indices], dtype=torch.long)
+
+
+def axis_batch_to_feature_batch(
+    config: AppConfig,
+    axis_batch: Any,
+    vocab_maps: dict[str, dict[str, int]],
+    require_labels: bool = True,
+    include_group_id: bool = True,
+    split: ParquetSplitConfig | None = None,
+) -> FeatureBatch:
+    """Construct a FeatureBatch directly from a packed three-axis payload."""
+
+    from .agg_direct import PreparedAxisBatch
+
+    if not isinstance(axis_batch, PreparedAxisBatch):
+        raise TypeError(
+            "axis_batch_to_feature_batch requires PreparedAxisBatch, got "
+            f"{type(axis_batch).__name__}"
+        )
+    active_split = config.data.train if split is None else split
+    adapter_options = (
+        {} if active_split.adapter is None else active_split.adapter.options
+    )
+    context_sources = {
+        str(source) for source in adapter_options.get("context_features", ())
+    }
+    validate_prehashed_nonzero = (
+        active_split.reader.validate_prehashed_nonzero
+    )
+    row_indices = axis_batch.request_row_indices
+    features: dict[str, Any] = {}
+
+    for feature in config.features:
+        request_level = feature.source in context_sources
+        source_values = (
+            axis_batch.request_values
+            if request_level
+            else axis_batch.candidate_values
+        )
+        if feature.source not in source_values:
+            axis_name = "request" if request_level else "candidate"
+            raise ValueError(
+                f"feature source {feature.source!r} missing from direct "
+                f"{axis_name} axis"
+            )
+        values = source_values[feature.source]
+        if feature.kind == "categorical":
+            value = (
+                _tensorize_python_categorical_bag(
+                    config,
+                    feature,
+                    values,
+                    vocab_maps,
+                    validate_prehashed_nonzero=validate_prehashed_nonzero,
+                )
+                if feature.pooling == "mean"
+                else _tensorize_python_categorical_values(
+                    config,
+                    config.resolved.categorical_input_by_name[feature.name],
+                    values,
+                    vocab_maps,
+                    validate_prehashed_nonzero=validate_prehashed_nonzero,
+                )
+            )
+        elif feature.kind == "dense":
+            value = _tensorize_dense(feature, list(values))
+        else:
+            raise ValueError(f"unsupported feature kind {feature.kind!r}")
+        features[feature.name] = (
+            _indexed_request_value(value, row_indices)
+            if request_level
+            else value
+        )
+
+    for sequence in config.sequences:
+        try:
+            selection_plan = axis_batch.sequence_plans[sequence.name]
+        except KeyError as error:
+            raise ValueError(
+                f"sequence plan {sequence.name!r} missing from direct batch"
+            ) from error
+        value = _tensorize_axis_sequence(
+            config,
+            sequence,
+            axis_batch.request_values,
+            selection_plan,
+            vocab_maps,
+            validate_prehashed_nonzero=validate_prehashed_nonzero,
+        )
+        value["row_indices"] = row_indices
+        features[sequence.name] = value
+
+    labels = None
+    label_mask = None
+    label_columns = active_split.labels
+    if label_columns and all(
+        column in axis_batch.candidate_values
+        for column in label_columns.values()
+    ):
+        label_names = list(label_columns)
+        labels = torch.stack(
+            [
+                torch.tensor(
+                    [
+                        0.0 if value is None else float(value)
+                        for value in axis_batch.candidate_values[
+                            label_columns[name]
+                        ]
+                    ],
+                    dtype=torch.float32,
+                )
+                for name in label_names
+            ],
+            dim=1,
+        )
+        mask_columns = active_split.label_masks
+        mask_column_names = [mask_columns.get(name) for name in label_names]
+        if mask_columns and all(
+            column is not None and column in axis_batch.candidate_values
+            for column in mask_column_names
+        ):
+            label_mask = torch.stack(
+                [
+                    torch.tensor(
+                        [
+                            0.0 if value is None else float(value)
+                            for value in axis_batch.candidate_values[column]
+                        ],
+                        dtype=torch.float32,
+                    )
+                    for column in mask_column_names
+                    if column is not None
+                ],
+                dim=1,
+            )
+    elif require_labels:
+        raise ValueError("required label columns are missing from direct batch")
+
+    group_ids: list[str] = []
+    if include_group_id:
+        group_source = active_split.group_id or active_split.request_id
+        if group_source is None:
+            group_ids = ["" for _ in range(axis_batch.n_candidates)]
+        elif group_source not in axis_batch.candidate_values:
+            raise ValueError(
+                f"missing configured group-id column {group_source!r}"
+            )
+        else:
+            group_ids = [
+                "" if value is None else str(value)
+                for value in axis_batch.candidate_values[group_source]
+            ]
+
+    prediction_keys: dict[str, list[Any]] = {}
+    for output_name, source in active_split.prediction_keys.items():
+        if source not in axis_batch.candidate_values:
+            raise ValueError(
+                f"prediction key source {source!r} missing from direct "
+                "candidate axis"
+            )
+        values = list(axis_batch.candidate_values[source])
+        if len(values) != axis_batch.n_candidates:
+            raise RuntimeError(
+                f"prediction key source {source!r} produced {len(values)} "
+                f"values for {axis_batch.n_candidates} rows"
+            )
+        prediction_keys[output_name] = values
+
+    scenario_values = (
+        None
+        if config.scenarios.source is None
+        else axis_batch.candidate_values.get(config.scenarios.source)
+    )
+    return FeatureBatch(
+        features=features,
+        labels=labels,
+        label_mask=label_mask,
+        scenario_id=_scenario_values_tensor(
+            config,
+            scenario_values,
+            axis_batch.n_candidates,
+        ),
+        group_id=group_ids,
+        prediction_keys=prediction_keys,
+    )
 
 
 _REQUEST_DEDUP_AUTO = object()
