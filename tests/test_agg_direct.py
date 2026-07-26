@@ -21,6 +21,7 @@ from src.dataloader import (
     _adapter_request_level_sources,
     build_packed_request_plan,
     build_sequence_selection_plan,
+    compact_list_column_from_rows,
     effective_bucket_length_from_pre_compaction,
     iter_packed_request_groups,
     iter_shuffled_request_groups,
@@ -688,6 +689,31 @@ class SequenceSelectionPlanTest(unittest.TestCase):
 
 
 # --- Axis-separated adapt / source registry / pack materialize ---
+
+class CompactListColumnTest(unittest.TestCase):
+    def test_object_rows_with_trailing_nulls_stay_object(self) -> None:
+        """Later object-ndarray nulls must not select int64 packing.
+
+        Repro for host-prepare TypeError: int() ... NoneType when the first
+        object row sets sample=int and a subsequent row contains None.
+        """
+
+        rows = [
+            np.asarray([11, 22], dtype=object),
+            np.asarray([33, None, 44], dtype=object),
+            np.asarray([55], dtype=object),
+        ]
+        column = compact_list_column_from_rows(rows)
+        self.assertEqual(column.values.dtype, object)
+        self.assertEqual(list(column[0]), [11, 22])
+        self.assertEqual(list(column[1]), [33, None, 44])
+        self.assertEqual(list(column[2]), [55])
+
+    def test_python_lists_with_nulls_stay_object(self) -> None:
+        column = compact_list_column_from_rows([[1, 2], [3, None], [4]])
+        self.assertEqual(column.values.dtype, object)
+        self.assertEqual(list(column[1]), [3, None])
+
 
 class AdapterRequestLevelSourcesTest(unittest.TestCase):
     def test_includes_coarse_scene_derived_columns(self) -> None:

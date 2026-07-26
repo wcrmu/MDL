@@ -181,8 +181,8 @@ CANDIDATE_ITEM_SCALAR_FIELDS = frozenset(
     }
 )
 ITEM_BAG_FIELDS |= CANDIDATE_ITEM_BAG_FIELDS
-# Field-level maxima observed from the 10k-row sample.  These describe the
-# distribution tail; they are not training allocations or truncation targets.
+# Field-level maximum values observed from the 10k-row sample.  These describe
+# the distribution tail; they are not training allocations or truncation targets.
 OBSERVED_MULTIVALUE_MAX_LENGTHS = {
     # Extremely short (max <= 6).
     "clk_cnt_1d_hn": 1,

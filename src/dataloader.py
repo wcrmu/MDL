@@ -10948,24 +10948,26 @@ def compact_list_column_from_rows(rows: Sequence[Any]) -> CompactListColumn:
             if length:
                 if row.dtype == object:
                     numeric_nd = False
+                    # Must detect nulls on every object row (a later None after
+                    # sample is set used to pick int64 and TypeError on assign).
+                    # Vectorized equality beats a Python element loop here.
+                    if not saw_none and bool(np.equal(row, None).any()):
+                        saw_none = True
                     if sample is None:
                         for item in row:
-                            if item is None:
-                                saw_none = True
-                            elif sample is None:
+                            if item is not None:
                                 sample = item
+                                break
                 elif sample_dtype is None:
                     sample_dtype = row.dtype
                     sample = row.item(0) if length else sample
         else:
             numeric_nd = False
             length = len(row)
-            if not saw_none:
-                for item in row:
-                    if item is None:
-                        saw_none = True
-                        break
-            if sample is None and length:
+            # ``None in seq`` is a C-level scan for list/tuple.
+            if not saw_none and None in row:
+                saw_none = True
+            if sample is None:
                 for item in row:
                     if item is not None:
                         sample = item
@@ -10980,11 +10982,6 @@ def compact_list_column_from_rows(rows: Sequence[Any]) -> CompactListColumn:
         )
 
     if numeric_nd and sample_dtype is not None and sample_dtype != object:
-        if total == 0:
-            return CompactListColumn(
-                values=np.empty(0, dtype=np.int64),
-                offsets=offsets,
-            )
         values = np.empty(total, dtype=sample_dtype)
         cursor = 0
         for row in rows:

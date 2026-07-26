@@ -2169,7 +2169,15 @@ def _host_prepare_process_main(
             if callable(close):
                 close()
     except BaseException as error:  # noqa: BLE001 - propagate to parent
-        queue.put(error)
+        # Pickling a bare exception across spawn drops the child traceback.
+        # Embed it in the message so train logs show the real int(None)/etc site.
+        import traceback
+
+        queue.put(
+            RuntimeError(
+                f"{type(error).__name__}: {error}\n{traceback.format_exc()}"
+            )
+        )
 
 
 class _ProcessHostPrepareIterator:

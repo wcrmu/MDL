@@ -506,7 +506,7 @@ window to oldest-to-newest; the adapter does not reverse the raw sequence.
 | flatten_query_hash | 3 | 512 | 6.7% | 78 | 1,000 |
 | Total | 107 | — | — | — | — |
 
-The null rates, medians, and maxima above come from the relocated historical
+The null rates, medians, and maximum values above come from the relocated historical
 sample document. They are observations, not full-HDFS guarantees and not
 runtime truncation settings.
 
