@@ -303,7 +303,7 @@ def _grouped_lookup_worker(rank: int, world_size: int, port: int) -> None:
 
 
 def _grouped_mixed_dim_lookup_worker(rank: int, world_size: int, port: int) -> None:
-    """Mixed embedding widths must share one padded collective and stay correct."""
+    """Mixed embedding widths must share one packed collective and stay correct."""
 
     _init_gloo(rank, world_size, port)
     try:

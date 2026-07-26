@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
+import os
 from time import perf_counter
 from typing import Any, Iterable, Literal
 
@@ -17,6 +18,31 @@ import torch
 import torch.distributed as torch_dist
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _grouped_emb_pack_values_enabled(mixed_dims: bool) -> bool:
+    """Exact-width 1D value A2A for mixed-dim groups (default on).
+
+    Keeps one fused collective while dropping max-dim pad bytes on the wire.
+    Set ``MDL_GROUPED_EMB_PADDED_A2A=1`` to force the old padded path.
+    """
+
+    if not mixed_dims:
+        return False
+    if _env_flag_enabled("MDL_GROUPED_EMB_PADDED_A2A"):
+        return False
+    if os.environ.get("MDL_GROUPED_EMB_PACKED_A2A", "").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return False
+    return True
 
 
 EmbeddingShardStrategy = Literal["row_wise", "table_wise"]
@@ -751,6 +777,76 @@ def _table_indices_for_keys(keys: Tensor, table_offsets: tuple[int, ...]) -> Ten
     return torch.bucketize(keys, boundaries, right=True)
 
 
+def _embedding_dims_for_keys(
+    keys: Tensor,
+    table_offsets: tuple[int, ...],
+    embedding_dims: tuple[int, ...],
+) -> Tensor:
+    """Per-key embedding width for fused multi-table keys."""
+
+    table_indices = _table_indices_for_keys(keys, table_offsets)
+    dim_table = torch.tensor(
+        embedding_dims, dtype=torch.long, device=keys.device
+    )
+    return dim_table.index_select(0, table_indices)
+
+
+def _element_split_sizes(
+    dims: Tensor, row_splits: tuple[int, ...]
+) -> tuple[int, ...]:
+    """Sum per-row embedding widths inside each row-split segment."""
+
+    if not row_splits:
+        return ()
+    if dims.numel() == 0:
+        return tuple(0 for _ in row_splits)
+    split_tensor = torch.tensor(
+        row_splits, dtype=torch.long, device=dims.device
+    )
+    ends = torch.cumsum(split_tensor, dim=0)
+    starts = ends - split_tensor
+    prefix = torch.zeros(1, dtype=torch.long, device=dims.device)
+    prefix = torch.cat((prefix, torch.cumsum(dims.long(), dim=0)))
+    totals = prefix.index_select(0, ends) - prefix.index_select(0, starts)
+    return tuple(int(value) for value in totals.tolist())
+
+
+def _pack_rows_by_dim(values: Tensor, dims: Tensor) -> Tensor:
+    """Pack ``[N, max_dim]`` rows into a 1D payload of exact widths.
+
+    Avoid device->host syncs on the mixed-dim hot path; ``masked_select`` keeps
+    the pack fully on-device until the collective needs host split sizes.
+    """
+
+    if values.ndim != 2:
+        raise ValueError("pack expects a 2D value tensor")
+    if dims.numel() != values.size(0):
+        raise ValueError("dims length must match the number of value rows")
+    if values.size(0) == 0:
+        return values.new_empty(0)
+    max_dim = values.size(1)
+    columns = torch.arange(max_dim, device=values.device).unsqueeze(0)
+    return values.masked_select(columns < dims.unsqueeze(1))
+
+
+def _unpack_rows_by_dim(
+    flat: Tensor, dims: Tensor, max_dim: int
+) -> Tensor:
+    """Unpack a 1D exact-width payload into ``[N, max_dim]`` (zero-padded)."""
+
+    if dims.ndim != 1:
+        raise ValueError("dims must be a 1D tensor")
+    if max_dim < 0:
+        raise ValueError("max_dim must be non-negative")
+    rows = dims.numel()
+    output = flat.new_zeros((rows, max_dim))
+    if rows == 0:
+        return output
+    columns = torch.arange(max_dim, device=flat.device).unsqueeze(0)
+    output.masked_scatter_(columns < dims.unsqueeze(1), flat)
+    return output
+
+
 class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
     """Route several compatible embedding tables with one collective group.
 
@@ -758,6 +854,10 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
     is one distinct local table weight. Keeping weights as explicit autograd
     inputs is important: aliases may issue several requests, but each physical
     table still receives exactly one sparse gradient.
+
+    Mixed embedding widths still share one value collective: rows are packed to
+    a 1D exact-width payload for the wire, then locally unpacked / sliced back
+    to each table's true dim. Homogeneous groups keep the denser 2D path.
     """
 
     @staticmethod
@@ -774,9 +874,14 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             raise TypeError("sharded embedding indices must be torch.long")
         if not modules:
             raise ValueError("grouped embedding lookup requires at least one table")
-        # Pad narrower tables to the group max width so every embedding dim can
-        # share one value all_to_all. Callers slice back to the real width.
-        embedding_dim = max(module.embedding_dim for module in modules)
+        # Local buffers use the group max width; mixed-dim groups pack to a 1D
+        # exact-width payload for the value all_to_all so pad bytes never hit the
+        # wire. Callers still slice each request back to its true width.
+        table_embedding_dims = tuple(module.embedding_dim for module in modules)
+        embedding_dim = max(table_embedding_dims)
+        pack_values = _grouped_emb_pack_values_enabled(
+            len(set(table_embedding_dims)) > 1
+        )
         rank, world_size = _distributed_rank_world(metadata.process_group)
         if any(module.world_size != world_size for module in modules):
             raise RuntimeError("embedding plan does not match the active process group")
@@ -839,8 +944,9 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
         send_splits_tensor = torch.bincount(requester_owners, minlength=world_size)
 
         communication_started = perf_counter()
+        profile_tag = "packed" if pack_values else str(embedding_dim)
         with torch.profiler.record_function(
-            f"sharded_embedding_group::{embedding_dim}::forward_all_to_all"
+            f"sharded_embedding_group::{profile_tag}::forward_all_to_all"
         ):
             send_splits, recv_splits = _exchange_and_host_splits(
                 send_splits_tensor, metadata.process_group
@@ -884,12 +990,37 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
                     values = padded
                 owner_unique_values.index_copy_(0, selected, values)
             received_values = owner_unique_values.index_select(0, owner_inverse)
-            returned_values = _all_to_all_variable(
-                received_values,
-                recv_splits,
-                send_splits,
-                metadata.process_group,
-            )
+            if pack_values:
+                received_dims = _embedding_dims_for_keys(
+                    received_keys, metadata.table_offsets, table_embedding_dims
+                )
+                sorted_dims = _embedding_dims_for_keys(
+                    sorted_keys, metadata.table_offsets, table_embedding_dims
+                )
+                # One host sync for both element-split vectors (NCCL needs ints).
+                value_send_splits = _element_split_sizes(received_dims, recv_splits)
+                value_recv_splits = _element_split_sizes(sorted_dims, send_splits)
+                returned_values = _unpack_rows_by_dim(
+                    _all_to_all_variable(
+                        _pack_rows_by_dim(received_values, received_dims),
+                        value_send_splits,
+                        value_recv_splits,
+                        metadata.process_group,
+                    ),
+                    sorted_dims,
+                    embedding_dim,
+                )
+            else:
+                sorted_dims = None
+                received_dims = None
+                value_send_splits = recv_splits
+                value_recv_splits = send_splits
+                returned_values = _all_to_all_variable(
+                    received_values,
+                    recv_splits,
+                    send_splits,
+                    metadata.process_group,
+                )
         communication_seconds = perf_counter() - communication_started
 
         requester_values = local_weights[0].new_empty(
@@ -907,18 +1038,26 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
         ctx.lookup_metadata = metadata
         ctx.world_size = world_size
         ctx.group_embedding_dim = embedding_dim
+        ctx.table_embedding_dims = table_embedding_dims
+        ctx.pack_values = pack_values
         ctx.local_weight_shapes = tuple(tuple(weight.shape) for weight in local_weights)
         ctx.local_weight_dtypes = tuple(weight.dtype for weight in local_weights)
         ctx.send_splits = send_splits
         ctx.recv_splits = recv_splits
-        ctx.save_for_backward(
+        ctx.value_send_splits = value_send_splits
+        ctx.value_recv_splits = value_recv_splits
+        saved: list[Tensor] = [
             active_positions,
             requester_inverse,
             send_order,
             sorted_keys,
             owner_unique_keys,
             owner_inverse,
-        )
+        ]
+        if pack_values:
+            assert sorted_dims is not None and received_dims is not None
+            saved.extend((sorted_dims, received_dims))
+        ctx.save_for_backward(*saved)
 
         if metadata.collect_stats:
             table_count = len(modules)
@@ -945,12 +1084,13 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
                 dim=0,
             ).to(device="cpu")
             id_bytes = packed_indices.element_size()
-            value_bytes = local_weights[0].element_size() * embedding_dim
+            element_size = local_weights[0].element_size()
             for table_index, module in enumerate(modules):
                 local_unique = int(count_matrix[0, table_index].item())
                 received = int(count_matrix[1, table_index].item())
                 returned = int(count_matrix[2, table_index].item())
                 owner_unique = int(count_matrix[3, table_index].item())
+                value_bytes = element_size * module.embedding_dim
                 module._stats_sink.record_forward(
                     EmbeddingCommunicationStats(
                         table_name=module.table_name,
@@ -976,6 +1116,7 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> tuple[Any, ...]:  # type: ignore[override]
         metadata: _GroupedLookupMetadata = ctx.lookup_metadata
+        saved = ctx.saved_tensors
         (
             active_positions,
             requester_inverse,
@@ -983,8 +1124,9 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             sorted_keys,
             owner_unique_keys,
             owner_inverse,
-        ) = ctx.saved_tensors
+        ) = saved[:6]
         embedding_dim = int(ctx.group_embedding_dim)
+        pack_values = bool(ctx.pack_values)
         flat_grad = grad_output.reshape(-1, embedding_dim)
         active_grad = flat_grad.index_select(0, active_positions)
         requester_grad = flat_grad.new_zeros((send_order.numel(), embedding_dim))
@@ -993,15 +1135,32 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
         sorted_grad = requester_grad.index_select(0, send_order)
 
         communication_started = perf_counter()
+        profile_tag = "packed" if pack_values else str(embedding_dim)
         with torch.profiler.record_function(
-            f"sharded_embedding_group::{embedding_dim}::backward_all_to_all"
+            f"sharded_embedding_group::{profile_tag}::backward_all_to_all"
         ):
-            received_grad = _all_to_all_variable(
-                sorted_grad,
-                ctx.send_splits,
-                ctx.recv_splits,
-                metadata.process_group,
-            )
+            if pack_values:
+                sorted_dims = saved[6]
+                received_dims = saved[7]
+                # Forward value A2A used input=recv_elem / output=send_elem; the
+                # gradient route is the transpose: input=send_elem / output=recv_elem.
+                received_grad = _unpack_rows_by_dim(
+                    _all_to_all_variable(
+                        _pack_rows_by_dim(sorted_grad, sorted_dims),
+                        ctx.value_recv_splits,
+                        ctx.value_send_splits,
+                        metadata.process_group,
+                    ),
+                    received_dims,
+                    embedding_dim,
+                )
+            else:
+                received_grad = _all_to_all_variable(
+                    sorted_grad,
+                    ctx.send_splits,
+                    ctx.recv_splits,
+                    metadata.process_group,
+                )
         communication_seconds = perf_counter() - communication_started
         owner_grad = received_grad.new_zeros(
             (owner_unique_keys.numel(), embedding_dim)
@@ -1040,7 +1199,7 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             sent_table_indices = _table_indices_for_keys(
                 sorted_keys, metadata.table_offsets
             )
-            value_bytes = grad_output.element_size() * embedding_dim
+            element_size = grad_output.element_size()
             received_table_indices = owner_table_indices.index_select(0, owner_inverse)
             count_matrix = torch.stack(
                 (
@@ -1052,6 +1211,7 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             for table_index, module in enumerate(metadata.modules):
                 sent_count = int(count_matrix[0, table_index].item())
                 received_count = int(count_matrix[1, table_index].item())
+                value_bytes = element_size * module.embedding_dim
                 module._stats_sink.record_backward(
                     sent_bytes=sent_count * value_bytes,
                     received_bytes=received_count * value_bytes,
@@ -1066,8 +1226,9 @@ def grouped_sharded_embedding_lookup(
     """Lookup compatible tables in grouped owner-based collectives.
 
     Requests are partitioned by device, dtype, process group, and dedup policy.
-    Different embedding widths share one padded value collective (pad to the
-    group max width, then slice). A singleton retains the simpler per-table
+    Different embedding widths share one value collective: rows are packed to
+    exact per-table widths on the wire (no max-dim pad traffic), then locally
+    unpacked and sliced. A singleton retains the simpler per-table
     implementation; all other requests in a partition share one count exchange,
     request route, and response route.
     """
@@ -1116,10 +1277,10 @@ def grouped_sharded_embedding_lookup(
     for request_index, (module, indices) in enumerate(request_list):
         if indices.dtype != torch.long:
             raise TypeError("sharded embedding indices must be torch.long")
-        # Intentionally omit embedding_dim: mixed widths share one padded
-        # collective (pad to group max). That cuts RankMixer from ~20
-        # all_to_all_single ops/step to ~4 and raises multi-GPU util on
-        # SYS/PCIe fabrics where collective latency dominates bandwidth.
+        # Intentionally omit embedding_dim: mixed widths share one value
+        # collective (exact-width 1D pack on the wire). That cuts RankMixer
+        # from ~20 all_to_all_single ops/step to ~4 and raises multi-GPU util
+        # on SYS/PCIe fabrics where collective latency dominates bandwidth.
         key = (
             indices.device,
             module.weight.device,

@@ -9,12 +9,13 @@ runtime:
   compile_mode: default
   require_compact_sequence_batches: false
   allow_tf32: true
-  activation_checkpoint: full
+  # selective + batch 1280: best util≥80 / sps on 2-GPU e2e mock (≈90% util).
+  activation_checkpoint: selective
   attention_backend: flash
   varlen_packing: compact
   sequence_projection_chunk_tokens: 131072
-  # Bound LONGER by padded event tokens rather than fixed rows. At batch 1024
-  # this gives 128 rows for length 2048, 256 for length 1024, and the full batch
+  # Bound LONGER by padded event tokens rather than fixed rows. At batch 1280
+  # this gives 160 rows for length 2048, 320 for length 1024, and the full batch
   # for streams <=256, keeping Tensor Cores fed without unbounded HBM growth.
   sequence_encoder_chunk_rows: 0
   sequence_encoder_chunk_tokens: 262144
@@ -74,15 +75,15 @@ data:
       length_bucket_metric: sum
       length_buckets:
       - max_length: 1024
-        batch_size: 1024
+        batch_size: 1280
       - max_length: 2048
-        batch_size: 1024
+        batch_size: 640
       - max_length: 4096
-        batch_size: 1024
+        batch_size: 320
       - max_length: 6144
-        batch_size: 1024
+        batch_size: 224
       - max_length:
-        batch_size: 1024
+        batch_size: 160
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
       input_columns:
@@ -5360,8 +5361,8 @@ model:
   use_request_cache: true
 training:
   # Physical batch per rank/GPU. It is never divided by world size; the default
-  # two-rank launch therefore processes 2048 samples per forward collectively.
-  batch_size: 1024
+  # two-rank launch therefore processes 2560 samples per forward collectively.
+  batch_size: 1280
   gradient_accumulation_steps: 1
   embedding_distribution: sharded
   dense_distribution: ddp

@@ -5420,6 +5420,42 @@ class MDLRankMixerBlock(nn.Module):
         return feature_tokens, scenario_tokens, task_tokens
 
 
+class _MDLRankMixerGraphedStack(nn.Module):
+    """Parameter-free view of RankMixer blocks+logits for CUDA Graph capture.
+
+    Holds only a weak owner reference so DDP / optimizers keep a single copy of
+    the live parameters while ``make_graphed_callables`` records the dense
+    launch sequence for one static shape.
+    """
+
+    def __init__(self, owner: "MDLRankMixerModel") -> None:
+        super().__init__()
+        self._owner = owner
+
+    def forward(
+        self,
+        feature_tokens: Tensor,
+        scenario_tokens: Tensor,
+        task_tokens: Tensor,
+        scenario_mask: Tensor,
+    ) -> Tensor:
+        owner = self._owner
+        for block in owner.blocks:
+            feature_tokens, scenario_tokens, task_tokens = block(
+                feature_tokens,
+                scenario_tokens,
+                task_tokens,
+                scenario_mask,
+            )
+        return _mdl_logits(
+            owner,
+            feature_tokens,
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
+        )
+
+
 class MDLRankMixerModel(nn.Module):
     def __init__(
         self,
@@ -5500,9 +5536,95 @@ class MDLRankMixerModel(nn.Module):
             for _layer_index in range(config.model.num_layers)
         )
         _init_mdl_output_modules(self, config, self.metadata)
+        # Per static-shape graphed callable (blocks+logits). Keys are tensor
+        # meta tuples so length-bucket batch sizes each capture once.
+        self._cuda_graph_backbone_pool: dict[tuple[Any, ...], Any] = {}
 
     def precompute_request_cache(self, features: dict[str, Any]) -> dict[str, LongerSequenceCache]:
         return self.encoder_bank.precompute_request_cache(features)
+
+    def _run_rankmixer_blocks(
+        self,
+        feature_tokens: Tensor,
+        scenario_tokens: Tensor,
+        task_tokens: Tensor,
+        scenario_mask: Tensor,
+    ) -> Tensor:
+        """Eager / checkpointed RankMixer stack → logits."""
+
+        for block in self.blocks:
+            if _activation_checkpoint_enabled(
+                self.config.runtime.activation_checkpoint
+            ) and self.training:
+                feature_tokens, scenario_tokens, task_tokens = checkpoint(
+                    block,
+                    feature_tokens,
+                    scenario_tokens,
+                    task_tokens,
+                    scenario_mask,
+                    use_reentrant=False,
+                )
+            else:
+                feature_tokens, scenario_tokens, task_tokens = block(
+                    feature_tokens,
+                    scenario_tokens,
+                    task_tokens,
+                    scenario_mask,
+                )
+        return _mdl_logits(
+            self,
+            feature_tokens,
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
+        )
+
+    def _run_rankmixer_blocks_cuda_graph(
+        self,
+        feature_tokens: Tensor,
+        scenario_tokens: Tensor,
+        task_tokens: Tensor,
+        scenario_mask: Tensor,
+    ) -> Tensor:
+        """Replay a per-shape CUDA Graph of the dense RankMixer stack."""
+
+        key = (
+            tuple(feature_tokens.shape),
+            tuple(scenario_tokens.shape),
+            tuple(task_tokens.shape),
+            tuple(scenario_mask.shape),
+            feature_tokens.dtype,
+            scenario_tokens.dtype,
+            task_tokens.dtype,
+            scenario_mask.dtype,
+            feature_tokens.device,
+        )
+        graphed = self._cuda_graph_backbone_pool.get(key)
+        if graphed is None:
+            sample_args = (
+                feature_tokens.detach().clone(),
+                scenario_tokens.detach().clone(),
+                task_tokens.detach().clone(),
+                scenario_mask.detach().clone(),
+            )
+            wrapper = _MDLRankMixerGraphedStack(self)
+            graphed = torch.cuda.make_graphed_callables(
+                wrapper,
+                sample_args,
+                num_warmup_iters=3,
+                allow_unused_input=True,
+            )
+            # Warmup/capture runs leave autograd grads on the shared live
+            # parameters; drop them so the caller's optimizer.step is clean.
+            for parameter in self.parameters():
+                parameter.grad = None
+            self._cuda_graph_backbone_pool[key] = graphed
+        return graphed(
+            feature_tokens,
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
+        )
 
     def forward(
         self,
@@ -5527,32 +5649,29 @@ class MDLRankMixerModel(nn.Module):
             self.metadata.scenario_count,
             validate=getattr(self.config.runtime, "validate_scenario_ids", True),
         )
-        for block in self.blocks:
-            if _activation_checkpoint_enabled(
+        use_cuda_graph = (
+            bool(getattr(self.config.runtime, "cuda_graph_backbone", False))
+            and self.training
+            and torch.is_grad_enabled()
+            and feature_tokens.is_cuda
+            and not _activation_checkpoint_enabled(
                 self.config.runtime.activation_checkpoint
-            ) and self.training:
-                feature_tokens, scenario_tokens, task_tokens = checkpoint(
-                    block,
-                    feature_tokens,
-                    scenario_tokens,
-                    task_tokens,
-                    scenario_mask,
-                    use_reentrant=False,
-                )
-            else:
-                feature_tokens, scenario_tokens, task_tokens = block(
-                    feature_tokens,
-                    scenario_tokens,
-                    task_tokens,
-                    scenario_mask,
-                )
-        logits = _mdl_logits(
-            self,
-            feature_tokens,
-            scenario_tokens,
-            task_tokens,
-            scenario_mask,
+            )
         )
+        if use_cuda_graph:
+            logits = self._run_rankmixer_blocks_cuda_graph(
+                feature_tokens,
+                scenario_tokens,
+                task_tokens,
+                scenario_mask,
+            )
+        else:
+            logits = self._run_rankmixer_blocks(
+                feature_tokens,
+                scenario_tokens,
+                task_tokens,
+                scenario_mask,
+            )
         output = {"logits": logits}
         output.update(_sparse_moe_outputs(self, logits))
         return output

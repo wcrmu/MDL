@@ -1713,6 +1713,10 @@ class RuntimeConfig:
     # reduce-overhead enables CUDA Graph capture for fixed-shape launch-bound
     # workloads; default preserves ordinary Inductor execution.
     compile_mode: Literal["default", "reduce-overhead"] = "default"
+    # Capture the dense RankMixer stack (blocks + logits) after encoder_bank /
+    # projectors with a per-shape CUDA Graph pool. Embedding all_to_all stays
+    # eager. Requires activation_checkpoint=none and compile=false.
+    cuda_graph_backbone: bool = False
     # OneTrans can avoid a dynamic slice when the reader guarantees that no
     # prefix column is padding for every row in the batch.
     require_compact_sequence_batches: bool = False
@@ -1782,6 +1786,7 @@ class RuntimeConfig:
                 raise ValueError(f"runtime.{field_name} must be a string")
         for field_name in (
             "compile",
+            "cuda_graph_backbone",
             "allow_tf32",
             "require_compact_sequence_batches",
             "trim_all_invalid_sequence_prefix",
@@ -1790,6 +1795,15 @@ class RuntimeConfig:
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise ValueError(f"runtime.{field_name} must be a boolean")
+        if self.cuda_graph_backbone and self.compile:
+            raise ValueError(
+                "runtime.cuda_graph_backbone cannot be combined with runtime.compile"
+            )
+        if self.cuda_graph_backbone and self.activation_checkpoint != "none":
+            raise ValueError(
+                "runtime.cuda_graph_backbone requires runtime.activation_checkpoint=none "
+                "(selective/full recompute is incompatible with CUDA Graph capture)"
+            )
         if self.nproc_per_node is not None and type(self.nproc_per_node) is not int:
             raise ValueError("runtime.nproc_per_node must be an integer or null")
         if type(self.master_port) is not int:

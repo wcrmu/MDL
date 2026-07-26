@@ -36,7 +36,13 @@ from src.dataloader import (
     validate_matching_schemas,
 )
 from src.features import fit_vocabs, plan_vocab_fit, vocab_artifacts, vocab_strategy_fingerprint
-from src.train import evaluate_mdl, is_main_process, predict_mdl, train_mdl
+from src.train import (
+    _configure_nccl_runtime_env,
+    evaluate_mdl,
+    is_main_process,
+    predict_mdl,
+    train_mdl,
+)
 
 
 def _expand_hour_partition(
@@ -126,7 +132,7 @@ _TRAINING_OVERRIDE_FIELDS = (
     "checkpoint_path",
 )
 
-_RUNTIME_OVERRIDE_FIELDS = ("activation_checkpoint",)
+_RUNTIME_OVERRIDE_FIELDS = ("activation_checkpoint", "cuda_graph_backbone")
 
 
 def _scale_length_buckets(buckets: tuple, old_batch_size: int, new_batch_size: int) -> tuple:
@@ -363,6 +369,15 @@ def _add_runtime_override_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="override runtime.activation_checkpoint (none|selective|full)",
     )
+    parser.add_argument(
+        "--cuda-graph-backbone",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "override runtime.cuda_graph_backbone; graphs the dense RankMixer "
+            "stack after embeddings (requires activation_checkpoint=none)"
+        ),
+    )
 
 
 def _cmd_validate_config(args: argparse.Namespace) -> int:
@@ -391,6 +406,7 @@ def _cmd_validate_config(args: argparse.Namespace) -> int:
     print(f"lr_dense: {config.training.lr_dense}")
     print(f"lr_sparse: {config.training.lr_sparse}")
     print(f"activation_checkpoint: {config.runtime.activation_checkpoint}")
+    print(f"cuda_graph_backbone: {config.runtime.cuda_graph_backbone}")
     buckets = config.data.train.reader.length_buckets
     if buckets:
         rendered = ",".join(
@@ -492,6 +508,9 @@ def _launch_ddp_command(args: argparse.Namespace, config) -> int:
     # Expandable segments let adjacent variable-length batches reuse one CUDA
     # segment instead of failing with free-but-fragmented HBM near capacity.
     env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    # Probe local CUDA P2P: keep NVLink/P2P when healthy, otherwise fall back
+    # via NCCL_IGNORE_DISABLED_P2P / NCCL_P2P_DISABLE (see train.py).
+    _configure_nccl_runtime_env(env)
     # Tiny container /dev/shm (often 64MiB) cannot hold NCCL's ~32MiB/rank
     # host segments. Prefer a same-length string-patched libnccl that writes
     # under /tmp/msh (see artifacts/gpu_util_e2e_mock/nccl_patched/). Fall back

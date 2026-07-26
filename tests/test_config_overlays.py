@@ -358,6 +358,27 @@ class ModelConfigOverlayTest(unittest.TestCase):
                 r"runtime\.onetrans_batched_ns must be a boolean",
             ),
             (
+                RuntimeConfig(cuda_graph_backbone="true"),
+                r"runtime\.cuda_graph_backbone must be a boolean",
+            ),
+            (
+                RuntimeConfig(
+                    device="cuda",
+                    cuda_graph_backbone=True,
+                    activation_checkpoint="selective",
+                ),
+                r"cuda_graph_backbone requires runtime.activation_checkpoint=none",
+            ),
+            (
+                RuntimeConfig(
+                    device="cuda",
+                    cuda_graph_backbone=True,
+                    compile=True,
+                    activation_checkpoint="none",
+                ),
+                r"cuda_graph_backbone cannot be combined with runtime.compile",
+            ),
+            (
                 TrainingConfig(dense_optimizer_foreach_bucket_mb=-1),
                 r"training\.dense_optimizer_foreach_bucket_mb must be a non-negative integer",
             ),

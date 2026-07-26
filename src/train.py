@@ -18,7 +18,7 @@ import sqlite3
 import tempfile
 import threading
 from time import perf_counter, time_ns
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, MutableMapping
 
 import numpy as np
 import torch
@@ -460,6 +460,86 @@ def _dev_shm_free_bytes() -> int:
     return int(st.f_bavail) * int(st.f_frsize)
 
 
+def _local_cuda_p2p_accessible() -> bool | None:
+    """Probe whether every visible CUDA device pair can use P2P.
+
+    Returns:
+        True: all pairs report peer access (NCCL can use P2P/NVLink).
+        False: at least one pair cannot (must fall back to SHM/NET).
+        None: CUDA unavailable, probe failed, or this process only sees one
+        GPU while other local ranks own peers (cannot claim P2P is healthy).
+    """
+
+    if not torch.cuda.is_available():
+        return None
+    device_count = int(torch.cuda.device_count())
+    local_world = _env_int("LOCAL_WORLD_SIZE", _env_int("WORLD_SIZE", 1))
+    if device_count <= 1:
+        # torchrun remaps each rank to a single visible GPU, so peer access
+        # cannot be probed here. Treat multi-GPU local jobs as inconclusive
+        # unless the parent launcher already decided (env already set).
+        return True if local_world <= 1 else None
+    try:
+        for source in range(device_count):
+            for peer in range(device_count):
+                if source == peer:
+                    continue
+                if not torch.cuda.can_device_access_peer(source, peer):
+                    return False
+    except Exception:  # noqa: BLE001 - probe must never crash launch
+        return None
+    return True
+
+
+def _configure_nccl_runtime_env(
+    environ: MutableMapping[str, str] | None = None,
+) -> None:
+    """Use CUDA P2P when healthy; otherwise tell NCCL to fall back safely.
+
+    - P2P OK → leave NCCL defaults so NVLink/P2P stays enabled.
+    - P2P broken → ``NCCL_IGNORE_DISABLED_P2P=1`` + ``NCCL_P2P_DISABLE=1``
+      so NCCL skips doomed P2P and uses SHM/NET.
+    - Inconclusive (e.g. each torchrun rank only sees one GPU) → only
+      ``NCCL_IGNORE_DISABLED_P2P=1``: still try P2P when the fabric allows
+      it, but do not abort if the driver/NVLink reports disabled P2P.
+    - Explicit env exports always win.
+
+    ``environ`` defaults to ``os.environ``; the DDP launcher may pass a copied
+    dict so child processes inherit the decision.
+    """
+
+    env: MutableMapping[str, str] = os.environ if environ is None else environ
+    if "NCCL_IGNORE_DISABLED_P2P" in env:
+        return
+    accessible = _local_cuda_p2p_accessible()
+    if accessible is True:
+        if is_main_process():
+            logger.info(
+                "CUDA P2P accessible across %d visible GPU(s); NCCL will use P2P",
+                int(torch.cuda.device_count()),
+            )
+        return
+    if accessible is False:
+        env["NCCL_IGNORE_DISABLED_P2P"] = "1"
+        # Skip doomed P2P attempts; SHM/NET path is the working transport here.
+        env.setdefault("NCCL_P2P_DISABLE", "1")
+        if is_main_process():
+            logger.warning(
+                "CUDA P2P is not accessible between some visible GPUs; "
+                "enabling NCCL_IGNORE_DISABLED_P2P=1 and NCCL_P2P_DISABLE=%s "
+                "so NCCL falls back to SHM/NET",
+                env.get("NCCL_P2P_DISABLE", "1"),
+            )
+        return
+    # Probe inconclusive: keep the historical safe default.
+    env.setdefault("NCCL_IGNORE_DISABLED_P2P", "1")
+    if is_main_process():
+        logger.info(
+            "CUDA P2P probe inconclusive; defaulting NCCL_IGNORE_DISABLED_P2P=%s",
+            env.get("NCCL_IGNORE_DISABLED_P2P"),
+        )
+
+
 def _resolve_process_group_backend(device: torch.device) -> str:
     """Pick a process-group backend that can actually initialize here.
 
@@ -497,6 +577,8 @@ def _setup_distributed(config: AppConfig) -> DistributedContext:
     initialized_here = False
 
     if enabled and not torch_dist.is_initialized():
+        if device.type == "cuda":
+            _configure_nccl_runtime_env()
         backend = _resolve_process_group_backend(device)
         torch_dist.init_process_group(
             backend=backend,
@@ -2006,9 +2088,14 @@ _DTYPE_TO_NUMPY = {
 
 
 def _tensor_to_raw_bytes(buffer: Tensor) -> bytes:
-    if buffer.dtype == torch.bfloat16:
-        return buffer.detach().contiguous().view(torch.uint16).numpy().tobytes()
-    array = np.ascontiguousarray(buffer.detach().numpy().reshape(-1))
+    """Copy one coalesced CPU buffer into a standalone bytes object."""
+
+    contiguous = buffer.detach().contiguous()
+    if contiguous.dtype == torch.bfloat16:
+        return contiguous.view(torch.uint16).numpy().tobytes()
+    array = contiguous.numpy().reshape(-1)
+    if not array.flags["C_CONTIGUOUS"]:
+        array = np.ascontiguousarray(array)
     return array.tobytes()
 
 
@@ -2033,7 +2120,11 @@ def _raw_bytes_to_tensor(
 
 
 def _spill_feature_batch_for_ipc(batch: FeatureBatch, share_dir: Path) -> dict[str, Any]:
-    """Pack coalesced buffers into an anonymous memfd Queue payload."""
+    """Pack coalesced buffers into an anonymous memfd Queue payload.
+
+    Writes each buffer sequentially into the memfd (no giant ``b"".join`` peak)
+    so large batches stay within tiny-container memory headroom.
+    """
 
     del share_dir
     if not batch._packed_buffers:
@@ -2041,27 +2132,29 @@ def _spill_feature_batch_for_ipc(batch: FeatureBatch, share_dir: Path) -> dict[s
     import mmap
     from multiprocessing.reduction import DupFd
 
+    chunks = [_tensor_to_raw_bytes(buffer) for buffer in batch._packed_buffers]
     buffer_records: list[tuple[str, int, int]] = []
-    chunks: list[bytes] = []
     offset = 0
-    for buffer in batch._packed_buffers:
-        raw = _tensor_to_raw_bytes(buffer)
-        buffer_records.append((str(buffer.dtype), len(raw), offset))
-        chunks.append(raw)
-        offset += len(raw)
-    blob = b"".join(chunks)
+    for buffer, chunk in zip(batch._packed_buffers, chunks):
+        buffer_records.append((str(buffer.dtype), len(chunk), offset))
+        offset += len(chunk)
+    total = offset
     fd = os.memfd_create(f"mdl-host-prep-{time_ns()}", 0)
     try:
-        os.ftruncate(fd, len(blob))
-        mapped = mmap.mmap(fd, len(blob))
+        os.ftruncate(fd, total)
+        mapped = mmap.mmap(fd, total)
         try:
-            mapped.write(blob)
+            cursor = 0
+            for chunk in chunks:
+                end = cursor + len(chunk)
+                mapped[cursor:end] = chunk
+                cursor = end
             mapped.flush()
         finally:
             mapped.close()
         payload = {
             "fd": DupFd(fd),
-            "size": len(blob),
+            "size": total,
             "buffers": buffer_records,
             "features": _encode_feature_batch_views(batch.features, batch._packed_buffers),
             "labels": _encode_feature_batch_views(batch.labels, batch._packed_buffers),
@@ -2090,6 +2183,7 @@ def _load_feature_batch_from_ipc(
             buffers: list[Tensor] = []
             for dtype_name, nbytes, offset in payload["buffers"]:
                 dtype = getattr(torch, dtype_name.removeprefix("torch."))
+                # mmap slice returns bytes (a copy); safe to close afterward.
                 raw = mapped[offset : offset + nbytes]
                 buffers.append(_raw_bytes_to_tensor(raw, dtype=dtype, pin_memory=pin_memory))
             buffer_tuple = tuple(buffers)
@@ -2184,7 +2278,11 @@ class _ProcessHostPrepareIterator:
     """Yield FeatureBatches prepared in a spawn child via memfd IPC.
 
     Avoids tiny container ``/dev/shm``. Parent materializes pinned packed
-    buffers on the train thread (same cost profile as v12 pin).
+    buffers on the train thread.
+
+    A second pin/H2D child was prototyped to cut dataloader wait, but this
+    container blocks CUDA IPC (``pidfd_getfd: Operation not permitted``) and
+    ``/dev/shm`` is too small for CPU tensor sharing — so decode stays here.
     """
 
     _SENTINEL = None
@@ -2723,7 +2821,13 @@ def _validate_sharded_embedding_metadata(
     if not context.enabled:
         return
     gathered: list[object | None] = [None] * context.world_size
-    torch_dist.all_gather_object(gathered, descriptors)
+    # Prefer the CPU control group so metadata exchange does not depend on NCCL
+    # / NVLink / P2P being healthy before the first training step.
+    torch_dist.all_gather_object(
+        gathered,
+        descriptors,
+        group=context.control_group,
+    )
     if any(item != descriptors for item in gathered):
         raise RuntimeError(
             "sharded embedding metadata or ownership plan differs across ranks"
