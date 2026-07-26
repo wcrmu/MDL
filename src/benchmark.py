@@ -229,6 +229,22 @@ def _process_peak_rss_bytes() -> int:
     return value if platform.system() == "Darwin" else value * 1024
 
 
+def _process_children_peak_rss_bytes() -> int:
+    """Peak RSS attributed to waited-for child processes (adapter workers)."""
+
+    value = int(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
+    return value if platform.system() == "Darwin" else value * 1024
+
+
+def _direct_pipeline_stats_payload() -> dict[str, Any]:
+    try:
+        from .agg_direct import get_direct_pipeline_stats
+
+        return get_direct_pipeline_stats().as_dict()
+    except Exception:
+        return {}
+
+
 def _nvidia_smi_device_selector(device: torch.device) -> str:
     """Map a process-local CUDA index back to nvidia-smi's physical selector."""
 
@@ -468,10 +484,16 @@ def _environment(config: AppConfig, context: DistributedContext) -> dict[str, An
             "pin_memory": train_reader.pin_memory,
             "coalesce_pinned_tensors": train_reader.coalesce_pinned_tensors,
             "device_prefetch_batches": train_reader.device_prefetch_batches,
+            "host_prepare_prefetch": train_reader.host_prepare_prefetch,
+            "overlap_host_prepare": train_reader.overlap_host_prepare,
             "deduplicate_request_features": (
                 train_reader.deduplicate_request_features
             ),
+            "agg_direct_mode": train_reader.agg_direct_mode,
         },
+        "direct_pipeline": _direct_pipeline_stats_payload(),
+        "process_peak_rss_bytes": _process_peak_rss_bytes(),
+        "process_children_peak_rss_bytes": _process_children_peak_rss_bytes(),
         "vocab_strategy_hash": vocab_strategy_fingerprint(config),
     }
 

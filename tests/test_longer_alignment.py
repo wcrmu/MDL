@@ -711,6 +711,74 @@ class LongerSequenceEncoderAlignmentTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(tokens.grad).all())
         self.assertTrue(torch.isfinite(cls.grad).all())
 
+    def test_summary_only_empty_sequence_matches_globals_only_path(self) -> None:
+        torch.manual_seed(48)
+        encoder = LongerSequenceEncoder(
+            token_dim=4,
+            num_heads=2,
+            hidden_dim=8,
+            query_token_count=8,
+            self_layers=1,
+            summary_tokens=1,
+            token_merge=1,
+            inner_layers=0,
+            user_global_tokens=1,
+            summary_only=True,
+        ).eval()
+        tokens = torch.zeros(3, 0, 4)
+        mask = torch.zeros(3, 0, dtype=torch.bool)
+        cls = torch.randn(3, 1, 4)
+
+        with torch.no_grad():
+            summary = encoder.forward_request_summary(tokens, mask, cls)
+            expected = encoder._forward_globals_only(cls).flatten(start_dim=1)
+            cache = encoder.precompute_cache(tokens, mask, cls)
+            cached = encoder(
+                tokens,
+                mask,
+                tokens.new_zeros(3, 0, encoder.token_dim),
+                cache=cache,
+                user_global_tokens=cls,
+            )
+
+        torch.testing.assert_close(summary, expected)
+        torch.testing.assert_close(cached, expected)
+        self.assertEqual(tuple(cache.recent_mask.shape), (3, 0))
+
+    def test_fused_kv_loads_legacy_key_value_state_dict(self) -> None:
+        from src.model import LongerSequenceAttentionBlock
+
+        legacy = LongerSequenceAttentionBlock(4, 2, 8)
+        # Synthesize a pre-fusion checkpoint payload.
+        state = {
+            "query_norm.weight": legacy.query_norm.weight.detach().clone(),
+            "query_norm.bias": legacy.query_norm.bias.detach().clone(),
+            "key_norm.weight": legacy.key_norm.weight.detach().clone(),
+            "key_norm.bias": legacy.key_norm.bias.detach().clone(),
+            "query_projection.weight": legacy.query_projection.weight.detach().clone(),
+            "query_projection.bias": legacy.query_projection.bias.detach().clone(),
+            "key_projection.weight": legacy.kv_projection.weight[:4].detach().clone(),
+            "key_projection.bias": legacy.kv_projection.bias[:4].detach().clone(),
+            "value_projection.weight": legacy.kv_projection.weight[4:].detach().clone(),
+            "value_projection.bias": legacy.kv_projection.bias[4:].detach().clone(),
+            "output_projection.weight": legacy.output_projection.weight.detach().clone(),
+            "output_projection.bias": legacy.output_projection.bias.detach().clone(),
+            "ffn_norm.weight": legacy.ffn_norm.weight.detach().clone(),
+            "ffn_norm.bias": legacy.ffn_norm.bias.detach().clone(),
+            "ffn.0.weight": legacy.ffn[0].weight.detach().clone(),
+            "ffn.0.bias": legacy.ffn[0].bias.detach().clone(),
+            "ffn.3.weight": legacy.ffn[3].weight.detach().clone(),
+            "ffn.3.bias": legacy.ffn[3].bias.detach().clone(),
+        }
+        restored = LongerSequenceAttentionBlock(4, 2, 8)
+        restored.load_state_dict(state)
+        tokens = torch.randn(2, 3, 4)
+        mask = torch.ones(2, 3, dtype=torch.bool)
+        torch.testing.assert_close(
+            restored.forward_full(tokens, mask),
+            legacy.forward_full(tokens, mask),
+        )
+
 
 class LongerInputGenerationAlignmentTest(unittest.TestCase):
     def _sequence(self, order: str) -> SequenceConfig:

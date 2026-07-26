@@ -452,13 +452,19 @@ class ReaderConfig(_DeeplyImmutableConfig):
     engine: str = "pyarrow_dataset"
     # When true, the scanner reads only columns required by features and labels.
     columns_pruning: bool = True
-    # PyArrow uses this to size CPU and IO thread pools. Zero means default behavior.
+    # Layer 1 — Parquet IO / scan parallelism (threads, not processes).
+    # Sizes prefetch threads, PyArrow CPU/IO pools, and metadata
+    # ThreadPoolExecutor. Zero leaves PyArrow defaults (no reader-owned
+    # multi-file/row-group prefetch pool beyond a single consumer thread).
+    # Typical production values: 4 or 8.
     num_workers: int = 0
-    # CPU-bound Python adapters can run in isolated child processes so agg-row
-    # expansion does not serialize on the training process's GIL. Zero keeps
-    # adapter execution in-process.
+    # Layer 2 — Adapter CPU (agg expand etc.). When > 0, ProcessPoolExecutor
+    # (forkserver, else spawn) runs the adapter off the training-process GIL.
+    # Zero keeps adapter execution in-process (serial on the consumer thread).
+    # This is independent of num_workers: reading files stays multi-threaded.
     adapter_workers: int = 0
-    # Dataset scanner readahead. Larger values can help throughput but use more memory.
+    # Prefetch runway for the threaded Parquet scanner (row groups / files).
+    # Combined with num_workers to bound concurrent IO threads and queue depth.
     prefetch_batches: int = 2
     # Hard queue budget per rank. Count and bytes are both enforced.
     max_prefetch_bytes: int = 512 * 1024 * 1024
@@ -470,6 +476,15 @@ class ReaderConfig(_DeeplyImmutableConfig):
     # Number of already-copied CUDA batches kept ahead of the training loop.
     # Zero preserves the synchronous transfer path.
     device_prefetch_batches: int = 0
+    # When true, FeatureBatch tensorize/pin runs after backward so it overlaps
+    # in-flight GPU backward kernels on the same thread (no GIL fight with
+    # forward launch). Ignored when device_prefetch_batches > 0 or
+    # host_prepare_prefetch > 0.
+    overlap_host_prepare: bool = True
+    # Run pack+tensorize in a spawn child and feed shared-memory FeatureBatches
+    # through a queue of this depth. Avoids GIL contention with training; 0
+    # keeps prepare in-process. Requires pin_memory when CUDA training pins.
+    host_prepare_prefetch: int = 0
     # Repeated candidates from one request can share Context and UPS tensors.
     # The adapter remains responsible for declaring context feature membership.
     deduplicate_request_features: bool = False
@@ -502,9 +517,10 @@ class ReaderConfig(_DeeplyImmutableConfig):
     shuffle_buffer_rows: int = 0
     shuffle_seed: int = 0
     # Direct agg→FeatureBatch producer. ``legacy`` keeps candidate-flat Arrow.
-    # ``direct`` uses RequestGroupBlock descriptors (rollout). ``compare`` runs
-    # both on small batches for oracle checks without training on direct output.
-    agg_direct_mode: Literal["legacy", "direct", "compare"] = "legacy"
+    # ``direct`` uses Python AdaptedAxisBundle (rollout). ``direct_arrow`` keeps
+    # payload in Arrow and gathers at pack time. ``compare`` runs legacy+direct
+    # oracles without training on direct output.
+    agg_direct_mode: Literal["legacy", "direct", "direct_arrow", "compare"] = "legacy"
     # Remote (HDFS/viewfs) IO resilience. Timeouts wrap blocking libhdfs calls
     # in a daemon thread so hung opens cannot stall the trainer forever.
     hdfs_op_timeout: float = 30.0
@@ -560,12 +576,15 @@ class ReaderConfig(_DeeplyImmutableConfig):
         for field_name in (
             "pin_memory",
             "coalesce_pinned_tensors",
+            "overlap_host_prepare",
             "deduplicate_request_features",
             "validate_prehashed_nonzero",
             "trusted_input",
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise ValueError(f"reader.{field_name} must be a boolean")
+        if type(self.host_prepare_prefetch) is not int or self.host_prepare_prefetch < 0:
+            raise ValueError("reader.host_prepare_prefetch must be a non-negative integer")
         if self.cardinality_audit_raw_rows is not None and (
             type(self.cardinality_audit_raw_rows) is not int
             or self.cardinality_audit_raw_rows < 0
@@ -575,13 +594,21 @@ class ReaderConfig(_DeeplyImmutableConfig):
             )
         if self.device_prefetch_batches < 0:
             raise ValueError("reader.device_prefetch_batches must be non-negative")
+        if (
+            self.host_prepare_prefetch > 0
+            and self.device_prefetch_batches > 0
+        ):
+            raise ValueError(
+                "reader.host_prepare_prefetch and reader.device_prefetch_batches "
+                "cannot both be positive"
+            )
         if self.shard_unit not in {"file", "row_group", "record_batch"}:
             raise ValueError("reader.shard_unit must be file, row_group, or record_batch")
         if self.length_bucket_metric not in {"max", "sum"}:
             raise ValueError("reader.length_bucket_metric must be max or sum")
-        if self.agg_direct_mode not in {"legacy", "direct", "compare"}:
+        if self.agg_direct_mode not in {"legacy", "direct", "direct_arrow", "compare"}:
             raise ValueError(
-                "reader.agg_direct_mode must be legacy, direct, or compare"
+                "reader.agg_direct_mode must be legacy, direct, direct_arrow, or compare"
             )
         if type(self.shuffle_buffer_rows) is not int or self.shuffle_buffer_rows < 0:
             raise ValueError("reader.shuffle_buffer_rows must be a non-negative integer")
@@ -2150,8 +2177,9 @@ class TrainingConfig:
     # Adagrad accumulators remain FP32 in the built-in sharded optimizer.
     embedding_weight_dtype: Literal["fp32", "bf16"] = "fp32"
     # Communication statistics are diagnostic-only. Grouped sharded lookups
-    # otherwise need device-to-host count reductions for every table.
-    embedding_collect_stats: bool = True
+    # otherwise need device-to-host count reductions for every table. Default
+    # off so single- and multi-GPU training are not gated on O(tables) syncs.
+    embedding_collect_stats: bool = False
     # Sharded lookups can assert every encoded ID and owner assignment on the
     # GPU. Disable only when IDs come from the validated project encoder.
     embedding_validate_indices: bool = True

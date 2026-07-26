@@ -15,6 +15,7 @@ from typing import Any, Iterable, Literal
 
 import torch
 import torch.distributed as torch_dist
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 
@@ -273,6 +274,25 @@ def _distributed_rank_world(
     )
 
 
+def _process_group_backend(
+    process_group: torch_dist.ProcessGroup | None,
+) -> str:
+    if not torch_dist.is_available() or not torch_dist.is_initialized():
+        return "gloo"
+    try:
+        return torch_dist.get_backend(process_group)
+    except Exception:
+        return "gloo"
+
+
+def _collective_tensor(values: Tensor, process_group: torch_dist.ProcessGroup | None) -> Tensor:
+    """Stage CUDA tensors onto CPU when the active PG backend is Gloo."""
+
+    if values.device.type == "cuda" and _process_group_backend(process_group) == "gloo":
+        return values.detach().cpu()
+    return values
+
+
 def _exchange_and_host_splits(
     send_splits_tensor: Tensor,
     process_group: torch_dist.ProcessGroup | None,
@@ -292,13 +312,12 @@ def _exchange_and_host_splits(
     if world_size == 1:
         send = (int(send_splits_tensor[0].item()),)
         return send, send
-    recv_splits_tensor = torch.empty_like(send_splits_tensor)
+    send_for_collective = _collective_tensor(send_splits_tensor, process_group)
+    recv_splits_tensor = torch.empty_like(send_for_collective)
     torch_dist.all_to_all_single(
-        recv_splits_tensor, send_splits_tensor, group=process_group
+        recv_splits_tensor, send_for_collective, group=process_group
     )
-    both = torch.stack((send_splits_tensor, recv_splits_tensor)).to(
-        device="cpu"
-    )
+    both = torch.stack((send_for_collective, recv_splits_tensor)).to(device="cpu")
     send = tuple(int(value) for value in both[0].tolist())
     recv = tuple(int(value) for value in both[1].tolist())
     return send, recv
@@ -312,15 +331,56 @@ def _all_to_all_variable(
 ) -> Tensor:
     if len(send_splits) == 1:
         return values.clone()
-    output = values.new_empty((sum(recv_splits), *values.shape[1:]))
+    payload = _collective_tensor(values.contiguous(), process_group)
+    output = payload.new_empty((sum(recv_splits), *payload.shape[1:]))
     torch_dist.all_to_all_single(
         output,
-        values.contiguous(),
+        payload,
         output_split_sizes=list(recv_splits),
         input_split_sizes=list(send_splits),
         group=process_group,
     )
+    if output.device != values.device:
+        output = output.to(device=values.device, non_blocking=values.device.type == "cuda")
     return output
+
+
+def _single_rank_embedding(
+    weight: Tensor,
+    indices: Tensor,
+    *,
+    num_embeddings: int,
+    padding_idx: int,
+    table_name: str,
+    validate_indices: bool,
+) -> Tensor:
+    """Local ``F.embedding`` for world_size==1 sharded tables.
+
+    The collective lookup path still runs unique / argsort / ``.item()`` syncs
+    when there is only one rank. On single-GPU training that overhead dominates
+    hundreds of small scalar tables.
+    """
+
+    if indices.dtype != torch.long:
+        raise TypeError("sharded embedding indices must be torch.long")
+    if validate_indices:
+        flat = indices.reshape(-1)
+        invalid = (flat < 0) | (flat >= num_embeddings)
+        if _invalid_any(
+            invalid,
+            f"embedding {table_name!r} received an out-of-range ID",
+        ):
+            examples = flat[invalid][:5].detach().cpu().tolist()
+            raise IndexError(
+                f"embedding {table_name!r} received IDs outside "
+                f"[0, {num_embeddings}): {examples}"
+            )
+    return F.embedding(
+        indices,
+        weight,
+        padding_idx=padding_idx,
+        sparse=True,
+    )
 
 
 class _ShardedEmbeddingLookup(torch.autograd.Function):
@@ -599,6 +659,34 @@ class ShardedEmbedding(nn.Module):
                 self.weight[local_padding].zero_()
 
     def forward(self, indices: Tensor) -> Tensor:
+        if self.world_size == 1:
+            output = _single_rank_embedding(
+                self.weight,
+                indices,
+                num_embeddings=self.num_embeddings,
+                padding_idx=self.padding_idx,
+                table_name=self.table_name,
+                validate_indices=self.validate_indices,
+            )
+            if self.collect_stats:
+                # Avoid device->host syncs on the single-rank hot path; padding
+                # exclusions are not required for local-only stats.
+                raw_ids = int(indices.numel())
+                self._stats_sink.record_forward(
+                    EmbeddingCommunicationStats(
+                        table_name=self.table_name,
+                        raw_ids=raw_ids,
+                        active_ids=raw_ids,
+                        local_unique_ids=raw_ids,
+                        owner_unique_ids=raw_ids,
+                        sent_ids=0,
+                        received_ids=0,
+                        forward_sent_bytes=0,
+                        forward_received_bytes=0,
+                        forward_collective_enqueue_seconds=0.0,
+                    )
+                )
+            return output
         return _ShardedEmbeddingLookup.apply(
             self.weight,
             indices,
@@ -686,7 +774,9 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             raise TypeError("sharded embedding indices must be torch.long")
         if not modules:
             raise ValueError("grouped embedding lookup requires at least one table")
-        embedding_dim = modules[0].embedding_dim
+        # Pad narrower tables to the group max width so every embedding dim can
+        # share one value all_to_all. Callers slice back to the real width.
+        embedding_dim = max(module.embedding_dim for module in modules)
         rank, world_size = _distributed_rank_world(metadata.process_group)
         if any(module.world_size != world_size for module in modules):
             raise RuntimeError("embedding plan does not match the active process group")
@@ -786,6 +876,12 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
                         raise RuntimeError("received embedding IDs owned by another rank")
                 local_rows = module.shard_spec.local_row_ids(global_ids)
                 values = local_weight.index_select(0, local_rows)
+                if values.size(-1) != embedding_dim:
+                    padded = owner_unique_values.new_zeros(
+                        (values.size(0), embedding_dim)
+                    )
+                    padded[:, : values.size(-1)].copy_(values)
+                    values = padded
                 owner_unique_values.index_copy_(0, selected, values)
             received_values = owner_unique_values.index_select(0, owner_inverse)
             returned_values = _all_to_all_variable(
@@ -810,6 +906,7 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
 
         ctx.lookup_metadata = metadata
         ctx.world_size = world_size
+        ctx.group_embedding_dim = embedding_dim
         ctx.local_weight_shapes = tuple(tuple(weight.shape) for weight in local_weights)
         ctx.local_weight_dtypes = tuple(weight.dtype for weight in local_weights)
         ctx.send_splits = send_splits
@@ -824,6 +921,7 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
         )
 
         if metadata.collect_stats:
+            table_count = len(modules)
             requester_table_indices = _table_indices_for_keys(
                 requester_keys, metadata.table_offsets
             )
@@ -836,15 +934,23 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             owner_unique_table_indices = _table_indices_for_keys(
                 owner_unique_keys, metadata.table_offsets
             )
+            # One host sync for all per-table counters (not O(tables) .item()).
+            count_matrix = torch.stack(
+                (
+                    torch.bincount(requester_table_indices, minlength=table_count),
+                    torch.bincount(received_table_indices, minlength=table_count),
+                    torch.bincount(returned_table_indices, minlength=table_count),
+                    torch.bincount(owner_unique_table_indices, minlength=table_count),
+                ),
+                dim=0,
+            ).to(device="cpu")
             id_bytes = packed_indices.element_size()
             value_bytes = local_weights[0].element_size() * embedding_dim
             for table_index, module in enumerate(modules):
-                local_unique = int((requester_table_indices == table_index).sum().item())
-                received = int((received_table_indices == table_index).sum().item())
-                returned = int((returned_table_indices == table_index).sum().item())
-                owner_unique = int(
-                    (owner_unique_table_indices == table_index).sum().item()
-                )
+                local_unique = int(count_matrix[0, table_index].item())
+                received = int(count_matrix[1, table_index].item())
+                returned = int(count_matrix[2, table_index].item())
+                owner_unique = int(count_matrix[3, table_index].item())
                 module._stats_sink.record_forward(
                     EmbeddingCommunicationStats(
                         table_name=module.table_name,
@@ -878,7 +984,7 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             owner_unique_keys,
             owner_inverse,
         ) = ctx.saved_tensors
-        embedding_dim = metadata.modules[0].embedding_dim
+        embedding_dim = int(ctx.group_embedding_dim)
         flat_grad = grad_output.reshape(-1, embedding_dim)
         active_grad = flat_grad.index_select(0, active_positions)
         requester_grad = flat_grad.new_zeros((send_order.numel(), embedding_dim))
@@ -915,9 +1021,9 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             global_ids = owner_unique_keys.index_select(0, selected)
             global_ids = global_ids - metadata.table_offsets[table_index]
             local_rows = module.shard_spec.local_row_ids(global_ids)
-            values = owner_grad.index_select(0, selected).to(
-                dtype=ctx.local_weight_dtypes[table_index]
-            )
+            values = owner_grad.index_select(0, selected)[
+                :, : module.embedding_dim
+            ].to(dtype=ctx.local_weight_dtypes[table_index])
             local_weight_grads.append(
                 torch.sparse_coo_tensor(
                     local_rows.unsqueeze(0),
@@ -930,16 +1036,22 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             )
 
         if metadata.collect_stats:
+            table_count = len(metadata.modules)
             sent_table_indices = _table_indices_for_keys(
                 sorted_keys, metadata.table_offsets
             )
             value_bytes = grad_output.element_size() * embedding_dim
             received_table_indices = owner_table_indices.index_select(0, owner_inverse)
+            count_matrix = torch.stack(
+                (
+                    torch.bincount(sent_table_indices, minlength=table_count),
+                    torch.bincount(received_table_indices, minlength=table_count),
+                ),
+                dim=0,
+            ).to(device="cpu")
             for table_index, module in enumerate(metadata.modules):
-                sent_count = int((sent_table_indices == table_index).sum().item())
-                received_count = int(
-                    (received_table_indices == table_index).sum().item()
-                )
+                sent_count = int(count_matrix[0, table_index].item())
+                received_count = int(count_matrix[1, table_index].item())
                 module._stats_sink.record_backward(
                     sent_bytes=sent_count * value_bytes,
                     received_bytes=received_count * value_bytes,
@@ -953,25 +1065,65 @@ def grouped_sharded_embedding_lookup(
 ) -> list[Tensor]:
     """Lookup compatible tables in grouped owner-based collectives.
 
-    Requests are partitioned by device, dtype, embedding width, process group,
-    and dedup policy. A singleton retains the simpler per-table implementation;
-    all other requests in a partition share one count exchange, request route,
-    and response route.
+    Requests are partitioned by device, dtype, process group, and dedup policy.
+    Different embedding widths share one padded value collective (pad to the
+    group max width, then slice). A singleton retains the simpler per-table
+    implementation; all other requests in a partition share one count exchange,
+    request route, and response route.
     """
 
     request_list = list(requests)
     if not request_list:
         return []
+    # Single-GPU training owns every row locally. Keep native embedding autograd
+    # and skip the collective unique/argsort/.item() tax that still runs when
+    # world_size==1 in the grouped route.
+    if all(module.world_size == 1 for module, _indices in request_list):
+        outputs = [
+            _single_rank_embedding(
+                module.weight,
+                indices,
+                num_embeddings=module.num_embeddings,
+                padding_idx=module.padding_idx,
+                table_name=module.table_name,
+                validate_indices=module.validate_indices,
+            )
+            for module, indices in request_list
+        ]
+        if any(module.collect_stats for module, _indices in request_list):
+            for module, indices in request_list:
+                if not module.collect_stats:
+                    continue
+                raw_ids = int(indices.numel())
+                module._stats_sink.record_forward(
+                    EmbeddingCommunicationStats(
+                        table_name=module.table_name,
+                        raw_ids=raw_ids,
+                        active_ids=raw_ids,
+                        local_unique_ids=raw_ids,
+                        owner_unique_ids=raw_ids,
+                        sent_ids=0,
+                        received_ids=0,
+                        forward_sent_bytes=0,
+                        forward_received_bytes=0,
+                        forward_collective_enqueue_seconds=0.0,
+                    )
+                )
+        return outputs
+
     outputs: list[Tensor | None] = [None] * len(request_list)
     groups: dict[tuple[Any, ...], list[int]] = {}
     for request_index, (module, indices) in enumerate(request_list):
         if indices.dtype != torch.long:
             raise TypeError("sharded embedding indices must be torch.long")
+        # Intentionally omit embedding_dim: mixed widths share one padded
+        # collective (pad to group max). That cuts RankMixer from ~20
+        # all_to_all_single ops/step to ~4 and raises multi-GPU util on
+        # SYS/PCIe fabrics where collective latency dominates bandwidth.
         key = (
             indices.device,
             module.weight.device,
             module.weight.dtype,
-            module.embedding_dim,
             module.world_size,
             module.local_dedup,
             module.collect_stats,
@@ -992,6 +1144,7 @@ def grouped_sharded_embedding_lookup(
         flat_indices: list[Tensor] = []
         request_numels: list[int] = []
         request_shapes: list[torch.Size] = []
+        request_dims: list[int] = []
         for request_index in group_indices:
             module, indices = request_list[request_index]
             module_id = id(module)
@@ -1004,6 +1157,7 @@ def grouped_sharded_embedding_lookup(
             flat_indices.append(indices.reshape(-1))
             request_numels.append(indices.numel())
             request_shapes.append(indices.shape)
+            request_dims.append(module.embedding_dim)
         table_offsets: list[int] = []
         next_offset = 0
         for module in unique_modules:
@@ -1026,11 +1180,13 @@ def grouped_sharded_embedding_lookup(
             *(module.weight for module in unique_modules),
         )
         offset = 0
-        for request_index, request_numel, request_shape in zip(
-            group_indices, request_numels, request_shapes
+        for request_index, request_numel, request_shape, request_dim in zip(
+            group_indices, request_numels, request_shapes, request_dims
         ):
-            part = packed_output.narrow(0, offset, request_numel)
-            outputs[request_index] = part.view(*request_shape, packed_output.size(-1))
+            part = packed_output.narrow(0, offset, request_numel).narrow(
+                -1, 0, request_dim
+            )
+            outputs[request_index] = part.reshape(*request_shape, request_dim)
             offset += request_numel
 
     if any(output is None for output in outputs):

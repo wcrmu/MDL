@@ -492,6 +492,45 @@ def _launch_ddp_command(args: argparse.Namespace, config) -> int:
     # Expandable segments let adjacent variable-length batches reuse one CUDA
     # segment instead of failing with free-but-fragmented HBM near capacity.
     env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    # Tiny container /dev/shm (often 64MiB) cannot hold NCCL's ~32MiB/rank
+    # host segments. Prefer a same-length string-patched libnccl that writes
+    # under /tmp/msh (see artifacts/gpu_util_e2e_mock/nccl_patched/). Fall back
+    # to Gloo only when that library is missing.
+    try:
+        st = os.statvfs("/dev/shm")
+        shm_free = int(st.f_bavail) * int(st.f_frsize)
+    except OSError:
+        shm_free = 0
+    if shm_free and shm_free < 512 * 1024 * 1024:
+        patched = (
+            MAIN_SCRIPT.parent.parent
+            / "artifacts"
+            / "gpu_util_e2e_mock"
+            / "nccl_patched"
+            / "libnccl.so.2"
+        )
+        redirect = os.environ.get("MDL_NCCL_SHM_REDIRECT", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if redirect and patched.is_file():
+            Path("/tmp/msh").mkdir(parents=True, exist_ok=True)
+            prev = env.get("LD_PRELOAD", "").strip()
+            preload = str(patched) if not prev else f"{patched}:{prev}"
+            env["LD_PRELOAD"] = preload
+            env.setdefault("MDL_DIST_BACKEND", "nccl")
+            patched_dir = str(patched.parent)
+            lib_path = env.get("LD_LIBRARY_PATH", "")
+            if patched_dir not in lib_path.split(":"):
+                env["LD_LIBRARY_PATH"] = (
+                    patched_dir if not lib_path else f"{patched_dir}:{lib_path}"
+                )
+        else:
+            # Embedding collectives CPU-stage CUDA tensors under Gloo.
+            env.setdefault("NCCL_SHM_DISABLE", "1")
+            env.setdefault("MDL_DIST_BACKEND", "gloo")
     return subprocess.run(command, env=env, check=False).returncode
 
 

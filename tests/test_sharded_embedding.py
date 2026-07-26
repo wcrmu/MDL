@@ -302,6 +302,114 @@ def _grouped_lookup_worker(rank: int, world_size: int, port: int) -> None:
         torch_dist.destroy_process_group()
 
 
+def _grouped_mixed_dim_lookup_worker(rank: int, world_size: int, port: int) -> None:
+    """Mixed embedding widths must share one padded collective and stay correct."""
+
+    _init_gloo(rank, world_size, port)
+    try:
+        checker = getattr(torch.sparse, "check_sparse_tensor_invariants", None)
+        if checker is not None:
+            checker.disable()
+        specs = [
+            EmbeddingTableSpec("user", 13, 4),
+            EmbeddingTableSpec("item", 19, 8),
+        ]
+        plan = plan_embedding_shards(
+            specs,
+            world_size=world_size,
+            strategy="row_wise",
+            table_wise_max_rows=4,
+        )
+        modules = [
+            ShardedEmbedding(
+                spec.num_embeddings,
+                spec.embedding_dim,
+                table_name=spec.name,
+                shard_spec=plan.tables[spec.name],
+            )
+            for spec in specs
+        ]
+        full_weights = [
+            torch.arange(
+                spec.num_embeddings * spec.embedding_dim, dtype=torch.float32
+            ).view(spec.num_embeddings, spec.embedding_dim)
+            / float(10 + index)
+            for index, spec in enumerate(specs)
+        ]
+        for module, weight in zip(modules, full_weights):
+            weight[0].zero_()
+            module.load_full_weight_(weight)
+
+        ids_by_rank = (
+            (
+                torch.tensor([1, 1, 4, 0]),
+                torch.tensor([2, 8, 8]),
+            ),
+            (
+                torch.tensor([2, 4, 4, 0]),
+                torch.tensor([3, 8, 12]),
+            ),
+        )
+        user_ids, item_ids = ids_by_rank[rank]
+        actual = grouped_sharded_embedding_lookup(
+            [
+                (modules[0], user_ids),
+                (modules[1], item_ids),
+            ]
+        )
+        expected = [
+            F.embedding(user_ids, full_weights[0], padding_idx=0),
+            F.embedding(item_ids, full_weights[1], padding_idx=0),
+        ]
+        for output, reference in zip(actual, expected):
+            torch.testing.assert_close(output, reference)
+            self_dim = reference.size(-1)
+            if output.size(-1) != self_dim:
+                raise AssertionError(
+                    f"mixed-dim lookup returned width {output.size(-1)} != {self_dim}"
+                )
+        sum(output.square().sum() for output in actual).backward()
+
+        optimizer = ShardedAdagrad(
+            [module.weight for module in modules],
+            lr=0.15,
+            initial_accumulator_value=0.1,
+        )
+        optimizer.step()
+
+        reference_weights = [weight.clone().requires_grad_(True) for weight in full_weights]
+        reference_loss = 0.0
+        for rank_user, rank_item in ids_by_rank:
+            reference_loss = reference_loss + F.embedding(
+                rank_user, reference_weights[0], padding_idx=0
+            ).square().sum()
+            reference_loss = reference_loss + F.embedding(
+                rank_item, reference_weights[1], padding_idx=0
+            ).square().sum()
+        reference_loss = reference_loss / float(world_size)
+        reference_loss.backward()
+        reference_optimizer = torch.optim.Adagrad(
+            reference_weights,
+            lr=0.15,
+            initial_accumulator_value=0.1,
+        )
+        reference_optimizer.step()
+
+        for module, spec, reference_weight in zip(
+            modules, specs, reference_weights
+        ):
+            global_ids = torch.arange(spec.num_embeddings)
+            owned = plan.tables[spec.name].owner(global_ids) == rank
+            torch.testing.assert_close(
+                module.weight.detach(),
+                reference_weight.detach()[owned],
+                rtol=1e-6,
+                atol=1e-6,
+            )
+    finally:
+        torch_dist.destroy_process_group()
+
+
 class ShardingPlannerTest(unittest.TestCase):
     def test_auto_uses_row_wise_for_large_and_lpt_for_small_tables(self) -> None:
         specs = [
@@ -442,6 +550,65 @@ class ShardedEmbeddingParityTest(unittest.TestCase):
             join=True,
             start_method="spawn",
         )
+
+    def test_grouped_mixed_dims_match_full_table_adagrad(self) -> None:
+        torch_mp.start_processes(
+            _grouped_mixed_dim_lookup_worker,
+            args=(2, _free_port()),
+            nprocs=2,
+            join=True,
+            start_method="spawn",
+        )
+
+
+class SingleRankEmbeddingFastPathTest(unittest.TestCase):
+    def test_single_rank_grouped_lookup_matches_native_embedding(self) -> None:
+        table_a = EmbeddingTableSpec("a", num_embeddings=16, embedding_dim=4)
+        table_b = EmbeddingTableSpec("b", num_embeddings=16, embedding_dim=4)
+        plan = plan_embedding_shards(
+            [table_a, table_b],
+            world_size=1,
+            strategy="row_wise",
+            table_wise_max_rows=32,
+        )
+        emb_a = ShardedEmbedding(
+            table_a.num_embeddings,
+            table_a.embedding_dim,
+            table_name=table_a.name,
+            shard_spec=plan.tables[table_a.name],
+            padding_idx=0,
+            collect_stats=False,
+        )
+        emb_b = ShardedEmbedding(
+            table_b.num_embeddings,
+            table_b.embedding_dim,
+            table_name=table_b.name,
+            shard_spec=plan.tables[table_b.name],
+            padding_idx=0,
+            collect_stats=False,
+        )
+        full_a = torch.randn(16, 4)
+        full_b = torch.randn(16, 4)
+        full_a[0].zero_()
+        full_b[0].zero_()
+        emb_a.load_full_weight_(full_a)
+        emb_b.load_full_weight_(full_b)
+        ids_a = torch.tensor([0, 3, 3, 7], dtype=torch.long)
+        ids_b = torch.tensor([1, 2, 0, 15], dtype=torch.long)
+
+        actual = grouped_sharded_embedding_lookup(
+            ((emb_a, ids_a), (emb_b, ids_b))
+        )
+        expected = [
+            F.embedding(ids_a, full_a, padding_idx=0),
+            F.embedding(ids_b, full_b, padding_idx=0),
+        ]
+        torch.testing.assert_close(actual[0], expected[0])
+        torch.testing.assert_close(actual[1], expected[1])
+        loss = actual[0].square().sum() + actual[1].square().sum()
+        loss.backward()
+        self.assertIsNotNone(emb_a.weight.grad)
+        self.assertIsNotNone(emb_b.weight.grad)
 
 
 if __name__ == "__main__":

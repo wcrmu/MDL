@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 import unittest
 
 import numpy as np
@@ -524,8 +525,19 @@ class SequenceSelectionPlanTest(unittest.TestCase):
         )
         np.testing.assert_array_equal(plan.pre_compaction_lengths, [3, 2])
         np.testing.assert_array_equal(plan.compacted_lengths, [2, 2])
-        np.testing.assert_array_equal(plan.selections[0], [0, 2])
-        np.testing.assert_array_equal(plan.selections[1], [0, 1])
+
+        def _selection_indices(selection: object) -> np.ndarray:
+            if (
+                isinstance(selection, tuple)
+                and len(selection) == 2
+                and all(isinstance(value, (int, np.integer)) for value in selection)
+            ):
+                start, end = selection
+                return np.arange(int(start), int(end), dtype=np.int64)
+            return np.asarray(selection)
+
+        np.testing.assert_array_equal(_selection_indices(plan.selections[0]), [0, 2])
+        np.testing.assert_array_equal(_selection_indices(plan.selections[1]), [0, 1])
         np.testing.assert_array_equal(plan.token_to_request, [0, 0, 1, 1])
 
     def test_direct_shuffle_matches_legacy_with_buffer(self) -> None:
@@ -1228,8 +1240,376 @@ class AxisSeparatedAdaptTest(unittest.TestCase):
         self.assertEqual(bundle.n_requests, 1)
         self.assertEqual(bundle.request_ids, ("A",))
         # First-wins representative payload is context 10 (ctx_scalar 101), not 999.
-        self.assertEqual(bundle.request_features["ctx_scalar_hn"], (101,))
+        np.testing.assert_array_equal(bundle.request_features["ctx_scalar_hn"], [101])
         np.testing.assert_array_equal(bundle.candidate_to_request, [0, 0, 0])
+
+    def test_source_registry_counts_cross_source_duplicate_request_ids(self) -> None:
+        from src.agg_direct import RequestGroupBlock, SourceRegistry
+
+        registry = SourceRegistry()
+        blocks = (
+            RequestGroupBlock(
+                source_id=0,
+                raw_row_index=0,
+                request_id="A",
+                representative_request_position=0,
+                candidate_positions=np.asarray([0], dtype=np.int64),
+                candidate_offset=0,
+                candidate_count=1,
+                pre_compaction_sequence_lengths={},
+                effective_bucket_length=0,
+                stable_group_order=0,
+            ),
+            RequestGroupBlock(
+                source_id=1,
+                raw_row_index=0,
+                request_id="A",
+                representative_request_position=0,
+                candidate_positions=np.asarray([0], dtype=np.int64),
+                candidate_offset=0,
+                candidate_count=1,
+                pre_compaction_sequence_lengths={},
+                effective_bucket_length=0,
+                stable_group_order=0,
+            ),
+            RequestGroupBlock(
+                source_id=1,
+                raw_row_index=1,
+                request_id="B",
+                representative_request_position=0,
+                candidate_positions=np.asarray([0], dtype=np.int64),
+                candidate_offset=0,
+                candidate_count=1,
+                pre_compaction_sequence_lengths={},
+                effective_bucket_length=0,
+                stable_group_order=1,
+            ),
+        )
+        with self.assertLogs("src.agg_direct", level="WARNING") as logs:
+            events = registry.observe_pack(blocks)
+        self.assertEqual(events, 1)
+        stats = registry.snapshot_stats()
+        self.assertEqual(stats.packs_observed, 1)
+        self.assertEqual(stats.cross_source_duplicate_request_id_events, 1)
+        self.assertEqual(stats.packs_with_cross_source_duplicate_request_ids, 1)
+        self.assertTrue(any("request_id='A'" in message for message in logs.output))
+
+    def test_axis_complete_label_rejects_null_nonbinary_nan_bool(self) -> None:
+        from types import SimpleNamespace
+
+        from src.agg_direct import AdaptedAxisBundle
+        from src.dataloader import adapt_mdl_rankmixer_parquet
+
+        base = {
+            "ctx_scalar_hn": [[101]],
+            "ctx_bag_hn": [[1]],
+            "item_scalar_hn": [[[201], [202]]],
+            "sku_a_hn": [[[11], [12]]],
+            "sku_b_hn": [[[21], [22]]],
+            "impr_x_goods_id_hn": [[-1]],
+            "impr_x_time": [[4900]],
+            "impr_x_indices": [[[10]]],
+            "scene_id": [[7]],
+            "search_id": [["r0"]],
+            "impr_time": [[5000]],
+            "label_a": [[0, 1]],
+            "label_b": [[1, 0]],
+            "label_c": [[0, 1]],
+        }
+        required = [
+            "ctx_scalar_hn",
+            "ctx_bag_hn",
+            "item_scalar_hn",
+            "sku_a_hn",
+            "sku_b_hn",
+            "impr_x_goods_id_hn",
+            "impr_x_time_delta_ms",
+            "scene_id",
+            "search_id",
+            "label_a",
+            "label_b",
+            "label_c",
+        ]
+        options = {
+            "context_features": ["ctx_scalar_hn", "ctx_bag_hn"],
+            "item_features": ["item_scalar_hn", "sku_a_hn", "sku_b_hn"],
+            "multivalue_features": ["ctx_bag_hn", "sku_a_hn", "sku_b_hn"],
+            "aligned_multivalue_groups": [["sku_a_hn", "sku_b_hn"]],
+            "ups_types": ["impr"],
+            "request_columns": ["scene_id", "search_id", "impr_time"],
+            "integer_request_columns": ["scene_id", "impr_time"],
+            "labels": {"a": "label_a", "b": "label_b", "c": "label_c"},
+            "request_time_column": "impr_time",
+            "time_delta_outputs": {"impr": "impr_x_time_delta_ms"},
+        }
+
+        def axis_context(*, trusted_input: bool = False):
+            return SimpleNamespace(
+                required_columns=tuple(required),
+                options=options,
+                trusted_input=trusted_input,
+                _runtime_cache={
+                    "axis_separated": True,
+                    "axis_request_id_column": "search_id",
+                },
+            )
+
+        good = adapt_mdl_rankmixer_parquet(
+            pa.table(base), context=axis_context()
+        )
+        self.assertIsInstance(good, AdaptedAxisBundle)
+        self.assertEqual(good.label_features["label_a"].tolist(), [0, 1])
+
+        cases = [
+            ("label_a", [[0, None]], "None"),
+            ("label_a", [[0, 2]], "2"),
+            ("label_a", [[0, float("nan")]], "nan"),
+            (
+                "label_a",
+                pa.array([[False, True]], type=pa.list_(pa.bool_())),
+                "False",
+            ),
+        ]
+        for column, values, pattern in cases:
+            payload = dict(base)
+            payload[column] = values
+            with self.assertRaisesRegex(ValueError, pattern):
+                adapt_mdl_rankmixer_parquet(
+                    pa.table(payload), context=axis_context()
+                )
+            # trusted_input must not skip the complete-label contract.
+            with self.assertRaisesRegex(ValueError, pattern):
+                adapt_mdl_rankmixer_parquet(
+                    pa.table(payload),
+                    context=axis_context(trusted_input=True),
+                )
+
+    def test_direct_arrow_prepared_batch_matches_python_direct(self) -> None:
+        """Oracle: pack-time Arrow gather equals AdaptedAxisBundle gather."""
+
+        from src.agg_direct import (
+            prepare_packed_arrow_axis_batch,
+            request_group_blocks_from_arrow_source,
+        )
+        from src.dataloader import adapt_mdl_rankmixer_parquet
+
+        table = pa.table(
+            {
+                "context_indices": pa.array([[0, 1]], type=pa.list_(pa.int64())),
+                "target_indices": pa.array([[0, 1, 1]], type=pa.list_(pa.int64())),
+                "ctx_scalar_hn": pa.array(
+                    [[[101], [102]]], type=pa.list_(pa.list_(pa.int64()))
+                ),
+                "ctx_bag_hn": pa.array(
+                    [[[1, 2], None]], type=pa.list_(pa.list_(pa.int64()))
+                ),
+                "item_scalar_hn": pa.array(
+                    [[[201], [202], [203]]], type=pa.list_(pa.list_(pa.int64()))
+                ),
+                "sku_a_hn": pa.array(
+                    [[[11, 12], [13], [14, 15]]], type=pa.list_(pa.list_(pa.int64()))
+                ),
+                "sku_b_hn": pa.array(
+                    [[[21, None], [22], [23, 24]]], type=pa.list_(pa.list_(pa.int64()))
+                ),
+                "impr_x_goods_id_hn": pa.array(
+                    [[-1, -2, -3]], type=pa.list_(pa.int64())
+                ),
+                "impr_x_time": pa.array(
+                    [[4900, 4500, 3000]], type=pa.list_(pa.int64())
+                ),
+                "impr_x_indices": pa.array(
+                    [[[0, 1], [1], [0]]], type=pa.list_(pa.list_(pa.int64()))
+                ),
+                "scene_id": pa.array([[7, 8]], type=pa.list_(pa.int64())),
+                "search_id": pa.array([["r0", "r1"]], type=pa.list_(pa.string())),
+                "impr_time": pa.array([[5000, 6000]], type=pa.list_(pa.int64())),
+                "label_a": pa.array([[0, 1, 0]], type=pa.list_(pa.int64())),
+                "label_b": pa.array([[1, 0, 1]], type=pa.list_(pa.int64())),
+                "label_c": pa.array([[0, 0, 1]], type=pa.list_(pa.int64())),
+            }
+        )
+        required = [
+            "ctx_scalar_hn",
+            "ctx_bag_hn",
+            "item_scalar_hn",
+            "sku_a_hn",
+            "sku_b_hn",
+            "impr_x_goods_id_hn",
+            "impr_x_time_delta_ms",
+            "scene_id",
+            "search_id",
+            "label_a",
+            "label_b",
+            "label_c",
+        ]
+        options = {
+            "context_features": ["ctx_scalar_hn", "ctx_bag_hn"],
+            "item_features": ["item_scalar_hn", "sku_a_hn", "sku_b_hn"],
+            "multivalue_features": ["ctx_bag_hn", "sku_a_hn", "sku_b_hn"],
+            "aligned_multivalue_groups": [["sku_a_hn", "sku_b_hn"]],
+            "ups_types": ["impr"],
+            "request_columns": ["scene_id", "search_id", "impr_time"],
+            "integer_request_columns": ["scene_id", "impr_time"],
+            "labels": {"a": "label_a", "b": "label_b", "c": "label_c"},
+            "request_time_column": "impr_time",
+            "time_delta_outputs": {"impr": "impr_x_time_delta_ms"},
+            "time_delta_transform": "raw_ms",
+        }
+        sequences = [
+            SimpleNamespace(
+                name="impr",
+                max_length=None,
+                truncation="head",
+                null_anchor_field=None,
+                fields=[
+                    SimpleNamespace(name="goods_id_hn", source="impr_x_goods_id_hn"),
+                    SimpleNamespace(
+                        name="time_delta_ms", source="impr_x_time_delta_ms"
+                    ),
+                ],
+            )
+        ]
+
+        python_context = SimpleNamespace(
+            required_columns=tuple(required),
+            options=options,
+            trusted_input=False,
+            _runtime_cache={
+                "axis_separated": True,
+                "axis_request_id_column": "search_id",
+            },
+        )
+        python_bundle = adapt_mdl_rankmixer_parquet(table, context=python_context)
+        self.assertIsInstance(python_bundle, AdaptedAxisBundle)
+
+        arrow_context = SimpleNamespace(
+            required_columns=tuple(required),
+            options=options,
+            trusted_input=False,
+            _runtime_cache={
+                "arrow_axis": True,
+                "axis_request_id_column": "search_id",
+            },
+        )
+        arrow_source = adapt_mdl_rankmixer_parquet(table, context=arrow_context)
+        from src.agg_direct import ArrowAxisSource
+
+        self.assertIsInstance(arrow_source, ArrowAxisSource)
+        self.assertEqual(arrow_source.n_candidates, python_bundle.n_candidates)
+        self.assertEqual(arrow_source.n_requests, python_bundle.n_requests)
+        self.assertEqual(arrow_source.request_ids, python_bundle.request_ids)
+        np.testing.assert_array_equal(
+            arrow_source.candidate_to_request, python_bundle.candidate_to_request
+        )
+
+        python_blocks = request_group_blocks_from_axis_bundle(
+            python_bundle, source_id=0, sequences=sequences
+        )
+        arrow_blocks = request_group_blocks_from_arrow_source(
+            arrow_source, source_id=0, sequences=sequences
+        )
+        self.assertEqual(
+            [block.candidate_count for block in python_blocks],
+            [block.candidate_count for block in arrow_blocks],
+        )
+        self.assertEqual(
+            [block.pre_compaction_sequence_lengths for block in python_blocks],
+            [block.pre_compaction_sequence_lengths for block in arrow_blocks],
+        )
+
+        packed = build_packed_request_plan(python_blocks)
+        python_prepared = prepare_packed_axis_batch(
+            {0: python_bundle},
+            packed,
+            sequences=sequences,
+            request_id_column="search_id",
+            candidate_request_columns=["search_id"],
+        )
+        arrow_prepared = prepare_packed_arrow_axis_batch(
+            {0: arrow_source},
+            packed,
+            sequences=sequences,
+            request_id_column="search_id",
+            candidate_request_columns=["search_id"],
+        )
+        self.assertEqual(python_prepared.n_candidates, arrow_prepared.n_candidates)
+        self.assertEqual(python_prepared.n_requests, arrow_prepared.n_requests)
+        self.assertEqual(
+            set(python_prepared.request_values), set(arrow_prepared.request_values)
+        )
+        self.assertEqual(
+            set(python_prepared.candidate_values),
+            set(arrow_prepared.candidate_values),
+        )
+        for name in python_prepared.request_values:
+            left = python_prepared.request_values[name]
+            right = arrow_prepared.request_values[name]
+            self.assertEqual(len(left), len(right), msg=name)
+
+            def _resolve(value: Any) -> Any:
+                type_name = type(value).__name__
+                if type_name == "SequenceColumnRef":
+                    return value.column[int(value.slot)]
+                return value
+
+            left_is_batch = type(left).__name__ == "SequenceColumnBatch"
+            right_is_batch = type(right).__name__ == "SequenceColumnBatch"
+            if left_is_batch or right_is_batch:
+                for index in range(len(left)):
+                    left_value = left[index] if left_is_batch else _resolve(left[index])
+                    right_value = (
+                        right[index] if right_is_batch else _resolve(right[index])
+                    )
+                    if isinstance(left_value, np.ndarray) or isinstance(
+                        right_value, np.ndarray
+                    ):
+                        np.testing.assert_array_equal(
+                            np.asarray(left_value),
+                            np.asarray(right_value),
+                            err_msg=f"{name}[{index}]",
+                        )
+                    else:
+                        self.assertEqual(
+                            left_value, right_value, msg=f"{name}[{index}]"
+                        )
+                continue
+            if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+                np.testing.assert_array_equal(
+                    np.asarray(left),
+                    np.asarray(right),
+                    err_msg=name,
+                )
+                continue
+
+            for index, (left_value, right_value) in enumerate(zip(left, right)):
+                left_value = _resolve(left_value)
+                right_value = _resolve(right_value)
+                if isinstance(left_value, np.ndarray) or isinstance(
+                    right_value, np.ndarray
+                ):
+                    np.testing.assert_array_equal(
+                        np.asarray(left_value),
+                        np.asarray(right_value),
+                        err_msg=f"{name}[{index}]",
+                    )
+                else:
+                    self.assertEqual(left_value, right_value, msg=f"{name}[{index}]")
+        for name in python_prepared.candidate_values:
+            left = python_prepared.candidate_values[name]
+            right = arrow_prepared.candidate_values[name]
+            self.assertEqual(len(left), len(right), msg=name)
+            for index, (left_value, right_value) in enumerate(zip(left, right)):
+                if isinstance(left_value, np.ndarray) or isinstance(
+                    right_value, np.ndarray
+                ):
+                    np.testing.assert_array_equal(
+                        np.asarray(left_value),
+                        np.asarray(right_value),
+                        err_msg=f"{name}[{index}]",
+                    )
+                else:
+                    self.assertEqual(left_value, right_value, msg=f"{name}[{index}]")
 
 
 if __name__ == "__main__":

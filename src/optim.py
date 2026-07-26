@@ -208,6 +208,7 @@ class ShardedRowWiseAdagrad(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        fused_update = None
         for group in self.param_groups:
             lr = float(group["lr"])
             lr_decay = float(group["lr_decay"])
@@ -220,7 +221,10 @@ class ShardedRowWiseAdagrad(torch.optim.Optimizer):
                     raise RuntimeError(
                         "ShardedRowWiseAdagrad expects one-dimensional row-sparse COO gradients"
                     )
-                grad = grad.coalesce()
+                # Sparse embedding grads are usually already coalesced by the
+                # embedding backward; skip a full rewrite when possible.
+                if not grad.is_coalesced():
+                    grad = grad.coalesce()
                 if grad.sparse_dim() != 1 or grad.dense_dim() != 1:
                     raise RuntimeError(
                         "ShardedRowWiseAdagrad expects one sparse row dimension "
@@ -229,24 +233,54 @@ class ShardedRowWiseAdagrad(torch.optim.Optimizer):
                 rows = grad.indices()[0]
                 values = grad.values()
                 state: dict[str, Any] = self.state[parameter]
-                state["step"].add_(1.0)
-                step = float(state["step"].item())
-                clear_lr = lr / (1.0 + (step - 1.0) * lr_decay)
+                # step lives on CPU; keep a python float to avoid .item() per table
+                # across hundreds of embedding parameters each iteration.
+                step_tensor = state["step"]
+                step = float(step_tensor) + 1.0
+                step_tensor.fill_(step)
+                if lr_decay == 0.0:
+                    clear_lr = lr
+                else:
+                    clear_lr = lr / (1.0 + (step - 1.0) * lr_decay)
                 if rows.numel() == 0:
                     continue
 
                 accumulator: Tensor = state["sum"]
-                state_values = values.float()
+                # Fused Triton path collapses ~4 tiny launches/table into one.
+                # Coalesced grads guarantee unique rows (no accumulator races).
+                if parameter.is_cuda and accumulator.is_cuda:
+                    if fused_update is None:
+                        from .rowwise_adagrad_kernels import (
+                            fused_rowwise_adagrad_update,
+                        )
+
+                        fused_update = fused_rowwise_adagrad_update
+                    fused_update(
+                        parameter,
+                        accumulator,
+                        rows,
+                        values,
+                        lr=clear_lr,
+                        eps=eps,
+                    )
+                    continue
+
+                if values.dtype == torch.float32:
+                    state_values = values
+                else:
+                    state_values = values.float()
                 row_squared_mean = state_values.square().mean(dim=1)
                 accumulator.index_add_(0, rows, row_squared_mean)
                 denominator = (
                     accumulator.index_select(0, rows).sqrt_().add_(eps).unsqueeze(1)
                 )
                 update = state_values / denominator
+                if update.dtype != parameter.dtype:
+                    update = update.to(dtype=parameter.dtype)
                 parameter.index_add_(
                     0,
                     rows,
-                    update.to(dtype=parameter.dtype),
+                    update,
                     alpha=-clear_lr,
                 )
         return loss

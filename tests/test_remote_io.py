@@ -241,6 +241,40 @@ class PrefetchScalingTest(unittest.TestCase):
         )
         self.assertEqual(workers, 2)
 
+    def test_local_workers_honor_num_workers_without_hardcap(self) -> None:
+        # Local IO is multi-threaded: num_workers must not be silently capped at 4.
+        self.assertEqual(
+            scaled_hdfs_prefetch_workers(
+                world_size=1,
+                num_workers=8,
+                prefetch_batches=8,
+                work_item_count=100,
+                remote=False,
+            ),
+            8,
+        )
+        self.assertEqual(
+            scaled_hdfs_prefetch_workers(
+                world_size=1,
+                num_workers=4,
+                prefetch_batches=8,
+                work_item_count=100,
+                remote=False,
+            ),
+            4,
+        )
+        # num_workers=0 → PyArrow defaults; single consumer prefetch thread only.
+        self.assertEqual(
+            scaled_hdfs_prefetch_workers(
+                world_size=1,
+                num_workers=0,
+                prefetch_batches=8,
+                work_item_count=100,
+                remote=False,
+            ),
+            1,
+        )
+
     def test_scanner_remote_prefetch_uses_gpu_scale(self) -> None:
         from src.dataloader import ParquetScanner
 

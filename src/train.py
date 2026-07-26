@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -10,15 +9,18 @@ from importlib import import_module
 import inspect
 import logging
 import math
+import multiprocessing as mp
 import os
+import pickle
 from pathlib import Path
 import queue
 import sqlite3
 import tempfile
 import threading
-from time import perf_counter
+from time import perf_counter, time_ns
 from typing import Any, Callable, Iterator
 
+import numpy as np
 import torch
 import torch.distributed as torch_dist
 from torch import Tensor, nn
@@ -39,13 +41,18 @@ from .agg_direct import (
     build_request_deduplication_from_pack,
     iter_length_bucketed_packs,
     materialize_packed_blocks,
+    prepare_packed_arrow_axis_batch,
     prepare_packed_axis_batch,
+    publish_direct_pipeline_stats,
     request_group_blocks_from_adapted_table,
+    request_group_blocks_from_arrow_source,
     request_group_blocks_from_axis_bundle,
+    reset_direct_pipeline_stats,
 )
 from .checkpoint import load_model_checkpoint, save_model_checkpoint
 from .dataloader import (
     FeatureBatch,
+    _coalesce_feature_batch,
     _column_array,
     _require_pyarrow,
     _safe_table_take,
@@ -446,6 +453,41 @@ def _build_model_on_device(
     return build_model(config, vocab_maps).to(device)
 
 
+def _dev_shm_free_bytes() -> int:
+    try:
+        st = os.statvfs("/dev/shm")
+    except OSError:
+        return 0
+    return int(st.f_bavail) * int(st.f_frsize)
+
+
+def _resolve_process_group_backend(device: torch.device) -> str:
+    """Pick a process-group backend that can actually initialize here.
+
+    NCCL 2.2x still allocates ~32MiB/rank under ``/dev/shm`` during init even
+    when ``NCCL_SHM_DISABLE=1``. Containers with the default 64MiB shm therefore
+    cannot form a 2-rank NCCL group. Fall back to Gloo (CPU collectives; CUDA
+    tensors are staged in the embedding all-to-all helpers).
+    """
+
+    forced = os.environ.get("MDL_DIST_BACKEND", "").strip().lower()
+    if forced in {"nccl", "gloo"}:
+        return forced
+    if device.type != "cuda":
+        return "gloo"
+    shm_free = _dev_shm_free_bytes()
+    # Two ranks need ~33MiB each for NCCL's SHM segments on this stack.
+    if shm_free and shm_free < 256 * 1024 * 1024:
+        logger.warning(
+            "Using Gloo process group because /dev/shm free=%.1fMiB is too "
+            "small for NCCL (need host --shm-size>=1g for NCCL multi-GPU). "
+            "Set MDL_DIST_BACKEND=nccl to force NCCL.",
+            shm_free / (1024 * 1024),
+        )
+        return "gloo"
+    return "nccl"
+
+
 def _setup_distributed(config: AppConfig) -> DistributedContext:
     global _CONTROL_PROCESS_GROUP
     world_size = _env_int("WORLD_SIZE", 1)
@@ -456,13 +498,15 @@ def _setup_distributed(config: AppConfig) -> DistributedContext:
     initialized_here = False
 
     if enabled and not torch_dist.is_initialized():
-        backend = "nccl" if device.type == "cuda" else "gloo"
+        backend = _resolve_process_group_backend(device)
         torch_dist.init_process_group(
             backend=backend,
             init_method="env://",
             timeout=_PROCESS_GROUP_TIMEOUT,
         )
         initialized_here = True
+        if rank == 0:
+            logger.info("Initialized process group backend=%s world_size=%d", backend, world_size)
 
     control_group: torch_dist.ProcessGroup | None = None
     if enabled and device.type == "cuda":
@@ -739,6 +783,32 @@ def _concat_batch_tables(pa: Any, tables: list[object]) -> object:
             ),
         )
 
+    def _decode_dictionary_columns(table: object) -> object:
+        """Materialize dictionary columns so mixed list/dict schemas can concat."""
+
+        arrays: list[Any] = []
+        changed = False
+        for column_index, name in enumerate(table.column_names):
+            column = table[name]
+            if not any(
+                pa.types.is_dictionary(chunk.type) for chunk in column.chunks
+            ):
+                arrays.append(column.combine_chunks())
+                continue
+            changed = True
+            decoded = [
+                chunk.dictionary_decode()
+                if pa.types.is_dictionary(chunk.type)
+                else chunk
+                for chunk in column.chunks
+            ]
+            arrays.append(
+                decoded[0] if len(decoded) == 1 else pa.concat_arrays(decoded)
+            )
+        if not changed:
+            return table
+        return pa.Table.from_arrays(arrays, names=table.column_names)
+
     # Request slices produced from one adapted scanner table share the same
     # dictionary buffers. Group those slices by source and decode one combined
     # index vector per source/column instead of calling dictionary_decode for
@@ -810,6 +880,15 @@ def _concat_batch_tables(pa: Any, tables: list[object]) -> object:
                 else pa.concat_arrays(source_arrays)
             )
         return pa.Table.from_arrays(arrays, names=tables[0].column_names)
+
+    # Scanner batches can interleave plain list<> and dictionary<list<>>
+    # encodings for the same logical column. Normalize before concat_tables.
+    try:
+        schemas_match = all(table.schema.equals(tables[0].schema) for table in tables[1:])
+    except Exception:
+        schemas_match = False
+    if not schemas_match:
+        tables = [_decode_dictionary_columns(table) for table in tables]
 
     combined = pa.concat_tables(tables)
     if all(column.num_chunks <= 1 for column in combined.columns):
@@ -1143,10 +1222,11 @@ def _iter_batch_tables_direct(
     """Axis-separated adapt → descriptor pack → direct FeatureBatch payload.
 
     Skips candidate-flat materialization of whole scanner tables. Adapted
-    payloads stay as :class:`AdaptedAxisBundle` under a :class:`SourceRegistry`
-    until every referencing block has been packed; then the source is released.
-    The adapter-parquet path yields :class:`PreparedAxisBatch` without rebuilding
-    Arrow. ``flat_parquet`` remains a transitional narrow-Arrow fallback.
+    payloads stay as :class:`AdaptedAxisBundle` or :class:`ArrowAxisSource`
+    under a :class:`SourceRegistry` until every referencing block has been
+    packed; then the source is released. The adapter-parquet path yields
+    :class:`PreparedAxisBatch` without rebuilding Arrow. ``flat_parquet``
+    remains a transitional narrow-Arrow fallback.
     """
 
     reader = _split_reader(config, split_name)
@@ -1171,7 +1251,9 @@ def _iter_batch_tables_direct(
     }
 
     use_axis = split.format == "adapter_parquet"
+    use_arrow_axis = use_axis and reader.agg_direct_mode == "direct_arrow"
     registry = SourceRegistry()
+    reset_direct_pipeline_stats()
 
     def blocks() -> Iterator[Any]:
         if use_axis:
@@ -1183,15 +1265,24 @@ def _iter_batch_tables_direct(
                 shard_world_size=shard_world_size,
                 require_labels=require_labels,
                 producer_queue_size=producer_queue,
+                arrow_axis=use_arrow_axis,
             )
             for bundle in bundle_iter:
                 source_id = registry.put(bundle)
-                group_blocks = request_group_blocks_from_axis_bundle(
-                    bundle,
-                    source_id=source_id,
-                    sequences=config.sequences,
-                    length_bucket_metric=reader.length_bucket_metric,
-                )
+                if use_arrow_axis:
+                    group_blocks = request_group_blocks_from_arrow_source(
+                        bundle,
+                        source_id=source_id,
+                        sequences=config.sequences,
+                        length_bucket_metric=reader.length_bucket_metric,
+                    )
+                else:
+                    group_blocks = request_group_blocks_from_axis_bundle(
+                        bundle,
+                        source_id=source_id,
+                        sequences=config.sequences,
+                        length_bucket_metric=reader.length_bucket_metric,
+                    )
                 if not group_blocks:
                     # put() leaves refcount 0; release(0) drops the empty payload.
                     registry.release(source_id, 0)
@@ -1223,37 +1314,34 @@ def _iter_batch_tables_direct(
             registry.acquire(source_id, len(group_blocks))
             yield from group_blocks
 
-    for pack in iter_length_bucketed_packs(
-        blocks(),
-        buckets=reader.length_buckets,
-        default_batch_size=config.training.batch_size,
-        shuffle_buffer_rows=reader.shuffle_buffer_rows,
-        shuffle_seed=reader.shuffle_seed,
-        shard_rank=shard_rank,
-    ):
-        packed = build_packed_request_plan(pack)
-        sources_in_pack: dict[int, int] = {}
-        source_releases_in_pack: dict[int, int] = {}
-        for block in packed.blocks:
-            sources_in_pack[block.source_id] = (
-                sources_in_pack.get(block.source_id, 0) + 1
-            )
-            if block.releases_source_reference:
-                source_releases_in_pack[block.source_id] = (
-                    source_releases_in_pack.get(block.source_id, 0) + 1
+    try:
+        for pack in iter_length_bucketed_packs(
+            blocks(),
+            buckets=reader.length_buckets,
+            default_batch_size=config.training.batch_size,
+            shuffle_buffer_rows=reader.shuffle_buffer_rows,
+            shuffle_seed=reader.shuffle_seed,
+            shard_rank=shard_rank,
+        ):
+            packed = build_packed_request_plan(pack)
+            registry.observe_pack(packed.blocks)
+            sources_in_pack: dict[int, int] = {}
+            source_releases_in_pack: dict[int, int] = {}
+            for block in packed.blocks:
+                sources_in_pack[block.source_id] = (
+                    sources_in_pack.get(block.source_id, 0) + 1
                 )
+                if block.releases_source_reference:
+                    source_releases_in_pack[block.source_id] = (
+                        source_releases_in_pack.get(block.source_id, 0) + 1
+                    )
 
-        if use_axis:
-            bundles = {
-                source_id: registry.get(source_id)
-                for source_id in sources_in_pack
-            }
-            prepared = prepare_packed_axis_batch(
-                bundles,
-                packed,
-                sequences=config.sequences,
-                request_id_column=split.request_id,
-                candidate_request_columns=sorted(
+            if use_axis:
+                retained = {
+                    source_id: registry.get(source_id)
+                    for source_id in sources_in_pack
+                }
+                candidate_request_columns = sorted(
                     {
                         *(
                             [split.request_id]
@@ -1272,42 +1360,59 @@ def _iter_batch_tables_direct(
                         ),
                         *split.prediction_keys.values(),
                     }
-                ),
-            )
-        else:
-            source_tables = {
-                source_id: registry.get(source_id)
-                for source_id in sources_in_pack
-            }
-            candidate_table = materialize_packed_blocks(
-                source_tables, packed.blocks
-            )
-            request_columns = sorted(
-                {
-                    *(
-                        [split.request_id]
-                        if split.request_id is not None
-                        else []
-                    ),
-                    *context_sources,
-                    *sequence_sources,
+                )
+                if use_arrow_axis:
+                    prepared = prepare_packed_arrow_axis_batch(
+                        retained,
+                        packed,
+                        sequences=config.sequences,
+                        request_id_column=split.request_id,
+                        candidate_request_columns=candidate_request_columns,
+                    )
+                else:
+                    prepared = prepare_packed_axis_batch(
+                        retained,
+                        packed,
+                        sequences=config.sequences,
+                        request_id_column=split.request_id,
+                        candidate_request_columns=candidate_request_columns,
+                    )
+            else:
+                source_tables = {
+                    source_id: registry.get(source_id)
+                    for source_id in sources_in_pack
                 }
-            )
-            request_dedup = build_request_deduplication_from_pack(
-                packed,
-                source_tables,
-                columns=request_columns,
-            )
-            prepared = PreparedBatchTable(
-                table=candidate_table,
-                request_deduplication=request_dedup,
-            )
+                candidate_table = materialize_packed_blocks(
+                    source_tables, packed.blocks
+                )
+                request_columns = sorted(
+                    {
+                        *(
+                            [split.request_id]
+                            if split.request_id is not None
+                            else []
+                        ),
+                        *context_sources,
+                        *sequence_sources,
+                    }
+                )
+                request_dedup = build_request_deduplication_from_pack(
+                    packed,
+                    source_tables,
+                    columns=request_columns,
+                )
+                prepared = PreparedBatchTable(
+                    table=candidate_table,
+                    request_deduplication=request_dedup,
+                )
 
-        try:
-            yield prepared
-        finally:
-            for source_id, count in source_releases_in_pack.items():
-                registry.release(source_id, count)
+            try:
+                yield prepared
+            finally:
+                for source_id, count in source_releases_in_pack.items():
+                    registry.release(source_id, count)
+    finally:
+        publish_direct_pipeline_stats(registry.snapshot_stats())
 
 
 def _iter_batch_tables(
@@ -1319,7 +1424,7 @@ def _iter_batch_tables(
 ) -> Iterator[object]:
     reader = _split_reader(config, split_name)
     if (
-        reader.agg_direct_mode in {"direct", "compare"}
+        reader.agg_direct_mode in {"direct", "direct_arrow", "compare"}
         and reader.deduplicate_request_features
     ):
         yield from _iter_batch_tables_direct(
@@ -1671,6 +1776,17 @@ def _prepare_feature_batch(
     )
 
 
+def _schedule_overlapped_host_prepare(batch_iterator: object) -> None:
+    """Fetch+prepare the next host batch while CUDA backward kernels drain."""
+
+    schedule_fetch = getattr(batch_iterator, "schedule_fetch", None)
+    if callable(schedule_fetch):
+        schedule_fetch()
+    schedule_next = getattr(batch_iterator, "schedule_next", None)
+    if callable(schedule_next):
+        schedule_next()
+
+
 def _split_reader(config: AppConfig, split_name: str) -> ReaderConfig:
     split = config.data.train if split_name == "train" else config.data.test
     if split is None:
@@ -1697,7 +1813,7 @@ def iter_feature_batches(
         # deduplication is disabled. There is no distinct direct result to
         # compare in that mode.
         if not reader.deduplicate_request_features:
-            yield from iter_feature_batches(
+            return iter_feature_batches(
                 _config_with_reader_mode(config, split_name, "legacy"),
                 split_name,
                 vocab_maps,
@@ -1707,62 +1823,35 @@ def iter_feature_batches(
                 pin_memory=pin_memory,
                 include_group_id=include_group_id,
             )
-            return
-
-        legacy_iter = iter_feature_batches(
-            _config_with_reader_mode(config, split_name, "legacy"),
+        return _iter_compare_feature_batches(
+            config,
             split_name,
             vocab_maps,
-            require_labels,
+            require_labels=require_labels,
             shard_rank=shard_rank,
             shard_world_size=shard_world_size,
             pin_memory=pin_memory,
             include_group_id=include_group_id,
         )
-        direct_iter = iter_feature_batches(
-            _config_with_reader_mode(config, split_name, "direct"),
-            split_name,
-            vocab_maps,
-            require_labels,
-            shard_rank=shard_rank,
-            shard_world_size=shard_world_size,
-            pin_memory=pin_memory,
-            include_group_id=include_group_id,
-        )
-        sentinel = object()
-        batch_index = 0
-        try:
-            while True:
-                legacy_batch = next(legacy_iter, sentinel)
-                direct_batch = next(direct_iter, sentinel)
-                if legacy_batch is sentinel and direct_batch is sentinel:
-                    break
-                if legacy_batch is sentinel or direct_batch is sentinel:
-                    exhausted = (
-                        "legacy" if legacy_batch is sentinel else "direct"
-                    )
-                    raise AssertionError(
-                        "agg_direct compare batch-count mismatch: "
-                        f"{exhausted} ended before batch {batch_index}"
-                    )
-                assert isinstance(legacy_batch, FeatureBatch)
-                assert isinstance(direct_batch, FeatureBatch)
-                _assert_feature_batch_equal(
-                    legacy_batch,
-                    direct_batch,
-                    batch_index=batch_index,
-                )
-                # Compare mode is an oracle gate; train/evaluate on the legacy
-                # result until the caller explicitly selects direct.
-                yield legacy_batch
-                batch_index += 1
-        finally:
-            legacy_iter.close()
-            direct_iter.close()
-        return
 
     pin_memory = reader.pin_memory and pin_memory
     coalesce_pinned_tensors = reader.coalesce_pinned_tensors and pin_memory
+    # Prefer a spawn child for pack+tensorize: shared-memory FeatureBatches
+    # avoid GIL fights with wide-batch forward (threaded prepare regresses).
+    if reader.host_prepare_prefetch > 0 and reader.device_prefetch_batches == 0:
+        return _ProcessHostPrepareIterator(
+            config,
+            split_name,
+            vocab_maps,
+            require_labels=require_labels,
+            shard_rank=shard_rank,
+            shard_world_size=shard_world_size,
+            pin_memory=pin_memory,
+            coalesce_pinned_tensors=coalesce_pinned_tensors,
+            include_group_id=include_group_id,
+            queue_size=int(reader.host_prepare_prefetch),
+        )
+
     table_iter = _iter_batch_tables(
         config,
         split_name,
@@ -1771,106 +1860,506 @@ def iter_feature_batches(
         require_labels=require_labels,
     )
 
-    if reader.prefetch_batches <= 0:
-        for table in table_iter:
-            yield _prepare_feature_batch(
-                config,
-                split,
-                table,
-                vocab_maps,
-                require_labels,
-                pin_memory,
-                coalesce_pinned_tensors,
-                include_group_id,
-            )
-        return
+    def _prepare(table: object) -> FeatureBatch:
+        return _prepare_feature_batch(
+            config,
+            split,
+            table,
+            vocab_maps,
+            require_labels,
+            pin_memory,
+            coalesce_pinned_tensors,
+            include_group_id,
+        )
 
-    max_pending = max(1, reader.prefetch_batches)
-    # Build only a two-batch runway before the first yield. Filling a deep
-    # queue synchronously delayed the first optimizer step by several complete
-    # adapter/tensorization batches. After that first yield, device prefetch (or
-    # the next consumer call) ramps the queue to its configured steady depth.
-    target_pending = min(max_pending, 2)
-    worker_count = min(max_pending, max(1, reader.num_workers))
-    pending: deque[tuple[Future[FeatureBatch], int]] = deque()
-    pending_bytes = 0
-    buffered_table: object | None = None
-    buffered_reservation = 0
-    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="mdl-reader") as executor:
-        exhausted = False
-        while pending or not exhausted or buffered_table is not None:
-            while len(pending) < target_pending and not exhausted:
-                if buffered_table is None:
-                    try:
-                        table = next(table_iter)
-                    except StopIteration:
-                        exhausted = True
-                        break
-                    reservation = _estimate_prepared_batch_bytes(config, table)
-                else:
-                    table = buffered_table
-                    reservation = buffered_reservation
-                    buffered_table = None
-                    buffered_reservation = 0
-                if (
-                    pending
-                    and pending_bytes + reservation > reader.max_prefetch_bytes
-                ):
-                    buffered_table = table
-                    buffered_reservation = reservation
-                    break
-                pending.append(
-                    (
-                        executor.submit(
-                            _prepare_feature_batch,
-                            config,
-                            split,
-                            table,
-                            vocab_maps,
-                            require_labels,
-                            pin_memory,
-                            coalesce_pinned_tensors,
-                            include_group_id,
-                        ),
-                        reservation,
-                    )
+    # Same-thread overlap with leftover CUDA backward when process prefetch is off.
+    if reader.overlap_host_prepare and reader.device_prefetch_batches == 0:
+        return _OverlappedHostPrepareIterator(table_iter, _prepare)
+    return _iter_sync_prepared_feature_batches(table_iter, _prepare)
+
+
+def _iter_sync_prepared_feature_batches(
+    table_iter: Iterator[object],
+    prepare_fn: Callable[[object], FeatureBatch],
+) -> Iterator[FeatureBatch]:
+    for table in table_iter:
+        yield prepare_fn(table)
+
+
+def _iter_compare_feature_batches(
+    config: AppConfig,
+    split_name: str,
+    vocab_maps: dict[str, dict[str, int]],
+    *,
+    require_labels: bool,
+    shard_rank: int,
+    shard_world_size: int,
+    pin_memory: bool,
+    include_group_id: bool,
+) -> Iterator[FeatureBatch]:
+    legacy_iter = iter_feature_batches(
+        _config_with_reader_mode(config, split_name, "legacy"),
+        split_name,
+        vocab_maps,
+        require_labels,
+        shard_rank=shard_rank,
+        shard_world_size=shard_world_size,
+        pin_memory=pin_memory,
+        include_group_id=include_group_id,
+    )
+    direct_iter = iter_feature_batches(
+        _config_with_reader_mode(config, split_name, "direct"),
+        split_name,
+        vocab_maps,
+        require_labels,
+        shard_rank=shard_rank,
+        shard_world_size=shard_world_size,
+        pin_memory=pin_memory,
+        include_group_id=include_group_id,
+    )
+    sentinel = object()
+    batch_index = 0
+    try:
+        while True:
+            legacy_batch = next(legacy_iter, sentinel)
+            direct_batch = next(direct_iter, sentinel)
+            if legacy_batch is sentinel and direct_batch is sentinel:
+                break
+            if legacy_batch is sentinel or direct_batch is sentinel:
+                exhausted = "legacy" if legacy_batch is sentinel else "direct"
+                raise AssertionError(
+                    "agg_direct compare batch-count mismatch: "
+                    f"{exhausted} ended before batch {batch_index}"
                 )
-                pending_bytes += reservation
-            if not pending:
-                if buffered_table is not None:
-                    # A single oversized batch is admitted to guarantee progress.
-                    table = buffered_table
-                    reservation = buffered_reservation
-                    buffered_table = None
-                    buffered_reservation = 0
-                    pending.append(
-                        (
-                            executor.submit(
-                                _prepare_feature_batch,
-                                config,
-                                split,
-                                table,
-                                vocab_maps,
-                                require_labels,
-                                pin_memory,
-                                coalesce_pinned_tensors,
-                                include_group_id,
-                            ),
-                            reservation,
-                        )
-                    )
-                    pending_bytes += reservation
-                else:
-                    break
-            future, reservation = pending.popleft()
-            batch = future.result()
-            actual_bytes = _feature_batch_tensor_bytes(batch)
-            if actual_bytes > reservation:
-                pending_bytes += actual_bytes - reservation
-                reservation = actual_bytes
-            target_pending = max_pending
-            yield batch
-            pending_bytes -= reservation
+            assert isinstance(legacy_batch, FeatureBatch)
+            assert isinstance(direct_batch, FeatureBatch)
+            _assert_feature_batch_equal(
+                legacy_batch,
+                direct_batch,
+                batch_index=batch_index,
+            )
+            # Compare mode is an oracle gate; train/evaluate on the legacy
+            # result until the caller explicitly selects direct.
+            yield legacy_batch
+            batch_index += 1
+    finally:
+        close = getattr(legacy_iter, "close", None)
+        if callable(close):
+            close()
+        close = getattr(direct_iter, "close", None)
+        if callable(close):
+            close()
+
+
+def _configure_host_prepare_tensor_sharing() -> Path:
+    """Scratch dir for host-prepare helpers; tensor IPC uses anonymous memfd."""
+
+    share_dir = Path(os.environ.get("MDL_TORCH_SHARE_DIR", "/tmp/mdl-torch-shm"))
+    share_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["TMPDIR"] = str(share_dir)
+    os.environ["TEMP"] = str(share_dir)
+    os.environ["TMP"] = str(share_dir)
+    tempfile.tempdir = str(share_dir)
+    return share_dir
+
+
+def _encode_feature_batch_views(value: Any, buffers: tuple[Tensor, ...]) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _encode_feature_batch_views(child, buffers)
+            for key, child in value.items()
+        }
+    if isinstance(value, torch.Tensor):
+        data_ptr = value.untyped_storage().data_ptr()
+        for index, buffer in enumerate(buffers):
+            if buffer.untyped_storage().data_ptr() == data_ptr:
+                return (
+                    "_view",
+                    index,
+                    tuple(int(dim) for dim in value.size()),
+                    tuple(int(step) for step in value.stride()),
+                    int(value.storage_offset()),
+                )
+        raise ValueError("feature tensor is not a view into coalesced packed buffers")
+    return value
+
+
+def _decode_feature_batch_views(value: Any, buffers: tuple[Tensor, ...]) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _decode_feature_batch_views(child, buffers)
+            for key, child in value.items()
+        }
+    if isinstance(value, tuple) and value and value[0] == "_view":
+        _, index, size, stride, offset = value
+        return buffers[int(index)].as_strided(size, stride, int(offset))
+    return value
+
+
+_DTYPE_TO_NUMPY = {
+    torch.float32: np.float32,
+    torch.float16: np.float16,
+    torch.int64: np.int64,
+    torch.int32: np.int32,
+    torch.int16: np.int16,
+    torch.int8: np.int8,
+    torch.uint8: np.uint8,
+    torch.bool: np.bool_,
+}
+
+
+def _tensor_to_raw_bytes(buffer: Tensor) -> bytes:
+    if buffer.dtype == torch.bfloat16:
+        return buffer.detach().contiguous().view(torch.uint16).numpy().tobytes()
+    array = np.ascontiguousarray(buffer.detach().numpy().reshape(-1))
+    return array.tobytes()
+
+
+def _raw_bytes_to_tensor(
+    raw: memoryview | bytes,
+    *,
+    dtype: torch.dtype,
+    pin_memory: bool,
+) -> Tensor:
+    if dtype == torch.bfloat16:
+        numel = len(raw) // 2
+        tensor = torch.empty(numel, dtype=torch.bfloat16, pin_memory=pin_memory)
+        tensor.view(torch.uint16).numpy()[:] = np.frombuffer(raw, dtype=np.uint16)
+        return tensor
+    np_dtype = _DTYPE_TO_NUMPY.get(dtype)
+    if np_dtype is None:
+        raise TypeError(f"unsupported packed dtype for host-prepare IPC: {dtype}")
+    array = np.frombuffer(raw, dtype=np_dtype)
+    tensor = torch.empty(array.shape[0], dtype=dtype, pin_memory=pin_memory)
+    tensor.numpy()[:] = array
+    return tensor
+
+
+def _spill_feature_batch_for_ipc(batch: FeatureBatch, share_dir: Path) -> dict[str, Any]:
+    """Pack coalesced buffers into an anonymous memfd Queue payload."""
+
+    del share_dir
+    if not batch._packed_buffers:
+        raise ValueError("host-prepare IPC requires coalesced _packed_buffers")
+    import mmap
+    from multiprocessing.reduction import DupFd
+
+    buffer_records: list[tuple[str, int, int]] = []
+    chunks: list[bytes] = []
+    offset = 0
+    for buffer in batch._packed_buffers:
+        raw = _tensor_to_raw_bytes(buffer)
+        buffer_records.append((str(buffer.dtype), len(raw), offset))
+        chunks.append(raw)
+        offset += len(raw)
+    blob = b"".join(chunks)
+    fd = os.memfd_create(f"mdl-host-prep-{time_ns()}", 0)
+    try:
+        os.ftruncate(fd, len(blob))
+        mapped = mmap.mmap(fd, len(blob))
+        try:
+            mapped.write(blob)
+            mapped.flush()
+        finally:
+            mapped.close()
+        payload = {
+            "fd": DupFd(fd),
+            "size": len(blob),
+            "buffers": buffer_records,
+            "features": _encode_feature_batch_views(batch.features, batch._packed_buffers),
+            "labels": _encode_feature_batch_views(batch.labels, batch._packed_buffers),
+            "label_mask": _encode_feature_batch_views(batch.label_mask, batch._packed_buffers),
+            "scenario_id": _encode_feature_batch_views(batch.scenario_id, batch._packed_buffers),
+            "group_id": batch.group_id,
+            "prediction_keys": batch.prediction_keys,
+        }
+    finally:
+        os.close(fd)
+    return payload
+
+
+def _load_feature_batch_from_ipc(
+    payload: dict[str, Any],
+    *,
+    pin_memory: bool,
+) -> FeatureBatch:
+    import mmap
+
+    fd = payload["fd"].detach()
+    size = int(payload["size"])
+    try:
+        mapped = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
+        try:
+            buffers: list[Tensor] = []
+            for dtype_name, nbytes, offset in payload["buffers"]:
+                dtype = getattr(torch, dtype_name.removeprefix("torch."))
+                raw = mapped[offset : offset + nbytes]
+                buffers.append(_raw_bytes_to_tensor(raw, dtype=dtype, pin_memory=pin_memory))
+            buffer_tuple = tuple(buffers)
+            labels = payload["labels"]
+            label_mask = payload["label_mask"]
+            return FeatureBatch(
+                features=_decode_feature_batch_views(payload["features"], buffer_tuple),
+                labels=None if labels is None else _decode_feature_batch_views(labels, buffer_tuple),
+                label_mask=(
+                    None if label_mask is None else _decode_feature_batch_views(label_mask, buffer_tuple)
+                ),
+                scenario_id=_decode_feature_batch_views(payload["scenario_id"], buffer_tuple),
+                group_id=list(payload["group_id"]),
+                prediction_keys=dict(payload["prediction_keys"]),
+                _packed_buffers=buffer_tuple,
+            )
+        finally:
+            mapped.close()
+    finally:
+        os.close(fd)
+
+
+def _host_prepare_process_main(
+    queue: Any,
+    config: AppConfig,
+    split_name: str,
+    vocab_maps: dict[str, dict[str, int]],
+    *,
+    require_labels: bool,
+    shard_rank: int,
+    shard_world_size: int,
+    coalesce_tensors: bool,
+    include_group_id: bool,
+) -> None:
+    """Child entry: pack+tensorize on CPU and push memfd FeatureBatch payloads."""
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["MDL_HOST_PREPARE_PROCESS"] = "1"
+    share_dir = _configure_host_prepare_tensor_sharing()
+    try:
+        import psutil
+
+        n_cpu = int(psutil.cpu_count(logical=True) or 4)
+        prepare_cores = min(max(16, n_cpu // 3), n_cpu)
+        psutil.Process().cpu_affinity(list(range(prepare_cores)))
+    except Exception:
+        prepare_cores = 16
+    try:
+        split = config.data.train if split_name == "train" else config.data.test
+        if split is None:
+            raise ValueError(f"split {split_name!r} is not configured")
+        table_iter = _iter_batch_tables(
+            config,
+            split_name,
+            shard_rank=shard_rank,
+            shard_world_size=shard_world_size,
+            require_labels=require_labels,
+        )
+        try:
+            for table in table_iter:
+                batch = _prepare_feature_batch(
+                    config,
+                    split,
+                    table,
+                    vocab_maps,
+                    require_labels,
+                    False,
+                    False,
+                    include_group_id,
+                )
+                if coalesce_tensors:
+                    batch = _coalesce_feature_batch(batch, pin_memory=False)
+                queue.put(_spill_feature_batch_for_ipc(batch, share_dir))
+            queue.put(None)
+        finally:
+            close = getattr(table_iter, "close", None)
+            if callable(close):
+                close()
+    except BaseException as error:  # noqa: BLE001 - propagate to parent
+        queue.put(error)
+
+
+class _ProcessHostPrepareIterator:
+    """Yield FeatureBatches prepared in a spawn child via memfd IPC.
+
+    Avoids tiny container ``/dev/shm``. Parent materializes pinned packed
+    buffers on the train thread (same cost profile as v12 pin).
+    """
+
+    _SENTINEL = None
+
+    def __init__(
+        self,
+        config: AppConfig,
+        split_name: str,
+        vocab_maps: dict[str, dict[str, int]],
+        *,
+        require_labels: bool,
+        shard_rank: int,
+        shard_world_size: int,
+        pin_memory: bool,
+        coalesce_pinned_tensors: bool,
+        include_group_id: bool,
+        queue_size: int,
+    ) -> None:
+        if queue_size <= 0:
+            raise ValueError("host_prepare_prefetch queue_size must be positive")
+        del coalesce_pinned_tensors
+        self._pin_memory = bool(pin_memory)
+        self._closed = False
+        _configure_host_prepare_tensor_sharing()
+        self._ctx = mp.get_context("spawn")
+        self._queue: Any = self._ctx.Queue(maxsize=int(queue_size))
+        self._process = self._ctx.Process(
+            target=_host_prepare_process_main,
+            kwargs={
+                "queue": self._queue,
+                "config": config,
+                "split_name": split_name,
+                "vocab_maps": vocab_maps,
+                "require_labels": require_labels,
+                "shard_rank": shard_rank,
+                "shard_world_size": shard_world_size,
+                "coalesce_tensors": True,
+                "include_group_id": include_group_id,
+            },
+            name=f"mdl-host-prepare-{split_name}",
+            daemon=False,
+        )
+        self._process.start()
+        try:
+            import psutil
+
+            n_cpu = int(psutil.cpu_count(logical=True) or 4)
+            prepare_cores = min(max(16, n_cpu // 3), n_cpu)
+            if prepare_cores < n_cpu:
+                psutil.Process().cpu_affinity(list(range(prepare_cores, n_cpu)))
+        except Exception:
+            pass
+
+    def __iter__(self) -> "_ProcessHostPrepareIterator":
+        return self
+
+    def __next__(self) -> FeatureBatch:
+        if self._closed:
+            raise StopIteration
+        item = self._queue.get()
+        if item is self._SENTINEL:
+            self.close()
+            raise StopIteration
+        if isinstance(item, BaseException):
+            self.close()
+            raise RuntimeError("host prepare process failed") from item
+        if not isinstance(item, dict):
+            self.close()
+            raise TypeError(
+                f"host prepare process returned {type(item).__name__}, "
+                "expected memfd payload dict"
+            )
+        return _load_feature_batch_from_ipc(item, pin_memory=self._pin_memory)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        process = self._process
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5.0)
+        try:
+            self._queue.close()
+        except Exception:
+            pass
+        try:
+            self._queue.join_thread()
+        except Exception:
+            pass
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class _OverlappedHostPrepareIterator:
+    """Yield FeatureBatches while hiding prepare under leftover CUDA backward.
+
+    Training should call ``schedule_fetch`` then ``schedule_next`` after
+    backward. Both run on the train thread: the table iterator is a generator
+    that owns a ProcessPool, and threaded prepare under the optimizer was
+    measured to inflate optimizer time via GIL contention on RankMixer.
+    """
+
+    def __init__(
+        self,
+        table_iter: Iterator[object],
+        prepare_fn: Callable[[object], FeatureBatch],
+    ) -> None:
+        self._table_iter = table_iter
+        self._prepare_fn = prepare_fn
+        self._ready: FeatureBatch | None = None
+        self._pending_table: object | None = None
+        self._exhausted = False
+        self._fill_ready()
+
+    def __iter__(self) -> "_OverlappedHostPrepareIterator":
+        return self
+
+    def __next__(self) -> FeatureBatch:
+        if self._ready is None:
+            self._fill_ready()
+        if self._ready is None:
+            raise StopIteration
+        batch = self._ready
+        self._ready = None
+        return batch
+
+    def schedule_fetch(self) -> None:
+        """Pull the next packed table without tensorizing it yet."""
+
+        if (
+            self._ready is not None
+            or self._pending_table is not None
+            or self._exhausted
+        ):
+            return
+        try:
+            self._pending_table = next(self._table_iter)
+        except StopIteration:
+            self._exhausted = True
+            self._pending_table = None
+
+    def schedule_next(self) -> None:
+        """Tensorize/pin the pending table; fetch first if needed."""
+
+        if self._ready is not None or self._exhausted:
+            return
+        if self._pending_table is None:
+            self.schedule_fetch()
+        if self._pending_table is None:
+            return
+        table = self._pending_table
+        self._pending_table = None
+        self._ready = self._prepare_fn(table)
+
+    def _fill_ready(self) -> None:
+        if self._exhausted:
+            self._ready = None
+            return
+        if self._pending_table is not None:
+            table = self._pending_table
+            self._pending_table = None
+            self._ready = self._prepare_fn(table)
+            return
+        try:
+            table = next(self._table_iter)
+        except StopIteration:
+            self._exhausted = True
+            self._ready = None
+            return
+        self._ready = self._prepare_fn(table)
+
+    def close(self) -> None:
+        close = getattr(self._table_iter, "close", None)
+        if callable(close):
+            close()
 
 
 @dataclass(frozen=True)
@@ -3318,6 +3807,16 @@ def train_mdl(
             if device.type == "cuda"
             else 0
         )
+        if device_prefetch_depth > 0:
+            # The CUDA prefetch thread calls next(host_iterator), which still
+            # runs Python FeatureBatch prepare. That contends for the GIL with
+            # the training thread's wide-batch forward and can inflate step time.
+            logger.warning(
+                "reader.device_prefetch_batches=%d overlaps host-batch prepare "
+                "with training on another thread; on wide feature batches this "
+                "often lowers GPU utilization. Prefer 0 unless prepare is cheap.",
+                device_prefetch_depth,
+            )
         batches_on_device = device_prefetch_depth > 0
         batch_iterator = (
             _DevicePrefetchIterator(
@@ -3526,6 +4025,10 @@ def train_mdl(
             window_forward_seconds += forward_seconds
             window_backward_seconds += backward_seconds
             accumulation_index += 1
+            # Hide next host fetch+prepare under leftover CUDA backward work.
+            # Process-prefetch materialize runs on its own thread — skip here.
+            if not isinstance(batch_iterator, _ProcessHostPrepareIterator):
+                _schedule_overlapped_host_prepare(batch_iterator)
             if not synchronize_gradients:
                 continue
 

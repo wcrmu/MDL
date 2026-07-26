@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import math
 from typing import Any
@@ -7,6 +8,7 @@ from typing import Any
 import torch
 import torch.distributed as torch_dist
 from torch import Tensor, nn
+from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .config import (
@@ -428,6 +430,101 @@ def _mean_pool_categorical_bag(
     return (embedded * weights).sum(dim=1) / denominator
 
 
+def _batch_mean_pool_flat_bags(
+    bags: Sequence[tuple[str, Tensor, Tensor, Tensor, str]],
+) -> dict[str, Tensor]:
+    """Mean-pool many flat categorical bags with one segmented reduction.
+
+    Bags that share ``(dtype, dim, null_policy, batch)`` are concatenated so
+    ``repeat_interleave`` / ``index_add_`` launch once per group instead of
+    once per feature. Numerics match :func:`_mean_pool_categorical_bag`.
+    """
+
+    if not bags:
+        return {}
+    if len(bags) == 1:
+        name, embedded, indices, lengths, null_policy = bags[0]
+        return {
+            name: _mean_pool_categorical_bag(
+                embedded, indices, lengths, null_policy
+            )
+        }
+
+    grouped: dict[
+        tuple[torch.dtype, int, str, int, torch.device],
+        list[tuple[str, Tensor, Tensor, Tensor]],
+    ] = {}
+    for name, embedded, indices, lengths, null_policy in bags:
+        if embedded.ndim != 2 or indices.ndim != 1 or lengths.ndim != 1:
+            # Fall back per-bag for padded / exotic layouts.
+            grouped.setdefault(
+                (
+                    embedded.dtype,
+                    -1,
+                    null_policy,
+                    int(lengths.numel()),
+                    embedded.device,
+                ),
+                [],
+            ).append((name, embedded, indices, lengths))
+            continue
+        key = (
+            embedded.dtype,
+            int(embedded.size(-1)),
+            null_policy,
+            int(lengths.numel()),
+            embedded.device,
+        )
+        grouped.setdefault(key, []).append((name, embedded, indices, lengths))
+
+    outputs: dict[str, Tensor] = {}
+    for (dtype, dim, null_policy, batch, device), group in grouped.items():
+        del dtype
+        if dim < 0 or len(group) == 1 or batch == 0:
+            for name, embedded, indices, lengths in group:
+                outputs[name] = _mean_pool_categorical_bag(
+                    embedded, indices, lengths, null_policy
+                )
+            continue
+
+        flat_embs: list[Tensor] = []
+        flat_weights: list[Tensor] = []
+        flat_lengths: list[Tensor] = []
+        for _name, embedded, indices, lengths in group:
+            if embedded.size(0) != indices.size(0):
+                raise ValueError(
+                    "categorical bag flat values and embeddings are misaligned"
+                )
+            lengths_long = lengths.long()
+            if null_policy == "exclude":
+                weights = indices.ne(0).to(dtype=embedded.dtype)
+            else:
+                weights = embedded.new_ones(indices.shape)
+            flat_embs.append(embedded)
+            flat_weights.append(weights)
+            flat_lengths.append(lengths_long)
+
+        bag_count = len(group)
+        emb_cat = torch.cat(flat_embs, dim=0)
+        weight_cat = torch.cat(flat_weights, dim=0)
+        lengths_cat = torch.stack(flat_lengths, dim=0).reshape(-1)
+        segment_ids = torch.repeat_interleave(
+            torch.arange(bag_count * batch, device=device, dtype=torch.long),
+            lengths_cat,
+        )
+        sums = emb_cat.new_zeros((bag_count * batch, dim))
+        counts = emb_cat.new_zeros((bag_count * batch,))
+        if segment_ids.numel():
+            sums.index_add_(0, segment_ids, emb_cat * weight_cat.unsqueeze(-1))
+            counts.index_add_(0, segment_ids, weight_cat)
+        pooled = (sums / counts.clamp(min=1).unsqueeze(-1)).view(
+            bag_count, batch, dim
+        )
+        for bag_index, (name, _embedded, _indices, _lengths) in enumerate(group):
+            outputs[name] = pooled[bag_index]
+    return outputs
+
+
 def _indexed_row_indices(value: Any) -> Tensor | None:
     if not isinstance(value, dict):
         return None
@@ -446,6 +543,58 @@ def _gather_indexed_rows(encoded: Tensor, value: Any) -> Tensor:
     if row_indices.device != encoded.device:
         row_indices = row_indices.to(encoded.device)
     return encoded.index_select(0, row_indices)
+
+
+def _batch_gather_indexed_rows(
+    encoded: dict[str, Tensor],
+    features: Mapping[str, Any],
+    names: Sequence[str] | None = None,
+) -> None:
+    """Collapse per-feature ``index_select`` gathers into stacked gathers.
+
+    Request-dedup FeatureBatches attach the same ``row_indices`` to many
+    scalar/sequence outputs. Gathering each tensor separately floods the GPU
+    with tiny kernels and tanks SM util; stacking compatible ranks into one
+    ``index_select`` keeps numerics identical while cutting launch count.
+    """
+
+    target_names = list(encoded if names is None else names)
+    groups: dict[tuple[int, tuple[int, ...], torch.dtype, torch.device], list[str]] = {}
+    device_indices: dict[tuple[int, torch.device], Tensor] = {}
+    for name in target_names:
+        if name not in encoded:
+            continue
+        original = _indexed_row_indices(features.get(name))
+        if original is None:
+            continue
+        tensor = encoded[name]
+        cache_key = (id(original), tensor.device)
+        row_indices = device_indices.get(cache_key)
+        if row_indices is None:
+            row_indices = (
+                original
+                if original.device == tensor.device
+                else original.to(device=tensor.device)
+            )
+            device_indices[cache_key] = row_indices
+        group_key = (
+            id(original),
+            tuple(int(size) for size in tensor.shape[1:]),
+            tensor.dtype,
+            tensor.device,
+        )
+        groups.setdefault(group_key, []).append(name)
+
+    for (index_id, _tail, _dtype, device), group_names in groups.items():
+        row_indices = device_indices[(index_id, device)]
+        if len(group_names) == 1:
+            name = group_names[0]
+            encoded[name] = encoded[name].index_select(0, row_indices)
+            continue
+        stacked = torch.stack([encoded[name] for name in group_names], dim=0)
+        gathered = stacked.index_select(1, row_indices)
+        for offset, name in enumerate(group_names):
+            encoded[name] = gathered[offset]
 
 
 def _projection_mlp(input_dim: int, token_dim: int, hidden_dim: int, activation: str) -> nn.Sequential:
@@ -561,8 +710,10 @@ class LongerSequenceAttentionBlock(nn.Module):
         self.query_norm = nn.LayerNorm(token_dim)
         self.key_norm = nn.LayerNorm(token_dim)
         self.query_projection = nn.Linear(token_dim, token_dim)
-        self.key_projection = nn.Linear(token_dim, token_dim)
-        self.value_projection = nn.Linear(token_dim, token_dim)
+        # Fused K/V projection: one GEMM instead of two same-shaped launches.
+        # Legacy checkpoints may still store key_projection.* / value_projection.*;
+        # see _load_from_state_dict for migration.
+        self.kv_projection = nn.Linear(token_dim, 2 * token_dim)
         self.output_projection = nn.Linear(token_dim, token_dim)
         self.dropout = nn.Dropout(dropout)
         self.ffn_norm = nn.LayerNorm(token_dim)
@@ -572,6 +723,23 @@ class LongerSequenceAttentionBlock(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, token_dim),
         )
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        key_w = prefix + "key_projection.weight"
+        value_w = prefix + "value_projection.weight"
+        kv_w = prefix + "kv_projection.weight"
+        if key_w in state_dict and value_w in state_dict and kv_w not in state_dict:
+            state_dict[kv_w] = torch.cat(
+                [state_dict.pop(key_w), state_dict.pop(value_w)], dim=0
+            )
+            key_b = prefix + "key_projection.bias"
+            value_b = prefix + "value_projection.bias"
+            kv_b = prefix + "kv_projection.bias"
+            if key_b in state_dict and value_b in state_dict:
+                state_dict[kv_b] = torch.cat(
+                    [state_dict.pop(key_b), state_dict.pop(value_b)], dim=0
+                )
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def _split_heads(self, tokens: Tensor) -> Tensor:
         batch_size, token_count, _dim = tokens.shape
@@ -713,10 +881,20 @@ class LongerSequenceAttentionBlock(nn.Module):
 
     def project_kv(self, key_tokens: Tensor) -> tuple[Tensor, Tensor]:
         key_input = self.key_norm(key_tokens)
-        return (
-            self._split_heads(self.key_projection(key_input)),
-            self._split_heads(self.value_projection(key_input)),
+        key, value = self.kv_projection(key_input).split(self.token_dim, dim=-1)
+        return self._split_heads(key), self._split_heads(value)
+
+    def project_v(self, key_tokens: Tensor) -> Tensor:
+        """Value-only projection for the single-token attention fast path."""
+
+        key_input = self.key_norm(key_tokens)
+        bias = self.kv_projection.bias
+        value = F.linear(
+            key_input,
+            self.kv_projection.weight[self.token_dim :],
+            None if bias is None else bias[self.token_dim :],
         )
+        return self._split_heads(value)
 
     def forward_projected_kv(
         self,
@@ -749,6 +927,15 @@ class LongerSequenceAttentionBlock(nn.Module):
         query_valid_mask: Tensor,
         key_valid_mask: Tensor,
     ) -> Tensor:
+        # Single valid token => softmax is identically 1, so Flash packing is
+        # pure overhead on top of the V / out-proj / FFN matmuls.
+        if (
+            query_tokens.size(1) == 1
+            and key.size(2) == 1
+            and query_valid_mask.size(1) == 1
+            and key_valid_mask.size(1) == 1
+        ):
+            return self._finish_attention(query_tokens, value)
         query = self._split_heads(self.query_projection(self.query_norm(query_tokens)))
         if self.attention_backend == "flash":
             attended = self._flash_varlen_attention(
@@ -782,6 +969,17 @@ class LongerSequenceAttentionBlock(nn.Module):
         global_query_count: int,
     ) -> Tensor:
         """Evaluate LONGER globals and recent queries without semantic collapse."""
+
+        # No recent queries (empty history under summary_only) collapses to full
+        # attention over globals — and often the single-token fast path.
+        if global_query_count == query_tokens.size(1):
+            return self.forward_full_projected_kv(
+                query_tokens,
+                key,
+                value,
+                query_valid_mask,
+                key_valid_mask,
+            )
 
         query = self._split_heads(self.query_projection(self.query_norm(query_tokens)))
         if self.attention_backend != "flash":
@@ -850,6 +1048,8 @@ class LongerSequenceAttentionBlock(nn.Module):
         tokens: Tensor,
         valid_mask: Tensor,
     ) -> Tensor:
+        if tokens.size(1) == 1 and valid_mask.size(1) == 1:
+            return self._finish_attention(tokens, self.project_v(tokens))
         key, value = self.project_kv(tokens)
         return self.forward_full_projected_kv(
             tokens, key, value, valid_mask, valid_mask
@@ -1034,15 +1234,43 @@ class LongerSequenceEncoder(nn.Module):
 
     def _recent_tokens(self, merged_tokens: Tensor, merged_mask: Tensor) -> tuple[Tensor, Tensor]:
         count = self.query_token_count
-        if merged_tokens.size(1) >= count:
+        available = merged_tokens.size(1)
+        if available >= count:
             return merged_tokens[:, -count:, :], merged_mask[:, -count:]
-        pad = count - merged_tokens.size(1)
+        # summary_only never emits recent tokens, and left-pad queries are
+        # always masked invalid — they only inflate Flash varlen capacity.
+        # Keep the historical left-pad when the flattened recent suffix is part
+        # of the public output width.
+        if self.summary_only:
+            if available == 0:
+                return merged_tokens[:, :0, :], merged_mask[:, :0]
+            return merged_tokens, merged_mask
+        pad = count - available
         token_pad = merged_tokens.new_zeros(merged_tokens.size(0), pad, self.token_dim)
         mask_pad = torch.zeros(merged_mask.size(0), pad, dtype=torch.bool, device=merged_mask.device)
         return (
             torch.cat([token_pad, merged_tokens], dim=1),
             torch.cat([mask_pad, merged_mask], dim=1),
         )
+
+    def _forward_globals_only(self, user_global_tokens: Tensor) -> Tensor:
+        """Cross + self over user/CLS globals with no sequence history.
+
+        Empty (or all-invalid) sequences never contribute keys, so recent
+        queries are pure Flash packing overhead. With one global token this
+        also hits the single-token attention fast path.
+        """
+
+        user_mask = torch.ones(
+            user_global_tokens.size(0),
+            self.user_global_tokens,
+            dtype=torch.bool,
+            device=user_global_tokens.device,
+        )
+        hidden = self.cross_block.forward_full(user_global_tokens, user_mask)
+        for block in self.self_blocks:
+            hidden = block.forward_full(hidden, user_mask)
+        return hidden
 
     def precompute_cache(
         self,
@@ -1064,6 +1292,47 @@ class LongerSequenceEncoder(nn.Module):
             dtype=torch.bool,
             device=tokens.device,
         )
+        if (
+            self.summary_only
+            and self.candidate_global_tokens == 0
+            and tokens.size(1) == 0
+        ):
+            final_user = self._forward_globals_only(user_global_tokens)
+            empty_tokens = tokens.new_zeros(tokens.size(0), 0, self.token_dim)
+            empty_mask = mask.new_zeros(tokens.size(0), 0)
+            empty_kv = tokens.new_empty(
+                tokens.size(0),
+                self.cross_block.num_heads,
+                0,
+                self.cross_block.head_dim,
+            )
+            layer_caches = tuple(
+                LongerSelfLayerCache(
+                    cacheable_key=empty_kv,
+                    cacheable_value=empty_kv,
+                    user_output=final_user,
+                    recent_output=empty_tokens,
+                )
+                for _ in self.self_blocks
+            )
+            if not layer_caches:
+                cross_user_output = final_user
+            else:
+                # Cross output is not needed when self layers produced the
+                # summary; keep a consistent cache payload for consumers.
+                cross_user_output = user_global_tokens
+            return LongerSequenceCache(
+                merged_tokens=empty_tokens,
+                merged_mask=empty_mask,
+                cross_user_input=user_global_tokens,
+                cross_cacheable_key=empty_kv,
+                cross_cacheable_value=empty_kv,
+                cross_user_output=cross_user_output if layer_caches else final_user,
+                cross_recent_output=empty_tokens,
+                user_mask=user_mask,
+                recent_mask=empty_mask,
+                self_layers=layer_caches,
+            )
         if self.checkpoint_token_merger and self.training:
             merged_tokens, merged_mask = checkpoint(
                 self.token_merger,
@@ -1290,6 +1559,11 @@ class LongerSequenceEncoder(nn.Module):
                 f"user_global_tokens must have shape {expected_user_shape}, "
                 f"got {tuple(user_global_tokens.shape)}"
             )
+        if tokens.size(1) == 0:
+            current_user = self._forward_globals_only(user_global_tokens)
+            if current_user.size(1) != self.summary_tokens:
+                raise RuntimeError("LONGER summary output token count is inconsistent")
+            return current_user.flatten(start_dim=1)
 
         user_mask = torch.ones(
             tokens.size(0),
@@ -2065,6 +2339,8 @@ class FeatureEncoderBank(nn.Module):
         feature: FeatureConfig,
         value: Any,
         preembedded: Tensor | None = None,
+        *,
+        apply_row_indices: bool = True,
     ) -> Tensor:
         if feature.kind == "dense":
             original_value = value
@@ -2110,7 +2386,9 @@ class FeatureEncoderBank(nn.Module):
                     f"dense feature {feature.name!r} expected dimension {feature.dimension}, "
                     f"got {dense.size(1)}"
                 )
-            return _gather_indexed_rows(dense, original_value)
+            if apply_row_indices:
+                return _gather_indexed_rows(dense, original_value)
+            return dense
         if feature.kind == "categorical":
             if feature.pooling == "mean":
                 if not isinstance(value, dict):
@@ -2134,7 +2412,9 @@ class FeatureEncoderBank(nn.Module):
                     lengths.long(),
                     feature.pooling_null_policy,
                 )
-                return _gather_indexed_rows(pooled, value)
+                if apply_row_indices:
+                    return _gather_indexed_rows(pooled, value)
+                return pooled
             original_value = value
             if isinstance(value, dict):
                 value = value.get("values")
@@ -2145,7 +2425,9 @@ class FeatureEncoderBank(nn.Module):
                 if preembedded is not None
                 else self.embeddings[feature.name](value.long())
             )
-            return _gather_indexed_rows(encoded, original_value)
+            if apply_row_indices:
+                return _gather_indexed_rows(encoded, original_value)
+            return encoded
         raise ValueError(f"feature {feature.name!r} is not scalar")
 
     def _right_aligned_sequence(
@@ -2646,18 +2928,39 @@ class FeatureEncoderBank(nn.Module):
     ) -> dict[str, Tensor]:
         encoded: dict[str, Tensor] = {}
         sharded_requests: list[tuple[str, ShardedEmbedding, Tensor]] = []
+        pending_bags: list[tuple[FeatureConfig, Any, Tensor | None]] = []
+        feature_by_name = {feature.name: feature for feature in self.config.features}
         for feature in self.config.features:
             if feature.name not in self.included_scalar_feature_names:
                 continue
             if names is not None and feature.name not in names:
                 continue
             value = features[feature.name]
+            if feature.kind == "categorical" and feature.pooling == "mean":
+                preembedded = (
+                    None
+                    if preencoded_inputs is None
+                    else preencoded_inputs.get(feature.name)
+                )
+                embedding = self.embeddings[feature.name]
+                if preembedded is None and isinstance(embedding, ShardedEmbedding):
+                    indices = value.get("values") if isinstance(value, dict) else value
+                    if not isinstance(indices, Tensor):
+                        raise ValueError(
+                            f"categorical feature {feature.name!r} must contain tensor IDs"
+                        )
+                    sharded_requests.append((feature.name, embedding, indices.long()))
+                    pending_bags.append((feature, value, None))
+                    continue
+                pending_bags.append((feature, value, preembedded))
+                continue
             if feature.kind == "categorical":
                 if preencoded_inputs is not None and feature.name in preencoded_inputs:
                     encoded[feature.name] = self._encode_scalar_feature(
                         feature,
                         value,
                         preembedded=preencoded_inputs[feature.name],
+                        apply_row_indices=False,
                     )
                     continue
                 embedding = self.embeddings[feature.name]
@@ -2669,7 +2972,12 @@ class FeatureEncoderBank(nn.Module):
                         )
                     sharded_requests.append((feature.name, embedding, indices.long()))
                     continue
-            encoded[feature.name] = self._encode_scalar_feature(feature, value)
+            encoded[feature.name] = self._encode_scalar_feature(
+                feature,
+                value,
+                apply_row_indices=False,
+            )
+        sharded_outputs_by_name: dict[str, Tensor] = {}
         if sharded_requests:
             sharded_outputs = grouped_sharded_embedding_lookup(
                 (embedding, indices)
@@ -2678,16 +2986,57 @@ class FeatureEncoderBank(nn.Module):
             for (name, _embedding, _indices), output in zip(
                 sharded_requests, sharded_outputs
             ):
-                feature = next(item for item in self.config.features if item.name == name)
+                sharded_outputs_by_name[name] = output
+                feature = feature_by_name[name]
+                if feature.pooling == "mean":
+                    continue
                 encoded[name] = self._encode_scalar_feature(
                     feature,
                     features[name],
                     preembedded=output,
+                    apply_row_indices=False,
                 )
+        if pending_bags:
+            bag_inputs: list[tuple[str, Tensor, Tensor, Tensor, str]] = []
+            for feature, value, preembedded in pending_bags:
+                if preembedded is None:
+                    preembedded = sharded_outputs_by_name.get(feature.name)
+                if preembedded is None:
+                    indices = value.get("values") if isinstance(value, dict) else value
+                    if not isinstance(indices, Tensor):
+                        raise ValueError(
+                            f"categorical bag feature {feature.name!r} must contain tensor IDs"
+                        )
+                    preembedded = self.embeddings[feature.name](indices.long())
+                if not isinstance(value, dict):
+                    raise ValueError(
+                        f"categorical bag feature {feature.name!r} must contain values and lengths"
+                    )
+                indices = value.get("values")
+                lengths = value.get("lengths")
+                if not isinstance(indices, Tensor) or not isinstance(lengths, Tensor):
+                    raise ValueError(
+                        f"categorical bag feature {feature.name!r} must contain tensor values and lengths"
+                    )
+                bag_inputs.append(
+                    (
+                        feature.name,
+                        preembedded,
+                        indices.long(),
+                        lengths.long(),
+                        feature.pooling_null_policy,
+                    )
+                )
+            encoded.update(_batch_mean_pool_flat_bags(bag_inputs))
+        _batch_gather_indexed_rows(encoded, features)
         return encoded
 
 
-    def precompute_request_cache(self, features: dict[str, Any]) -> dict[str, LongerSequenceCache]:
+    def precompute_request_cache(
+        self,
+        features: dict[str, Any],
+        preencoded_inputs: dict[str, Tensor] | None = None,
+    ) -> dict[str, LongerSequenceCache]:
         caches: dict[str, LongerSequenceCache] = {}
         if not self.build_sequence_summaries:
             return caches
@@ -2705,11 +3054,12 @@ class FeatureEncoderBank(nn.Module):
             for sequence in longer_sequences
             for name in sequence.longer_user_global_inputs
         }
-        preencoded_inputs = self._preencode_sharded_inputs(
-            features,
-            scalar_names=user_input_names,
-            sequence_names={sequence.name for sequence in longer_sequences},
-        )
+        if preencoded_inputs is None:
+            preencoded_inputs = self._preencode_sharded_inputs(
+                features,
+                scalar_names=user_input_names,
+                sequence_names={sequence.name for sequence in longer_sequences},
+            )
         request_features = dict(features)
         for name in user_input_names:
             value = request_features.get(name)
@@ -2781,8 +3131,36 @@ class FeatureEncoderBank(nn.Module):
             inline_longer_names = {
                 sequence.name for sequence in relevant_longer_sequences
             }
-        elif request_cache is None and self.config.model.use_request_cache:
-            request_cache = self.precompute_request_cache(features)
+        # One grouped embedding pass covers scalars + every sequence that this
+        # forward will touch (request-cache and residual active sequences).
+        preencode_sequence_names = (
+            {
+                sequence.name
+                for sequence in self.config.sequences
+                if (
+                    self.sequence_summary_names is None
+                    or sequence.name in self.sequence_summary_names
+                )
+                and sequence.name not in inline_longer_names
+            }
+            if self.build_sequence_summaries
+            else set()
+        )
+        if (
+            request_cache is None
+            and self.config.model.use_request_cache
+            and not inline_longer_names
+        ):
+            preencoded_inputs = self._preencode_sharded_inputs(
+                features,
+                sequence_names=preencode_sequence_names,
+            )
+            request_cache = self.precompute_request_cache(
+                features,
+                preencoded_inputs=preencoded_inputs,
+            )
+        else:
+            preencoded_inputs = None
         active_sequence_names = (
             {
                 sequence.name
@@ -2801,10 +3179,20 @@ class FeatureEncoderBank(nn.Module):
             if self.build_sequence_summaries
             else set()
         )
-        preencoded_inputs = self._preencode_sharded_inputs(
-            features,
-            sequence_names=active_sequence_names,
-        )
+        if preencoded_inputs is None:
+            preencoded_inputs = self._preencode_sharded_inputs(
+                features,
+                sequence_names=active_sequence_names,
+            )
+        elif active_sequence_names - preencode_sequence_names:
+            # External request_cache callers may omit residual sequences.
+            preencoded_inputs = {
+                **preencoded_inputs,
+                **self._preencode_sharded_inputs(
+                    features,
+                    sequence_names=active_sequence_names - preencode_sequence_names,
+                ),
+            }
         encoded = self.encode_scalar_features(
             features,
             preencoded_inputs=preencoded_inputs,
@@ -2812,6 +3200,7 @@ class FeatureEncoderBank(nn.Module):
 
         if not self.build_sequence_summaries:
             return encoded
+        sequence_names_for_gather: list[str] = []
         for sequence in self.config.sequences:
             if (
                 self.sequence_summary_names is not None
@@ -2859,7 +3248,8 @@ class FeatureEncoderBank(nn.Module):
                     mask,
                     user_globals,
                 )
-                encoded[sequence.name] = _gather_indexed_rows(pooled, value)
+                encoded[sequence.name] = pooled
+                sequence_names_for_gather.append(sequence.name)
                 continue
             sequence_cache = None if request_cache is None else request_cache.get(sequence.name)
             row_indices = _indexed_row_indices(value)
@@ -2906,11 +3296,13 @@ class FeatureEncoderBank(nn.Module):
                 encoded,
                 sequence_cache,
             )
-            encoded[sequence.name] = (
-                pooled
-                if row_indices is not None and pooled.size(0) == row_indices.numel()
-                else _gather_indexed_rows(pooled, value)
-            )
+            if row_indices is not None and pooled.size(0) == row_indices.numel():
+                encoded[sequence.name] = pooled
+            else:
+                encoded[sequence.name] = pooled
+                sequence_names_for_gather.append(sequence.name)
+        if sequence_names_for_gather:
+            _batch_gather_indexed_rows(encoded, features, sequence_names_for_gather)
         return encoded
 
 

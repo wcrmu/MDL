@@ -53,7 +53,7 @@ does not use the agg adapter's request/candidate/sequence axes.
 ## Correctness gates
 
 - Complete test suite: **379 passed, 3 skipped**.
-- Direct module tests: **27 passed**.
+- Direct module tests: **30 passed** (includes complete-label + cross-source stats).
 - Full mock first-batch oracle: legacy and direct matched exactly for 511
   candidates and all 178 feature/sequence entries, labels, masks, scenario IDs,
   group IDs, and prediction keys.
@@ -61,6 +61,13 @@ does not use the agg adapter's request/candidate/sequence axes.
   3 and final sequence length 2.
 - Oversized request integration tests verify 5 candidates split as 2/2/1
   without an early `SourceRegistry` release.
+- Complete-label contract is enforced inside the adapter for both flat and
+  axis-separated paths (`null` / `2` / `NaN` / `bool` rejected), including under
+  `trusted_input=true`. Direct no longer relies on flat-Arrow
+  `_validate_complete_label_contract`.
+- Pack-time counter warns on cross-source duplicate `request_id` without merging
+  blocks. Benchmark JSON exports `direct_pipeline` stats plus parent/children
+  peak RSS.
 - `compileall`, focused lint, and `git diff --check` pass.
 
 ## Data-only results
@@ -157,7 +164,67 @@ itself fell to 0.674 s, leaving adapter normalization at 3.329 s as the largest
 reader-side CPU target. Further gains require an Arrow-native or compiled
 adapter, not another FeatureBatch rewrite.
 
-Raw reports are under `artifacts/agg_direct_bench/`. The principal files are:
+## Exclusive GPU 0 re-run (2026-07-24 correctness follow-up)
+
+Same `bench_b512_{legacy,direct}.yaml`, fixture
+`mock_parquet_full_2x2500_zstd`, batch 512, on an idle RTX 4090
+(`CUDA_VISIBLE_DEVICES=0`).
+
+### Data-only (warmup 2 / steps 8)
+
+| Metric | Legacy | Direct | Change |
+|---|---:|---:|---:|
+| Throughput | 286.39 samples/s | 326.24 samples/s | **+13.9%** |
+| Wait ratio | 0.9976 | 0.9677 | - |
+| Peak host RSS | 1.54 GB | 2.23 GB | +45% |
+| `peak_retained_sources` | 0 | 10 | - |
+| Cross-source duplicate `request_id` events | 0 | 0 | - |
+
+### End-to-end (warmup 3 / steps 10)
+
+| Metric | Legacy | Direct | Change |
+|---|---:|---:|---:|
+| Throughput | 263.68 samples/s | 307.55 samples/s | **+16.6%** |
+| GPU util | **9.97%** | **10.79%** | +0.8 pt |
+| Data wait ratio | 0.6125 | 0.1636 | **-73%** |
+| Mean step | 1.940 s | 1.663 s | -14% |
+| Mean data wait | 1.188 s | 0.272 s | -77% |
+| Peak HBM | 10.0 GB | 10.0 GB | - |
+
+Interpretation: on an exclusive GPU, direct cuts data wait sharply and lifts
+throughput ~15%, but E2E GPU util remains ~11%. That matches the Amdahl view —
+producer is still far below the ~1700 cand/s needed to approach the ~63%
+no-reader ceiling. Next work is Arrow-native / compiled adapter, not more
+FeatureBatch plumbing.
+
+Raw reports: `artifacts/agg_direct_bench/correctness_followup/`.
+
+## Adapter micro-opts (2026-07-24)
+
+Additional changes: axis-only complete-label validation, vectorized
+`_time_deltas`, inlined UPS membership checks, single-chunk Arrow column read.
+
+### Data-only GPU0 (3-run mean)
+
+| Mode | Prior | Now | Δ |
+|---|---:|---:|---:|
+| Legacy | 286.4 | 238.8 | -17% |
+| Direct | 326.2 | **340.2** | **+4%** |
+
+### E2E GPU0
+
+| Mode | Prior | Now | GPU util |
+|---|---:|---:|---:|
+| Legacy | 263.7 | 244.2 | 9.25% |
+| Direct | 307.6 | **361.5** | 10.19% |
+
+Direct E2E throughput +17%, but GPU util still ~10%. Legacy data-only regressed
+on this host (needs follow-up); direct gains are not enough without
+Arrow-native agg expansion (~1700 cand/s target).
+
+Reports: `artifacts/agg_direct_bench/adapter_speedup/`.
+
+Earlier reports under `artifacts/agg_direct_bench/`:
 
 - `legacy_data_direct_rework_r1.json`, `r2.json`
 - `direct_data_noarrow_mp_r1.json`, `r2.json`

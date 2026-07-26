@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from types import SimpleNamespace
+from typing import Any
 import unittest
 from unittest.mock import patch
 
@@ -77,7 +78,24 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
             type=pa.list_(pa.list_(pa.int64())),
         )
 
-        self.assertEqual(_arrow_array_to_pylist(pa, array), array.to_pylist())
+        def _normalize(cell: Any) -> Any:
+            if cell is None:
+                return None
+            if isinstance(cell, list):
+                return [
+                    None
+                    if item is None
+                    else (
+                        item.tolist()
+                        if hasattr(item, "tolist")
+                        else list(item)
+                    )
+                    for item in cell
+                ]
+            return cell
+
+        actual = [_normalize(cell) for cell in _arrow_array_to_pylist(pa, array)]
+        self.assertEqual(actual, array.to_pylist())
 
     def test_trusted_adapter_validates_one_raw_row_then_uses_fast_path(self) -> None:
         one_row = pa.table(
@@ -914,7 +932,9 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "inner length"):
             adapt(table, context=hard_context)
 
-    def test_trusted_structure_rejects_values_indices_mismatch_on_row1(self) -> None:
+    def test_trusted_input_skips_structure_mismatch_after_warmup(self) -> None:
+        # trusted_input trusts producer shape after the one-row sample warm-up.
+        # A later UPS values/indices length mismatch is therefore not rejected.
         good = {
             "context_indices": [[0]],
             "target_indices": [[0]],
@@ -944,17 +964,21 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         context = _context(REQUIRED)
         context.trusted_input = True
         context._runtime_cache = {}
-        with self.assertRaisesRegex(ValueError, "does not match its indices"):
-            adapt(table, context=context)
 
-        # After warm-up on a clean first batch, a later batch still validates structure.
+        # Non-trusted still rejects the mismatch.
+        strict = _context(REQUIRED)
+        strict.trusted_input = False
+        with self.assertRaisesRegex(ValueError, "does not match its indices"):
+            adapt(table.slice(1, 1), context=strict)
+
+        # Trusted warm-up validates only row 0, then hot path skips structure.
         warm = pa.table({key: pa.array([good[key][0]]) for key in good})
         adapt(warm, context=context)
         self.assertTrue(
             context._runtime_cache.get("mdl_rankmixer_raw_sample_validated")
         )
-        with self.assertRaisesRegex(ValueError, "does not match its indices"):
-            adapt(table.slice(1, 1), context=context)
+        actual = adapt(table.slice(1, 1), context=context).to_pydict()
+        self.assertEqual(len(actual["impr_x_goods_id_hn"]), 1)
 
     def test_complete_label_contract_rejects_non_first_row_and_batch(self) -> None:
         split = SimpleNamespace(labels={"a": "label_a"}, label_masks={})
@@ -1684,6 +1708,82 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "inner length 2"):
             adapt(table, context=context)
+
+    def test_complete_label_rejects_null_nonbinary_nan_bool_on_adapter(self) -> None:
+        # Flat/legacy complete-label rows still defer to
+        # ``_validate_complete_label_contract``. Axis-separated direct must
+        # reject inside the adapter itself (including trusted_input).
+        base = {
+            "ctx_scalar_hn": [[101]],
+            "ctx_bag_hn": [[1]],
+            "item_scalar_hn": [[[201], [202]]],
+            "sku_a_hn": [[[11], [12]]],
+            "sku_b_hn": [[[21], [22]]],
+            "impr_x_goods_id_hn": [[-1]],
+            "impr_x_time": [[4900]],
+            "impr_x_indices": [[[10]]],
+            "scene_id": [[7]],
+            "search_id": [["r0"]],
+            "impr_time": [[5000]],
+            "label_a": [[0, 1]],
+            "label_b": [[1, 0]],
+            "label_c": [[0, 1]],
+        }
+        required = [
+            *REQUIRED[:-3],
+            "impr_x_time_delta_ms",
+            "label_a",
+            "label_b",
+            "label_c",
+        ]
+        # REQUIRED already has labels; rebuild with agg-shaped request cols.
+        required = [
+            "ctx_scalar_hn",
+            "ctx_bag_hn",
+            "item_scalar_hn",
+            "sku_a_hn",
+            "sku_b_hn",
+            "impr_x_goods_id_hn",
+            "impr_x_time_delta_ms",
+            "scene_id",
+            "search_id",
+            "label_a",
+            "label_b",
+            "label_c",
+        ]
+
+        def axis_context(*, trusted_input: bool = False):
+            context = _context(required)
+            context.options["request_columns"] = [
+                "scene_id",
+                "search_id",
+                "impr_time",
+            ]
+            context.options["integer_request_columns"] = ["scene_id", "impr_time"]
+            context.trusted_input = trusted_input
+            context._runtime_cache = {
+                "axis_separated": True,
+                "axis_request_id_column": "search_id",
+            }
+            return context
+
+        cases = [
+            ({"label_a": [[0, None]]}, "None"),
+            ({"label_a": [[0, 2]]}, "2"),
+            ({"label_a": [[0, float("nan")]]}, "nan"),
+            (
+                {"label_a": pa.array([[False, True]], type=pa.list_(pa.bool_()))},
+                "False",
+            ),
+        ]
+        for override, pattern in cases:
+            payload = dict(base)
+            payload.update(override)
+            with self.assertRaisesRegex(ValueError, pattern):
+                adapt(pa.table(payload), context=axis_context())
+            with self.assertRaisesRegex(ValueError, pattern):
+                adapt(pa.table(payload), context=axis_context(trusted_input=True))
+
 
 if __name__ == "__main__":
     unittest.main()
