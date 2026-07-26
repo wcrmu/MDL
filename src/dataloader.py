@@ -11321,7 +11321,8 @@ def _is_dense_numeric_column(column: Any) -> bool:
     return (
         isinstance(column, np.ndarray)
         and column.ndim == 1
-        and column.dtype != object
+        # ``kind in 'iufb'`` excludes object ('O') without a slower dtype!=object.
+        and column.dtype.kind in "iufb"
     )
 
 
@@ -11330,10 +11331,36 @@ def _columns_share_dense_dtype(columns: Sequence[Any]) -> bool:
 
     if not columns:
         return False
-    if not all(_is_dense_numeric_column(column) for column in columns):
+    first = columns[0]
+    if not _is_dense_numeric_column(first):
         return False
-    sample_dtype = columns[0].dtype
-    return all(column.dtype == sample_dtype for column in columns)
+    sample_dtype = first.dtype
+    for column in columns[1:]:
+        if (
+            not isinstance(column, np.ndarray)
+            or column.ndim != 1
+            or column.dtype != sample_dtype
+        ):
+            return False
+    return True
+
+
+# Candidate-column kind codes for pack classify (faster than repeated isinstance).
+_PACK_COL_OBJECT = 0
+_PACK_COL_DENSE = 1
+_PACK_COL_LIST = 2
+
+
+def _pack_column_kind(column: Any) -> tuple[int, int]:
+    """Return ``(kind, dtype_num)`` for dense-compatible pack classification."""
+
+    if isinstance(column, CompactListColumn):
+        return _PACK_COL_LIST, 0
+    if isinstance(column, np.ndarray) and column.ndim == 1:
+        dtype = column.dtype
+        if dtype.kind in "iufb":
+            return _PACK_COL_DENSE, int(dtype.num)
+    return _PACK_COL_OBJECT, 0
 
 
 def prepare_packed_axis_batch(
@@ -11466,15 +11493,13 @@ def prepare_packed_axis_batch(
             request_values[name] = tuple(rows)
             continue
         if name in request_feature_name_set:
-            per_bundle_columns = [
-                bundle.request_features[name]
-                for bundle in unique_bundles
-                if name in bundle.request_features
-            ]
-            sample_column = per_bundle_columns[0] if per_bundle_columns else None
-            if isinstance(sample_column, CompactListColumn) and all(
-                isinstance(column, CompactListColumn) for column in per_bundle_columns
-            ):
+            sample_column = None
+            for bundle in unique_bundles:
+                if name in bundle.request_features:
+                    sample_column = bundle.request_features[name]
+                    break
+            if isinstance(sample_column, CompactListColumn):
+                # CompactListColumn is homogeneous by construction across sources.
                 request_values[name] = SequenceColumnBatch(
                     columns=tuple(
                         bundle.request_features[name] for bundle in unique_bundles
@@ -11483,11 +11508,19 @@ def prepare_packed_axis_batch(
                     column_index=shared_column_index,
                 )
                 continue
-            # Dense gather only when every source column is dense+same dtype.
-            # Mixed int64/object (nulls on one adapter batch) used to pick int64
-            # from the first source and TypeError on ``out[...] = object_col``.
-            if _columns_share_dense_dtype(per_bundle_columns):
-                out = np.empty(n_requests, dtype=per_bundle_columns[0].dtype)
+            # Single-bundle: first-column dtype is enough. Multi-bundle: require
+            # shared dense dtype so a null object column cannot poison int64 out.
+            use_dense = _is_dense_numeric_column(sample_column)
+            if use_dense and len(unique_bundles) > 1:
+                use_dense = _columns_share_dense_dtype(
+                    [
+                        bundle.request_features[name]
+                        for bundle in unique_bundles
+                        if name in bundle.request_features
+                    ]
+                )
+            if use_dense:
+                out = np.empty(n_requests, dtype=sample_column.dtype)
                 for bundle, out_idx, slots_arr in bundle_groups:
                     out[out_idx] = bundle.request_features[name][slots_arr]
                 request_values[name] = out
@@ -11498,9 +11531,14 @@ def prepare_packed_axis_batch(
             request_values[name] = tuple(rows)
             continue
         if request_id_column is not None and name == request_id_column:
-            per_bundle_ids = [np.asarray(bundle.request_ids) for bundle in unique_bundles]
-            if _columns_share_dense_dtype(per_bundle_ids):
-                out = np.empty(n_requests, dtype=per_bundle_ids[0].dtype)
+            sample_ids = np.asarray(unique_bundles[0].request_ids)
+            use_dense = _is_dense_numeric_column(sample_ids)
+            if use_dense and len(unique_bundles) > 1:
+                use_dense = _columns_share_dense_dtype(
+                    [np.asarray(bundle.request_ids) for bundle in unique_bundles]
+                )
+            if use_dense:
+                out = np.empty(n_requests, dtype=sample_ids.dtype)
                 for bundle, out_idx, slots_arr in bundle_groups:
                     out[out_idx] = np.asarray(bundle.request_ids)[slots_arr]
                 request_values[name] = out
@@ -11548,55 +11586,99 @@ def prepare_packed_axis_batch(
         raise KeyError(name)
 
     # Resolve each candidate name to its owning map once (item/label/...).
-    # Dense fancy-index requires the column to be dense on *every* source in the
-    # pack: production packs mix adapter batches, and null labels/scalars become
-    # object arrays on only some sources.
+    # Fast paths:
+    # - 1 source: inline 4-map probe (no helper, no cross-source scan)
+    # - N sources: one index pass/source with precomputed kind+dtype_num, then
+    #   O(names) equality checks (no per-name isinstance/all scans)
     candidate_maps: dict[str, str] = {}
     list_batch_names: list[str] = []
     dense_names: list[str] = []
     object_names: list[str] = []
-    _candidate_map_order = (
-        "item_features",
-        "label_features",
-        "label_mask_features",
-        "candidate_metadata",
-    )
-    for name in candidate_name_list:
-        if name in broadcast_set:
-            object_names.append(name)
-            continue
-        map_name: str | None = None
-        per_source_columns: list[Any] = []
-        consistent = True
+    n_unique_sources = len(unique_source_ids)
+
+    if n_unique_sources == 1:
+        bundle = bundles[unique_source_ids[0]]
+        item_feats = bundle.item_features
+        label_feats = bundle.label_features
+        mask_feats = bundle.label_mask_features
+        meta_feats = bundle.candidate_metadata
+        for name in candidate_name_list:
+            if name in broadcast_set:
+                object_names.append(name)
+                continue
+            if name in item_feats:
+                map_name = "item_features"
+                sample_column = item_feats[name]
+            elif name in label_feats:
+                map_name = "label_features"
+                sample_column = label_feats[name]
+            elif name in mask_feats:
+                map_name = "label_mask_features"
+                sample_column = mask_feats[name]
+            elif name in meta_feats:
+                map_name = "candidate_metadata"
+                sample_column = meta_feats[name]
+            else:
+                object_names.append(name)
+                continue
+            candidate_maps[name] = map_name
+            kind, _dtype_num = _pack_column_kind(sample_column)
+            if kind == _PACK_COL_LIST:
+                list_batch_names.append(name)
+            elif kind == _PACK_COL_DENSE:
+                dense_names.append(name)
+            else:
+                object_names.append(name)
+    else:
+        # name -> (map_name, kind, dtype_num) per source; column fetched later.
+        source_indexes: list[dict[str, tuple[str, int, int]]] = []
         for source_id in unique_source_ids:
             bundle = bundles[source_id]
-            column = None
-            local_map = None
-            for candidate_map in _candidate_map_order:
-                feats = getattr(bundle, candidate_map)
-                if name in feats:
-                    column = feats[name]
-                    local_map = candidate_map
+            index: dict[str, tuple[str, int, int]] = {}
+            for map_name in (
+                "item_features",
+                "label_features",
+                "label_mask_features",
+                "candidate_metadata",
+            ):
+                for feature_name, column in getattr(bundle, map_name).items():
+                    if feature_name in index:
+                        continue
+                    kind, dtype_num = _pack_column_kind(column)
+                    index[feature_name] = (map_name, kind, dtype_num)
+            source_indexes.append(index)
+        first_index = source_indexes[0]
+        rest_indexes = source_indexes[1:]
+        for name in candidate_name_list:
+            if name in broadcast_set:
+                object_names.append(name)
+                continue
+            first = first_index.get(name)
+            if first is None:
+                object_names.append(name)
+                continue
+            map_name, kind0, dtype0 = first
+            ok = True
+            for index in rest_indexes:
+                other = index.get(name)
+                if (
+                    other is None
+                    or other[0] != map_name
+                    or other[1] != kind0
+                    or other[2] != dtype0
+                ):
+                    ok = False
                     break
-            if column is None or local_map is None:
-                consistent = False
-                break
-            if map_name is None:
-                map_name = local_map
-            elif map_name != local_map:
-                consistent = False
-                break
-            per_source_columns.append(column)
-        if not consistent or map_name is None or not per_source_columns:
-            object_names.append(name)
-            continue
-        candidate_maps[name] = map_name
-        if all(isinstance(column, CompactListColumn) for column in per_source_columns):
-            list_batch_names.append(name)
-        elif _columns_share_dense_dtype(per_source_columns):
-            dense_names.append(name)
-        else:
-            object_names.append(name)
+            if not ok:
+                object_names.append(name)
+                continue
+            candidate_maps[name] = map_name
+            if kind0 == _PACK_COL_LIST:
+                list_batch_names.append(name)
+            elif kind0 == _PACK_COL_DENSE:
+                dense_names.append(name)
+            else:
+                object_names.append(name)
 
     candidate_values: dict[str, Any] = {}
     for name in list_batch_names:
@@ -11627,24 +11709,23 @@ def prepare_packed_axis_batch(
         np.flatnonzero(shared_candidate_index == unique_idx)
         for unique_idx in range(len(dense_by_source))
     ]
+    # slots are already int64; hoist per-source index vectors out of the name loop.
+    slots_by_unique = [shared_candidate_slots[reqs] for reqs in reqs_by_unique]
     for name in dense_names:
-        sample_dtype = None
+        sample_column = None
         for cols in dense_by_source:
-            column = cols.get(name)
-            if column is not None:
-                sample_dtype = column.dtype
+            sample_column = cols.get(name)
+            if sample_column is not None:
                 break
-        if sample_dtype is None:
+        if sample_column is None:
             candidate_values[name] = np.empty(0, dtype=np.int64)
             continue
-        out = np.empty(n_candidates, dtype=sample_dtype)
+        out = np.empty(n_candidates, dtype=sample_column.dtype)
         for unique_idx, cols in enumerate(dense_by_source):
             reqs = reqs_by_unique[unique_idx]
             if reqs.size == 0:
                 continue
-            out[reqs] = cols[name][
-                shared_candidate_slots[reqs].astype(np.int64, copy=False)
-            ]
+            out[reqs] = cols[name][slots_by_unique[unique_idx]]
         candidate_values[name] = out
 
     object_rows: dict[str, list[Any]] = {name: [] for name in object_names}

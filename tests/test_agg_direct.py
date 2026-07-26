@@ -768,6 +768,36 @@ class PreparePackedAxisBatchNullTest(unittest.TestCase):
         self.assertIn(None, clicks)
         self.assertEqual(sorted(value for value in clicks if value is not None), [0, 1, 1])
 
+    def test_single_source_int64_stays_dense_ndarray(self) -> None:
+        dense = AdaptedAxisBundle(
+            n_candidates=3,
+            n_requests=1,
+            request_ids=("r0",),
+            candidate_to_request=np.zeros(3, dtype=np.int64),
+            request_features={"user_id": np.asarray([1], dtype=np.int64)},
+            sequence_features={},
+            item_features={"item_id": np.asarray([10, 11, 12], dtype=np.int64)},
+            label_features={"click": np.asarray([0, 1, 0], dtype=np.int64)},
+            label_mask_features={},
+            candidate_metadata={},
+            request_raw_rows=np.asarray([0], dtype=np.int64),
+            candidate_raw_rows=np.asarray([0, 0, 0], dtype=np.int64),
+        )
+        blocks = request_group_blocks_from_axis_bundle(
+            dense, source_id=0, sequences=()
+        )
+        prepared = prepare_packed_axis_batch(
+            {0: dense},
+            build_packed_request_plan(blocks),
+            sequences=(),
+            request_id_column="request_id",
+            candidate_request_columns=("request_id",),
+        )
+        clicks = prepared.candidate_values["click"]
+        self.assertIsInstance(clicks, np.ndarray)
+        self.assertEqual(clicks.dtype, np.int64)
+        np.testing.assert_array_equal(clicks, [0, 1, 0])
+
 
 class AdapterRequestLevelSourcesTest(unittest.TestCase):
     def test_includes_coarse_scene_derived_columns(self) -> None:
