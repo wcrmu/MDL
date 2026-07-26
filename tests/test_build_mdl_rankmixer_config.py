@@ -10,6 +10,7 @@ import torch
 import yaml
 
 from scripts.build_mdl_rankmixer_config import (
+    AUTO_SCENARIO_NAME,
     CANDIDATE_ITEM_BAG_FIELDS,
     CANDIDATE_ITEM_SCALAR_FIELDS,
     CONTEXT_SCALAR_FIELDS,
@@ -19,16 +20,20 @@ from scripts.build_mdl_rankmixer_config import (
     MULTIVALUE_MAX_LENGTHS,
     OBSERVED_MULTIVALUE_MAX_LENGTHS,
     ONETRANS_SEQUENCE_LENGTH_CAPS,
+    PRODUCTION_COARSE_CONFIG_NAMES,
     REQUEST_CONTEXT_BAG_FIELDS,
     REQUEST_CONTEXT_SCALAR_FIELDS,
     apply_embedding_profile,
     build_config,
     build_name_estimate_report,
+    derive_fine_payload,
+    fine_config_name,
     _cap_multivalue_observed_max,
     _find_sequence_field,
     _resolve_share_root,
     _categorical_entries_by_name,
     render_config,
+    write_fine_siblings,
 )
 from scripts.profile_prehashed_parquet import profile_spec_from_mapping
 from src.config import ResolvedPreHashedEncoding, load_app_config
@@ -1013,21 +1018,34 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 )
                 self.assertTrue(config.data.train.reader.trusted_input)
                 self.assertTrue(config.data.test.reader.trusted_input)
+                # Production profiles keep cardinality audit tiny (1) so startup
+                # does not scan hundreds of rows per table before training.
                 self.assertEqual(
                     config.data.train.reader.effective_cardinality_audit_raw_rows(),
-                    256,
+                    1,
                 )
                 self.assertEqual(
                     config.data.test.reader.effective_cardinality_audit_raw_rows(),
-                    256,
+                    1,
                 )
                 self.assertFalse(config.data.train.label_masks)
                 self.assertFalse(config.data.test.label_masks)
                 self.assertEqual(config.training.loss_reduction, "mean_per_task")
                 if memory_optimized:
+                    expected_proj_chunk = (
+                        131072 if model_name == "mdl_rankmixer" else 81920
+                    )
+                    expected_batch = (
+                        1536 if model_name == "mdl_rankmixer" else 1408
+                    )
+                    expected_buckets = (
+                        [1536, 960, 640, 480, 768]
+                        if model_name == "mdl_rankmixer"
+                        else [1408, 880, 576, 432, 704]
+                    )
                     self.assertEqual(
                         config.runtime.sequence_projection_chunk_tokens,
-                        131072,
+                        expected_proj_chunk,
                     )
                     self.assertEqual(
                         config.runtime.sequence_encoder_chunk_rows,
@@ -1035,10 +1053,10 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     )
                     self.assertEqual(
                         config.runtime.sequence_encoder_chunk_tokens,
-                        262144 if model_name == "mdl_rankmixer" else 0,
+                        262144 if model_name == "mdl_rankmixer" else 163840,
                     )
                     self.assertTrue(config.runtime.onetrans_batched_ns)
-                    self.assertEqual(config.training.batch_size, 1024)
+                    self.assertEqual(config.training.batch_size, expected_batch)
                     self.assertEqual(
                         config.training.gradient_accumulation_steps,
                         1,
@@ -1053,7 +1071,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                             bucket.batch_size
                             for bucket in config.data.train.reader.length_buckets
                         ],
-                        [1024, 1024, 1024, 1024, 1024],
+                        expected_buckets,
                     )
                 self.assertTrue(config.training.quick_eval.enabled)
                 self.assertEqual(config.training.quick_eval.split, "train")
@@ -1083,7 +1101,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertTrue(config.data.train.reader.coalesce_pinned_tensors)
                 self.assertEqual(config.data.train.reader.num_workers, 4)
                 self.assertEqual(config.data.train.reader.adapter_workers, 4)
-                self.assertEqual(config.data.train.reader.scanner_batch_rows, 64)
+                self.assertEqual(config.data.train.reader.scanner_batch_rows, 128)
                 self.assertEqual(
                     config.data.train.reader.device_prefetch_batches,
                     0,
@@ -1095,7 +1113,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     config.data.train.reader.schema_validation_samples,
-                    64,
+                    1,
                 )
                 self.assertEqual(
                     config.resolved.categorical_embedding_dims["goods_id_hn"],
@@ -1484,6 +1502,39 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         self.assertEqual(len(plan.context_features), 51)
                         self.assertEqual(len(plan.item_features), 118)
 
+    def test_production_fine_yamls_build_adapter_plans(self) -> None:
+        from types import SimpleNamespace
+
+        from src.dataloader import (
+            _build_mdl_rankmixer_adapter_plan,
+            required_columns_for_split,
+        )
+
+        for coarse_name in PRODUCTION_COARSE_CONFIG_NAMES:
+            config_name = fine_config_name(coarse_name)
+            with self.subTest(config=config_name):
+                config = load_app_config(ROOT / "configs" / config_name)
+                self.assertTrue(config.scenarios.auto_discover)
+                for split_name, split in (
+                    ("train", config.data.train),
+                    ("test", config.data.test),
+                ):
+                    with self.subTest(split=split_name):
+                        options = split.adapter.options
+                        self.assertNotIn("search_scene_ids", options)
+                        self.assertNotIn("coarse_scene_index_column", options)
+                        self.assertIsNone(options.get("unlisted_scene_policy"))
+                        required = required_columns_for_split(config, split)
+                        plan = _build_mdl_rankmixer_adapter_plan(
+                            SimpleNamespace(
+                                options=options,
+                                required_columns=tuple(required),
+                            )
+                        )
+                        self.assertIsNone(plan.coarse_scene)
+                        self.assertEqual(len(plan.context_features), 51)
+                        self.assertEqual(len(plan.item_features), 118)
+
     def test_production_mdl_yamls_flatten_spec_sku_aliases(self) -> None:
         for config_name in ("mdl_rankmixer.yaml", "mdl_onetrans.yaml"):
             with self.subTest(config=config_name):
@@ -1583,6 +1634,92 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             "task_fst_cart_prior",
             [token["name"] for token in right["tokenization"]["sequence_tokens"]],
         )
+
+    def test_derive_fine_payload_preserves_capacity(self) -> None:
+        for coarse_name in PRODUCTION_COARSE_CONFIG_NAMES:
+            with self.subTest(config=coarse_name):
+                coarse_path = ROOT / "configs" / coarse_name
+                coarse = yaml.safe_load(coarse_path.read_text(encoding="utf-8"))
+                fine = derive_fine_payload(coarse)
+                self.assertEqual(
+                    fine["scenarios"],
+                    {
+                        "names": [AUTO_SCENARIO_NAME],
+                        "source": "scene_id",
+                        "source_encoding": "raw",
+                        "auto_discover": True,
+                        "max_discovered": 256,
+                    },
+                )
+                self.assertEqual(
+                    fine["training"]["batch_size"],
+                    coarse["training"]["batch_size"],
+                )
+                for split_name in ("train", "test"):
+                    options = fine["data"][split_name]["adapter"]["options"]
+                    self.assertNotIn("search_scene_ids", options)
+                    self.assertNotIn("coarse_scene_index_column", options)
+                    self.assertNotIn("unlisted_scene_policy", options)
+                feature_names = {item["name"] for item in fine["features"]}
+                if coarse_name.startswith("mdl_"):
+                    self.assertIn("scenario_prior_scene_id_hn", feature_names)
+                    self.assertNotIn(SEARCH_PRIOR_FEATURE, feature_names)
+                    self.assertNotIn(RECOMMENDATION_PRIOR_FEATURE, feature_names)
+                    tokens = {
+                        token["name"]: token
+                        for token in fine["tokenization"]["scenario_tokens"]
+                    }
+                    self.assertEqual(
+                        set(tokens),
+                        {AUTO_SCENARIO_NAME, "global"},
+                    )
+                    self.assertEqual(
+                        tokens[AUTO_SCENARIO_NAME]["prior_inputs"][0],
+                        "scenario_prior_scene_id_hn",
+                    )
+                else:
+                    self.assertNotIn("scenario_prior_scene_id_hn", feature_names)
+
+    def test_production_fine_yamls_match_derived_siblings(self) -> None:
+        for coarse_name in PRODUCTION_COARSE_CONFIG_NAMES:
+            with self.subTest(config=coarse_name):
+                coarse = yaml.safe_load(
+                    (ROOT / "configs" / coarse_name).read_text(encoding="utf-8")
+                )
+                fine_name = fine_config_name(coarse_name)
+                fine_path = ROOT / "configs" / fine_name
+                self.assertTrue(fine_path.is_file(), fine_name)
+                written = yaml.safe_load(fine_path.read_text(encoding="utf-8"))
+                derived = derive_fine_payload(coarse)
+                self.assertEqual(written, derived)
+                config = load_app_config(fine_path)
+                self.assertTrue(config.scenarios.auto_discover)
+                self.assertEqual(config.scenarios.names, (AUTO_SCENARIO_NAME,))
+                self.assertEqual(config.scenarios.source, "scene_id")
+                self.assertEqual(config.scenarios.source_encoding, "raw")
+                for split in (config.data.train, config.data.test):
+                    self.assertNotIn("search_scene_ids", split.adapter.options)
+
+    def test_write_fine_siblings_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            configs_dir = Path(directory)
+            for coarse_name in PRODUCTION_COARSE_CONFIG_NAMES:
+                source = ROOT / "configs" / coarse_name
+                (configs_dir / coarse_name).write_text(
+                    source.read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+            written = write_fine_siblings(configs_dir)
+            self.assertEqual(
+                [path.name for path in written],
+                [fine_config_name(name) for name in PRODUCTION_COARSE_CONFIG_NAMES],
+            )
+            for coarse_name, output in zip(PRODUCTION_COARSE_CONFIG_NAMES, written):
+                expected = ROOT / "configs" / fine_config_name(coarse_name)
+                self.assertEqual(
+                    output.read_text(encoding="utf-8"),
+                    expected.read_text(encoding="utf-8"),
+                )
 
 
 if __name__ == "__main__":

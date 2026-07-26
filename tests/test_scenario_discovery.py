@@ -31,7 +31,7 @@ class ScenarioDiscoveryScannerTest(unittest.TestCase):
         self.assertEqual(discovery.reader.shard_unit, "file")
         self.assertEqual(discovery.reader.schema_validation_samples, 1)
         self.assertEqual(discovery.reader.eager_schema_validation, "sample")
-        self.assertEqual(base.data.train.reader.scanner_batch_rows, 64)
+        self.assertEqual(base.data.train.reader.scanner_batch_rows, 128)
         self.assertEqual(base.data.train.reader.shard_unit, "row_group")
 
     def test_arrow_unique_handles_list_and_scalar_scene_ids(self) -> None:

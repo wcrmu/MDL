@@ -5539,6 +5539,7 @@ class MDLRankMixerModel(nn.Module):
         # Per static-shape graphed callable (blocks+logits). Keys are tensor
         # meta tuples so length-bucket batch sizes each capture once.
         self._cuda_graph_backbone_pool: dict[tuple[Any, ...], Any] = {}
+        self._cuda_graph_backbone_capture_allowed = True
 
     def precompute_request_cache(self, features: dict[str, Any]) -> dict[str, LongerSequenceCache]:
         return self.encoder_bank.precompute_request_cache(features)
@@ -5601,6 +5602,14 @@ class MDLRankMixerModel(nn.Module):
         )
         graphed = self._cuda_graph_backbone_pool.get(key)
         if graphed is None:
+            if not getattr(self, "_cuda_graph_backbone_capture_allowed", True):
+                # Post-DDP lazy capture is unsafe; keep training correct via eager.
+                return self._run_rankmixer_blocks(
+                    feature_tokens,
+                    scenario_tokens,
+                    task_tokens,
+                    scenario_mask,
+                )
             sample_args = (
                 feature_tokens.detach().clone(),
                 scenario_tokens.detach().clone(),
@@ -5625,6 +5634,118 @@ class MDLRankMixerModel(nn.Module):
             task_tokens,
             scenario_mask,
         )
+
+    def prewarm_cuda_graph_backbone(self, device: torch.device) -> None:
+        """Capture dense RankMixer graphs before DDP registers reducer hooks.
+
+        ``make_graphed_callables`` includes module parameters in the backward
+        surface; capturing after ``DistributedDataParallel`` wraps the module
+        trips ``cudaErrorStreamCaptureImplicit`` when reducer AccumulateGrad
+        hooks run on the capture stream.
+        """
+
+        if not bool(getattr(self.config.runtime, "cuda_graph_backbone", False)):
+            return
+        if device.type != "cuda":
+            return
+        if _activation_checkpoint_enabled(self.config.runtime.activation_checkpoint):
+            raise RuntimeError(
+                "prewarm_cuda_graph_backbone requires runtime.activation_checkpoint=none"
+            )
+
+        was_training = self.training
+        self.train()
+        token_dim = int(self.config.model.token_dim)
+        feature_count = int(self.metadata.feature_token_count)
+        scenario_count = int(self.metadata.scenario_count)
+        precision = str(self.config.runtime.precision)
+        dtype = (
+            torch.bfloat16
+            if precision == "bf16"
+            else torch.float16
+            if precision == "fp16"
+            else torch.float32
+        )
+        batch_sizes: list[int] = []
+        buckets = getattr(self.config.data.train.reader, "length_buckets", None) or ()
+        for bucket in buckets:
+            batch_size = getattr(bucket, "batch_size", None)
+            if batch_size is not None and int(batch_size) > 0:
+                batch_sizes.append(int(batch_size))
+        top_batch = int(getattr(self.config.training, "batch_size", 0) or 0)
+        if top_batch > 0:
+            batch_sizes.append(top_batch)
+        if not batch_sizes:
+            batch_sizes = [1]
+        # Unique preserve order
+        seen: set[int] = set()
+        ordered_batches = []
+        for batch_size in batch_sizes:
+            if batch_size not in seen:
+                seen.add(batch_size)
+                ordered_batches.append(batch_size)
+
+        amp_dtype = None if precision == "fp32" else dtype
+        for batch_size in ordered_batches:
+            feature_tokens = torch.empty(
+                batch_size,
+                feature_count,
+                token_dim,
+                device=device,
+                dtype=dtype,
+            ).uniform_(-0.02, 0.02).requires_grad_(True)
+            if self.config.model.use_scenario_tokens:
+                scenario_token_count = scenario_count + int(
+                    self.config.model.use_global_scenario_token
+                )
+                scenario_tokens = torch.empty(
+                    batch_size,
+                    scenario_token_count,
+                    token_dim,
+                    device=device,
+                    dtype=dtype,
+                ).uniform_(-0.02, 0.02).requires_grad_(True)
+            else:
+                scenario_tokens = feature_tokens.new_empty(batch_size, 0, token_dim)
+            if self.config.model.use_task_tokens:
+                task_tokens = torch.empty(
+                    batch_size,
+                    int(self.metadata.task_count),
+                    token_dim,
+                    device=device,
+                    dtype=dtype,
+                ).uniform_(-0.02, 0.02).requires_grad_(True)
+            else:
+                task_tokens = feature_tokens.new_empty(batch_size, 0, token_dim)
+            scenario_mask = torch.ones(
+                batch_size,
+                scenario_count,
+                device=device,
+                dtype=torch.bool,
+            )
+            if amp_dtype is None:
+                self._run_rankmixer_blocks_cuda_graph(
+                    feature_tokens,
+                    scenario_tokens,
+                    task_tokens,
+                    scenario_mask,
+                )
+            else:
+                with torch.amp.autocast(
+                    device_type=device.type,
+                    dtype=amp_dtype,
+                    cache_enabled=False,
+                ):
+                    self._run_rankmixer_blocks_cuda_graph(
+                        feature_tokens,
+                        scenario_tokens,
+                        task_tokens,
+                        scenario_mask,
+                    )
+            for parameter in self.parameters():
+                parameter.grad = None
+        if not was_training:
+            self.eval()
 
     def forward(
         self,

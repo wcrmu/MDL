@@ -10,7 +10,7 @@ runtime:
   require_compact_sequence_batches: false
   allow_tf32: true
   # selective + batch 1024: best util≥80 / sps on 2-GPU e2e mock for rankmixer.
-  activation_checkpoint: selective
+  activation_checkpoint: none
   attention_backend: flash
   distributed: ddp
   nproc_per_node: 2
@@ -34,8 +34,8 @@ data:
       num_workers: 4
       adapter_workers: 4
       prefetch_batches: 4
-      max_prefetch_bytes: 4294967296
-      scanner_batch_rows: 64
+      max_prefetch_bytes: 8589934592
+      scanner_batch_rows: 128
       pin_memory: true
       shard_unit: row_group
       eager_schema_validation: sample
@@ -59,18 +59,19 @@ data:
       worker_stagger_sec: 1.0
       hdfs_pre_buffer: true
       hdfs_close_timeout: 5
+      # Sum-scale boundaries (12 UPS caps sum ~7852); catch-all fits >1 request group.
       length_bucket_metric: sum
       length_buckets:
-      - max_length: 1024
-        batch_size: 1024
       - max_length: 2048
-        batch_size: 512
+        batch_size: 1280
       - max_length: 4096
-        batch_size: 256
+        batch_size: 800
       - max_length: 6144
-        batch_size: 179
+        batch_size: 512
+      - max_length: 8192
+        batch_size: 384
       - max_length:
-        batch_size: 128
+        batch_size: 640
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
       input_columns:
@@ -823,8 +824,8 @@ data:
       num_workers: 4
       adapter_workers: 4
       prefetch_batches: 4
-      max_prefetch_bytes: 4294967296
-      scanner_batch_rows: 64
+      max_prefetch_bytes: 8589934592
+      scanner_batch_rows: 128
       pin_memory: true
       shard_unit: row_group
       eager_schema_validation: sample
@@ -848,16 +849,16 @@ data:
       hdfs_close_timeout: 5
       length_bucket_metric: sum
       length_buckets:
-      - max_length: 1024
-        batch_size: 72
       - max_length: 2048
-        batch_size: 48
+        batch_size: 72
       - max_length: 4096
-        batch_size: 32
+        batch_size: 48
       - max_length: 6144
-        batch_size: 22
+        batch_size: 32
+      - max_length: 8192
+        batch_size: 24
       - max_length:
-        batch_size: 16
+        batch_size: 48
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
       input_columns:
@@ -4821,7 +4822,7 @@ model:
   use_request_cache: true
 training:
   # Physical batch per rank/GPU (util≥80 winner on 2-GPU e2e mock).
-  batch_size: 1024
+  batch_size: 1280
   embedding_distribution: sharded
   dense_distribution: ddp
   embedding_sharding:

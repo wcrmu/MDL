@@ -1,6 +1,6 @@
-# Production training config for mdl_rankmixer; launcher defaults to 2×H100.
+# Fine sibling of configs/rankmixer.yaml (rankmixer); default training still uses the coarse YAML.
 # flash-attn varlen + Row-Wise Adagrad + Phase 2 shared_dim embedding profile.
-# Scenarios: fixed search/recommendation via coarse_scene_index (121 search scene_ids; others -> recommendation).
+# Scenarios: fine-grained scene_id discovery from train (names=[__auto__], max_discovered=256); no coarse search/recommendation routing.
 # Adapter grouping: context_features=51 request-axis; item_features=118 candidate-axis.
 runtime:
   device: cuda
@@ -9,25 +9,12 @@ runtime:
   compile_mode: default
   require_compact_sequence_batches: false
   allow_tf32: true
-  # full + batch 1536: optimizes wall-clock samples/s (recompute less HBM than
-  # none; faster than selective on same data). Util is secondary.
-  activation_checkpoint: full
+  activation_checkpoint: none
   attention_backend: flash
-  varlen_packing: compact
-  sequence_projection_chunk_tokens: 131072
-  # Bound LONGER by padded event tokens rather than fixed rows. At batch 1280
-  # this gives 160 rows for length 2048, 320 for length 1024, and the full batch
-  # for streams <=256, keeping Tensor Cores fed without unbounded HBM growth.
-  sequence_encoder_chunk_rows: 0
-  sequence_encoder_chunk_tokens: 262144
-  onetrans_batched_ns: true
   distributed: ddp
-  # Default local launch width only; training.batch_size remains per rank/GPU.
   nproc_per_node: 2
   master_addr: 127.0.0.1
   master_port: 29500
-  # Compact varlen packing already removes invalid tokens; avoid a CUDA scalar
-  # readback just to trim a common padded prefix.
   trim_all_invalid_sequence_prefix: false
   validate_scenario_ids: false
 data:
@@ -54,8 +41,6 @@ data:
       schema_validation_samples: 1
       cardinality_audit_raw_rows: 1
       coalesce_pinned_tensors: true
-      # Full-width bags make concurrent H2D/data production contend with the
-      # CPU launch path; host prefetch remains enabled but CUDA prefetch does not.
       device_prefetch_batches: 0
       deduplicate_request_features: true
       agg_direct_mode: direct
@@ -73,21 +58,19 @@ data:
       worker_stagger_sec: 1.0
       hdfs_pre_buffer: true
       hdfs_close_timeout: 5
-      # Boundaries are on SUM of per-sequence lengths (12 UPS; caps sum ~7852).
-      # Catch-all sized for multi-request packs so prod local_rows stay high and
-      # HBM/GPU stay fed (same data finishes in fewer, denser steps).
+      # Sum-scale boundaries (12 UPS caps sum ~7852); catch-all fits >1 request group.
       length_bucket_metric: sum
       length_buckets:
       - max_length: 2048
-        batch_size: 1536
+        batch_size: 1280
       - max_length: 4096
-        batch_size: 960
+        batch_size: 800
       - max_length: 6144
-        batch_size: 640
+        batch_size: 512
       - max_length: 8192
-        batch_size: 480
-      - max_length:
-        batch_size: 768
+        batch_size: 384
+      - max_length: null
+        batch_size: 640
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
       input_columns:
@@ -696,131 +679,6 @@ data:
           flatten_query_hash: flatten_query_hash_x_time_delta_log1p_seconds
         time_delta_transform: log1p_seconds
         compact_request_lists: true
-        search_scene_ids:
-        - 2
-        - 21
-        - 23
-        - 27
-        - 28
-        - 31
-        - 35
-        - 38
-        - 39
-        - 40
-        - 42
-        - 45
-        - 50
-        - 62
-        - 68
-        - 70
-        - 76
-        - 77
-        - 78
-        - 81
-        - 85
-        - 90
-        - 93
-        - 94
-        - 95
-        - 98
-        - 100
-        - 110
-        - 111
-        - 130
-        - 133
-        - 135
-        - 137
-        - 141
-        - 145
-        - 146
-        - 150
-        - 152
-        - 159
-        - 160
-        - 167
-        - 168
-        - 175
-        - 186
-        - 187
-        - 191
-        - 197
-        - 198
-        - 204
-        - 211
-        - 219
-        - 231
-        - 233
-        - 240
-        - 245
-        - 246
-        - 252
-        - 255
-        - 282
-        - 283
-        - 294
-        - 298
-        - 299
-        - 301
-        - 310
-        - 317
-        - 319
-        - 325
-        - 335
-        - 338
-        - 340
-        - 341
-        - 351
-        - 356
-        - 357
-        - 366
-        - 377
-        - 383
-        - 384
-        - 385
-        - 391
-        - 392
-        - 393
-        - 394
-        - 396
-        - 398
-        - 401
-        - 403
-        - 404
-        - 415
-        - 416
-        - 417
-        - 419
-        - 420
-        - 421
-        - 423
-        - 424
-        - 428
-        - 430
-        - 435
-        - 436
-        - 437
-        - 438
-        - 446
-        - 448
-        - 452
-        - 459
-        - 464
-        - 471
-        - 475
-        - 482
-        - 485
-        - 492
-        - 504
-        - 519
-        - 1105
-        - 1106
-        - 1116
-        - 1121
-        - 1136
-        - 1137
-        coarse_scene_index_column: coarse_scene_index
-        coarse_scene_prior_id_column: coarse_scene_prior_id
-        unlisted_scene_policy: recommendation
   schema_policy:
     require_same_schema: true
     allow_missing_nullable_columns: false
@@ -863,7 +721,6 @@ data:
       worker_stagger_sec: 1.0
       hdfs_pre_buffer: true
       hdfs_close_timeout: 5
-      # Keep the same sum-scale boundaries as train; tiny batches for quick eval.
       length_bucket_metric: sum
       length_buckets:
       - max_length: 2048
@@ -874,7 +731,7 @@ data:
         batch_size: 32
       - max_length: 8192
         batch_size: 24
-      - max_length:
+      - max_length: null
         batch_size: 48
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
@@ -1485,131 +1342,6 @@ data:
           flatten_query_hash: flatten_query_hash_x_time_delta_log1p_seconds
         time_delta_transform: log1p_seconds
         compact_request_lists: true
-        search_scene_ids:
-        - 2
-        - 21
-        - 23
-        - 27
-        - 28
-        - 31
-        - 35
-        - 38
-        - 39
-        - 40
-        - 42
-        - 45
-        - 50
-        - 62
-        - 68
-        - 70
-        - 76
-        - 77
-        - 78
-        - 81
-        - 85
-        - 90
-        - 93
-        - 94
-        - 95
-        - 98
-        - 100
-        - 110
-        - 111
-        - 130
-        - 133
-        - 135
-        - 137
-        - 141
-        - 145
-        - 146
-        - 150
-        - 152
-        - 159
-        - 160
-        - 167
-        - 168
-        - 175
-        - 186
-        - 187
-        - 191
-        - 197
-        - 198
-        - 204
-        - 211
-        - 219
-        - 231
-        - 233
-        - 240
-        - 245
-        - 246
-        - 252
-        - 255
-        - 282
-        - 283
-        - 294
-        - 298
-        - 299
-        - 301
-        - 310
-        - 317
-        - 319
-        - 325
-        - 335
-        - 338
-        - 340
-        - 341
-        - 351
-        - 356
-        - 357
-        - 366
-        - 377
-        - 383
-        - 384
-        - 385
-        - 391
-        - 392
-        - 393
-        - 394
-        - 396
-        - 398
-        - 401
-        - 403
-        - 404
-        - 415
-        - 416
-        - 417
-        - 419
-        - 420
-        - 421
-        - 423
-        - 424
-        - 428
-        - 430
-        - 435
-        - 436
-        - 437
-        - 438
-        - 446
-        - 448
-        - 452
-        - 459
-        - 464
-        - 471
-        - 475
-        - 482
-        - 485
-        - 492
-        - 504
-        - 519
-        - 1105
-        - 1106
-        - 1116
-        - 1121
-        - 1136
-        - 1137
-        coarse_scene_index_column: coarse_scene_index
-        coarse_scene_prior_id_column: coarse_scene_prior_id
-        unlisted_scene_policy: recommendation
     prediction_keys:
       search_id: search_id
       candidate_position: candidate_position
@@ -3466,98 +3198,6 @@ features:
   pooling_null_policy: exclude
   max_length: 1
   truncation: head
-- name: scenario_important_currency_hn
-  kind: categorical
-  source: currency_hn
-  embedding_scope: scenario
-  embedding_dim: 8
-  encoding:
-    type: pre_hashed
-    num_buckets: 128
-    padding_id: 0
-- name: scenario_important_hash_language_site_hn
-  kind: categorical
-  source: hash_language_site_hn
-  embedding_scope: scenario
-  embedding_dim: 16
-  encoding:
-    type: pre_hashed
-    num_buckets: 4096
-    padding_id: 0
-- name: scenario_important_language_hn
-  kind: categorical
-  source: language_hn
-  embedding_scope: scenario
-  embedding_dim: 16
-  encoding:
-    type: pre_hashed
-    num_buckets: 512
-    padding_id: 0
-- name: scenario_important_page_elsn_hn
-  kind: categorical
-  source: page_elsn_hn
-  embedding_scope: scenario
-  embedding_dim: 16
-  encoding:
-    type: pre_hashed
-    num_buckets: 4096
-    padding_id: 0
-- name: scenario_important_page_sn_hn
-  kind: categorical
-  source: page_sn_hn
-  embedding_scope: scenario
-  embedding_dim: 24
-  encoding:
-    type: pre_hashed
-    num_buckets: 8192
-    padding_id: 0
-- name: scenario_search_prior_coarse_scene
-  kind: categorical
-  source: coarse_scene_prior_id
-  embedding_scope: scenario
-  embedding_dim: 16
-  encoding:
-    type: identity
-    num_buckets: 3
-    padding_id: 0
-    out_of_range: error
-- name: scenario_recommendation_prior_coarse_scene
-  kind: categorical
-  source: coarse_scene_prior_id
-  embedding_scope: scenario
-  embedding_dim: 16
-  encoding:
-    type: identity
-    num_buckets: 3
-    padding_id: 0
-    out_of_range: error
-- name: task_important_currency_hn
-  kind: categorical
-  source: currency_hn
-  embedding_scope: task
-  embedding_dim: 8
-  encoding:
-    type: pre_hashed
-    num_buckets: 128
-    padding_id: 0
-- name: task_important_hash_language_site_hn
-  kind: categorical
-  source: hash_language_site_hn
-  embedding_scope: task
-  embedding_dim: 16
-  encoding:
-    type: pre_hashed
-    num_buckets: 4096
-    padding_id: 0
-- name: task_important_language_hn
-  kind: categorical
-  source: language_hn
-  embedding_scope: task
-  embedding_dim: 16
-  encoding:
-    type: pre_hashed
-    num_buckets: 512
-    padding_id: 0
 sequences:
 - name: impr
   null_anchor_field: goods_id_hn
@@ -4711,396 +4351,13 @@ sequences:
   longer_user_global_tokens: 0
   longer_cls_tokens: 1
   longer_candidate_global_tokens: 0
-- name: task_fst_cart_prior
-  null_anchor_field: goods_id_hn
-  embedding_scope: task
-  max_length: 512
-  truncation: head
-  sequence_order: newest_to_oldest
-  encoder: mean_pool
-  time_delta_field: time_delta_log1p_seconds
-  fields:
-  - name: time_delta_log1p_seconds
-    kind: dense
-    source: cart_long_x_time_delta_log1p_seconds
-    dimension: 1
-  - name: cat1_id_hn
-    kind: categorical
-    source: cart_long_x_cat1_id_hn
-    embedding_dim: 8
-    encoding:
-      type: pre_hashed
-      num_buckets: 256
-      padding_id: 0
-      share_embedding: true
-      share_with: cat1_id_hn
-  - name: cat2_id_hn
-    kind: categorical
-    source: cart_long_x_cat2_id_hn
-    embedding_dim: 16
-    encoding:
-      type: pre_hashed
-      num_buckets: 4096
-      padding_id: 0
-      share_embedding: true
-      share_with: cat2_id_hn
-  - name: cat3_id_hn
-    kind: categorical
-    source: cart_long_x_cat3_id_hn
-    embedding_dim: 24
-    encoding:
-      type: pre_hashed
-      num_buckets: 32768
-      padding_id: 0
-      share_embedding: true
-      share_with: cat3_id_hn
-  - name: cat4_id_hn
-    kind: categorical
-    source: cart_long_x_cat4_id_hn
-    embedding_dim: 32
-    encoding:
-      type: pre_hashed
-      num_buckets: 131072
-      padding_id: 0
-      share_embedding: true
-      share_with: cat4_id_hn
-  - name: cat_id_hn
-    kind: categorical
-    source: cart_long_x_cat_id_hn
-    embedding_dim: 32
-    encoding:
-      type: pre_hashed
-      num_buckets: 262144
-      padding_id: 0
-      share_embedding: true
-      share_with: cat_id_hn
-  - name: goods_id_hn
-    kind: categorical
-    source: cart_long_x_goods_id_hn
-    embedding_dim: 48
-    encoding:
-      type: pre_hashed
-      num_buckets: 134217728
-      padding_id: 0
-      share_embedding: true
-      share_with: goods_id_hn
-  - name: mall_id_hn
-    kind: categorical
-    source: cart_long_x_mall_id_hn
-    embedding_dim: 32
-    encoding:
-      type: pre_hashed
-      num_buckets: 4194304
-      padding_id: 0
-      share_embedding: true
-      share_with: mall_id_hn
-  - name: price_hn
-    kind: categorical
-    source: cart_long_x_price_hn
-    embedding_dim: 16
-    encoding:
-      type: pre_hashed
-      num_buckets: 4096
-      padding_id: 0
-      share_embedding: true
-      share_with: price_hn
-  - name: timegap_hn
-    kind: categorical
-    source: cart_long_x_timegap_hn
-    embedding_dim: 8
-    encoding:
-      type: pre_hashed
-      num_buckets: 64
-      padding_id: 0
-  - name: spec_hn
-    kind: categorical
-    source: cart_long_x_spec_hn
-    embedding_dim: 48
-    encoding:
-      type: pre_hashed
-      num_buckets: 8388608
-      padding_id: 0
-      share_embedding: true
-      share_with: cart_long.spec_hn
-  - name: sku_ids_hn
-    kind: categorical
-    source: cart_long_x_sku_ids_hn
-    embedding_dim: 48
-    encoding:
-      type: pre_hashed
-      num_buckets: 16777216
-      padding_id: 0
-      share_embedding: true
-      share_with: cart_long.sku_ids_hn
-- name: task_upid_pay_prior
-  null_anchor_field: goods_id_hn
-  embedding_scope: task
-  max_length: 256
-  truncation: head
-  sequence_order: newest_to_oldest
-  encoder: mean_pool
-  time_delta_field: time_delta_log1p_seconds
-  fields:
-  - name: time_delta_log1p_seconds
-    kind: dense
-    source: buy_long_x_time_delta_log1p_seconds
-    dimension: 1
-  - name: cat1_id_hn
-    kind: categorical
-    source: buy_long_x_cat1_id_hn
-    embedding_dim: 8
-    encoding:
-      type: pre_hashed
-      num_buckets: 256
-      padding_id: 0
-      share_embedding: true
-      share_with: cat1_id_hn
-  - name: cat2_id_hn
-    kind: categorical
-    source: buy_long_x_cat2_id_hn
-    embedding_dim: 16
-    encoding:
-      type: pre_hashed
-      num_buckets: 4096
-      padding_id: 0
-      share_embedding: true
-      share_with: cat2_id_hn
-  - name: cat3_id_hn
-    kind: categorical
-    source: buy_long_x_cat3_id_hn
-    embedding_dim: 24
-    encoding:
-      type: pre_hashed
-      num_buckets: 32768
-      padding_id: 0
-      share_embedding: true
-      share_with: cat3_id_hn
-  - name: cat4_id_hn
-    kind: categorical
-    source: buy_long_x_cat4_id_hn
-    embedding_dim: 32
-    encoding:
-      type: pre_hashed
-      num_buckets: 131072
-      padding_id: 0
-      share_embedding: true
-      share_with: cat4_id_hn
-  - name: cat_id_hn
-    kind: categorical
-    source: buy_long_x_cat_id_hn
-    embedding_dim: 32
-    encoding:
-      type: pre_hashed
-      num_buckets: 262144
-      padding_id: 0
-      share_embedding: true
-      share_with: cat_id_hn
-  - name: goods_id_hn
-    kind: categorical
-    source: buy_long_x_goods_id_hn
-    embedding_dim: 48
-    encoding:
-      type: pre_hashed
-      num_buckets: 134217728
-      padding_id: 0
-      share_embedding: true
-      share_with: goods_id_hn
-  - name: mall_id_hn
-    kind: categorical
-    source: buy_long_x_mall_id_hn
-    embedding_dim: 32
-    encoding:
-      type: pre_hashed
-      num_buckets: 4194304
-      padding_id: 0
-      share_embedding: true
-      share_with: mall_id_hn
-  - name: sales_hn
-    kind: categorical
-    source: buy_long_x_sales_hn
-    embedding_dim: 16
-    encoding:
-      type: pre_hashed
-      num_buckets: 4096
-      padding_id: 0
-      share_embedding: true
-      share_with: sales_hn
-  - name: price_hn
-    kind: categorical
-    source: buy_long_x_price_hn
-    embedding_dim: 16
-    encoding:
-      type: pre_hashed
-      num_buckets: 4096
-      padding_id: 0
-      share_embedding: true
-      share_with: price_hn
-  - name: timegap_hn
-    kind: categorical
-    source: buy_long_x_timegap_hn
-    embedding_dim: 8
-    encoding:
-      type: pre_hashed
-      num_buckets: 64
-      padding_id: 0
-  - name: spec_hn
-    kind: categorical
-    source: buy_long_x_spec_hn
-    embedding_dim: 48
-    encoding:
-      type: pre_hashed
-      num_buckets: 8388608
-      padding_id: 0
-      share_embedding: true
-      share_with: cart_long.spec_hn
-  - name: sku_ids_hn
-    kind: categorical
-    source: buy_long_x_sku_ids_hn
-    embedding_dim: 48
-    encoding:
-      type: pre_hashed
-      num_buckets: 16777216
-      padding_id: 0
-      share_embedding: true
-      share_with: cart_long.sku_ids_hn
-- name: task_cateid_filter_prior
-  null_anchor_field: goods_id_hn
-  embedding_scope: task
-  max_length: 256
-  truncation: head
-  sequence_order: newest_to_oldest
-  encoder: mean_pool
-  time_delta_field: time_delta_log1p_seconds
-  fields:
-  - name: time_delta_log1p_seconds
-    kind: dense
-    source: buy_long_x_time_delta_log1p_seconds
-    dimension: 1
-  - name: cat1_id_hn
-    kind: categorical
-    source: buy_long_x_cat1_id_hn
-    embedding_dim: 8
-    encoding:
-      type: pre_hashed
-      num_buckets: 256
-      padding_id: 0
-      share_embedding: true
-      share_with: cat1_id_hn
-  - name: cat2_id_hn
-    kind: categorical
-    source: buy_long_x_cat2_id_hn
-    embedding_dim: 16
-    encoding:
-      type: pre_hashed
-      num_buckets: 4096
-      padding_id: 0
-      share_embedding: true
-      share_with: cat2_id_hn
-  - name: cat3_id_hn
-    kind: categorical
-    source: buy_long_x_cat3_id_hn
-    embedding_dim: 24
-    encoding:
-      type: pre_hashed
-      num_buckets: 32768
-      padding_id: 0
-      share_embedding: true
-      share_with: cat3_id_hn
-  - name: cat4_id_hn
-    kind: categorical
-    source: buy_long_x_cat4_id_hn
-    embedding_dim: 32
-    encoding:
-      type: pre_hashed
-      num_buckets: 131072
-      padding_id: 0
-      share_embedding: true
-      share_with: cat4_id_hn
-  - name: cat_id_hn
-    kind: categorical
-    source: buy_long_x_cat_id_hn
-    embedding_dim: 32
-    encoding:
-      type: pre_hashed
-      num_buckets: 262144
-      padding_id: 0
-      share_embedding: true
-      share_with: cat_id_hn
-  - name: goods_id_hn
-    kind: categorical
-    source: buy_long_x_goods_id_hn
-    embedding_dim: 48
-    encoding:
-      type: pre_hashed
-      num_buckets: 134217728
-      padding_id: 0
-      share_embedding: true
-      share_with: goods_id_hn
-  - name: mall_id_hn
-    kind: categorical
-    source: buy_long_x_mall_id_hn
-    embedding_dim: 32
-    encoding:
-      type: pre_hashed
-      num_buckets: 4194304
-      padding_id: 0
-      share_embedding: true
-      share_with: mall_id_hn
-  - name: sales_hn
-    kind: categorical
-    source: buy_long_x_sales_hn
-    embedding_dim: 16
-    encoding:
-      type: pre_hashed
-      num_buckets: 4096
-      padding_id: 0
-      share_embedding: true
-      share_with: sales_hn
-  - name: price_hn
-    kind: categorical
-    source: buy_long_x_price_hn
-    embedding_dim: 16
-    encoding:
-      type: pre_hashed
-      num_buckets: 4096
-      padding_id: 0
-      share_embedding: true
-      share_with: price_hn
-  - name: timegap_hn
-    kind: categorical
-    source: buy_long_x_timegap_hn
-    embedding_dim: 8
-    encoding:
-      type: pre_hashed
-      num_buckets: 64
-      padding_id: 0
-  - name: spec_hn
-    kind: categorical
-    source: buy_long_x_spec_hn
-    embedding_dim: 48
-    encoding:
-      type: pre_hashed
-      num_buckets: 8388608
-      padding_id: 0
-      share_embedding: true
-      share_with: cart_long.spec_hn
-  - name: sku_ids_hn
-    kind: categorical
-    source: buy_long_x_sku_ids_hn
-    embedding_dim: 48
-    encoding:
-      type: pre_hashed
-      num_buckets: 16777216
-      padding_id: 0
-      share_embedding: true
-      share_with: cart_long.sku_ids_hn
 scenarios:
   names:
-  - search
-  - recommendation
-  source: coarse_scene_index
-  source_encoding: index
-  auto_discover: false
+  - __auto__
+  source: scene_id
+  source_encoding: raw
+  auto_discover: true
+  max_discovered: 256
 tokenization:
   feature_tokenizer: rankmixer
   num_feature_tokens: 32
@@ -5283,58 +4540,6 @@ tokenization:
   - srch_q2i
   - ups_clk_sku
   - flatten_query_hash
-  task_tokens:
-  - name: fst_cart
-    important_inputs: &id001
-    - task_important_currency_hn
-    - task_important_hash_language_site_hn
-    - task_important_language_hn
-    prior_inputs:
-    - task_fst_cart_prior
-  - name: upid_pay
-    important_inputs: *id001
-    prior_inputs:
-    - task_upid_pay_prior
-  - name: cateid_filter
-    important_inputs: *id001
-    prior_inputs:
-    - task_cateid_filter_prior
-  scenario_tokens:
-  - name: search
-    important_inputs:
-    - scenario_important_currency_hn
-    - scenario_important_hash_language_site_hn
-    - scenario_important_language_hn
-    - scenario_important_page_elsn_hn
-    - scenario_important_page_sn_hn
-    prior_inputs:
-    - scenario_search_prior_coarse_scene
-    - impr
-    - clk_long
-    - view_long
-  - name: recommendation
-    important_inputs:
-    - scenario_important_currency_hn
-    - scenario_important_hash_language_site_hn
-    - scenario_important_language_hn
-    - scenario_important_page_elsn_hn
-    - scenario_important_page_sn_hn
-    prior_inputs:
-    - scenario_recommendation_prior_coarse_scene
-    - impr
-    - clk_long
-    - view_long
-  - name: global
-    important_inputs:
-    - scenario_important_currency_hn
-    - scenario_important_hash_language_site_hn
-    - scenario_important_language_hn
-    - scenario_important_page_elsn_hn
-    - scenario_important_page_sn_hn
-    prior_inputs:
-    - impr
-    - clk_long
-    - view_long
 vocab_strategy:
   defaults:
     fit_split: train
@@ -5344,7 +4549,7 @@ vocab_strategy:
     artifact_dir: artifacts/vocab
   features: {}
 model:
-  name: mdl_rankmixer
+  name: rankmixer
   embedding_dim: 32
   token_dim: 768
   num_layers: 2
@@ -5357,18 +4562,15 @@ model:
   task_head_activation: gelu
   rankmixer_ffn_type: dense
   sequence_fusion: intent_ordered
-  use_task_tokens: true
-  use_scenario_tokens: true
-  use_global_scenario_token: true
-  use_task_feature_interaction: true
-  use_scenario_feature_interaction: true
+  use_task_tokens: false
+  use_scenario_tokens: false
+  use_global_scenario_token: false
+  use_task_feature_interaction: false
+  use_scenario_feature_interaction: false
   mdl_feature_interaction: direct_ffn
   use_request_cache: true
 training:
-  # Physical batch per rank/GPU. It is never divided by world size; the default
-  # two-rank launch therefore processes 3072 samples per forward collectively.
-  batch_size: 1536
-  gradient_accumulation_steps: 1
+  batch_size: 1280
   embedding_distribution: sharded
   dense_distribution: ddp
   embedding_sharding:
@@ -5387,13 +4589,10 @@ training:
   lr_sparse: 0.001
   lr_schedule: constant
   lr_warmup_steps: 500
-  lr_decay_steps:
+  lr_decay_steps: null
   lr_min_ratio: 0.0
   dense_optimizer: rmsprop
-  # Bounded foreach combines small parameter updates without allocating a
-  # full-model optimizer workspace.
-  fused_dense_optimizer: false
-  dense_optimizer_foreach_bucket_mb: 128
+  fused_dense_optimizer: true
   rmsprop_alpha: 0.99999
   rmsprop_momentum: 0.0
   sparse_optimizer: rowwise_adagrad
@@ -5402,12 +4601,10 @@ training:
   embedding_sparse_gradients: true
   embedding_weight_dtype: bf16
   sparse_update_mode: ddp_synced_adagrad
-  sparse_parameter_server_adapter:
+  sparse_parameter_server_adapter: null
   dense_clip_norm: 1.0
   sparse_clip_norm: 1.0
   loss_reduction: mean_per_task
-  # Reading loss/token scalars every step drains the asynchronous CUDA queue.
-  log_every_steps: 100
   quick_eval:
     enabled: true
     every_steps: 1000
@@ -5415,6 +4612,6 @@ training:
     split: train
     auc_bins: 4096
   save_checkpoint: false
-  checkpoint_path: artifacts/checkpoints/mdl_rankmixer_2xh100_phase2_shared_dim
+  checkpoint_path: artifacts/checkpoints/rankmixer_2xh100_phase2_shared_dim
   embedding_collect_stats: false
   embedding_validate_indices: false

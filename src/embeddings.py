@@ -777,6 +777,35 @@ def _table_indices_for_keys(keys: Tensor, table_offsets: tuple[int, ...]) -> Ten
     return torch.bucketize(keys, boundaries, right=True)
 
 
+def _table_row_segments(
+    table_indices: Tensor,
+) -> tuple[Tensor, list[tuple[int, int, int]]]:
+    """Group row positions by table with one argsort (not O(tables) nonzero).
+
+    Returns ``(order, segments)`` where ``order`` sorts rows by table id and
+    each segment is ``(table_index, start, count)`` into ``order``.
+    """
+
+    if table_indices.numel() == 0:
+        empty = table_indices.new_empty(0)
+        return empty, []
+    order = torch.argsort(table_indices, stable=True)
+    sorted_tables = table_indices.index_select(0, order)
+    unique_tables, counts = torch.unique_consecutive(
+        sorted_tables, return_counts=True
+    )
+    # One small host sync for segment bounds instead of per-table nonzero.
+    unique_list = unique_tables.tolist()
+    counts_list = counts.tolist()
+    segments: list[tuple[int, int, int]] = []
+    offset = 0
+    for table_id, count in zip(unique_list, counts_list):
+        count_i = int(count)
+        segments.append((int(table_id), offset, count_i))
+        offset += count_i
+    return order, segments
+
+
 def _embedding_dims_for_keys(
     keys: Tensor,
     table_offsets: tuple[int, ...],
@@ -963,14 +992,22 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             owner_table_indices = _table_indices_for_keys(
                 owner_unique_keys, metadata.table_offsets
             )
-            for table_index, (module, local_weight) in enumerate(
-                zip(modules, local_weights)
-            ):
-                selected = torch.nonzero(
-                    owner_table_indices == table_index, as_tuple=False
-                ).flatten()
-                if not selected.numel():
-                    continue
+            order, segments = _table_row_segments(owner_table_indices)
+            # Fill in table-sorted order, then one scatter back to key order.
+            mixed_width = pack_values
+            sorted_values = (
+                owner_unique_values.new_zeros(
+                    (owner_unique_keys.numel(), embedding_dim)
+                )
+                if mixed_width
+                else owner_unique_values.new_empty(
+                    (owner_unique_keys.numel(), embedding_dim)
+                )
+            )
+            for table_index, start, count in segments:
+                module = modules[table_index]
+                local_weight = local_weights[table_index]
+                selected = order.narrow(0, start, count)
                 global_ids = owner_unique_keys.index_select(0, selected)
                 global_ids = global_ids - metadata.table_offsets[table_index]
                 if metadata.validate_indices:
@@ -982,13 +1019,13 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
                         raise RuntimeError("received embedding IDs owned by another rank")
                 local_rows = module.shard_spec.local_row_ids(global_ids)
                 values = local_weight.index_select(0, local_rows)
-                if values.size(-1) != embedding_dim:
-                    padded = owner_unique_values.new_zeros(
-                        (values.size(0), embedding_dim)
-                    )
-                    padded[:, : values.size(-1)].copy_(values)
-                    values = padded
-                owner_unique_values.index_copy_(0, selected, values)
+                dest = sorted_values.narrow(0, start, count)
+                if values.size(-1) == embedding_dim:
+                    dest.copy_(values)
+                else:
+                    dest[:, : values.size(-1)].copy_(values)
+            if order.numel():
+                owner_unique_values.index_copy_(0, order, sorted_values)
             received_values = owner_unique_values.index_select(0, owner_inverse)
             if pack_values:
                 received_dims = _embedding_dims_for_keys(
@@ -1172,26 +1209,41 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
         owner_table_indices = _table_indices_for_keys(
             owner_unique_keys, metadata.table_offsets
         )
-        local_weight_grads: list[Tensor] = []
-        for table_index, module in enumerate(metadata.modules):
-            selected = torch.nonzero(
-                owner_table_indices == table_index, as_tuple=False
-            ).flatten()
+        local_weight_grads: list[Tensor | None] = [None] * len(metadata.modules)
+        order, segments = _table_row_segments(owner_table_indices)
+        for table_index, start, count in segments:
+            module = metadata.modules[table_index]
+            selected = order.narrow(0, start, count)
             global_ids = owner_unique_keys.index_select(0, selected)
             global_ids = global_ids - metadata.table_offsets[table_index]
             local_rows = module.shard_spec.local_row_ids(global_ids)
             values = owner_grad.index_select(0, selected)[
                 :, : module.embedding_dim
             ].to(dtype=ctx.local_weight_dtypes[table_index])
-            local_weight_grads.append(
-                torch.sparse_coo_tensor(
-                    local_rows.unsqueeze(0),
-                    values,
-                    size=ctx.local_weight_shapes[table_index],
-                    dtype=ctx.local_weight_dtypes[table_index],
-                    device=grad_output.device,
-                    is_coalesced=True,
-                )
+            local_weight_grads[table_index] = torch.sparse_coo_tensor(
+                local_rows.unsqueeze(0),
+                values,
+                size=ctx.local_weight_shapes[table_index],
+                dtype=ctx.local_weight_dtypes[table_index],
+                device=grad_output.device,
+                is_coalesced=True,
+            )
+        for table_index, module in enumerate(metadata.modules):
+            if local_weight_grads[table_index] is not None:
+                continue
+            # Tables with no owned rows still need an empty sparse grad slot.
+            empty_rows = owner_unique_keys.new_empty((1, 0))
+            empty_values = owner_grad.new_empty(
+                (0, module.embedding_dim),
+                dtype=ctx.local_weight_dtypes[table_index],
+            )
+            local_weight_grads[table_index] = torch.sparse_coo_tensor(
+                empty_rows,
+                empty_values,
+                size=ctx.local_weight_shapes[table_index],
+                dtype=ctx.local_weight_dtypes[table_index],
+                device=grad_output.device,
+                is_coalesced=True,
             )
 
         if metadata.collect_stats:

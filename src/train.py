@@ -2030,16 +2030,86 @@ def _iter_compare_feature_batches(
             close()
 
 
-def _configure_host_prepare_tensor_sharing() -> Path:
-    """Scratch dir for host-prepare helpers; tensor IPC uses anonymous memfd."""
+# Prefer zero-copy shared-memory FeatureBatch IPC when /dev/shm is large enough
+# for a deep host-prepare queue (prod nodes often expose hundreds of GiB). Tiny
+# containers (default Docker 64MiB) stay on anonymous memfd.
+_HOST_PREPARE_SHARE_SHM_BYTES = 2 * 1024 * 1024 * 1024
 
-    share_dir = Path(os.environ.get("MDL_TORCH_SHARE_DIR", "/tmp/mdl-torch-shm"))
+
+def _configure_host_prepare_tensor_sharing() -> Path:
+    """Scratch dir for host-prepare ``file_system`` tensor IPC.
+
+    Prefer ``/dev/shm`` when it has headroom so ``share`` mode can use
+    ``file_system`` sharing (reliable with spawn+Queue). ``file_descriptor``
+    sharing breaks across spawn Queue unpickle once the child's resource
+    sharer socket is gone. Tiny containers keep using ``/tmp``.
+    """
+
+    override = os.environ.get("MDL_TORCH_SHARE_DIR")
+    if override:
+        share_dir = Path(override)
+    elif _dev_shm_free_bytes() >= _HOST_PREPARE_SHARE_SHM_BYTES:
+        share_dir = Path("/dev/shm/mdl-torch-shm")
+    else:
+        share_dir = Path("/tmp/mdl-torch-shm")
     share_dir.mkdir(parents=True, exist_ok=True)
     os.environ["TMPDIR"] = str(share_dir)
     os.environ["TEMP"] = str(share_dir)
     os.environ["TMP"] = str(share_dir)
     tempfile.tempdir = str(share_dir)
     return share_dir
+
+
+def _host_prepare_ipc_mode(
+    environ: MutableMapping[str, str] | None = None,
+) -> str:
+    """Pick host-prepare IPC transport: ``share`` (zero-copy) or ``memfd``.
+
+    Override with ``MDL_HOST_PREPARE_IPC=share|memfd|auto`` (default auto).
+    ``share`` needs enough ``/dev/shm`` for pinned ``share_memory_`` queues;
+    otherwise we keep the memfd path that works under 64MiB containers.
+    """
+
+    env = os.environ if environ is None else environ
+    forced = str(env.get("MDL_HOST_PREPARE_IPC", "auto")).strip().lower()
+    if forced in {"share", "memfd"}:
+        return forced
+    shm_free = _dev_shm_free_bytes()
+    if shm_free >= _HOST_PREPARE_SHARE_SHM_BYTES:
+        return "share"
+    return "memfd"
+
+
+def _share_cpu_tensor_tree(value: Any) -> Any:
+    """Move CPU tensor storages into shared memory for ForkingPickler IPC."""
+
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cpu":
+            raise ValueError("host-prepare IPC requires CPU tensors")
+        return value.share_memory_()
+    if isinstance(value, dict):
+        return {key: _share_cpu_tensor_tree(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_share_cpu_tensor_tree(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_share_cpu_tensor_tree(child) for child in value)
+    return value
+
+
+def _share_feature_batch_for_ipc(batch: FeatureBatch) -> FeatureBatch:
+    """Share every tensor storage so mp.Queue transfers handles, not multi-GiB blobs."""
+
+    batch.features = _share_cpu_tensor_tree(batch.features)
+    if batch.labels is not None:
+        batch.labels = _share_cpu_tensor_tree(batch.labels)
+    if batch.label_mask is not None:
+        batch.label_mask = _share_cpu_tensor_tree(batch.label_mask)
+    batch.scenario_id = _share_cpu_tensor_tree(batch.scenario_id)
+    if batch._packed_buffers:
+        batch._packed_buffers = tuple(
+            _share_cpu_tensor_tree(buffer) for buffer in batch._packed_buffers
+        )
+    return batch
 
 
 def _encode_feature_batch_views(value: Any, buffers: tuple[Tensor, ...]) -> Any:
@@ -2217,12 +2287,36 @@ def _host_prepare_process_main(
     shard_world_size: int,
     coalesce_tensors: bool,
     include_group_id: bool,
+    ipc_mode: str,
+    pin_memory: bool,
 ) -> None:
-    """Child entry: pack+tensorize on CPU and push memfd FeatureBatch payloads."""
+    """Child entry: pack+tensorize and push FeatureBatches to the train process.
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    - ``memfd``: hide CUDA, coalesce unpinned, spill via anonymous memfd (tiny shm).
+    - ``share``: keep CUDA visible so we can pin in-child, then ``share_memory_``
+      so the parent receives already-pinned handles (large ``/dev/shm``).
+    """
+
     os.environ["MDL_HOST_PREPARE_PROCESS"] = "1"
+    use_share = ipc_mode == "share"
+    shm_free = _dev_shm_free_bytes()
+    shm_ok_for_pin_share = shm_free >= _HOST_PREPARE_SHARE_SHM_BYTES
+    if not use_share or not shm_ok_for_pin_share:
+        # Memfd, or forced share under tiny /dev/shm: pin on the parent and
+        # hide CUDA so the child never steals a torchrun-remapped device.
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
     share_dir = _configure_host_prepare_tensor_sharing()
+    if use_share:
+        try:
+            import torch.multiprocessing as torch_mp
+
+            # Always ``file_system`` for spawn+Queue: ``file_descriptor`` needs
+            # the child's resource_sharer socket during parent unpickle, which
+            # races and raises FileNotFoundError. With large /dev/shm the
+            # share dir lives there so this stays a tmpfs mmap path.
+            torch_mp.set_sharing_strategy("file_system")
+        except (RuntimeError, ValueError, AttributeError):
+            pass
     try:
         import psutil
 
@@ -2235,6 +2329,10 @@ def _host_prepare_process_main(
         split = config.data.train if split_name == "train" else config.data.test
         if split is None:
             raise ValueError(f"split {split_name!r} is not configured")
+        # Pin-in-child needs CUDA + enough /dev/shm for pinned share_memory_.
+        child_pin = bool(
+            pin_memory and use_share and shm_ok_for_pin_share and torch.cuda.is_available()
+        )
         table_iter = _iter_batch_tables(
             config,
             split_name,
@@ -2255,8 +2353,13 @@ def _host_prepare_process_main(
                     include_group_id,
                 )
                 if coalesce_tensors:
-                    batch = _coalesce_feature_batch(batch, pin_memory=False)
-                queue.put(_spill_feature_batch_for_ipc(batch, share_dir))
+                    batch = _coalesce_feature_batch(batch, pin_memory=child_pin)
+                elif child_pin:
+                    batch = pin_feature_batch(batch, coalesce_tensors=False)
+                if use_share:
+                    queue.put(_share_feature_batch_for_ipc(batch))
+                else:
+                    queue.put(_spill_feature_batch_for_ipc(batch, share_dir))
             queue.put(None)
         finally:
             close = getattr(table_iter, "close", None)
@@ -2275,14 +2378,14 @@ def _host_prepare_process_main(
 
 
 class _ProcessHostPrepareIterator:
-    """Yield FeatureBatches prepared in a spawn child via memfd IPC.
+    """Yield FeatureBatches prepared in a spawn child.
 
-    Avoids tiny container ``/dev/shm``. Parent materializes pinned packed
-    buffers on the train thread.
+    IPC auto-selects by ``/dev/shm`` size (see ``_host_prepare_ipc_mode``):
 
-    A second pin/H2D child was prototyped to cut dataloader wait, but this
-    container blocks CUDA IPC (``pidfd_getfd: Operation not permitted``) and
-    ``/dev/shm`` is too small for CPU tensor sharing — so decode stays here.
+    - large shm → ``share_memory_`` + optional in-child pin (zero-copy to train)
+    - tiny shm → anonymous memfd; parent materializes pinned packed buffers
+
+    Override with ``MDL_HOST_PREPARE_IPC=share|memfd|auto``.
     """
 
     _SENTINEL = None
@@ -2305,8 +2408,24 @@ class _ProcessHostPrepareIterator:
             raise ValueError("host_prepare_prefetch queue_size must be positive")
         del coalesce_pinned_tensors
         self._pin_memory = bool(pin_memory)
+        self._ipc_mode = _host_prepare_ipc_mode()
         self._closed = False
         _configure_host_prepare_tensor_sharing()
+        if self._ipc_mode == "share":
+            try:
+                import torch.multiprocessing as torch_mp
+
+                # Match the child: file_system under /dev/shm (or TMPDIR).
+                torch_mp.set_sharing_strategy("file_system")
+            except (RuntimeError, ValueError, AttributeError):
+                pass
+        if is_main_process():
+            logger.info(
+                "host-prepare IPC mode=%s (shm_free=%.1fMiB, pin_memory=%s)",
+                self._ipc_mode,
+                (_dev_shm_free_bytes() or 0) / (1024 * 1024),
+                self._pin_memory,
+            )
         self._ctx = mp.get_context("spawn")
         self._queue: Any = self._ctx.Queue(maxsize=int(queue_size))
         self._process = self._ctx.Process(
@@ -2321,6 +2440,8 @@ class _ProcessHostPrepareIterator:
                 "shard_world_size": shard_world_size,
                 "coalesce_tensors": True,
                 "include_group_id": include_group_id,
+                "ipc_mode": self._ipc_mode,
+                "pin_memory": self._pin_memory,
             },
             name=f"mdl-host-prepare-{split_name}",
             daemon=False,
@@ -2349,11 +2470,20 @@ class _ProcessHostPrepareIterator:
         if isinstance(item, BaseException):
             self.close()
             raise RuntimeError("host prepare process failed") from item
+        if isinstance(item, FeatureBatch):
+            # Shared-memory path: child already pinned when CUDA was available.
+            if self._pin_memory and item._packed_buffers:
+                if all(buffer.is_pinned() for buffer in item._packed_buffers):
+                    return item
+                return pin_feature_batch(item, coalesce_tensors=False)
+            if self._pin_memory:
+                return pin_feature_batch(item, coalesce_tensors=False)
+            return item
         if not isinstance(item, dict):
             self.close()
             raise TypeError(
                 f"host prepare process returned {type(item).__name__}, "
-                "expected memfd payload dict"
+                "expected FeatureBatch or memfd payload dict"
             )
         return _load_feature_batch_from_ipc(item, pin_memory=self._pin_memory)
 
@@ -3169,6 +3299,18 @@ def _prepare_forward_model(
 ) -> nn.Module:
     """Wrap DDP before compile so reducer buckets remain overlap boundaries."""
 
+    # CUDA-graph the dense RankMixer stack before DDP installs reducer hooks on
+    # parameters; make_graphed_callables bwd capture is incompatible with those hooks.
+    if (
+        bool(getattr(config.runtime, "cuda_graph_backbone", False))
+        and context.device.type == "cuda"
+        and hasattr(base_model, "prewarm_cuda_graph_backbone")
+    ):
+        base_model.prewarm_cuda_graph_backbone(context.device)
+        # Freeze further captures before DDP reducer hooks are installed.
+        if hasattr(base_model, "_cuda_graph_backbone_capture_allowed"):
+            base_model._cuda_graph_backbone_capture_allowed = False
+
     forward_model: nn.Module = base_model
     if context.enabled:
         _exclude_sparse_parameters_from_ddp(base_model, ddp_ignored)
@@ -3208,7 +3350,13 @@ def _autocast_context(config: AppConfig, device: torch.device):
     dtype = _autocast_dtype(config, device)
     if dtype is None:
         return nullcontext()
-    return torch.amp.autocast(device_type=device.type, dtype=dtype)
+    # make_graphed_callables forbids autocast caching during capture/replay.
+    cache_enabled = not bool(getattr(config.runtime, "cuda_graph_backbone", False))
+    return torch.amp.autocast(
+        device_type=device.type,
+        dtype=dtype,
+        cache_enabled=cache_enabled,
+    )
 
 
 def _make_grad_scaler(config: AppConfig, device: torch.device):
@@ -3983,12 +4131,14 @@ def train_mdl(
                 window_padded_token_slots = 0
                 window_loss_numerator = None
                 window_loss_denominator = None
-                window_step_started = perf_counter() if observing else 0.0
+                # Always time the window: Train-step logs need wait_ratio even
+                # when no benchmark step_observer is attached.
+                window_step_started = perf_counter()
                 window_dataloader_wait_seconds = 0.0
                 window_h2d_seconds = 0.0
                 window_forward_seconds = 0.0
                 window_backward_seconds = 0.0
-            dataloader_started = perf_counter() if observing else 0.0
+            dataloader_started = perf_counter()
             trace_batch: FeatureBatch | None = None
             collect_batch_stats = observing or (
                 log_steps
@@ -4015,9 +4165,7 @@ def train_mdl(
                 except StopIteration:
                     local_batch = None
                 local_batch_on_device = batches_on_device
-            dataloader_wait_seconds = (
-                perf_counter() - dataloader_started if observing else 0.0
-            )
+            dataloader_wait_seconds = perf_counter() - dataloader_started
             rank_active = local_batch is not None
             active_ranks = _active_rank_count(context, rank_active)
             if active_ranks == 0:
@@ -4261,6 +4409,10 @@ def train_mdl(
                     if window_padded_token_slots > 0
                     else 0.0
                 )
+                window_step_seconds = max(
+                    perf_counter() - window_step_started, 1.0e-9
+                )
+                wait_ratio = window_dataloader_wait_seconds / window_step_seconds
                 print(
                     f"Train step | step={steps} | loss={last_loss:.6f} "
                     f"active_ranks={window_active_ranks}/{context.world_size} "
@@ -4269,6 +4421,8 @@ def train_mdl(
                     f"runtime_effective_global_batch="
                     f"{runtime_effective_global_batch} "
                     f"padding_ratio={padding_ratio:.4f} "
+                    f"dataloader_wait_s={window_dataloader_wait_seconds:.4f} "
+                    f"dataloader_wait_ratio={wait_ratio:.4f} "
                     f"sparse_local_rows={sparse_sync_stats.local_rows} "
                     f"sparse_global_rows={sparse_sync_stats.global_rows} "
                     f"sparse_payload_mib={payload_mib:.2f}"

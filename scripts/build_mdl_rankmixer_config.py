@@ -1133,7 +1133,7 @@ def build_name_estimate_report(sample: Mapping[str, Any]) -> dict[str, Any]:
             "invalid_request_time_layout": 0,
             "sku_alignment_mismatches": 0,
             "sequence_lengths_after_request_filter": sequence_lengths,
-            # Ignored by auto-scene generation, but retained so the common
+            # Ignored by fine sibling generation, but retained so the common
             # report contract remains structurally valid.
             "scene_values": [{"scene_id": 0, "count": 1}],
         },
@@ -1462,6 +1462,229 @@ def _coarse_scenario_prior_feature(logical_name: str) -> dict[str, Any]:
             "out_of_range": "error",
         },
     }
+
+
+COARSE_ADAPTER_SCENE_KEYS = (
+    "search_scene_ids",
+    "coarse_scene_index_column",
+    "coarse_scene_prior_id_column",
+    "coarse_scene_raw_column",
+    "unlisted_scene_policy",
+)
+PRODUCTION_COARSE_CONFIG_NAMES = (
+    "rankmixer.yaml",
+    "mdl_rankmixer.yaml",
+    "onetrans.yaml",
+    "mdl_onetrans.yaml",
+)
+
+
+def fine_config_name(coarse_name: str) -> str:
+    """Return the fine-grained sibling filename for a coarse production YAML."""
+
+    path = Path(coarse_name)
+    return f"{path.stem}_fine{path.suffix}"
+
+
+def derive_fine_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive a fine-grained sibling from a coarse production payload.
+
+    Preserves hand-tuned capacity, embedding, and reader settings. Only rewrites
+    scenario routing, coarse adapter options, and MDL scenario-prior features.
+    """
+
+    result = deepcopy(dict(payload))
+    data = result.get("data")
+    if not isinstance(data, Mapping):
+        raise ValueError("payload.data is required")
+    for split_name in ("train", "test"):
+        split = data.get(split_name)
+        if not isinstance(split, Mapping):
+            continue
+        adapter = split.get("adapter")
+        if not isinstance(adapter, Mapping):
+            continue
+        options = adapter.get("options")
+        if not isinstance(options, dict):
+            raise ValueError(f"data.{split_name}.adapter.options must be a mapping")
+        for key in COARSE_ADAPTER_SCENE_KEYS:
+            options.pop(key, None)
+
+    result["scenarios"] = {
+        "names": [AUTO_SCENARIO_NAME],
+        "source": "scene_id",
+        "source_encoding": "raw",
+        "auto_discover": True,
+        "max_discovered": 256,
+    }
+
+    features = result.get("features")
+    if not isinstance(features, list):
+        raise ValueError("payload.features must be a list")
+    by_name = {
+        str(feature.get("name")): feature
+        for feature in features
+        if isinstance(feature, Mapping)
+    }
+    has_coarse_priors = bool(INDEPENDENT_COARSE_SCENARIO_PRIORS & set(by_name))
+    if has_coarse_priors:
+        missing = sorted(INDEPENDENT_COARSE_SCENARIO_PRIORS - set(by_name))
+        if missing:
+            raise ValueError(
+                "coarse MDL payload is missing scenario priors: " + ", ".join(missing)
+            )
+        scene = by_name.get("scene_id_hn")
+        if not isinstance(scene, Mapping):
+            raise ValueError("scene_id_hn feature is required to derive fine prior")
+        encoding = scene.get("encoding")
+        if not isinstance(encoding, Mapping):
+            raise ValueError("scene_id_hn.encoding is required")
+        fine_prior = {
+            "name": "scenario_prior_scene_id_hn",
+            "kind": "categorical",
+            "source": "scene_id_hn",
+            "embedding_scope": "scenario",
+            "embedding_dim": int(scene["embedding_dim"]),
+            "encoding": {
+                "type": str(encoding["type"]),
+                "num_buckets": int(encoding["num_buckets"]),
+                "padding_id": int(encoding.get("padding_id", 0)),
+                "share_embedding": True,
+                "share_with": "scene_id_hn",
+            },
+        }
+        new_features: list[Any] = []
+        inserted = False
+        for feature in features:
+            if (
+                isinstance(feature, Mapping)
+                and feature.get("name") in INDEPENDENT_COARSE_SCENARIO_PRIORS
+            ):
+                if not inserted and feature.get("name") == SEARCH_PRIOR_FEATURE:
+                    new_features.append(fine_prior)
+                    inserted = True
+                continue
+            new_features.append(feature)
+        if not inserted:
+            new_features.append(fine_prior)
+        result["features"] = new_features
+
+        tokenization = result.get("tokenization")
+        if not isinstance(tokenization, dict):
+            raise ValueError("payload.tokenization is required for MDL fine derivation")
+        scenario_tokens = tokenization.get("scenario_tokens")
+        if not isinstance(scenario_tokens, list) or not scenario_tokens:
+            raise ValueError("MDL coarse payload must declare scenario_tokens")
+        search_token = next(
+            (
+                token
+                for token in scenario_tokens
+                if isinstance(token, Mapping) and token.get("name") == "search"
+            ),
+            None,
+        )
+        if not isinstance(search_token, Mapping):
+            raise ValueError("MDL coarse payload must declare a search scenario token")
+        important = list(search_token["important_inputs"])
+        shared_priors = list(MDL_SCENARIO_SHARED_PRIORS)
+        tokenization["scenario_tokens"] = [
+            {
+                "name": AUTO_SCENARIO_NAME,
+                "important_inputs": important,
+                "prior_inputs": ["scenario_prior_scene_id_hn", *shared_priors],
+            },
+            {
+                "name": "global",
+                "important_inputs": list(important),
+                "prior_inputs": list(shared_priors),
+            },
+        ]
+
+    config = AppConfig.from_mapping(result)
+    config.validate()
+    return result
+
+
+def render_fine_sibling(coarse_text: str, payload: Mapping[str, Any], *, coarse_name: str) -> str:
+    """Render a fine-grained sibling YAML, preserving production header style."""
+
+    header_lines: list[str] = []
+    for line in coarse_text.splitlines():
+        if line.startswith("#") or (not line.strip() and header_lines):
+            header_lines.append(line)
+            continue
+        break
+    rewritten: list[str] = []
+    for line in header_lines:
+        if "Scenarios:" in line:
+            rewritten.append(
+                "# Scenarios: fine-grained scene_id discovery from train "
+                "(names=[__auto__], max_discovered=256); no coarse "
+                "search/recommendation routing."
+            )
+            continue
+        if line.startswith("# Production training config for "):
+            model = line.removeprefix("# Production training config for ").split(";", 1)[0]
+            rewritten.append(
+                f"# Fine sibling of configs/{coarse_name} ({model}); "
+                "default training still uses the coarse YAML."
+            )
+            continue
+        if line.startswith("# Standalone 2×H100 production training config for "):
+            model = line.removeprefix(
+                "# Standalone 2×H100 production training config for "
+            ).rstrip(".")
+            rewritten.append(
+                f"# Fine sibling of configs/{coarse_name} ({model}); "
+                "default training still uses the coarse YAML."
+            )
+            continue
+        rewritten.append(line)
+    if rewritten and rewritten[-1].strip():
+        rewritten.append("")
+    body = yaml.safe_dump(
+        dict(payload),
+        sort_keys=False,
+        allow_unicode=True,
+        width=100,
+    )
+    return "\n".join(rewritten) + body
+
+
+def write_fine_siblings(
+    configs_dir: Path,
+    *,
+    dry_run: bool = False,
+) -> list[Path]:
+    """Derive and write ``*_fine.yaml`` siblings for the four production models."""
+
+    written: list[Path] = []
+    for coarse_name in PRODUCTION_COARSE_CONFIG_NAMES:
+        coarse_path = configs_dir / coarse_name
+        if not coarse_path.is_file():
+            raise FileNotFoundError(f"missing coarse production config: {coarse_path}")
+        coarse_text = coarse_path.read_text(encoding="utf-8")
+        coarse_payload = yaml.safe_load(coarse_text)
+        if not isinstance(coarse_payload, Mapping):
+            raise ValueError(f"{coarse_path} must contain a mapping")
+        fine_payload = derive_fine_payload(coarse_payload)
+        rendered = render_fine_sibling(
+            coarse_text,
+            fine_payload,
+            coarse_name=coarse_name,
+        )
+        output = configs_dir / fine_config_name(coarse_name)
+        if dry_run:
+            sys.stdout.write(f"--- {output} ---\n")
+            sys.stdout.write(rendered)
+            if not rendered.endswith("\n"):
+                sys.stdout.write("\n")
+        else:
+            temporary = output.with_suffix(output.suffix + ".tmp")
+            temporary.write_text(rendered, encoding="utf-8")
+            temporary.replace(output)
+        written.append(output)
+    return written
 
 
 def _reader_config(*, training: bool) -> dict[str, Any]:
@@ -2745,7 +2968,7 @@ def main() -> int:
         default="mdl_rankmixer",
         help="Model surface to generate (default: mdl_rankmixer).",
     )
-    sizing = parser.add_mutually_exclusive_group(required=True)
+    sizing = parser.add_mutually_exclusive_group(required=False)
     sizing.add_argument("--report", type=Path)
     sizing.add_argument(
         "--estimate-from-names",
@@ -2795,8 +3018,38 @@ def main() -> int:
             "configs should omit this and use fixed search/recommendation routing."
         ),
     )
+    parser.add_argument(
+        "--write-fine-siblings",
+        action="store_true",
+        help=(
+            "Derive configs/*_fine.yaml from the four coarse production "
+            "YAMLs under --configs-dir (default: configs/). Skips normal build."
+        ),
+    )
+    parser.add_argument(
+        "--configs-dir",
+        type=Path,
+        default=Path("configs"),
+        help="Directory containing coarse production YAMLs (default: configs/).",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.write_fine_siblings:
+        try:
+            written = write_fine_siblings(args.configs_dir, dry_run=args.dry_run)
+        except (OSError, TypeError, ValueError, yaml.YAMLError) as error:
+            parser.error(str(error))
+        print(
+            json.dumps(
+                {"wrote": [str(path) for path in written]},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 0
+    if args.report is None and not args.estimate_from_names:
+        parser.error("one of the arguments --report --estimate-from-names is required")
     try:
         sample = _load_mapping(args.sample, kind="yaml")
         report = (
