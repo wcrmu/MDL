@@ -23,6 +23,11 @@ def _rowwise_adagrad_kernel():
     import triton
     import triton.language as tl
 
+    # Nested @triton.jit kernels resolve annotations (e.g. ``tl.constexpr``)
+    # against this module's globals, not the enclosing function locals. Bind
+    # ``tl`` here so compile does not raise ``NameError('tl is not defined')``.
+    globals()["tl"] = tl
+
     @triton.jit
     def _rowwise_adagrad_update_kernel(
         param_ptr,
