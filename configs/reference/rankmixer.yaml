@@ -1,5 +1,0 @@
-# Architecture smoke profile; replace feature/data scale for paper experiments.
-extends: default.yaml
-
-model:
-  name: rankmixer

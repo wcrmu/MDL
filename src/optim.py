@@ -10,6 +10,99 @@ import torch
 from torch import Tensor, nn
 
 
+_ROWWISE_ADAGRAD_KERNEL = None
+
+
+def _rowwise_adagrad_kernel():
+    """Lazily compile the Triton kernel so CPU-only imports stay lightweight."""
+
+    global _ROWWISE_ADAGRAD_KERNEL
+    if _ROWWISE_ADAGRAD_KERNEL is not None:
+        return _ROWWISE_ADAGRAD_KERNEL
+
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _rowwise_adagrad_update_kernel(
+        param_ptr,
+        acc_ptr,
+        rows_ptr,
+        vals_ptr,
+        n_touched,
+        dim,
+        lr,
+        eps,
+        stride_param,
+        stride_vals,
+        BLOCK: tl.constexpr,
+    ):
+        """One program per touched row: update accumulator and embedding row."""
+
+        pid = tl.program_id(0)
+        if pid >= n_touched:
+            return
+        row = tl.load(rows_ptr + pid)
+        offs = tl.arange(0, BLOCK)
+        mask = offs < dim
+        vals = tl.load(vals_ptr + pid * stride_vals + offs, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        sq_mean = tl.sum(vals * vals, axis=0) / dim
+        acc = tl.load(acc_ptr + row) + sq_mean
+        tl.store(acc_ptr + row, acc)
+        denom = tl.sqrt(acc) + eps
+        upd = vals / denom
+        old = tl.load(param_ptr + row * stride_param + offs, mask=mask).to(tl.float32)
+        tl.store(param_ptr + row * stride_param + offs, old - lr * upd, mask=mask)
+
+    _ROWWISE_ADAGRAD_KERNEL = _rowwise_adagrad_update_kernel
+    return _ROWWISE_ADAGRAD_KERNEL
+
+
+def fused_rowwise_adagrad_update(
+    parameter: torch.Tensor,
+    accumulator: torch.Tensor,
+    rows: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    lr: float,
+    eps: float,
+) -> None:
+    """Fused row-wise Adagrad update for one embedding table (Triton).
+
+    ``rows`` must be unique (coalesced sparse grads). ``values`` may be BF16 or
+    FP32; accumulators stay FP32. Parameter may be BF16 or FP32.
+    """
+
+    import triton
+
+    n_touched = int(rows.numel())
+    if n_touched == 0:
+        return
+    dim = int(parameter.shape[1])
+    rows = rows.contiguous()
+    if values.dtype == torch.float32:
+        vals = values.contiguous()
+    else:
+        vals = values.float().contiguous()
+    block = triton.next_power_of_2(dim)
+    kernel = _rowwise_adagrad_kernel()
+    kernel[(n_touched,)](
+        parameter,
+        accumulator,
+        rows,
+        vals,
+        n_touched,
+        dim,
+        float(lr),
+        float(eps),
+        parameter.stride(0),
+        vals.stride(0),
+        BLOCK=block,
+    )
+
+
 class ShardedAdagrad(torch.optim.Optimizer):
     """Exact row-sparse Adagrad over already-local embedding parameters.
 
@@ -208,7 +301,6 @@ class ShardedRowWiseAdagrad(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        fused_update = None
         for group in self.param_groups:
             lr = float(group["lr"])
             lr_decay = float(group["lr_decay"])
@@ -249,13 +341,7 @@ class ShardedRowWiseAdagrad(torch.optim.Optimizer):
                 # Fused Triton path collapses ~4 tiny launches/table into one.
                 # Coalesced grads guarantee unique rows (no accumulator races).
                 if parameter.is_cuda and accumulator.is_cuda:
-                    if fused_update is None:
-                        from .rowwise_adagrad_kernels import (
-                            fused_rowwise_adagrad_update,
-                        )
-
-                        fused_update = fused_rowwise_adagrad_update
-                    fused_update(
+                    fused_rowwise_adagrad_update(
                         parameter,
                         accumulator,
                         rows,

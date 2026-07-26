@@ -1285,7 +1285,7 @@ class AxisSeparatedAdaptTest(unittest.TestCase):
                 stable_group_order=1,
             ),
         )
-        with self.assertLogs("src.agg_direct", level="WARNING") as logs:
+        with self.assertLogs("src.dataloader", level="WARNING") as logs:
             events = registry.observe_pack(blocks)
         self.assertEqual(events, 1)
         stats = registry.snapshot_stats()

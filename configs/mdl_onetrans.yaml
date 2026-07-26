@@ -52,6 +52,8 @@ data:
       # CPU launch path; host prefetch remains enabled but CUDA prefetch does not.
       device_prefetch_batches: 0
       deduplicate_request_features: true
+      agg_direct_mode: direct
+      host_prepare_prefetch: 3
       validate_prehashed_nonzero: false
       trusted_input: true
       shuffle_buffer_rows: 512
@@ -838,6 +840,8 @@ data:
       coalesce_pinned_tensors: true
       device_prefetch_batches: 0
       deduplicate_request_features: true
+      agg_direct_mode: direct
+      host_prepare_prefetch: 3
       validate_prehashed_nonzero: false
       trusted_input: true
       hdfs_op_timeout: 30

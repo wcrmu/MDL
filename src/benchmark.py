@@ -238,7 +238,7 @@ def _process_children_peak_rss_bytes() -> int:
 
 def _direct_pipeline_stats_payload() -> dict[str, Any]:
     try:
-        from .agg_direct import get_direct_pipeline_stats
+        from .dataloader import get_direct_pipeline_stats
 
         return get_direct_pipeline_stats().as_dict()
     except Exception:

@@ -1,5 +1,0 @@
-# Architecture smoke profile with paper-aligned MDL extra embeddings.
-extends: default.yaml
-
-model:
-  name: mdl_rankmixer

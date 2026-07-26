@@ -33,14 +33,26 @@ from .config import (
     QuickEvalConfig,
     ReaderConfig,
 )
-from .agg_direct import (
+from .checkpoint import load_model_checkpoint, save_model_checkpoint
+from .dataloader import (
+    FeatureBatch,
     PreparedAxisBatch,
     PreparedBatchTable,
     SourceRegistry,
+    _coalesce_feature_batch,
+    _column_array,
+    _require_pyarrow,
+    _safe_table_take,
+    axis_batch_to_feature_batch,
     build_packed_request_plan,
     build_request_deduplication_from_pack,
+    discover_scenario_values,
+    iter_adapted_axis_bundles,
+    iter_flat_tables,
     iter_length_bucketed_packs,
     materialize_packed_blocks,
+    move_feature_batch,
+    pin_feature_batch,
     prepare_packed_arrow_axis_batch,
     prepare_packed_axis_batch,
     publish_direct_pipeline_stats,
@@ -48,20 +60,6 @@ from .agg_direct import (
     request_group_blocks_from_arrow_source,
     request_group_blocks_from_axis_bundle,
     reset_direct_pipeline_stats,
-)
-from .checkpoint import load_model_checkpoint, save_model_checkpoint
-from .dataloader import (
-    FeatureBatch,
-    _coalesce_feature_batch,
-    _column_array,
-    _require_pyarrow,
-    _safe_table_take,
-    axis_batch_to_feature_batch,
-    discover_scenario_values,
-    iter_adapted_axis_bundles,
-    iter_flat_tables,
-    move_feature_batch,
-    pin_feature_batch,
     resolve_auto_scenarios,
     run_feature_cardinality_audit,
     table_to_feature_batch,

@@ -21,3 +21,6 @@ requirements.txt
 /sample.yaml
 /data format.md
 /A100_8X80G*
+
+# Reference YAML snapshots — keep local only.
+/configs/reference/
