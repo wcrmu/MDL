@@ -3147,6 +3147,42 @@ def _non_blocking_transfer(config: AppConfig, split_name: str, device: torch.dev
     return _split_reader(config, split_name).pin_memory
 
 
+def _sequence_lengths_for_batch_rows(value: dict[str, Any]) -> Tensor | None:
+    """Return per-row sequence lengths aligned to the batch (after row_indices)."""
+
+    lengths = value.get("lengths")
+    fields = value.get("fields")
+    # Categorical bags also carry ``lengths`` but are feature lookups, not
+    # sequence events. Requiring the sequence ``fields`` mapping keeps the
+    # token numerator aligned with the padded-slot denominator.
+    if not isinstance(lengths, Tensor) or not isinstance(fields, dict):
+        return None
+    row_indices = value.get("row_indices")
+    if isinstance(row_indices, Tensor):
+        lengths = lengths.index_select(0, row_indices.to(lengths.device).long())
+    return lengths
+
+
+def _sequence_padded_width(value: dict[str, Any], lengths: Tensor) -> int:
+    """Rectangular pad width for one sequence feature.
+
+    Prefer the dense ``[rows, pad, ...]`` field width. When fields are compact
+    1D (direct-path dim-1 tensors), fall back to ``max(lengths)`` so the
+    denominator never under-counts the numerator (which previously made
+    ``padding_ratio`` negative).
+    """
+
+    padded_length = 0
+    fields = value.get("fields")
+    if isinstance(fields, dict):
+        for field_value in fields.values():
+            if isinstance(field_value, Tensor) and field_value.dim() >= 2:
+                padded_length = max(padded_length, int(field_value.size(1)))
+    if lengths.numel():
+        padded_length = max(padded_length, int(lengths.max().item()))
+    return padded_length
+
+
 def _batch_input_token_count(batch: FeatureBatch) -> int:
     """Count valid sequence events without materializing padding masks.
 
@@ -3160,17 +3196,10 @@ def _batch_input_token_count(batch: FeatureBatch) -> int:
     for value in batch.features.values():
         if not isinstance(value, dict):
             continue
-        lengths = value.get("lengths")
-        fields = value.get("fields")
-        # Categorical bags also carry ``lengths`` but are feature lookups, not
-        # sequence events. Requiring the sequence ``fields`` mapping keeps the
-        # token numerator aligned with the padded-slot denominator.
-        if not isinstance(lengths, Tensor) or not isinstance(fields, dict):
+        lengths = _sequence_lengths_for_batch_rows(value)
+        if lengths is None:
             continue
         found_sequence = True
-        row_indices = value.get("row_indices")
-        if isinstance(row_indices, Tensor):
-            lengths = lengths.index_select(0, row_indices.to(lengths.device).long())
         total += int(lengths.detach().sum().cpu().item())
     if found_sequence:
         return total
@@ -3185,21 +3214,12 @@ def _batch_padded_token_slots(batch: FeatureBatch) -> int:
     for value in batch.features.values():
         if not isinstance(value, dict):
             continue
-        lengths = value.get("lengths")
-        fields = value.get("fields")
-        if not isinstance(lengths, Tensor) or not isinstance(fields, dict):
+        lengths = _sequence_lengths_for_batch_rows(value)
+        if lengths is None:
             continue
         found_sequence = True
-        padded_length = 0
-        for field_value in fields.values():
-            if isinstance(field_value, Tensor) and field_value.dim() >= 2:
-                padded_length = int(field_value.size(1))
-                break
-        row_indices = value.get("row_indices")
-        logical_rows = (
-            int(row_indices.numel()) if isinstance(row_indices, Tensor) else int(lengths.numel())
-        )
-        total += logical_rows * padded_length
+        padded_length = _sequence_padded_width(value, lengths)
+        total += int(lengths.numel()) * padded_length
     if found_sequence:
         return total
     return int(batch.scenario_id.size(0))
@@ -4123,7 +4143,10 @@ def train_mdl(
                 last_loss = float(last_loss_tensor.float().cpu().item())
                 payload_mib = sparse_sync_stats.logical_payload_bytes / (1024 ** 2)
                 padding_ratio = (
-                    1.0 - window_input_tokens / window_padded_token_slots
+                    max(
+                        0.0,
+                        1.0 - window_input_tokens / window_padded_token_slots,
+                    )
                     if window_padded_token_slots > 0
                     else 0.0
                 )
@@ -4330,6 +4353,33 @@ class _StreamingHistogramAUC:
         return positives + negatives, positives, negatives
 
 
+class _StreamingCOPC:
+    """Calibration metric: COPC = sum(pred) / sum(label). Closer to 1 is better."""
+
+    def __init__(self) -> None:
+        # [sum_predictions, sum_labels]
+        self.totals = torch.zeros(2, dtype=torch.float64)
+
+    def update(self, scores: Tensor, labels: Tensor) -> None:
+        scores = scores.detach().float().flatten().cpu()
+        labels = labels.detach().float().flatten().cpu()
+        if scores.numel() != labels.numel():
+            raise ValueError("COPC scores and labels must have the same length")
+        if not scores.numel():
+            return
+        if not bool(torch.isfinite(scores).all()):
+            raise ValueError("COPC scores must be finite")
+        self.totals[0] += float(scores.sum().item())
+        self.totals[1] += float(labels.sum().item())
+
+    def compute(self) -> float | None:
+        predicted = float(self.totals[0].item())
+        labeled = float(self.totals[1].item())
+        if labeled <= 0.0:
+            return None
+        return predicted / labeled
+
+
 def _all_reduce_cpu_sum_(tensor: Tensor, context: DistributedContext) -> None:
     """Sum a CPU metric tensor even when the data process group is NCCL."""
 
@@ -4360,6 +4410,16 @@ def _reduce_evaluation_histograms(
     row_count = torch.tensor(rows, dtype=torch.long)
     _all_reduce_cpu_sum_(row_count, context)
     return int(row_count.item())
+
+
+def _reduce_evaluation_copc(
+    context: DistributedContext,
+    accumulators: list[_StreamingCOPC],
+) -> None:
+    if not context.enabled:
+        return
+    for accumulator in accumulators:
+        _all_reduce_cpu_sum_(accumulator.totals, context)
 
 
 def _run_training_quick_eval(
@@ -4402,6 +4462,7 @@ def _run_training_quick_eval(
         [_StreamingHistogramAUC(quick_eval.auc_bins)]
         for _ in config.task_names
     ]
+    copc_accumulators = [_StreamingCOPC() for _ in config.task_names]
     rows = 0
     local_batches = 0
     batch_iterator: Iterator[FeatureBatch] | None = None
@@ -4516,14 +4577,20 @@ def _run_training_quick_eval(
                         task_scores,
                         task_labels,
                     )
+                    copc_accumulators[task_index].update(
+                        task_scores,
+                        task_labels,
+                    )
 
         rows = _reduce_evaluation_histograms(context, accumulators, rows)
+        _reduce_evaluation_copc(context, copc_accumulators)
         metrics: dict[str, dict[str, float | int | None]] = {}
         for task_index, task_name in enumerate(config.task_names):
             accumulator = accumulators[task_index][0]
             examples, positives, negatives = accumulator.counts()
             metrics[task_name] = {
                 "auc": accumulator.compute(),
+                "copc": copc_accumulators[task_index].compute(),
                 "examples": examples,
                 "positives": positives,
                 "negatives": negatives,
@@ -4558,9 +4625,12 @@ def _print_training_quick_eval(
     )
     for task_name, metrics in result.metrics.items():
         auc = metrics["auc"]
+        copc = metrics.get("copc")
         formatted_auc = "NA" if auc is None else f"{float(auc):.8f}"
+        formatted_copc = "NA" if copc is None else f"{float(copc):.8f}"
         print(
             f"Quick eval task | step={step} task={task_name} auc={formatted_auc} "
+            f"copc={formatted_copc} "
             f"examples={metrics['examples']} positives={metrics['positives']} "
             f"negatives={metrics['negatives']}"
         )

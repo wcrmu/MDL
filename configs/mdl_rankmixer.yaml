@@ -49,7 +49,8 @@ data:
       pin_memory: true
       shard_unit: row_group
       eager_schema_validation: sample
-      schema_validation_samples: 64
+      schema_validation_samples: 1
+      cardinality_audit_raw_rows: 1
       coalesce_pinned_tensors: true
       # Full-width bags make concurrent H2D/data production contend with the
       # CPU launch path; host prefetch remains enabled but CUDA prefetch does not.
@@ -839,7 +840,8 @@ data:
       pin_memory: true
       shard_unit: row_group
       eager_schema_validation: sample
-      schema_validation_samples: 64
+      schema_validation_samples: 1
+      cardinality_audit_raw_rows: 1
       coalesce_pinned_tensors: true
       device_prefetch_batches: 0
       deduplicate_request_features: true

@@ -2091,7 +2091,7 @@ class DDPConfig:
 
 @dataclass(frozen=True)
 class QuickEvalConfig:
-    """Small, periodic AUC evaluation performed inside the training loop."""
+    """Small, periodic AUC/COPC evaluation performed inside the training loop."""
 
     enabled: bool = True
     # Run after every N completed optimizer steps.

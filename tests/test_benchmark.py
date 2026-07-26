@@ -341,6 +341,31 @@ class TraceCollectorTest(unittest.TestCase):
         self.assertEqual(_batch_input_token_count(batch), 6)
         self.assertEqual(_batch_padded_token_slots(batch), 12)
 
+    def test_sequence_token_metrics_handle_compact_1d_fields(self) -> None:
+        """1D compact fields must not under-count pad slots (negative ratio)."""
+
+        row_indices = torch.tensor([0, 0, 1, 1])
+        batch = FeatureBatch(
+            features={
+                "history": {
+                    # Direct-path dim-1 dense fields stay compact 1D.
+                    "fields": {"ts": torch.arange(6, dtype=torch.float32)},
+                    "lengths": torch.tensor([2, 1]),
+                    "row_indices": row_indices,
+                },
+            },
+            labels=None,
+            label_mask=None,
+            scenario_id=torch.zeros(4, dtype=torch.long),
+            group_id=[],
+        )
+        input_tokens = _batch_input_token_count(batch)
+        padded_slots = _batch_padded_token_slots(batch)
+        self.assertEqual(input_tokens, 6)
+        # Fall back to max(lengths)=2 → 4 rows * 2 slots.
+        self.assertEqual(padded_slots, 8)
+        self.assertGreaterEqual(padded_slots, input_tokens)
+
 
 class GpuUtilizationSamplerTest(unittest.TestCase):
     def test_visible_device_index_maps_to_physical_nvidia_smi_selector(self) -> None:

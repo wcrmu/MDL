@@ -89,6 +89,8 @@ class EvaluationMetricTest(unittest.TestCase):
         self.assertIs(staged_batches[1], batches[1])
         self.assertEqual(result.rows, 4)
         self.assertEqual(result.metrics["click"]["auc"], 1.0)
+        # logits [-2,2] + [-1,1] → sigmoid sums to ~2 with two positives → COPC≈1
+        self.assertAlmostEqual(float(result.metrics["click"]["copc"]), 1.0, places=5)
         self.assertEqual(result.metrics["click"]["examples"], 4)
         self.assertEqual(result.metrics["click"]["positives"], 2)
         self.assertEqual(result.metrics["click"]["negatives"], 2)
