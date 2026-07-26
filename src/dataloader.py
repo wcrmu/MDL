@@ -2892,6 +2892,34 @@ class _CoarseScenePlan:
         return frozenset({self.index_column, self.prior_id_column})
 
 
+def _adapter_derived_request_sources(options: Mapping[str, Any]) -> frozenset[str]:
+    """Adapter-derived request columns that are not listed in context_features.
+
+    Coarse-scene index/prior are computed from ``scene_id`` and written onto the
+    request axis, but the adapter plan conflict check forbids putting them in
+    ``context_features``. Direct-path readers must still treat them as
+    request-level (third bucket alongside context and candidate).
+    """
+
+    if options.get("search_scene_ids") is None:
+        return frozenset()
+    index_column = str(
+        options.get("coarse_scene_index_column", COARSE_SCENE_INDEX_COLUMN)
+    )
+    prior_id_column = str(
+        options.get("coarse_scene_prior_id_column", COARSE_SCENE_PRIOR_ID_COLUMN)
+    )
+    return frozenset({index_column, prior_id_column})
+
+
+def _adapter_request_level_sources(options: Mapping[str, Any]) -> set[str]:
+    """Sources tensorized from the request axis (context + derived request cols)."""
+
+    return {
+        str(source) for source in options.get("context_features", ())
+    } | set(_adapter_derived_request_sources(options))
+
+
 def _coarse_scene_plan(
     options: Mapping[str, Any],
     request_columns: set[str],
@@ -9343,12 +9371,6 @@ def axis_batch_to_feature_batch(
             f"{type(axis_batch).__name__}"
         )
     active_split = config.data.train if split is None else split
-    adapter_options = (
-        {} if active_split.adapter is None else active_split.adapter.options
-    )
-    context_sources = {
-        str(source) for source in adapter_options.get("context_features", ())
-    }
     validate_prehashed_nonzero = (
         active_split.reader.validate_prehashed_nonzero
     )
@@ -9360,18 +9382,23 @@ def axis_batch_to_feature_batch(
     bag_column_groups: dict[int, list[np.ndarray]] = {}
 
     for feature in config.features:
-        request_level = feature.source in context_sources
+        # Own the axis by payload presence, not context_features alone.
+        # Derived request columns (coarse_scene_prior_id, …) live only in
+        # request_values and are intentionally excluded from context_features.
+        in_request = feature.source in axis_batch.request_values
+        in_candidate = feature.source in axis_batch.candidate_values
+        if not in_request and not in_candidate:
+            raise ValueError(
+                f"feature source {feature.source!r} missing from direct "
+                "request and candidate axes"
+            )
+        # Broadcast metadata may appear on both axes; prefer candidate then.
+        request_level = in_request and not in_candidate
         source_values = (
             axis_batch.request_values
             if request_level
             else axis_batch.candidate_values
         )
-        if feature.source not in source_values:
-            axis_name = "request" if request_level else "candidate"
-            raise ValueError(
-                f"feature source {feature.source!r} missing from direct "
-                f"{axis_name} axis"
-            )
         values = source_values[feature.source]
         if feature.kind == "categorical":
             if feature.pooling == "mean":
@@ -9567,9 +9594,7 @@ def table_to_feature_batch(
     adapter_options = (
         {} if active_split.adapter is None else active_split.adapter.options
     )
-    context_sources = {
-        str(source) for source in adapter_options.get("context_features", ())
-    }
+    request_level_sources = _adapter_request_level_sources(adapter_options)
     if request_deduplication is _REQUEST_DEDUP_AUTO:
         request_take_columns: list[str] | None = None
         if active_split.reader.deduplicate_request_features:
@@ -9585,7 +9610,7 @@ def table_to_feature_batch(
                         if active_split.request_id is not None
                         else []
                     ),
-                    *context_sources,
+                    *request_level_sources,
                     *sequence_sources,
                 }
             )
@@ -9607,7 +9632,8 @@ def table_to_feature_batch(
     features: dict[str, Any] = {}
     for feature in config.features:
         request_level = (
-            request_row_indices is not None and feature.source in context_sources
+            request_row_indices is not None
+            and feature.source in request_level_sources
         )
         source_table = request_table if request_level else table
         if feature.kind == "categorical":
@@ -9886,7 +9912,7 @@ def move_feature_batch(
 
 
 # ---------------------------------------------------------------------------
-# Direct agg Arrow → FeatureBatch path (formerly src/agg_direct.py)
+# Direct agg Arrow → FeatureBatch path (merged from former src/agg_direct.py)
 #
 # RequestGroupBlock holds axis descriptors before shuffle/bucket/pack.
 # PreparedAxisBatch / SequenceSelectionPlan feed the Arrow-free tensorizer.

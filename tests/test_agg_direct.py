@@ -1,4 +1,7 @@
-"""Unit tests for agg_direct descriptor builders and batcher."""
+"""Unit tests for the direct agg path (descriptor builders and batcher).
+
+Implementation lives in ``src.dataloader`` (formerly ``src.agg_direct``).
+"""
 
 from __future__ import annotations
 
@@ -10,9 +13,12 @@ import numpy as np
 import pyarrow as pa
 import torch
 
-from src.agg_direct import (
+from src.dataloader import (
     AdaptedAxisBundle,
+    COARSE_SCENE_INDEX_COLUMN,
+    COARSE_SCENE_PRIOR_ID_COLUMN,
     RequestGroupBlock,
+    _adapter_request_level_sources,
     build_packed_request_plan,
     build_sequence_selection_plan,
     effective_bucket_length_from_pre_compaction,
@@ -365,7 +371,7 @@ class PackedPlanAndBatcherTest(unittest.TestCase):
         from pathlib import Path
         from unittest.mock import patch
 
-        from src.agg_direct import iter_length_bucketed_packs, materialize_packed_blocks
+        from src.dataloader import iter_length_bucketed_packs, materialize_packed_blocks
         from src.config import LengthBucketConfig, load_app_config
         from src.train import _iter_batch_tables, _iter_length_bucketed_tables
 
@@ -614,7 +620,7 @@ class SequenceSelectionPlanTest(unittest.TestCase):
         self.assertEqual(direct, legacy)
 
     def test_precomputed_request_dedup_matches_auto_plan(self) -> None:
-        from src.agg_direct import (
+        from src.dataloader import (
             build_packed_request_plan,
             build_request_deduplication_from_pack,
             materialize_packed_blocks,
@@ -645,7 +651,7 @@ class SequenceSelectionPlanTest(unittest.TestCase):
         self.assertEqual(row_indices.tolist(), [0, 0, 1])
 
     def test_multi_source_materialize_preserves_pack_order(self) -> None:
-        from src.agg_direct import materialize_packed_blocks
+        from src.dataloader import materialize_packed_blocks
 
         table0 = pa.table(
             {
@@ -683,9 +689,29 @@ class SequenceSelectionPlanTest(unittest.TestCase):
 
 # --- Axis-separated adapt / source registry / pack materialize ---
 
+class AdapterRequestLevelSourcesTest(unittest.TestCase):
+    def test_includes_coarse_scene_derived_columns(self) -> None:
+        sources = _adapter_request_level_sources(
+            {
+                "context_features": ["user_id", "scene_id"],
+                "search_scene_ids": [1, 2],
+            }
+        )
+        self.assertIn("user_id", sources)
+        self.assertIn("scene_id", sources)
+        self.assertIn(COARSE_SCENE_INDEX_COLUMN, sources)
+        self.assertIn(COARSE_SCENE_PRIOR_ID_COLUMN, sources)
+
+    def test_omits_derived_columns_without_search_scene_ids(self) -> None:
+        sources = _adapter_request_level_sources(
+            {"context_features": ["user_id"]}
+        )
+        self.assertEqual(sources, {"user_id"})
+
+
 class SourceRegistryTest(unittest.TestCase):
     def test_acquire_release_drops_payload(self) -> None:
-        from src.agg_direct import SourceRegistry
+        from src.dataloader import SourceRegistry
 
         registry = SourceRegistry()
         source_id = registry.put({"payload": 1})
@@ -700,7 +726,7 @@ class SourceRegistryTest(unittest.TestCase):
             registry.get(source_id)
 
     def test_release_zero_drops_unreferenced_put(self) -> None:
-        from src.agg_direct import SourceRegistry
+        from src.dataloader import SourceRegistry
 
         registry = SourceRegistry()
         source_id = registry.put("empty")
@@ -709,6 +735,165 @@ class SourceRegistryTest(unittest.TestCase):
 
 
 class AxisSeparatedAdaptTest(unittest.TestCase):
+    def test_direct_path_tensorizes_derived_request_columns(self) -> None:
+        """Derived request cols are not context_features but live on request axis."""
+
+        from dataclasses import replace
+        from pathlib import Path
+
+        from src.config import (
+            CategoricalEncodingConfig,
+            FeatureConfig,
+            ParquetAdapterConfig,
+            load_app_config,
+        )
+        from src.dataloader import axis_batch_to_feature_batch
+
+        root = Path(__file__).resolve().parents[1]
+        base = load_app_config(root / "configs" / "reference" / "default.yaml")
+        prior_feature = FeatureConfig(
+            name="scenario_search_prior_coarse_scene",
+            kind="categorical",
+            source=COARSE_SCENE_PRIOR_ID_COLUMN,
+            embedding_scope="scenario",
+            encoding=CategoricalEncodingConfig(
+                encoding="identity",
+                num_buckets=3,
+                padding_id=0,
+                out_of_range="error",
+            ),
+        )
+        sequence = replace(
+            base.sequences[0],
+            max_length=3,
+            truncation="head",
+            null_anchor_field="item_id",
+        )
+        adapter = ParquetAdapterConfig(
+            callable="unused:test",
+            options={
+                "context_features": [
+                    "user_id",
+                    "rankmixer_context_dense",
+                ],
+                "search_scene_ids": [21, 7],
+                "request_columns": ["scene_id"],
+            },
+        )
+        train_split = replace(
+            base.data.train,
+            request_id="request_id",
+            group_id="request_id",
+            adapter=adapter,
+            reader=replace(
+                base.data.train.reader,
+                deduplicate_request_features=True,
+            ),
+        )
+        config = replace(
+            base,
+            data=replace(base.data, train=train_split),
+            sequences=(sequence,),
+            features=tuple(base.features) + (prior_feature,),
+        )
+        self.assertNotIn(
+            COARSE_SCENE_PRIOR_ID_COLUMN,
+            set(adapter.options.get("context_features", ())),
+        )
+        self.assertIn(
+            COARSE_SCENE_PRIOR_ID_COLUMN,
+            _adapter_request_level_sources(adapter.options),
+        )
+
+        bundle = AdaptedAxisBundle(
+            n_candidates=3,
+            n_requests=2,
+            request_ids=("r0", "r1"),
+            candidate_to_request=np.asarray([0, 1, 0], dtype=np.int64),
+            request_features={
+                "user_id": ("u0", "u1"),
+                "rankmixer_context_dense": (
+                    tuple(float(index) for index in range(16)),
+                    tuple(float(index + 20) for index in range(16)),
+                ),
+                COARSE_SCENE_PRIOR_ID_COLUMN: (1, 2),
+            },
+            sequence_features={
+                "hist_item_id": (("i0", None, "i2"), ("i3", "i4")),
+                "hist_shop_id": (("s0", "s1", "s2"), ("s3", "s4")),
+                "hist_action": (("a0", "a1", "a2"), ("a3", "a4")),
+                "hist_age": ((0.1, 0.2, 0.3), (0.4, 0.5)),
+                "hist_time_delta": ((1.0, 2.0, 3.0), (4.0, 5.0)),
+            },
+            item_features={
+                "item_id": ("c0", "c1", "c2"),
+                "shop_id": ("cs0", "cs1", "cs2"),
+            },
+            label_features={"click": (0, 1, 0)},
+            label_mask_features={},
+            candidate_metadata={},
+            request_raw_rows=np.asarray([0, 0], dtype=np.int64),
+            candidate_raw_rows=np.asarray([0, 0, 0], dtype=np.int64),
+        )
+        blocks = request_group_blocks_from_axis_bundle(
+            bundle,
+            source_id=0,
+            sequences=config.sequences,
+        )
+        packed = build_packed_request_plan(blocks)
+        direct_input = prepare_packed_axis_batch(
+            {0: bundle},
+            packed,
+            sequences=config.sequences,
+            request_id_column="request_id",
+            candidate_request_columns=("request_id",),
+        )
+        self.assertIn(COARSE_SCENE_PRIOR_ID_COLUMN, direct_input.request_values)
+        self.assertNotIn(
+            COARSE_SCENE_PRIOR_ID_COLUMN, direct_input.candidate_values
+        )
+
+        all_item_values = {
+            value
+            for values in (("c0", "c1", "c2"), ("i0", "i2", "i3", "i4"))
+            for value in values
+        }
+        user_vocab = {"u0": 1, "u1": 2}
+        item_vocab = {
+            value: index + 1
+            for index, value in enumerate(sorted(all_item_values))
+        }
+        vocab_maps = {
+            "user_id": user_vocab,
+            "scenario_user_id": user_vocab,
+            "task_user_id": user_vocab,
+            "item_id": item_vocab,
+            "scenario_item_id": item_vocab,
+            "task_item_id": item_vocab,
+            "hist.item_id": item_vocab,
+        }
+        batch = axis_batch_to_feature_batch(
+            config,
+            direct_input,
+            vocab_maps,
+            split=train_split,
+        )
+        prior = batch.features["scenario_search_prior_coarse_scene"]
+        self.assertIsInstance(prior, dict)
+        self.assertIn("row_indices", prior)
+        # Request-axis payload (len == n_requests) + candidate broadcast indices.
+        self.assertEqual(tuple(prior["values"].shape), (2,))
+        self.assertEqual(tuple(prior["row_indices"].shape), (3,))
+        self.assertEqual(sorted(prior["values"].tolist()), [1, 2])
+        row_indices = torch.as_tensor(direct_input.request_row_indices)
+        torch.testing.assert_close(prior["row_indices"], row_indices, rtol=0, atol=0)
+        request_priors = [
+            int(value)
+            for value in direct_input.request_values[COARSE_SCENE_PRIOR_ID_COLUMN]
+        ]
+        expected = [request_priors[int(index)] for index in row_indices.tolist()]
+        self.assertEqual(prior["values"][prior["row_indices"]].tolist(), expected)
+
     def test_direct_feature_batch_matches_legacy_narrow_arrow(self) -> None:
         from dataclasses import replace
         from pathlib import Path
@@ -1029,7 +1214,7 @@ class AxisSeparatedAdaptTest(unittest.TestCase):
     def test_axis_bundle_skips_candidate_flat_and_matches_legacy_axes(self) -> None:
         from types import SimpleNamespace
 
-        from src.agg_direct import (
+        from src.dataloader import (
             AdaptedAxisBundle,
             build_packed_request_plan,
             materialize_packed_axis_bundles,
@@ -1174,7 +1359,7 @@ class AxisSeparatedAdaptTest(unittest.TestCase):
     def test_same_search_id_across_contexts_is_one_request_slot(self) -> None:
         from types import SimpleNamespace
 
-        from src.agg_direct import AdaptedAxisBundle
+        from src.dataloader import AdaptedAxisBundle
         from src.dataloader import adapt_mdl_rankmixer_parquet
 
         # Two context positions, same search_id A; three candidates.
@@ -1244,7 +1429,7 @@ class AxisSeparatedAdaptTest(unittest.TestCase):
         np.testing.assert_array_equal(bundle.candidate_to_request, [0, 0, 0])
 
     def test_source_registry_counts_cross_source_duplicate_request_ids(self) -> None:
-        from src.agg_direct import RequestGroupBlock, SourceRegistry
+        from src.dataloader import RequestGroupBlock, SourceRegistry
 
         registry = SourceRegistry()
         blocks = (
@@ -1297,7 +1482,7 @@ class AxisSeparatedAdaptTest(unittest.TestCase):
     def test_axis_complete_label_rejects_null_nonbinary_nan_bool(self) -> None:
         from types import SimpleNamespace
 
-        from src.agg_direct import AdaptedAxisBundle
+        from src.dataloader import AdaptedAxisBundle
         from src.dataloader import adapt_mdl_rankmixer_parquet
 
         base = {
@@ -1387,7 +1572,7 @@ class AxisSeparatedAdaptTest(unittest.TestCase):
     def test_direct_arrow_prepared_batch_matches_python_direct(self) -> None:
         """Oracle: pack-time Arrow gather equals AdaptedAxisBundle gather."""
 
-        from src.agg_direct import (
+        from src.dataloader import (
             prepare_packed_arrow_axis_batch,
             request_group_blocks_from_arrow_source,
         )
@@ -1493,7 +1678,7 @@ class AxisSeparatedAdaptTest(unittest.TestCase):
             },
         )
         arrow_source = adapt_mdl_rankmixer_parquet(table, context=arrow_context)
-        from src.agg_direct import ArrowAxisSource
+        from src.dataloader import ArrowAxisSource
 
         self.assertIsInstance(arrow_source, ArrowAxisSource)
         self.assertEqual(arrow_source.n_candidates, python_bundle.n_candidates)

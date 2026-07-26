@@ -39,6 +39,7 @@ from .dataloader import (
     PreparedAxisBatch,
     PreparedBatchTable,
     SourceRegistry,
+    _adapter_request_level_sources,
     _coalesce_feature_batch,
     _column_array,
     _require_pyarrow,
@@ -1239,9 +1240,7 @@ def _iter_batch_tables_direct(
         raise ValueError("reader.agg_direct_mode requires split.request_id")
 
     adapter_options = {} if split.adapter is None else split.adapter.options
-    context_sources = {
-        str(source) for source in adapter_options.get("context_features", ())
-    }
+    request_level_sources = _adapter_request_level_sources(adapter_options)
     sequence_sources = {
         field.source
         for sequence in config.sequences
@@ -1390,7 +1389,7 @@ def _iter_batch_tables_direct(
                             if split.request_id is not None
                             else []
                         ),
-                        *context_sources,
+                        *request_level_sources,
                         *sequence_sources,
                     }
                 )
