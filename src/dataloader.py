@@ -11315,6 +11315,27 @@ def _arrow_array_from_python_values(values: Sequence[Any]) -> Any:
     return pa.array(list(values), type=pa.int64())
 
 
+def _is_dense_numeric_column(column: Any) -> bool:
+    """True when a column can be fancy-indexed into a non-object ndarray."""
+
+    return (
+        isinstance(column, np.ndarray)
+        and column.ndim == 1
+        and column.dtype != object
+    )
+
+
+def _columns_share_dense_dtype(columns: Sequence[Any]) -> bool:
+    """All columns dense with an identical dtype (safe for one ``np.empty`` out)."""
+
+    if not columns:
+        return False
+    if not all(_is_dense_numeric_column(column) for column in columns):
+        return False
+    sample_dtype = columns[0].dtype
+    return all(column.dtype == sample_dtype for column in columns)
+
+
 def prepare_packed_axis_batch(
     bundles: Mapping[int, AdaptedAxisBundle],
     packed: PackedRequestPlan,
@@ -11445,12 +11466,15 @@ def prepare_packed_axis_batch(
             request_values[name] = tuple(rows)
             continue
         if name in request_feature_name_set:
-            sample_column = None
-            for bundle in unique_bundles:
-                if name in bundle.request_features:
-                    sample_column = bundle.request_features[name]
-                    break
-            if isinstance(sample_column, CompactListColumn):
+            per_bundle_columns = [
+                bundle.request_features[name]
+                for bundle in unique_bundles
+                if name in bundle.request_features
+            ]
+            sample_column = per_bundle_columns[0] if per_bundle_columns else None
+            if isinstance(sample_column, CompactListColumn) and all(
+                isinstance(column, CompactListColumn) for column in per_bundle_columns
+            ):
                 request_values[name] = SequenceColumnBatch(
                     columns=tuple(
                         bundle.request_features[name] for bundle in unique_bundles
@@ -11459,12 +11483,11 @@ def prepare_packed_axis_batch(
                     column_index=shared_column_index,
                 )
                 continue
-            if (
-                isinstance(sample_column, np.ndarray)
-                and sample_column.ndim == 1
-                and sample_column.dtype != object
-            ):
-                out = np.empty(n_requests, dtype=sample_column.dtype)
+            # Dense gather only when every source column is dense+same dtype.
+            # Mixed int64/object (nulls on one adapter batch) used to pick int64
+            # from the first source and TypeError on ``out[...] = object_col``.
+            if _columns_share_dense_dtype(per_bundle_columns):
+                out = np.empty(n_requests, dtype=per_bundle_columns[0].dtype)
                 for bundle, out_idx, slots_arr in bundle_groups:
                     out[out_idx] = bundle.request_features[name][slots_arr]
                 request_values[name] = out
@@ -11475,13 +11498,9 @@ def prepare_packed_axis_batch(
             request_values[name] = tuple(rows)
             continue
         if request_id_column is not None and name == request_id_column:
-            sample_ids = unique_bundles[0].request_ids
-            if (
-                isinstance(sample_ids, np.ndarray)
-                and sample_ids.ndim == 1
-                and sample_ids.dtype != object
-            ):
-                out = np.empty(n_requests, dtype=sample_ids.dtype)
+            per_bundle_ids = [np.asarray(bundle.request_ids) for bundle in unique_bundles]
+            if _columns_share_dense_dtype(per_bundle_ids):
+                out = np.empty(n_requests, dtype=per_bundle_ids[0].dtype)
                 for bundle, out_idx, slots_arr in bundle_groups:
                     out[out_idx] = np.asarray(bundle.request_ids)[slots_arr]
                 request_values[name] = out
@@ -11529,44 +11548,52 @@ def prepare_packed_axis_batch(
         raise KeyError(name)
 
     # Resolve each candidate name to its owning map once (item/label/...).
+    # Dense fancy-index requires the column to be dense on *every* source in the
+    # pack: production packs mix adapter batches, and null labels/scalars become
+    # object arrays on only some sources.
     candidate_maps: dict[str, str] = {}
     list_batch_names: list[str] = []
     dense_names: list[str] = []
     object_names: list[str] = []
+    _candidate_map_order = (
+        "item_features",
+        "label_features",
+        "label_mask_features",
+        "candidate_metadata",
+    )
     for name in candidate_name_list:
         if name in broadcast_set:
             object_names.append(name)
             continue
-        sample_column = None
-        map_name = None
+        map_name: str | None = None
+        per_source_columns: list[Any] = []
+        consistent = True
         for source_id in unique_source_ids:
             bundle = bundles[source_id]
-            if name in bundle.item_features:
-                sample_column = bundle.item_features[name]
-                map_name = "item_features"
-            elif name in bundle.label_features:
-                sample_column = bundle.label_features[name]
-                map_name = "label_features"
-            elif name in bundle.label_mask_features:
-                sample_column = bundle.label_mask_features[name]
-                map_name = "label_mask_features"
-            elif name in bundle.candidate_metadata:
-                sample_column = bundle.candidate_metadata[name]
-                map_name = "candidate_metadata"
-            else:
-                continue
-            break
-        if map_name is None or sample_column is None:
+            column = None
+            local_map = None
+            for candidate_map in _candidate_map_order:
+                feats = getattr(bundle, candidate_map)
+                if name in feats:
+                    column = feats[name]
+                    local_map = candidate_map
+                    break
+            if column is None or local_map is None:
+                consistent = False
+                break
+            if map_name is None:
+                map_name = local_map
+            elif map_name != local_map:
+                consistent = False
+                break
+            per_source_columns.append(column)
+        if not consistent or map_name is None or not per_source_columns:
             object_names.append(name)
             continue
         candidate_maps[name] = map_name
-        if isinstance(sample_column, CompactListColumn):
+        if all(isinstance(column, CompactListColumn) for column in per_source_columns):
             list_batch_names.append(name)
-        elif (
-            isinstance(sample_column, np.ndarray)
-            and sample_column.ndim == 1
-            and sample_column.dtype != object
-        ):
+        elif _columns_share_dense_dtype(per_source_columns):
             dense_names.append(name)
         else:
             object_names.append(name)

@@ -715,6 +715,60 @@ class CompactListColumnTest(unittest.TestCase):
         self.assertEqual(list(column[1]), [3, None])
 
 
+class PreparePackedAxisBatchNullTest(unittest.TestCase):
+    def test_mixed_dense_and_object_label_sources_do_not_int_none(self) -> None:
+        """Pack int64 labels with object/None labels from another source.
+
+        Repro for host-prepare: ``out[reqs] = cols[name]`` TypeError int(None)
+        when the first source looked dense and a later source had nulls.
+        """
+
+        dense = AdaptedAxisBundle(
+            n_candidates=2,
+            n_requests=1,
+            request_ids=("r0",),
+            candidate_to_request=np.asarray([0, 0], dtype=np.int64),
+            request_features={"user_id": np.asarray([1], dtype=np.int64)},
+            sequence_features={},
+            item_features={"item_id": np.asarray([10, 11], dtype=np.int64)},
+            label_features={"click": np.asarray([0, 1], dtype=np.int64)},
+            label_mask_features={},
+            candidate_metadata={},
+            request_raw_rows=np.asarray([0], dtype=np.int64),
+            candidate_raw_rows=np.asarray([0, 0], dtype=np.int64),
+        )
+        with_null = AdaptedAxisBundle(
+            n_candidates=2,
+            n_requests=1,
+            request_ids=("r1",),
+            candidate_to_request=np.asarray([0, 0], dtype=np.int64),
+            request_features={"user_id": np.asarray([2], dtype=np.int64)},
+            sequence_features={},
+            item_features={"item_id": np.asarray([20, 21], dtype=np.int64)},
+            label_features={"click": np.asarray([1, None], dtype=object)},
+            label_mask_features={},
+            candidate_metadata={},
+            request_raw_rows=np.asarray([0], dtype=np.int64),
+            candidate_raw_rows=np.asarray([0, 0], dtype=np.int64),
+        )
+        blocks = (
+            *request_group_blocks_from_axis_bundle(dense, source_id=0, sequences=()),
+            *request_group_blocks_from_axis_bundle(with_null, source_id=1, sequences=()),
+        )
+        packed = build_packed_request_plan(blocks)
+        prepared = prepare_packed_axis_batch(
+            {0: dense, 1: with_null},
+            packed,
+            sequences=(),
+            request_id_column="request_id",
+            candidate_request_columns=("request_id",),
+        )
+        clicks = list(prepared.candidate_values["click"])
+        self.assertEqual(len(clicks), 4)
+        self.assertIn(None, clicks)
+        self.assertEqual(sorted(value for value in clicks if value is not None), [0, 1, 1])
+
+
 class AdapterRequestLevelSourcesTest(unittest.TestCase):
     def test_includes_coarse_scene_derived_columns(self) -> None:
         sources = _adapter_request_level_sources(
