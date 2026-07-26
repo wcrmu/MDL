@@ -134,6 +134,8 @@ _TRAINING_OVERRIDE_FIELDS = (
 
 _RUNTIME_OVERRIDE_FIELDS = ("activation_checkpoint", "cuda_graph_backbone")
 
+_MODEL_OVERRIDE_FIELDS = ("mdl_feature_interaction",)
+
 
 def _scale_length_buckets(buckets: tuple, old_batch_size: int, new_batch_size: int) -> tuple:
     """Keep length-bucket ratios when CLI overrides training.batch_size."""
@@ -208,6 +210,21 @@ def _apply_runtime_overrides(config, args: argparse.Namespace):
     return replace(config, runtime=runtime)
 
 
+def _apply_model_overrides(config, args: argparse.Namespace):
+    """Apply optional CLI model architecture overrides."""
+
+    updates: dict[str, object] = {}
+    for field_name in _MODEL_OVERRIDE_FIELDS:
+        value = getattr(args, field_name, None)
+        if value is not None:
+            updates[field_name] = value
+    if not updates:
+        return config
+    model = replace(config.model, **updates)
+    model.validate()
+    return replace(config, model=model)
+
+
 def _load_config(args: argparse.Namespace):
     config = load_app_config(args.config)
     if any(
@@ -227,6 +244,8 @@ def _load_config(args: argparse.Namespace):
         config = _apply_training_overrides(config, args)
     if any(getattr(args, name, None) is not None for name in _RUNTIME_OVERRIDE_FIELDS):
         config = _apply_runtime_overrides(config, args)
+    if any(getattr(args, name, None) is not None for name in _MODEL_OVERRIDE_FIELDS):
+        config = _apply_model_overrides(config, args)
     return config
 
 
@@ -380,10 +399,24 @@ def _add_runtime_override_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_model_override_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--mdl-feature-interaction",
+        choices=["direct_ffn", "residual_ffn"],
+        default=None,
+        help=(
+            "override model.mdl_feature_interaction: direct_ffn matches MDL "
+            "Eq. 6 (FFN replaces mixed tokens); residual_ffn keeps RankMixer "
+            "residual+LayerNorm after the FFN"
+        ),
+    )
+
+
 def _cmd_validate_config(args: argparse.Namespace) -> int:
     config = _load_config(args)
     print(f"config: OK ({args.config})")
     print(f"model: {config.model.name}")
+    print(f"mdl_feature_interaction: {config.model.mdl_feature_interaction}")
     print(f"features: {len(config.features)}")
     print(f"train_inputs: {len(config.data.train.inputs)}")
     if config.data.test is not None:
@@ -667,6 +700,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_data_input_args(validate)
     _add_training_override_args(validate)
     _add_runtime_override_args(validate)
+    _add_model_override_args(validate)
     validate.set_defaults(func=_cmd_validate_config)
 
     profile = subparsers.add_parser("profile")
@@ -676,6 +710,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_data_input_args(profile)
     _add_training_override_args(profile)
     _add_runtime_override_args(profile)
+    _add_model_override_args(profile)
     profile.set_defaults(func=_cmd_profile)
 
     fit_vocab = subparsers.add_parser("fit-vocab")
@@ -698,6 +733,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_data_input_args(train)
     _add_training_override_args(train)
     _add_runtime_override_args(train)
+    _add_model_override_args(train)
     train.set_defaults(func=_cmd_train)
 
     benchmark = subparsers.add_parser("benchmark")
@@ -767,6 +803,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--master-port", type=int, default=None)
     _add_data_input_args(benchmark)
     _add_runtime_override_args(benchmark)
+    _add_model_override_args(benchmark)
     benchmark.set_defaults(func=_cmd_benchmark)
 
     predict = subparsers.add_parser("predict")
@@ -777,6 +814,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_data_input_args(predict)
     _add_training_override_args(predict)
     _add_runtime_override_args(predict)
+    _add_model_override_args(predict)
     predict.set_defaults(func=_cmd_predict)
 
     evaluate = subparsers.add_parser("evaluate")
@@ -795,6 +833,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_data_input_args(evaluate)
     _add_training_override_args(evaluate)
     _add_runtime_override_args(evaluate)
+    _add_model_override_args(evaluate)
     evaluate.set_defaults(func=_cmd_evaluate)
 
     return parser
