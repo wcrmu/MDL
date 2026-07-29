@@ -1917,7 +1917,8 @@ def iter_feature_batches(
     coalesce_pinned_tensors = reader.coalesce_pinned_tensors and pin_memory
     # Prefer a spawn child for pack+tensorize: shared-memory FeatureBatches
     # avoid GIL fights with wide-batch forward (threaded prepare regresses).
-    if reader.host_prepare_prefetch > 0 and reader.device_prefetch_batches == 0:
+    # May be wrapped later by ``_DevicePrefetchIterator`` for H2D overlap.
+    if reader.host_prepare_prefetch > 0:
         return _ProcessHostPrepareIterator(
             config,
             split_name,
@@ -3285,6 +3286,13 @@ def _maybe_compile_model(config: AppConfig, model: nn.Module) -> nn.Module:
         return model
     if not hasattr(torch, "compile"):
         raise RuntimeError("runtime.compile requires torch.compile support")
+    # RankMixer: fuse dense blocks+logits only. Compiling the full module pulls
+    # sharded-embedding host splits into inductor CUDAGraphs and thrashs.
+    raw = model.module if isinstance(model, DistributedDataParallel) else model
+    compile_dense = getattr(raw, "compile_dense_backbone", None)
+    if callable(compile_dense) and getattr(config.model, "name", None) == "rankmixer":
+        compile_dense()
+        return model
     compile_mode = getattr(config.runtime, "compile_mode", "default")
     if compile_mode == "default":
         return torch.compile(model)
@@ -3527,16 +3535,53 @@ def _set_optimizer_lrs(
 
 
 def _active_rank_count(context: DistributedContext, rank_active: bool) -> int:
+    return _start_active_rank_count(context, rank_active).wait()
+
+
+class _ActiveRankCountHandle:
+    """Async world-active-rank reduction; wait before loss scaling / exit checks."""
+
+    __slots__ = ("_value", "_work")
+
+    def __init__(self, value: Tensor, work: Any | None) -> None:
+        self._value = value
+        self._work = work
+
+    def wait(self) -> int:
+        if self._work is not None:
+            self._work.wait()
+        return int(self._value.item())
+
+
+def _start_active_rank_count(
+    context: DistributedContext,
+    rank_active: bool,
+) -> _ActiveRankCountHandle:
+    """Kick off active-rank allreduce so H2D can overlap the host collective."""
+
     if not context.enabled:
-        return int(rank_active)
-    device = torch.device("cpu") if context.control_group is not None else context.device
-    value = torch.tensor(int(rank_active), dtype=torch.long, device=device)
-    torch_dist.all_reduce(
+        value = torch.tensor(int(rank_active), dtype=torch.long)
+        return _ActiveRankCountHandle(value, None)
+    # Prefer CPU + Gloo control group so this never inserts a CUDA device sync
+    # into the training critical path.
+    if context.control_group is not None:
+        value = torch.tensor(int(rank_active), dtype=torch.long, device="cpu")
+        work = torch_dist.all_reduce(
+            value,
+            op=torch_dist.ReduceOp.SUM,
+            group=context.control_group,
+            async_op=True,
+        )
+        return _ActiveRankCountHandle(value, work)
+    value = torch.tensor(
+        int(rank_active), dtype=torch.long, device=context.device
+    )
+    work = torch_dist.all_reduce(
         value,
         op=torch_dist.ReduceOp.SUM,
-        group=context.control_group,
+        async_op=True,
     )
-    return int(value.item())
+    return _ActiveRankCountHandle(value, work)
 
 
 def _tensor_nbytes(tensor: Tensor) -> int:
@@ -3773,6 +3818,43 @@ def _step_sparse_moe_controllers(
         item.step_regularization_controller(active_ratio)
 
 
+def _request_row_indices_from_batch(
+    batch: FeatureBatch,
+    candidate_count: int,
+    device: torch.device,
+) -> Tensor:
+    """Resolve the shared candidate→request map carried by RLB feature payloads."""
+
+    resolved: Tensor | None = None
+    for value in batch.features.values():
+        if not isinstance(value, dict):
+            continue
+        candidate = value.get("row_indices")
+        if not isinstance(candidate, Tensor) or candidate.ndim != 1:
+            continue
+        if candidate.numel() != candidate_count:
+            continue
+        candidate = candidate.to(device=device, dtype=torch.long)
+        if resolved is None:
+            resolved = candidate
+            continue
+        if resolved.data_ptr() != candidate.data_ptr() and not torch.equal(
+            resolved,
+            candidate,
+        ):
+            raise ValueError(
+                "request-level loss requires one consistent row_indices mapping"
+            )
+    if resolved is None:
+        raise ValueError(
+            "mean_per_request_per_task requires request-deduplicated features "
+            "with candidate-to-request row_indices"
+        )
+    if resolved.numel() and bool((resolved < 0).any()):
+        raise ValueError("request row_indices must be non-negative")
+    return resolved
+
+
 def _loss_terms_from_batch(
     output: dict[str, Tensor],
     batch: FeatureBatch,
@@ -3794,23 +3876,54 @@ def _loss_terms_from_batch(
         reduction="none",
     )
     if batch.label_mask is None:
-        task_numerators = element_loss.sum(dim=0)
-        task_counts = element_loss.new_full(
-            (element_loss.size(1),),
-            float(element_loss.size(0)),
-        )
-        if not rank_active:
-            # Preserve the replayed forward graph on an exhausted rank while
-            # contributing no samples to either reduction.
-            task_numerators = task_numerators * 0.0
-            task_counts.zero_()
+        weights = torch.ones_like(element_loss)
     else:
         weights = batch.label_mask.to(
             device=logits.device,
             dtype=element_loss.dtype,
         )
-        if not rank_active:
-            weights = torch.zeros_like(weights)
+    if not rank_active:
+        # Preserve the replayed forward graph on an exhausted rank while
+        # contributing no samples to either reduction.
+        weights = torch.zeros_like(weights)
+
+    if loss_reduction == "mean_per_request_per_task":
+        row_indices = _request_row_indices_from_batch(
+            batch,
+            element_loss.size(0),
+            logits.device,
+        )
+        _request_ids, inverse_rows = torch.unique(
+            row_indices,
+            sorted=True,
+            return_inverse=True,
+        )
+        request_count = int(_request_ids.numel())
+        request_numerators = element_loss.new_zeros(
+            request_count,
+            element_loss.size(1),
+        ).index_add(
+            0,
+            inverse_rows,
+            element_loss * weights,
+        )
+        request_counts = element_loss.new_zeros(
+            request_count,
+            element_loss.size(1),
+        ).index_add(
+            0,
+            inverse_rows,
+            weights,
+        )
+        valid_requests = request_counts > 0
+        request_means = torch.where(
+            valid_requests,
+            request_numerators / request_counts.clamp_min(1.0),
+            torch.zeros_like(request_numerators),
+        )
+        task_numerators = request_means.sum(dim=0)
+        task_counts = valid_requests.sum(dim=0).to(dtype=element_loss.dtype)
+    else:
         task_numerators = (element_loss * weights).sum(dim=0)
         task_counts = weights.sum(dim=0)
 
@@ -3820,7 +3933,7 @@ def _loss_terms_from_batch(
         # world size makes the averaged gradient equal the global paper sum.
         world_size = float(torch_dist.get_world_size()) if distributed else 1.0
         prediction_loss = task_numerators.sum() * world_size
-    elif loss_reduction == "mean_per_task":
+    elif loss_reduction in {"mean_per_task", "mean_per_request_per_task"}:
         if distributed:
             global_counts = task_counts.detach().clone()
             torch_dist.all_reduce(global_counts, op=torch_dist.ReduceOp.SUM)
@@ -3838,7 +3951,10 @@ def _loss_terms_from_batch(
             )
         prediction_loss = (task_numerators * task_scale).sum()
     else:
-        raise ValueError("loss_reduction must be sum or mean_per_task")
+        raise ValueError(
+            "loss_reduction must be sum, mean_per_task, "
+            "or mean_per_request_per_task"
+        )
     moe_loss = output.get("moe_regularization_loss")
     total_loss = prediction_loss
     if moe_loss is not None and moe_loss_weight > 0.0:
@@ -4084,14 +4200,13 @@ def train_mdl(
             if device.type == "cuda"
             else 0
         )
-        if device_prefetch_depth > 0:
-            # The CUDA prefetch thread calls next(host_iterator), which still
-            # runs Python FeatureBatch prepare. That contends for the GIL with
-            # the training thread's wide-batch forward and can inflate step time.
+        host_prepare_depth = int(config.data.train.reader.host_prepare_prefetch)
+        if device_prefetch_depth > 0 and host_prepare_depth <= 0:
+            # Device-prefetch thread would call in-process prepare → GIL fight.
             logger.warning(
-                "reader.device_prefetch_batches=%d overlaps host-batch prepare "
-                "with training on another thread; on wide feature batches this "
-                "often lowers GPU utilization. Prefer 0 unless prepare is cheap.",
+                "reader.device_prefetch_batches=%d without host_prepare_prefetch "
+                "overlaps in-process FeatureBatch prepare with training; prefer "
+                "host_prepare_prefetch>0 so the CUDA thread only does H2D.",
                 device_prefetch_depth,
             )
         batches_on_device = device_prefetch_depth > 0
@@ -4114,6 +4229,7 @@ def train_mdl(
         window_padded_token_slots = 0
         window_loss_numerator: Tensor | None = None
         window_loss_denominator: Tensor | None = None
+        window_task_monitors: list[_StreamingTaskMonitor] | None = None
         window_step_started = 0.0
         window_dataloader_wait_seconds = 0.0
         window_h2d_seconds = 0.0
@@ -4131,6 +4247,7 @@ def train_mdl(
                 window_padded_token_slots = 0
                 window_loss_numerator = None
                 window_loss_denominator = None
+                window_task_monitors = None
                 # Always time the window: Train-step logs need wait_ratio even
                 # when no benchmark step_observer is attached.
                 window_step_started = perf_counter()
@@ -4167,29 +4284,9 @@ def train_mdl(
                 local_batch_on_device = batches_on_device
             dataloader_wait_seconds = perf_counter() - dataloader_started
             rank_active = local_batch is not None
-            active_ranks = _active_rank_count(context, rank_active)
-            if active_ranks == 0:
-                if accumulation_index > 0:
-                    for optimizer in optimizers:
-                        optimizer.zero_grad(set_to_none=True)
-                    consume_sharded_embedding_stats(base_model)
-                    if log_steps and context.rank == 0:
-                        print(
-                            "Gradient accumulation | "
-                            f"dropped_incomplete_micro_batches={accumulation_index} "
-                            f"required={gradient_accumulation_steps}"
-                        )
-                break
-            if (
-                steps == 0
-                and accumulation_index == 0
-                and context.enabled
-                and active_ranks != context.world_size
-            ):
-                raise RuntimeError(
-                    "replicated sparse DDP requires every rank to provide an initial batch; "
-                    "reduce world_size or choose a finer reader.shard_unit"
-                )
+            # Kick the Gloo/NCCL active-rank reduction immediately so pinned H2D
+            # can overlap it. Wait only after the host→device copy is queued.
+            active_rank_handle = _start_active_rank_count(context, rank_active)
             h2d_started = perf_counter() if observing else 0.0
             if rank_active:
                 if local_batch is None:
@@ -4206,11 +4303,35 @@ def train_mdl(
                 last_device_batch = batch
                 if trace_batch is not None:
                     last_trace_batch = trace_batch
+                active_ranks = active_rank_handle.wait()
             else:
+                active_ranks = active_rank_handle.wait()
+                if active_ranks == 0:
+                    if accumulation_index > 0:
+                        for optimizer in optimizers:
+                            optimizer.zero_grad(set_to_none=True)
+                        consume_sharded_embedding_stats(base_model)
+                        if log_steps and context.rank == 0:
+                            print(
+                                "Gradient accumulation | "
+                                f"dropped_incomplete_micro_batches={accumulation_index} "
+                                f"required={gradient_accumulation_steps}"
+                            )
+                    break
                 if last_device_batch is None:
                     raise RuntimeError("inactive rank has no batch available for zero-loss replay")
                 batch = last_device_batch
                 trace_batch = last_trace_batch
+            if (
+                steps == 0
+                and accumulation_index == 0
+                and context.enabled
+                and active_ranks != context.world_size
+            ):
+                raise RuntimeError(
+                    "replicated sparse DDP requires every rank to provide an initial batch; "
+                    "reduce world_size or choose a finer reader.shard_unit"
+                )
             if tracing:
                 _sync_device(device)
             h2d_seconds = perf_counter() - h2d_started if observing else 0.0
@@ -4282,6 +4403,30 @@ def train_mdl(
                 if collect_batch_stats:
                     window_input_tokens += _batch_input_token_count(stats_batch)
                     window_padded_token_slots += _batch_padded_token_slots(stats_batch)
+                if (
+                    collect_batch_stats
+                    and batch.labels is not None
+                    and "logits" in output
+                ):
+                    if window_task_monitors is None:
+                        window_task_monitors = [
+                            _StreamingTaskMonitor() for _ in config.task_names
+                        ]
+                    logits_f = output["logits"].detach().float()
+                    labels_f = batch.labels.detach().float()
+                    mask = (
+                        None
+                        if batch.label_mask is None
+                        else batch.label_mask.detach().bool()
+                    )
+                    for task_index, monitor in enumerate(window_task_monitors):
+                        task_logits = logits_f[:, task_index]
+                        task_labels = labels_f[:, task_index]
+                        if mask is not None:
+                            valid = mask[:, task_index]
+                            task_logits = task_logits[valid]
+                            task_labels = task_labels[valid]
+                        monitor.update(task_logits, task_labels)
             detached_numerator = loss_numerator.detach()
             detached_denominator = loss_denominator.detach()
             window_loss_numerator = (
@@ -4413,8 +4558,21 @@ def train_mdl(
                     perf_counter() - window_step_started, 1.0e-9
                 )
                 wait_ratio = window_dataloader_wait_seconds / window_step_seconds
+                task_stats = (
+                    [monitor.compute() for monitor in window_task_monitors]
+                    if window_task_monitors is not None
+                    else []
+                )
+                task_loss_parts = [
+                    f"{task_name}={_format_optional_float(stats['loss'])}"
+                    for task_name, stats in zip(config.task_names, task_stats)
+                ]
+                task_loss_suffix = (
+                    (" | " + " ".join(task_loss_parts)) if task_loss_parts else ""
+                )
                 print(
-                    f"Train step | step={steps} | loss={last_loss:.6f} "
+                    f"Train step | step={steps} | logloss={last_loss:.6f}"
+                    f"{task_loss_suffix} "
                     f"active_ranks={window_active_ranks}/{context.world_size} "
                     f"micro_batches={gradient_accumulation_steps} "
                     f"local_rows={window_rows} "
@@ -4427,6 +4585,27 @@ def train_mdl(
                     f"sparse_global_rows={sparse_sync_stats.global_rows} "
                     f"sparse_payload_mib={payload_mib:.2f}"
                 )
+                # Window-aggregated per-task moments for collapse detection.
+                for task_name, stats in zip(config.task_names, task_stats):
+                    print(
+                        f"Train task | step={steps} task={task_name} "
+                        f"logloss={_format_optional_float(stats['loss'])} "
+                        f"prob_mean={_format_optional_float(stats['prob_mean'])} "
+                        f"logit_mean={_format_optional_float(stats['logit_mean'])} "
+                        f"logit_std={_format_optional_float(stats['logit_std'])}"
+                    )
+                    warning_parts = _task_monitor_warning_parts(
+                        prob_mean=(
+                            None
+                            if stats["prob_mean"] is None
+                            else float(stats["prob_mean"])
+                        ),
+                    )
+                    if warning_parts:
+                        print(
+                            f"Train task warning | step={steps} task={task_name} "
+                            + " ".join(warning_parts)
+                        )
             if (
                 run_quick_eval
                 and quick_eval.enabled
@@ -4645,6 +4824,118 @@ class _StreamingCOPC:
         return predicted / labeled
 
 
+# Collapse / miscalibration heuristics for train and quick-eval monitors.
+_MONITOR_PROB_MEAN_WARN = 0.9
+_MONITOR_COPC_HIGH_WARN = 2.0
+_MONITOR_COPC_LOW_WARN = 0.5
+_MONITOR_AUC_WARN = 0.55
+
+
+class _StreamingTaskMonitor:
+    """Stream per-task BCE loss and logit/prob moments for collapse detection."""
+
+    def __init__(self) -> None:
+        # [count, loss_sum, logit_sum, logit_sq_sum, prob_sum]
+        self.totals = torch.zeros(5, dtype=torch.float64)
+
+    def update(self, logits: Tensor, labels: Tensor) -> None:
+        logits = logits.detach().float().flatten().cpu()
+        labels = labels.detach().float().flatten().cpu()
+        if logits.numel() != labels.numel():
+            raise ValueError("task monitor logits/labels must have the same length")
+        if not logits.numel():
+            return
+        if not bool(torch.isfinite(logits).all()):
+            raise ValueError("task monitor logits must be finite")
+        probabilities = torch.sigmoid(logits)
+        losses = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits,
+            labels,
+            reduction="none",
+        )
+        self.totals[0] += float(logits.numel())
+        self.totals[1] += float(losses.sum().item())
+        self.totals[2] += float(logits.sum().item())
+        self.totals[3] += float(logits.square().sum().item())
+        self.totals[4] += float(probabilities.sum().item())
+
+    def compute(self) -> dict[str, float | None]:
+        count = float(self.totals[0].item())
+        if count <= 0.0:
+            return {
+                "loss": None,
+                "prob_mean": None,
+                "logit_mean": None,
+                "logit_std": None,
+            }
+        logit_mean = float(self.totals[2].item()) / count
+        logit_second = float(self.totals[3].item()) / count
+        variance = max(logit_second - logit_mean * logit_mean, 0.0)
+        return {
+            "loss": float(self.totals[1].item()) / count,
+            "prob_mean": float(self.totals[4].item()) / count,
+            "logit_mean": logit_mean,
+            "logit_std": math.sqrt(variance),
+        }
+
+
+def _task_monitor_stats_from_batch(
+    logits: Tensor,
+    labels: Tensor,
+    label_mask: Tensor | None,
+    task_count: int,
+) -> list[dict[str, float | None]]:
+    """Compute per-task monitor stats for one local batch (no distributed reduce)."""
+
+    if logits.ndim != 2 or labels.ndim != 2:
+        raise ValueError("logits/labels must have shape [batch, tasks]")
+    if logits.shape != labels.shape:
+        raise ValueError("logits and labels shapes must match")
+    if logits.size(1) != task_count:
+        raise ValueError(
+            f"expected {task_count} tasks, got logits width {logits.size(1)}"
+        )
+    stats: list[dict[str, float | None]] = []
+    logits_f = logits.detach().float()
+    labels_f = labels.detach().float()
+    mask = None if label_mask is None else label_mask.detach().bool()
+    for task_index in range(task_count):
+        monitor = _StreamingTaskMonitor()
+        task_logits = logits_f[:, task_index]
+        task_labels = labels_f[:, task_index]
+        if mask is not None:
+            valid = mask[:, task_index]
+            task_logits = task_logits[valid]
+            task_labels = task_labels[valid]
+        monitor.update(task_logits, task_labels)
+        stats.append(monitor.compute())
+    return stats
+
+
+def _task_monitor_warning_parts(
+    *,
+    prob_mean: float | None = None,
+    copc: float | None = None,
+    auc: float | None = None,
+) -> list[str]:
+    warnings: list[str] = []
+    if prob_mean is not None and prob_mean > _MONITOR_PROB_MEAN_WARN:
+        warnings.append(f"prob_mean={prob_mean:.4f}>{_MONITOR_PROB_MEAN_WARN}")
+    if copc is not None and copc > _MONITOR_COPC_HIGH_WARN:
+        warnings.append(f"copc={copc:.4f}>{_MONITOR_COPC_HIGH_WARN}")
+    if copc is not None and 0.0 <= copc < _MONITOR_COPC_LOW_WARN:
+        warnings.append(f"copc={copc:.4f}<{_MONITOR_COPC_LOW_WARN}")
+    if auc is not None and auc < _MONITOR_AUC_WARN:
+        warnings.append(f"auc={auc:.4f}<{_MONITOR_AUC_WARN}")
+    return warnings
+
+
+def _format_optional_float(value: float | None, digits: int = 6) -> str:
+    if value is None:
+        return "NA"
+    return f"{float(value):.{digits}f}"
+
+
 def _all_reduce_cpu_sum_(tensor: Tensor, context: DistributedContext) -> None:
     """Sum a CPU metric tensor even when the data process group is NCCL."""
 
@@ -4680,6 +4971,16 @@ def _reduce_evaluation_histograms(
 def _reduce_evaluation_copc(
     context: DistributedContext,
     accumulators: list[_StreamingCOPC],
+) -> None:
+    if not context.enabled:
+        return
+    for accumulator in accumulators:
+        _all_reduce_cpu_sum_(accumulator.totals, context)
+
+
+def _reduce_evaluation_task_monitors(
+    context: DistributedContext,
+    accumulators: list[_StreamingTaskMonitor],
 ) -> None:
     if not context.enabled:
         return
@@ -4728,6 +5029,7 @@ def _run_training_quick_eval(
         for _ in config.task_names
     ]
     copc_accumulators = [_StreamingCOPC() for _ in config.task_names]
+    task_monitors = [_StreamingTaskMonitor() for _ in config.task_names]
     rows = 0
     local_batches = 0
     batch_iterator: Iterator[FeatureBatch] | None = None
@@ -4822,7 +5124,8 @@ def _run_training_quick_eval(
                     raise RuntimeError(
                         "quick-evaluation batch did not contain labels"
                     )
-                probabilities = torch.sigmoid(logits.float()).cpu()
+                logits_cpu = logits.float().cpu()
+                probabilities = torch.sigmoid(logits_cpu)
                 labels = batch.labels.float().cpu()
                 label_mask = (
                     None
@@ -4832,10 +5135,12 @@ def _run_training_quick_eval(
                 rows += int(labels.size(0))
                 for task_index in range(len(config.task_names)):
                     if label_mask is None:
+                        task_logits = logits_cpu[:, task_index]
                         task_scores = probabilities[:, task_index]
                         task_labels = labels[:, task_index]
                     else:
                         valid = label_mask[:, task_index]
+                        task_logits = logits_cpu[valid, task_index]
                         task_scores = probabilities[valid, task_index]
                         task_labels = labels[valid, task_index]
                     accumulators[task_index][0].update(
@@ -4846,16 +5151,23 @@ def _run_training_quick_eval(
                         task_scores,
                         task_labels,
                     )
+                    task_monitors[task_index].update(task_logits, task_labels)
 
         rows = _reduce_evaluation_histograms(context, accumulators, rows)
         _reduce_evaluation_copc(context, copc_accumulators)
+        _reduce_evaluation_task_monitors(context, task_monitors)
         metrics: dict[str, dict[str, float | int | None]] = {}
         for task_index, task_name in enumerate(config.task_names):
             accumulator = accumulators[task_index][0]
             examples, positives, negatives = accumulator.counts()
+            monitor = task_monitors[task_index].compute()
             metrics[task_name] = {
                 "auc": accumulator.compute(),
                 "copc": copc_accumulators[task_index].compute(),
+                "loss": monitor["loss"],
+                "prob_mean": monitor["prob_mean"],
+                "logit_mean": monitor["logit_mean"],
+                "logit_std": monitor["logit_std"],
                 "examples": examples,
                 "positives": positives,
                 "negatives": negatives,
@@ -4891,14 +5203,31 @@ def _print_training_quick_eval(
     for task_name, metrics in result.metrics.items():
         auc = metrics["auc"]
         copc = metrics.get("copc")
-        formatted_auc = "NA" if auc is None else f"{float(auc):.8f}"
-        formatted_copc = "NA" if copc is None else f"{float(copc):.8f}"
+        auc_value = None if auc is None else float(auc)
+        copc_value = None if copc is None else float(copc)
+        prob_mean = metrics.get("prob_mean")
+        prob_mean_value = None if prob_mean is None else float(prob_mean)
         print(
-            f"Quick eval task | step={step} task={task_name} auc={formatted_auc} "
-            f"copc={formatted_copc} "
+            f"Quick eval task | step={step} task={task_name} "
+            f"auc={_format_optional_float(auc_value, 8)} "
+            f"copc={_format_optional_float(copc_value, 8)} "
+            f"logloss={_format_optional_float(metrics.get('loss'))} "
+            f"prob_mean={_format_optional_float(prob_mean_value)} "
+            f"logit_mean={_format_optional_float(metrics.get('logit_mean'))} "
+            f"logit_std={_format_optional_float(metrics.get('logit_std'))} "
             f"examples={metrics['examples']} positives={metrics['positives']} "
             f"negatives={metrics['negatives']}"
         )
+        warning_parts = _task_monitor_warning_parts(
+            prob_mean=prob_mean_value,
+            copc=copc_value,
+            auc=auc_value,
+        )
+        if warning_parts:
+            print(
+                f"Quick eval warning | step={step} task={task_name} "
+                + " ".join(warning_parts)
+            )
 
 
 class _DiskBackedGroupAUC:

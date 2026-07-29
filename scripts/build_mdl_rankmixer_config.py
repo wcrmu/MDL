@@ -2,7 +2,7 @@
 """Build a production model YAML from sample fields and optional stats.
 
 The reference ``tests/fixtures/mdl_sample.yaml`` is authoritative for ordered
-fields, the 51/118 context/item split (request axis / candidate axis), UPS
+fields, the 47/100 context/item split (request axis / candidate axis), UPS
 schemas, and labels.  It is deliberately *not* authoritative for hash buckets,
 embedding widths, sequence lengths, scenes, or training capacity.  Those values
 come from ``profile_prehashed_parquet.py``.
@@ -39,7 +39,7 @@ from scripts.profile_prehashed_parquet import (  # noqa: E402
     load_profile_spec,
     profile_spec_from_mapping,
 )
-from src.config import AppConfig  # noqa: E402
+from src.config import AppConfig, DEAD_CONSTANT_FEATURE_NAMES  # noqa: E402
 from src.dataloader import (  # noqa: E402
     COARSE_SCENE_INDEX_COLUMN,
     COARSE_SCENE_PRIOR_EMBEDDING_DIM,
@@ -60,8 +60,8 @@ from src.embeddings import (  # noqa: E402
 )
 
 
-CONTEXT_FEATURE_COUNT = 51
-EXPECTED_FEATURE_COUNT = 169
+CONTEXT_FEATURE_COUNT = 47
+EXPECTED_FEATURE_COUNT = 147
 ITEM_FEATURE_COUNT = EXPECTED_FEATURE_COUNT - CONTEXT_FEATURE_COUNT
 EXPECTED_UPS_TYPES = (
     "impr",
@@ -80,6 +80,7 @@ SUPPORTED_MODELS = (
     "onetrans",
     "mdl_onetrans",
 )
+RANKMIXER_SEQUENCE_ENCODERS = ("longer", "stca")
 # Adapter contract: context_features == request axis, item_features == candidate
 # axis. Slot type (scalar/bag) is independent.
 CONTEXT_SCALAR_FIELDS = {
@@ -91,12 +92,10 @@ CONTEXT_SCALAR_FIELDS = {
     "plat_hn",
     "region_hn",
     "scene_id_hn",
+    "scene_impr_cnt_15d_hit_hn",
     "site_id_hn",
     "timezone_hn",
     "search_method_hn",
-    "scene_clk_cnt_15d_hit_hn",
-    "scene_impr_cnt_15d_hit_hn",
-    "uid_or_bg_hn",
     # Request-axis scalars (outer length follows requests; not multivalue).
     "query_pay_cnt_15d_hn",
     "opt_id_hn",
@@ -185,91 +184,89 @@ ITEM_BAG_FIELDS |= CANDIDATE_ITEM_BAG_FIELDS
 # the distribution tail; they are not training allocations or truncation targets.
 OBSERVED_MULTIVALUE_MAX_LENGTHS = {
     # Extremely short (max <= 6).
-    "clk_cnt_1d_hn": 1,
-    "clk_3d_cnt_hn": 1,
-    "clk_1d_cat_cnt_hn": 1,
     "cart_cnt_1d_hn": 1,
     "cart_cnt_3d_hn": 1,
+    "clk_1d_cat_cnt_hn": 1,
+    "clk_3d_cnt_hn": 1,
+    "clk_cnt_1d_hn": 1,
     "u_fst_ordr_cnt_mix_d_hn": 3,
-    "rev_ratings_cnt_crs_pos_hn": 5,
     "price_after_promotion_div_hn": 5,
+    "rev_ratings_cnt_crs_pos_hn": 5,
     "ups_incart_cat1_id_nc_hn": 5,
-    "sess_q2q_hash_list_hn": 6,
+    "goods_scene_clk_cnt_15d_hn": 6,
     "goods_title_tfidf_term_hash_list_hn": 6,
     "scene_adj_cartcvr_15d_hn": 6,
     "scene_adj_ctr_15d_hn": 6,
     "scene_adj_cvr_15d_hn": 6,
     "scene_cart_cnt_15d_hn": 6,
-    "goods_scene_clk_cnt_15d_hn": 6,
+    "sess_q2q_hash_list_hn": 6,
     # Medium (max 7-60).
-    "cart_long_hit_samestyle_i2i_idx_hn": 10,
-    "q_hit_good_correct_unigram_hn": 11,
-    "impr_long_goods_abs_timegap_1d_hn": 14,
+    "q_hit_good_correct_unigram_hn": 14,
     "g_sku_spec_unit_list_hn": 15,
-    "tit_in_top_query_cnt_hn": 15,
-    "query_extend_translation_hash_hn": 19,
-    "cart_hit_i2i_idx_hn": 20,
-    "clk_long_goods_abs_timegap_1d_hn": 21,
-    "recall_merge_cate1_ids_hn": 23,
-    "g_sku_spec_hn": 25,
+    "query_extend_translation_hash_hn": 15,
+    "cart_long_hit_samestyle_i2i_idx_hn": 16,
+    "tit_in_top_query_cnt_hn": 19,
+    "recall_merge_cate1_ids_hn": 24,
+    "cart_hit_i2i_idx_hn": 25,
     "g_sku_spec_hash_hn": 25,
-    "i2i_hit_site_q2i_idx_hn": 26,
-    "clk_hit_i2i_idx_hn": 28,
-    "query_tfidf_term_hash_list_hn": 30,
-    "scene_impr_cnt_15d_hn": 30,
+    "g_sku_spec_hn": 25,
+    "i2i_hit_site_q2i_idx_hn": 28,
+    "clk_hit_i2i_idx_hn": 29,
     "i2i_coclk_hn_share": 30,
     "i2i_list_amazoni2ifullgmv_hn_share": 30,
     "i2i_list_multimodal_hn_share": 30,
     "i2i_list_swingv3gmv_hn_share": 30,
+    "query_terms_hash_hn": 30,
+    "query_tfidf_term_hash_list_hn": 30,
+    "scene_impr_cnt_15d_hn": 30,
     "semi_swingi2i_cut30_hn_share": 30,
-    "query_terms_hash_hn": 33,
-    "main_goods_ids_hn_share": 34,
-    "i2i2cat2_swing_hn": 37,
-    "goods_ner_infos_hn": 39,
-    "query_hash_hn": 41,
-    "query_cat_hn": 41,
-    "origin_query_hash_hn": 42,
-    "g_prpty_val_id_list_hn": 45,
+    "clk_long_goods_abs_timegap_1d_hn": 37,
+    "i2i2cat2_swing_hn": 38,
+    "impr_long_goods_abs_timegap_1d_hn": 38,
+    "goods_ner_infos_hn": 45,
+    "main_goods_ids_hn_share": 45,
+    "origin_query_hash_hn": 46,
+    "query_cat_hn": 46,
+    "query_hash_hn": 46,
     "site_q2i_good_list_hn_share": 49,
-    "query_arr_hn": 51,
+    "query_arr_hn": 53,
+    "g_prpty_val_id_list_hn": 58,
     "mid_cmprc_diff_list_dis": 60,
     "mid_goods_prc_list_dis": 60,
     "only_semi_swingi2i_cut60_hn_share": 60,
     # Long (max 61-1000).
-    "goods_name_bigram_hn": 68,
-    "view_30m_cat1_ids_hn": 95,
-    "list_clk_cat1_ids_hn": 126,
-    "list_clk_cat_ids_hn": 126,
-    "ups_in_cart_2h_sku_cur_prices_hn": 168,
+    "goods_name_bigram_hn": 85,
+    "list_clk_cat1_ids_hn": 171,
+    "list_clk_cat_ids_hn": 171,
+    "view_30m_cat1_ids_hn": 176,
     "ups_query_term_hash_v2_hn": 200,
     "ups_query_tg_hn": 200,
     "ups_search_method_hash_hn": 200,
-    "sku_id_hn": 384,
-    "sku_price_v2_hn": 384,
-    "sku_sales_hn": 384,
-    "sku_spec_hash_hn": 384,
-    "sku_spec_hn": 384,
-    "sku_cart_cnt_7d_hn": 384,
-    "sku_ordr_cnt_1m_hn": 384,
-    "sku_price_dis_hn": 384,
-    "sku_sales_dis_hn": 384,
+    "sku_cart_cnt_7d_hn": 494,
+    "sku_id_hn": 494,
+    "sku_ordr_cnt_1m_hn": 494,
+    "sku_price_dis_hn": 494,
+    "sku_price_v2_hn": 494,
+    "sku_sales_dis_hn": 494,
+    "sku_sales_hn": 494,
+    "sku_spec_hash_hn": 494,
+    "sku_spec_hn": 494,
     "ups_in_cart_goods_hn_share": 600,
     "ups_in_cart_tg_hn": 600,
-    "offline_outside_goods_id_list_hn_share": 711,
-    "sku_spec_vids_hn": 768,
-    "cart_7d_cat1_ids_hn": 996,
+    "sku_spec_vids_hn": 988,
     "impr_3h_tg_hn": 1000,
     "impr_all_tg_hn": 1000,
     # Extremely long (max > 1000).
-    "recall_merge_cate_levels_hn": 1623,
-    "recall_merge_cate_ids_hn": 1623,
-    "view_7d_page_sns_hn": 2201,
-    "view_7d_page_elsns_hn": 2201,
-    "clk_7d_page_sns_hn": 2246,
-    "clk_7d_page_elsns_hn": 2246,
-    "flip_mall_ids_hn": 3579,
-    "buy_long_spec_vids_hn": 4860,
-    "cart_long_spec_vids_hn": 8120,
+    "recall_merge_cate_ids_hn": 1970,
+    "recall_merge_cate_levels_hn": 1970,
+    "cart_7d_cat1_ids_hn": 4162,
+    "buy_long_spec_vids_hn": 4841,
+    "offline_outside_goods_id_list_hn_share": 6701,
+    "view_7d_page_elsns_hn": 6978,
+    "view_7d_page_sns_hn": 6978,
+    "clk_7d_page_sns_hn": 8000,
+    "flip_mall_ids_hn": 9999,
+    "cart_long_spec_vids_hn": 10005,
 }
 
 
@@ -291,24 +288,370 @@ MULTIVALUE_MAX_LENGTHS = {
 }
 # Backward-compatible alias for callers that imported the old, partial map.
 RELATED_ITEM_BAG_MAX_LENGTHS = MULTIVALUE_MAX_LENGTHS
+PACK_MULTIVALUE_MAX_LENGTHS = dict(MULTIVALUE_MAX_LENGTHS)
 CORE_ITEM_FIELDS = ("goods_id_hn", "cat1_id_hn", "price_hn")
-SCENARIO_IMPORTANT_FIELDS = (
-    "currency_hn",
-    "hash_language_site_hn",
-    "language_hn",
-    "page_elsn_hn",
-    "page_sn_hn",
+# LONGER request-side globals (paper uses user_id). Production uses scene so
+# history compression is scene-conditioned alongside candidate globals.
+# uid_or_bg_hn is intentionally omitted: weak signal, large embedding table.
+CORE_USER_GLOBAL_FIELDS = ("scene_id_hn",)
+SCENARIO_IMPORTANT_FIELDS_BY_TOKEN = {
+    "search": (
+        "currency_hn",
+        "hash_language_site_hn",
+        "plat_hn",
+        "region_hn",
+        "page_elsn_hn",
+        "page_sn_hn",
+        "scene_id_hn",
+        "search_method_hn",
+        "cat1_id_hn",
+        "price_hn",
+    ),
+    "recommendation": (
+        "currency_hn",
+        "hash_language_site_hn",
+        "plat_hn",
+        "region_hn",
+        "page_elsn_hn",
+        "page_sn_hn",
+        "scene_id_hn",
+        "cat1_id_hn",
+        "price_hn",
+    ),
+    "global": (
+        "currency_hn",
+        "hash_language_site_hn",
+        "plat_hn",
+        "region_hn",
+        "cat1_id_hn",
+        "price_hn",
+    ),
+}
+SCENARIO_IMPORTANT_FIELDS = tuple(
+    dict.fromkeys(
+        source
+        for fields in SCENARIO_IMPORTANT_FIELDS_BY_TOKEN.values()
+        for source in fields
+    )
 )
-TASK_IMPORTANT_FIELDS = (
-    "currency_hn",
-    "hash_language_site_hn",
-    "language_hn",
+TASK_IMPORTANT_FIELDS_BY_TASK = {
+    "fst_cart": (
+        "cat1_id_hn",
+        "cat2_id_hn",
+        "price_hn",
+        "adj_cartcvr_hn",
+        "cart_cnt_3d_hn",
+    ),
+    "upid_pay": (
+        "cat1_id_hn",
+        "cat2_id_hn",
+        "price_hn",
+        "sales_hn",
+        "adj_cvr_hn",
+    ),
+    "cateid_filter": (
+        "cat1_id_hn",
+        "cat2_id_hn",
+        "cat_id_hn",
+        "rel_level_hn",
+        "rel_score_hn",
+    ),
+}
+TASK_IMPORTANT_FIELDS = tuple(
+    dict.fromkeys(
+        source
+        for fields in TASK_IMPORTANT_FIELDS_BY_TASK.values()
+        for source in fields
+    )
 )
+SCENARIO_IMPRESSION_PRIOR_FIELDS = (
+    "scene_impr_cnt_15d_hit_hn",
+    "scene_impr_cnt_15d_hn",
+)
+SCENARIO_CONDITIONED_HISTORY_PRIOR = "scenario_conditioned_clk_long_prior"
+
+# Fixed production RankMixer contract: 23 semantically coherent scalar/bag
+# groups plus the nine main history summaries = exactly 32 feature tokens.
+RANKMIXER_SEMANTIC_FEATURE_GROUPS = (
+    (
+        "request_environment",
+        (
+            "currency_hn",
+            "hash_language_site_hn",
+            "language_hn",
+            "plat_hn",
+            "region_hn",
+            "site_id_hn",
+            "timezone_hn",
+        ),
+    ),
+    (
+        "request_page_scene",
+        (
+            "page_elsn_hn",
+            "page_sn_hn",
+            "scene_id_hn",
+            "scene_impr_cnt_15d_hn",
+            "scene_impr_cnt_15d_hit_hn",
+        ),
+    ),
+    (
+        "query_identity",
+        (
+            "origin_query_hash_hn",
+            "query_arr_hn",
+            "query_hash_hn",
+            "query_terms_hash_hn",
+        ),
+    ),
+    (
+        "query_semantic_expansion",
+        (
+            "query_tfidf_term_hash_list_hn",
+            "query_extend_translation_hash_hn",
+            "sess_q2q_hash_list_hn",
+        ),
+    ),
+    (
+        "query_recall_context",
+        (
+            "search_method_hn",
+            "recall_merge_cate_levels_hn",
+            "recall_merge_cate1_ids_hn",
+            "recall_merge_cate_ids_hn",
+        ),
+    ),
+    (
+        "user_commerce_history",
+        (
+            "u_fst_ordr_cnt_mix_d_hn",
+            "cart_7d_cat1_ids_hn",
+            "flip_mall_ids_hn",
+            "list_clk_cat1_ids_hn",
+            "list_clk_cat_ids_hn",
+            "ups_in_cart_goods_hn_share",
+            "ups_incart_cat1_id_nc_hn",
+            "ups_in_cart_tg_hn",
+            "buy_long_spec_vids_hn",
+            "cart_long_spec_vids_hn",
+        ),
+    ),
+    (
+        "user_click_view_history",
+        (
+            "clk_7d_page_sns_hn",
+            "view_30m_cat1_ids_hn",
+            "view_7d_page_sns_hn",
+            "view_7d_page_elsns_hn",
+        ),
+    ),
+    (
+        "user_query_exposure_profile",
+        (
+            "ups_query_term_hash_v2_hn",
+            "ups_query_tg_hn",
+            "ups_search_method_hash_hn",
+            "opt_id_hn",
+            "impr_3h_tg_hn",
+            "impr_all_tg_hn",
+            "query_pay_cnt_15d_hn",
+        ),
+    ),
+    (
+        "item_category_hierarchy",
+        ("cat_id_hn", "cat1_id_hn", "cat2_id_hn", "cat3_id_hn", "cat4_id_hn"),
+    ),
+    (
+        "item_goods_identity",
+        ("goods_id_hn", "goods_cluster_id_1w_hn"),
+    ),
+    (
+        "item_text_content",
+        (
+            "goods_name_bigram_hn",
+            "goods_ner_infos_hn",
+            "goods_title_tfidf_term_hash_list_hn",
+        ),
+    ),
+    (
+        "item_sku_specification",
+        (
+            "g_sku_spec_hn",
+            "g_sku_spec_hash_hn",
+            "g_sku_spec_unit_list_hn",
+            "g_prpty_val_id_list_hn",
+            "sku_spec_hash_hn",
+            "sku_spec_hn",
+            "sku_spec_vids_hn",
+        ),
+    ),
+    (
+        "item_supply_quality",
+        (
+            "goods_avlb_sku_num_dis_hn",
+            "goods_onsale_sku_num_dis_hn",
+            "rev_ratings_cnt_crs_pos_hn",
+            "mall_id_hn",
+            "sellr_type_hn",
+            "site_x_asian_code_hn",
+        ),
+    ),
+    (
+        "sku_commerce",
+        (
+            "sku_id_hn",
+            "sku_price_v2_hn",
+            "sku_sales_hn",
+            "sku_cart_cnt_7d_hn",
+            "sku_ordr_cnt_1m_hn",
+            "sku_price_dis_hn",
+            "sku_sales_dis_hn",
+        ),
+    ),
+    (
+        "item_price_promotion",
+        (
+            "price_hn",
+            "price_bef_coupon_hn",
+            "price_after_promotion_hn",
+            "price_after_promotion_div_hn",
+            "mkt_prc_hn",
+            "show_price_hn",
+            "is_promotion_hn",
+            "promotion_discount_hn",
+            "auto_price_p05_dis",
+            "auto_price_p10_dis_hn",
+            "ori_price_hn_share",
+        ),
+    ),
+    (
+        "item_sales_value",
+        (
+            "sales_hn",
+            "auto_sales_p10_dis",
+            "nfk_sales_14d_hn",
+            "nfk_price_14d_hn",
+            "nfk_gmv_14d_hn",
+        ),
+    ),
+    (
+        "item_conversion_statistics",
+        (
+            "idx_c_adj_cart_cvr_15d_hn",
+            "idx_c_adj_ctr_15d_hn",
+            "idx_c_adj_ordr_cvr_15d_hn",
+            "idx_c_cart_cnt_15d_hn",
+            "idx_c_clk_cnt_15d_hn",
+            "idx_c_impr_cnt_15d_hn",
+            "idx_c_ordr_cnt_15d_hn",
+            "adj_cartcvr_hn",
+            "adj_ctr_hn",
+            "adj_cvr_hn",
+        ),
+    ),
+    (
+        "item_scene_statistics",
+        (
+            "goods_scene_clk_cnt_15d_hn",
+            "scene_adj_cartcvr_15d_hn",
+            "scene_adj_ctr_15d_hn",
+            "scene_adj_cvr_15d_hn",
+            "scene_cart_cnt_15d_hn",
+        ),
+    ),
+    (
+        "item_temporal_commerce",
+        (
+            "create_time_hn",
+            "f_goods_view_times_tg_l1_hn",
+            "target_gs_last_cart_tg_hn",
+            "impr_clk_6h_cnt_hn",
+            "clk_long_goods_abs_timegap_1d_hn",
+            "impr_long_goods_abs_timegap_1d_hn",
+            "mid_goods_prc_list_dis",
+            "mid_cmprc_diff_list_dis",
+        ),
+    ),
+    (
+        "retrieval_i2i_candidates",
+        (
+            "offline_outside_goods_id_list_hn_share",
+            "site_q2i_good_list_hn_share",
+            "main_goods_ids_hn_share",
+            "i2i2cat2_swing_hn",
+            "i2i_coclk_hn_share",
+            "i2i_list_amazoni2ifullgmv_hn_share",
+            "i2i_list_multimodal_hn_share",
+            "i2i_list_swingv3gmv_hn_share",
+            "i2i_hit_site_q2i_idx_hn",
+            "only_semi_swingi2i_cut60_hn_share",
+            "semi_swingi2i_cut30_hn_share",
+        ),
+    ),
+    (
+        "retrieval_hit_evidence",
+        (
+            "multimodal_i2i_hit_cart_size_hn",
+            "multimodal_i2i_hit_clk_size_hn",
+            "clk_hit_i2i_idx_hn",
+            "cart_hit_i2i_idx_hn",
+            "cart_long_hit_samestyle_i2i_idx_hn",
+            "ups_clkv2_i2i_goods_ids_hit_size",
+            "ups_clkv2_i2i_goods_ids_hit_all_size",
+        ),
+    ),
+    (
+        "query_item_relevance",
+        (
+            "rel_score_hn",
+            "rel_level_hn",
+            "q_hit_good_correct_unigram_hn",
+            "q2c_cart_15d_hit_val_hn",
+            "tit_in_top_query_cnt_hn",
+            "goods_query_emb32v3_cos_hn",
+            "query_cat_hn",
+            "us_ctr_price_dis50_hn",
+            "impr_cat_clk_goods_ids_cnt_1d_hn",
+        ),
+    ),
+    (
+        "creative_recent_behavior",
+        (
+            "campaign_id_hn",
+            "idx_goods_creative_id_hn",
+            "clk_cnt_1d_hn",
+            "clk_3d_cnt_hn",
+            "clk_1d_cat_cnt_hn",
+            "cart_cnt_1d_hn",
+            "cart_cnt_3d_hn",
+        ),
+    ),
+)
+# Independent scenario/task prior sequences must not clone the full growth-aware
+# high-card tables (each prior is a separate physical embedding). Cap by field
+# name so main pack / shared UPS tables can still follow the recommendation.
+PRIOR_INDEPENDENT_BUCKET_CAPS = {
+    "goods_id_hn": 1 << 24,  # 16M
+    "sku_id_hn": 1 << 25,  # 32M
+    "sku_ids_hn": 1 << 25,  # 32M
+    "spec_hn": 1 << 23,  # 8M
+    "spec_vids_hn": 1 << 24,  # 16M
+    "mall_id_hn": 1 << 22,  # 4M
+    "cat_id_hn": 1 << 20,
+    "cat1_id_hn": 1 << 12,
+    "cat2_id_hn": 1 << 14,
+    "cat3_id_hn": 1 << 17,
+    "cat4_id_hn": 1 << 19,
+}
 SCENARIO_SHARED_PRIOR_UPS = ("impr", "clk_long", "view_long")
+# Concrete scenario tokens get one independent history clone (paper: one
+# scenario-related behavior sequence per serving scenario). Global uses the
+# same request-only mean_pool pattern via scenario_global_*_prior clones.
+SCENARIO_SPECIFIC_PRIOR_UPS = ("clk_long",)
 TASK_PRIOR_UPS = {
     "fst_cart": "cart_long",
     "upid_pay": "buy_long",
-    "cateid_filter": "buy_long",
+    "cateid_filter": "srch_q2i",
 }
 # Alias kept for Phase 2 / docs; both MDL surfaces share this contract.
 MDL_MODELS = frozenset({"mdl_rankmixer", "mdl_onetrans"})
@@ -319,9 +662,55 @@ EXPECTED_LABELS = {
     "upid_pay": "upid_fst_trgt_noc_clk_pay_24h",
     "cateid_filter": "cateid_is_fst_scene_sp_filter",
 }
+
 OPTIONAL_FEATURE_COLUMNS = ("f_goods_view_times_tg_l1_hn",)
 TIME_DELTA_FIELD = "time_delta_log1p_seconds"
 AUTO_SCENARIO_NAME = "__auto__"
+
+
+def _scenario_prior_label(scenario_name: str) -> str:
+    """Stable sequence-name label for a scenario id (``__auto__`` → ``auto``)."""
+
+    return "auto" if scenario_name == AUTO_SCENARIO_NAME else scenario_name
+
+
+def _scenario_prior_sequence_name(scenario_name: str, ups: str) -> str:
+    return f"scenario_{_scenario_prior_label(scenario_name)}_{ups}_prior"
+
+
+def _scenario_specific_prior_inputs(scenario_name: str) -> list[str]:
+    """Independent scenario-history priors for one concrete scenario token."""
+
+    return [
+        _scenario_prior_sequence_name(scenario_name, ups)
+        for ups in SCENARIO_SPECIFIC_PRIOR_UPS
+    ]
+
+
+def _scenario_global_prior_inputs() -> list[str]:
+    """Request-only mean_pool hist priors for the global scenario token.
+
+    Concrete scenarios already use independent ``mean_pool`` clones (no candidate
+    ``target_inputs``). Global previously reused backbone LONGER/STCA summaries,
+    which on RankMixer are candidate-aware — leaking item identity into the
+    scenario prompt. Mirror the concrete-scenario pattern with scenario-scope
+    ``scenario_global_{impr,clk_long,view_long}_prior`` sequences instead.
+    """
+
+    return [
+        _scenario_prior_sequence_name("global", ups)
+        for ups in SCENARIO_SHARED_PRIOR_UPS
+    ]
+
+
+# Backward-compatible alias used by fine derivation / older call sites.
+def _scenario_shared_prior_inputs(
+    sequences: Sequence[Mapping[str, Any]] | None = None,
+) -> list[str]:
+    del sequences
+    return _scenario_global_prior_inputs()
+
+
 ESTIMATED_SEQUENCE_LENGTHS = {
     "impr": 1024,
     "clk_long": 2048,
@@ -362,47 +751,275 @@ PHASE2_TASK_PRIOR_SEQUENCES = (
     "task_upid_pay_prior",
     "task_cateid_filter_prior",
 )
-# Buy-prior dedup excludes timegap (Phase 2 keeps independent prior timegap tables)
-# and excludes spec/sku_ids (those already flatten onto cart_long via the dedicated
-# PHASE2_SPEC/SKU alias lists below).
-PHASE2_BUY_PRIOR_SHARE_FIELDS = (
-    "cat1_id_hn",
-    "cat2_id_hn",
-    "cat3_id_hn",
-    "cat4_id_hn",
-    "cat_id_hn",
-    "goods_id_hn",
-    "mall_id_hn",
-    "sales_hn",
-    "price_hn",
-)
-PHASE2_TASK_PRIOR_BASE_SHARES = {
-    "goods_id_hn": "goods_id_hn",
-    "cat1_id_hn": "cat1_id_hn",
-    "cat2_id_hn": "cat2_id_hn",
-    "cat3_id_hn": "cat3_id_hn",
-    "cat4_id_hn": "cat4_id_hn",
-    "cat_id_hn": "cat_id_hn",
-    "mall_id_hn": "mall_id_hn",
-    "price_hn": "price_hn",
-    "sales_hn": "sales_hn",
-}
-PHASE2_SPEC_SHARE_ALIASES = (
-    "buy_long.spec_hn",
-    "ups_clk_sku.spec_hn",
-    "task_fst_cart_prior.spec_hn",
-    "task_upid_pay_prior.spec_hn",
-    "task_cateid_filter_prior.spec_hn",
-)
-PHASE2_SKU_LIST_SHARE_ALIASES = (
-    "buy_long.sku_ids_hn",
-    "task_fst_cart_prior.sku_ids_hn",
-    "task_upid_pay_prior.sku_ids_hn",
-    "task_cateid_filter_prior.sku_ids_hn",
-)
+# Task priors keep independent embedding tables: never share onto candidate /
+# main-UPS roots, and never share across task_upid_pay_prior <->
+# task_cateid_filter_prior. Main UPS still merges buy_long/ups_clk_sku
+# spec/sku_ids onto cart_long in _apply_phase2_common.
 # Coarse scenario priors must keep independent identity tables. Never share them
 # onto scene_id_hn (fine-grained pre_hashed namespace).
 PHASE2_INDEPENDENT_SCENARIO_PRIORS = INDEPENDENT_COARSE_SCENARIO_PRIORS
+
+# Profile-driven emb/bucket targets from docs/emb_bucket_recommendation_growth.json
+# (Heaps growth 10→100 files, load-factor buckets, dim capped at 64). Applied after
+# name-estimate / Phase-2 tiers so regenerated YAMLs stay aligned.
+# uid_or_bg_hn is intentionally absent (removed from the feature contract).
+PROFILE_DRIVEN_EMBEDDING_SHAPES: dict[str, tuple[int, int]] = {
+    "ad_id_bin_hn": (256, 8),
+    "adj_cartcvr_hn": (256, 16),
+    "adj_ctr_hn": (256, 16),
+    "adj_cvr_hn": (256, 16),
+    "auto_price_p05_dis": (512, 16),
+    "auto_price_p10_dis_hn": (256, 16),
+    "auto_sales_p10_dis": (256, 16),
+    "buy_long_spec_vids_hn": (33554432, 64),
+    "buy_long_x_cat1_id_hn": (256, 16),
+    "buy_long_x_cat2_id_hn": (1024, 24),
+    "buy_long_x_cat3_id_hn": (16384, 32),
+    "buy_long_x_cat4_id_hn": (32768, 32),
+    "buy_long_x_cat_id_hn": (131072, 32),
+    "buy_long_x_goods_id_hn": (67108864, 64),
+    "buy_long_x_mall_id_hn": (4194304, 64),
+    "buy_long_x_price_hn": (256, 16),
+    "buy_long_x_sales_hn": (256, 16),
+    "buy_long_x_sku_ids_hn": (134217728, 64),
+    "buy_long_x_spec_hn": (33554432, 64),
+    "buy_long_x_timegap_hn": (256, 16),
+    "campaign_id_hn": (8388608, 64),
+    "cart_7d_cat1_ids_hn": (256, 16),
+    "cart_cnt_1d_hn": (256, 16),
+    "cart_cnt_3d_hn": (256, 16),
+    "cart_hit_i2i_idx_hn": (256, 16),
+    "cart_long_hit_samestyle_i2i_idx_hn": (256, 16),
+    "cart_long_spec_vids_hn": (33554432, 64),
+    "cart_long_x_cat1_id_hn": (256, 16),
+    "cart_long_x_cat2_id_hn": (1024, 24),
+    "cart_long_x_cat3_id_hn": (16384, 32),
+    "cart_long_x_cat4_id_hn": (65536, 32),
+    "cart_long_x_cat_id_hn": (131072, 32),
+    "cart_long_x_goods_id_hn": (134217728, 64),
+    "cart_long_x_mall_id_hn": (4194304, 64),
+    "cart_long_x_price_hn": (256, 16),
+    "cart_long_x_sku_ids_hn": (134217728, 64),
+    "cart_long_x_spec_hn": (67108864, 64),
+    "cart_long_x_timegap_hn": (256, 16),
+    "cat1_id_hn": (256, 16),
+    "cat2_id_hn": (1024, 24),
+    "cat3_id_hn": (8192, 24),
+    "cat4_id_hn": (32768, 32),
+    "cat_id_hn": (65536, 32),
+    "clk_1d_cat_cnt_hn": (256, 16),
+    "clk_3d_cnt_hn": (256, 16),
+    "clk_7d_page_sns_hn": (1024, 24),
+    "clk_cnt_1d_hn": (256, 16),
+    "clk_hit_i2i_idx_hn": (256, 16),
+    "clk_long_goods_abs_timegap_1d_hn": (256, 8),
+    "clk_long_x_cat1_id_hn": (256, 16),
+    "clk_long_x_cat2_id_hn": (1024, 24),
+    "clk_long_x_cat3_id_hn": (16384, 32),
+    "clk_long_x_cat4_id_hn": (65536, 32),
+    "clk_long_x_cat_id_hn": (131072, 32),
+    "clk_long_x_goods_id_hn": (134217728, 64),
+    "clk_long_x_mall_id_hn": (4194304, 64),
+    "clk_long_x_page_sn_hn": (4096, 24),
+    "clk_long_x_price_hn": (256, 16),
+    "clk_long_x_sales_hn": (256, 16),
+    "clk_long_x_timegap_hn": (256, 16),
+    "create_time_hn": (256, 8),
+    "currency_hn": (256, 16),
+    "f_goods_view_times_tg_l1_hn": (2048, 24),
+    "flatten_query_hash_x_flat_q_hash_hn": (2097152, 48),
+    "flatten_query_hash_x_timegap_hn": (256, 8),
+    "flip_mall_ids_hn": (2097152, 48),
+    "g_prpty_val_id_list_hn": (131072, 32),
+    "g_sku_spec_hash_hn": (16777216, 64),
+    "g_sku_spec_hn": (16777216, 64),
+    "g_sku_spec_unit_list_hn": (8388608, 64),
+    "goods_avlb_sku_num_dis_hn": (256, 16),
+    "goods_cluster_id_1w_hn": (32768, 32),
+    "goods_id_hn": (33554432, 64),
+    "goods_name_bigram_hn": (16777216, 64),
+    "goods_ner_infos_hn": (4194304, 64),
+    "goods_onsale_sku_num_dis_hn": (256, 16),
+    "goods_query_emb32v3_cos_hn": (512, 16),
+    "goods_scene_clk_cnt_15d_hn": (512, 16),
+    "goods_title_tfidf_term_hash_list_hn": (1048576, 48),
+    "hash_language_site_hn": (256, 16),
+    "i2i2cat2_swing_hn": (1024, 24),
+    "i2i_coclk_hn_share": (33554432, 64),
+    "i2i_hit_site_q2i_idx_hn": (256, 16),
+    "i2i_list_amazoni2ifullgmv_hn_share": (16777216, 64),
+    "i2i_list_multimodal_hn_share": (134217728, 64),
+    "i2i_list_swingv3gmv_hn_share": (33554432, 64),
+    "idx_c_adj_cart_cvr_15d_hn": (256, 16),
+    "idx_c_adj_ctr_15d_hn": (256, 16),
+    "idx_c_adj_ordr_cvr_15d_hn": (256, 16),
+    "idx_c_cart_cnt_15d_hn": (256, 16),
+    "idx_c_clk_cnt_15d_hn": (256, 16),
+    "idx_c_impr_cnt_15d_hn": (256, 16),
+    "idx_c_ordr_cnt_15d_hn": (256, 16),
+    "idx_goods_creative_id_hn": (67108864, 64),
+    "impr_3h_tg_hn": (256, 8),
+    "impr_all_tg_hn": (256, 8),
+    "impr_cat_clk_goods_ids_cnt_1d_hn": (4096, 24),
+    "impr_clk_6h_cnt_hn": (1024, 24),
+    "impr_long_goods_abs_timegap_1d_hn": (256, 8),
+    "impr_x_cat1_id_hn": (256, 16),
+    "impr_x_cat2_id_hn": (1024, 24),
+    "impr_x_cat3_id_hn": (16384, 32),
+    "impr_x_cat4_id_hn": (32768, 32),
+    "impr_x_cat_id_hn": (131072, 32),
+    "impr_x_goods_id_hn": (67108864, 64),
+    "impr_x_mall_id_hn": (2097152, 48),
+    "impr_x_page_sn_hn": (1024, 24),
+    "impr_x_price_hn": (256, 16),
+    "impr_x_sales_hn": (256, 16),
+    "impr_x_timegap_hn": (256, 8),
+    "is_promotion_hn": (256, 8),
+    "language_hn": (256, 8),
+    "list_clk_cat1_ids_hn": (256, 16),
+    "list_clk_cat_ids_hn": (65536, 32),
+    "main_goods_ids_hn_share": (16777216, 64),
+    "mall_id_hn": (2097152, 48),
+    "mid_cmprc_diff_list_dis": (256, 16),
+    "mid_goods_prc_list_dis": (256, 16),
+    "mkt_prc_hn": (256, 16),
+    "multimodal_i2i_hit_cart_size_hn": (256, 16),
+    "multimodal_i2i_hit_clk_size_hn": (256, 16),
+    "nfk_gmv_14d_hn": (256, 16),
+    "nfk_price_14d_hn": (256, 16),
+    "nfk_sales_14d_hn": (256, 16),
+    "offline_outside_goods_id_list_hn_share": (16777216, 64),
+    "only_semi_swingi2i_cut60_hn_share": (8388608, 64),
+    "opt_id_hn": (4096, 24),
+    "ori_price_hn_share": (256, 16),
+    "origin_query_hash_hn": (524288, 48),
+    "page_elsn_hn": (256, 16),
+    "page_sn_hn": (512, 16),
+    "plat_hn": (256, 8),
+    "price_after_promotion_div_hn": (16384, 32),
+    "price_after_promotion_hn": (256, 16),
+    "price_bef_coupon_hn": (256, 16),
+    "price_hn": (256, 16),
+    "promotion_discount_hn": (256, 16),
+    "q2c_cart_15d_hit_val_hn": (32768, 32),
+    "q_hit_good_correct_unigram_hn": (65536, 32),
+    "query_arr_hn": (131072, 32),
+    "query_cat_hn": (16777216, 64),
+    "query_extend_translation_hash_hn": (131072, 32),
+    "query_hash_hn": (131072, 32),
+    "query_pay_cnt_15d_hn": (256, 16),
+    "query_terms_hash_hn": (131072, 32),
+    "query_tfidf_term_hash_list_hn": (262144, 48),
+    "recall_merge_cate1_ids_hn": (256, 16),
+    "recall_merge_cate_ids_hn": (131072, 32),
+    "recall_merge_cate_levels_hn": (256, 8),
+    "region_hn": (256, 16),
+    "rel_level_hn": (256, 8),
+    "rel_score_hn": (256, 16),
+    "rev_ratings_cnt_crs_pos_hn": (1024, 24),
+    "sales_hn": (256, 16),
+    "scene_adj_cartcvr_15d_hn": (512, 16),
+    "scene_adj_ctr_15d_hn": (512, 16),
+    "scene_adj_cvr_15d_hn": (256, 16),
+    "scene_cart_cnt_15d_hn": (256, 16),
+    "scene_id_hn": (512, 16),
+    "scene_impr_cnt_15d_hit_hn": (256, 16),
+    "scene_impr_cnt_15d_hn": (32768, 32),
+    "search_method_hn": (256, 16),
+    "sellr_type_hn": (256, 8),
+    "semi_clk_x_cat_id_hn": (65536, 32),
+    "semi_clk_x_goods_id_hn": (8388608, 64),
+    "semi_clk_x_mall_id_hn": (262144, 48),
+    "semi_clk_x_page_sn_hn": (1024, 24),
+    "semi_clk_x_timegap_hn": (256, 8),
+    "semi_swingi2i_cut30_hn_share": (4194304, 64),
+    "sess_q2q_hash_list_hn": (8388608, 64),
+    "show_price_hn": (256, 16),
+    "site_id_hn": (256, 16),
+    "site_q2i_good_list_hn_share": (16777216, 64),
+    "site_x_asian_code_hn": (512, 16),
+    "sku_cart_cnt_7d_hn": (256, 16),
+    "sku_id_hn": (67108864, 64),
+    "sku_ordr_cnt_1m_hn": (256, 16),
+    "sku_price_dis_hn": (256, 16),
+    "sku_price_v2_hn": (256, 16),
+    "sku_sales_dis_hn": (256, 16),
+    "sku_sales_hn": (256, 16),
+    "sku_spec_hash_hn": (16777216, 64),
+    "sku_spec_hn": (16777216, 64),
+    "sku_spec_vids_hn": (8388608, 64),
+    "srch_q2i_x_cat1_id_hn": (256, 16),
+    "srch_q2i_x_cat2_id_hn": (1024, 24),
+    "srch_q2i_x_cat3_id_hn": (8192, 24),
+    "srch_q2i_x_cat4_id_hn": (32768, 32),
+    "srch_q2i_x_cat_id_hn": (131072, 32),
+    "srch_q2i_x_goods_id_hn": (16777216, 64),
+    "srch_q2i_x_mall_id_hn": (2097152, 48),
+    "srch_q2i_x_timegap_hn": (256, 16),
+    "target_gs_last_cart_tg_hn": (256, 16),
+    "timezone_hn": (1024, 24),
+    "tit_in_top_query_cnt_hn": (512, 16),
+    "u_fst_ordr_cnt_mix_d_hn": (512, 16),
+    "ups_clk_sku_x_cat1_id_hn": (256, 16),
+    "ups_clk_sku_x_cat2_id_hn": (1024, 24),
+    "ups_clk_sku_x_cat3_id_hn": (8192, 24),
+    "ups_clk_sku_x_cat4_id_hn": (32768, 32),
+    "ups_clk_sku_x_cat_id_hn": (65536, 32),
+    "ups_clk_sku_x_goods_id_hn": (33554432, 64),
+    "ups_clk_sku_x_mall_id_hn": (2097152, 48),
+    "ups_clk_sku_x_spec_hn": (16777216, 64),
+    "ups_clk_sku_x_timegap_hn": (256, 16),
+    "ups_clkv2_i2i_goods_ids_hit_all_size": (256, 16),
+    "ups_clkv2_i2i_goods_ids_hit_size": (256, 16),
+    "ups_in_cart_2h_sku_cur_prices_hn": (256, 8),
+    "ups_in_cart_goods_hn_share": (16777216, 64),
+    "ups_in_cart_tg_hn": (256, 16),
+    "ups_incart_cat1_id_nc_hn": (4096, 24),
+    "ups_query_term_hash_v2_hn": (2097152, 48),
+    "ups_query_tg_hn": (256, 8),
+    "ups_search_method_hash_hn": (256, 16),
+    "us_ctr_price_dis50_hn": (256, 16),
+    "view_30m_cat1_ids_hn": (256, 16),
+    "view_7d_page_elsns_hn": (512, 16),
+    "view_7d_page_sns_hn": (1024, 24),
+    "view_long_x_cat1_id_hn": (256, 16),
+    "view_long_x_cat2_id_hn": (1024, 24),
+    "view_long_x_cat3_id_hn": (16384, 32),
+    "view_long_x_cat4_id_hn": (65536, 32),
+    "view_long_x_cat_id_hn": (131072, 32),
+    "view_long_x_clk_bottom_img_hn": (256, 8),
+    "view_long_x_clk_cancel_wish_hn": (256, 8),
+    "view_long_x_clk_carousel_hn": (256, 8),
+    "view_long_x_clk_evaluate_hn": (256, 8),
+    "view_long_x_clk_more_hn": (256, 8),
+    "view_long_x_clk_svid_hn": (256, 8),
+    "view_long_x_clk_wish_hn": (256, 8),
+    "view_long_x_fvid_cv_hn": (256, 8),
+    "view_long_x_fvid_ratio_hn": (256, 8),
+    "view_long_x_goods_id_hn": (134217728, 64),
+    "view_long_x_mall_id_hn": (4194304, 64),
+    "view_long_x_page_sn_hn": (4096, 24),
+    "view_long_x_price_hn": (256, 16),
+    "view_long_x_sales_hn": (256, 16),
+    "view_long_x_share_hn": (256, 8),
+    "view_long_x_slide_bottom_detail_hn": (256, 8),
+    "view_long_x_slide_bottom_img_hn": (256, 8),
+    "view_long_x_slide_carousel_cnt_hn": (256, 8),
+    "view_long_x_slide_carousel_hn": (256, 8),
+    "view_long_x_stay_time_hn": (256, 8),
+    "view_long_x_switch_sku_cnt_hn": (256, 8),
+    "view_long_x_switch_sku_hn": (256, 8),
+    "view_long_x_timegap_hn": (256, 16),
+    "view_long_x_vid_hn": (256, 8),
+}
+PROFILE_DRIVEN_SEQUENCE_SHAPES: dict[str, tuple[int, int]] = {
+    "cart_long.sku_ids_hn": (134217728, 64),
+    "flatten_query_hash.flat_q_hash_hn": (2097152, 48),
+    "impr.timegap_hn": (256, 8),
+    "view_long.share_hn": (256, 8),
+    "view_long.stay_time_hn": (256, 8),
+    "view_long.vid_hn": (256, 8),
+}
 
 
 def _semantic_source(source: str) -> tuple[str | None, str]:
@@ -420,8 +1037,6 @@ def _estimated_bucket(source: str) -> int:
 
     # Entity identifiers dominate memory. Per-task history copies deliberately
     # use smaller tables than the union shared by the nine main UPS sequences.
-    if name == "uid_or_bg_hn":
-        return 1 << 26
     if name == "goods_id_hn":
         if prefix == "buy_long":
             return 1 << 24
@@ -450,7 +1065,11 @@ def _estimated_bucket(source: str) -> int:
         "impr_cat_clk_goods_ids_cnt_1d_hn",
     }:
         return 1 << 12
-    if "goods_ids" in name or "goods_id_list" in name or name == "ups_in_cart_goods_hn_share":
+    if (
+        "goods_ids" in name
+        or "goods_id_list" in name
+        or name == "ups_in_cart_goods_hn_share"
+    ):
         return 1 << 24
     if "goods_cluster_id" in name:
         return 1 << 22
@@ -475,7 +1094,8 @@ def _estimated_bucket(source: str) -> int:
     if name in {"mall_id_hn", "flip_mall_ids_hn"}:
         return 1 << 22
     if name == "ad_id_bin_hn":
-        return 1 << 24
+        # Near-binary hashed ad flag in production samples; keep tiny.
+        return 1 << 10
     if name == "campaign_id_hn":
         return 1 << 22
     if "creative_id" in name:
@@ -484,15 +1104,15 @@ def _estimated_bucket(source: str) -> int:
         return 1 << 18
 
     if "cat1_id" in name or "cate1_id" in name:
-        return 1 << 8
+        return 1 << 11
     if "cat2_id" in name or "cate2" in name:
-        return 1 << 12
+        return 1 << 14
     if "cat3_id" in name:
-        return 1 << 15
-    if "cat4_id" in name:
         return 1 << 17
+    if "cat4_id" in name:
+        return 1 << 19
     if "cat_id" in name or "cate_id" in name:
-        return 1 << 18
+        return 1 << 20
     if "cate_levels" in name:
         return 1 << 8
 
@@ -512,22 +1132,48 @@ def _estimated_bucket(source: str) -> int:
         "sellr_type_hn": 1 << 8,
         "site_x_asian_code_hn": 1 << 10,
         "is_promotion_hn": 1 << 4,
-        "timegap_hn": 1 << 6,
+        "timegap_hn": 1 << 10,
+        "price_hn": 1 << 10,
+        "sales_hn": 1 << 11,
+        "adj_cartcvr_hn": 1 << 10,
+        "adj_ctr_hn": 1 << 10,
+        "adj_cvr_hn": 1 << 10,
+        "auto_price_p05_dis": 1 << 13,
     }
     if name in small_exact:
         return small_exact[name]
     if "page_sns" in name or "page_elsns" in name:
         return 1 << 13
-    if name.startswith(("clk_", "slide_", "switch_", "fvid_")) and prefix == "view_long":
+    if (
+        name.startswith(("clk_", "slide_", "switch_", "fvid_"))
+        and prefix == "view_long"
+    ):
         return 1 << 6
 
     # These names denote already discretized measurements or compact derived
     # categories, not entity IDs. The original ordering is unavailable after
     # hashing, so they remain categorical tables.
     numeric_markers = (
-        "_cnt", "cnt_", "_size", "size_", "price", "prc", "sales",
-        "gmv", "cvr", "ctr", "score", "level", "ratio", "discount",
-        "timegap", "_time_hn", "_dis", "_hit", "_tg", "stay_time",
+        "_cnt",
+        "cnt_",
+        "_size",
+        "size_",
+        "price",
+        "prc",
+        "sales",
+        "gmv",
+        "cvr",
+        "ctr",
+        "score",
+        "level",
+        "ratio",
+        "discount",
+        "timegap",
+        "_time_hn",
+        "_dis",
+        "_hit",
+        "_tg",
+        "stay_time",
     )
     if any(marker in name for marker in numeric_markers):
         return 1 << 12
@@ -608,7 +1254,9 @@ def _require_empty_counter(value: Any, path: str, errors: list[str]) -> None:
         errors.append(f"{path} contains violations: {nonzero}")
 
 
-def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tuple[int, ...]:
+def validate_profile_report(
+    report: Mapping[str, Any], spec: ProfileSpec
+) -> tuple[int, ...]:
     errors: list[str] = []
     if int(report.get("format_version", 0)) < 4:
         errors.append(
@@ -623,7 +1271,9 @@ def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tup
     )
     for input_path, missing in missing_by_input.items():
         if missing:
-            errors.append(f"input {input_path!r} is missing configured columns: {missing}")
+            errors.append(
+                f"input {input_path!r} is missing configured columns: {missing}"
+            )
 
     contract = _require_mapping(report.get("contract"), "contract")
     if contract.get("partial_indices_rows", 0):
@@ -662,13 +1312,9 @@ def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tup
                     f"contract.label_distribution.{task}.total must be positive"
                 )
             if counts.get("other", 0):
-                errors.append(
-                    f"contract.label_distribution.{task}.other must be zero"
-                )
+                errors.append(f"contract.label_distribution.{task}.other must be zero")
             if counts.get("null", 0):
-                errors.append(
-                    f"contract.label_distribution.{task}.null must be zero"
-                )
+                errors.append(f"contract.label_distribution.{task}.null must be zero")
             if counts.get("minus_one", 0):
                 errors.append(
                     f"contract.label_distribution.{task}.minus_one must be zero"
@@ -725,9 +1371,7 @@ def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tup
             )
 
     sequence_sources = {
-        source
-        for sources in spec.sequence_sources.values()
-        for source in sources
+        source for sources in spec.sequence_sources.values() for source in sources
     }
     for source in sequence_sources:
         field = _require_mapping(field_reports.get(source), f"fields.{source}")
@@ -749,7 +1393,9 @@ def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tup
 
     for source in CORE_ITEM_FIELDS:
         field = _require_mapping(field_reports.get(source), f"fields.{source}")
-        nulls = _require_mapping(field.get("nulls_by_depth", {}), f"fields.{source}.nulls_by_depth")
+        nulls = _require_mapping(
+            field.get("nulls_by_depth", {}), f"fields.{source}.nulls_by_depth"
+        )
         if int(nulls.get("1", 0)) > 0:
             errors.append(f"core item field {source!r} contains candidate-level nulls")
 
@@ -758,12 +1404,13 @@ def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tup
     missing_context_scalars = CONTEXT_SCALAR_FIELDS - context_sources
     if missing_context_scalars:
         errors.append(
-            "the first 51 fields are missing expected scalar context fields: "
+            f"the first {CONTEXT_FEATURE_COUNT} fields are missing expected scalar "
+            "context fields: "
             + ", ".join(sorted(missing_context_scalars))
         )
     if not ITEM_BAG_FIELDS <= item_sources:
         errors.append(
-            "the final 118 fields are missing expected item bags: "
+            f"the final {ITEM_FEATURE_COUNT} fields are missing expected item bags: "
             + ", ".join(sorted(ITEM_BAG_FIELDS - item_sources))
         )
     declared_bags = (context_sources - CONTEXT_SCALAR_FIELDS) | ITEM_BAG_FIELDS
@@ -792,7 +1439,9 @@ def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tup
             f"contract.sequence_lengths_after_request_filter.{sequence}",
         )
         if int(summary.get("count", 0)) <= 0:
-            errors.append(f"sequence {sequence!r} has no per-request length observations")
+            errors.append(
+                f"sequence {sequence!r} has no per-request length observations"
+            )
 
     scene_rows = contract.get("scene_values", [])
     if not isinstance(scene_rows, list):
@@ -812,7 +1461,9 @@ def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tup
         "shared_embedding_groups",
     )
     source_to_group = {
-        source: root for root, sources in spec.shared_groups.items() for source in sources
+        source: root
+        for root, sources in spec.shared_groups.items()
+        for source in sources
     }
     for source in spec.categorical_sources:
         if source in source_to_group:
@@ -837,13 +1488,21 @@ def validate_profile_report(report: Mapping[str, Any], spec: ProfileSpec) -> tup
             or bucket <= 0
             or bucket & (bucket - 1)
         ):
-            errors.append(f"{label}.recommended_bucket_size must be a positive power of two")
+            errors.append(
+                f"{label}.recommended_bucket_size must be a positive power of two"
+            )
         dimension = stats.get("suggested_embedding_dim")
-        if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension <= 0:
+        if (
+            isinstance(dimension, bool)
+            or not isinstance(dimension, int)
+            or dimension <= 0
+        ):
             errors.append(f"{label}.suggested_embedding_dim must be positive")
 
     if errors:
-        raise ValueError("profile report is not production-ready:\n- " + "\n- ".join(errors))
+        raise ValueError(
+            "profile report is not production-ready:\n- " + "\n- ".join(errors)
+        )
     return tuple(scene_ids)
 
 
@@ -856,7 +1515,9 @@ class ReportValues:
             report["shared_embedding_groups"], "shared_embedding_groups"
         )
         self.source_to_group = {
-            source: root for root, sources in spec.shared_groups.items() for source in sources
+            source: root
+            for root, sources in spec.shared_groups.items()
+            for source in sources
         }
 
     @staticmethod
@@ -866,8 +1527,18 @@ class ReportValues:
 
     def categorical(self, source: str, *, shared: bool) -> tuple[int, int]:
         root = self.source_to_group.get(source) if shared else None
-        stats = self.shared[root] if root is not None else self.fields[source]
-        return int(stats["recommended_bucket_size"]), self._rounded_dimension(stats)
+        if root is not None:
+            stats = self.shared[root]
+            return int(stats["recommended_bucket_size"]), self._rounded_dimension(stats)
+        if source in self.fields:
+            stats = self.fields[source]
+            return int(stats["recommended_bucket_size"]), self._rounded_dimension(stats)
+        # Independent MDL clones (e.g. scenario_prior_scene_impr_*) may
+        # reference sources that are omitted from the main feature contract.
+        if source in PROFILE_DRIVEN_EMBEDDING_SHAPES:
+            buckets, dim = PROFILE_DRIVEN_EMBEDDING_SHAPES[source]
+            return int(buckets), int(dim)
+        raise KeyError(f"profile report missing categorical source {source!r}")
 
     def group_root(self, source: str) -> str | None:
         return self.source_to_group.get(source)
@@ -964,7 +1635,7 @@ def _independent_feature(
     values: ReportValues,
 ) -> dict[str, Any]:
     bucket, dimension = values.categorical(source, shared=False)
-    return {
+    entry: dict[str, Any] = {
         "name": logical_name,
         "kind": "categorical",
         "source": source,
@@ -972,6 +1643,12 @@ def _independent_feature(
         "embedding_dim": dimension,
         "encoding": _encoding(bucket=bucket),
     }
+    if source in MULTIVALUE_MAX_LENGTHS:
+        entry["pooling"] = "mean"
+        entry["pooling_null_policy"] = "exclude"
+        entry["max_length"] = int(MULTIVALUE_MAX_LENGTHS[source])
+        entry["truncation"] = "head"
+    return entry
 
 
 def _main_encoding(
@@ -986,8 +1663,12 @@ def _main_encoding(
 
 
 def _feature_bag_fields(sample_features: Sequence[Mapping[str, Any]]) -> set[str]:
-    context_sources = {str(item["source"]) for item in sample_features[:CONTEXT_FEATURE_COUNT]}
-    item_sources = {str(item["source"]) for item in sample_features[CONTEXT_FEATURE_COUNT:]}
+    context_sources = {
+        str(item["source"]) for item in sample_features[:CONTEXT_FEATURE_COUNT]
+    }
+    item_sources = {
+        str(item["source"]) for item in sample_features[CONTEXT_FEATURE_COUNT:]
+    }
     missing_request_context = REQUEST_CONTEXT_FIELDS - context_sources
     if missing_request_context:
         raise ValueError(
@@ -1024,12 +1705,22 @@ def _feature_bag_fields(sample_features: Sequence[Mapping[str, Any]]) -> set[str
             + ", ".join(sorted(missing_item_bags))
         )
     bag_fields = context_bags | ITEM_BAG_FIELDS
-    if bag_fields != set(MULTIVALUE_MAX_LENGTHS):
+    # MULTIVALUE_MAX_LENGTHS may include sources used only by independent MDL
+    # clones (e.g. scenario_prior_scene_impr_*) that are not main-pack bags.
+    allowed_extra = set(SCENARIO_IMPORTANT_FIELDS) | set(TASK_IMPORTANT_FIELDS)
+    if not bag_fields <= set(MULTIVALUE_MAX_LENGTHS):
         missing_lengths = sorted(bag_fields - set(MULTIVALUE_MAX_LENGTHS))
-        stale_lengths = sorted(set(MULTIVALUE_MAX_LENGTHS) - bag_fields)
         raise ValueError(
-            "multivalue max-length map disagrees with declared bags: "
-            f"missing={missing_lengths}, stale={stale_lengths}"
+            "multivalue max-length map missing declared bags: "
+            f"{missing_lengths}"
+        )
+    stale_lengths = sorted(
+        set(MULTIVALUE_MAX_LENGTHS) - bag_fields - allowed_extra
+    )
+    if stale_lengths:
+        raise ValueError(
+            "multivalue max-length map has unused entries: "
+            f"{stale_lengths}"
         )
     return bag_fields
 
@@ -1049,8 +1740,13 @@ def build_name_estimate_report(sample: Mapping[str, Any]) -> dict[str, Any]:
     """Create a scanner-shaped report using names only, with no data access."""
 
     raw_features = sample.get("features")
-    if not isinstance(raw_features, list) or len(raw_features) != EXPECTED_FEATURE_COUNT:
-        raise ValueError(f"sample fixture must contain exactly {EXPECTED_FEATURE_COUNT} features")
+    if (
+        not isinstance(raw_features, list)
+        or len(raw_features) != EXPECTED_FEATURE_COUNT
+    ):
+        raise ValueError(
+            f"sample fixture must contain exactly {EXPECTED_FEATURE_COUNT} features"
+        )
     spec = profile_spec_from_mapping(
         sample,
         context_feature_count=CONTEXT_FEATURE_COUNT,
@@ -1152,10 +1848,7 @@ def _main_features(
     max_bag_length: int | None,
 ) -> tuple[list[dict[str, Any]], set[str]]:
     bag_fields = _feature_bag_fields(sample_features)
-    sku_length = max(
-        MULTIVALUE_MAX_LENGTHS[source]
-        for source in DEFAULT_SKU_FIELDS
-    )
+    sku_length = max(MULTIVALUE_MAX_LENGTHS[source] for source in DEFAULT_SKU_FIELDS)
     if max_bag_length is not None:
         sku_length = min(sku_length, max_bag_length)
     result: list[dict[str, Any]] = []
@@ -1223,9 +1916,12 @@ def _main_sequences(
     max_sequence_length: int | None,
     encoder: str = "longer",
     sequence_length_caps: Mapping[str, int] | None = None,
+    include_scene_user_global: bool = True,
 ) -> list[dict[str, Any]]:
-    if encoder not in {"longer", "raw"}:
-        raise ValueError("production main sequence encoder must be longer or raw")
+    if encoder not in {*RANKMIXER_SEQUENCE_ENCODERS, "raw"}:
+        raise ValueError(
+            "production main sequence encoder must be longer, stca, or raw"
+        )
     result: list[dict[str, Any]] = []
     for raw_sequence in sample_sequences:
         name = str(raw_sequence["name"])
@@ -1275,19 +1971,54 @@ def _main_sequences(
             "fields": fields,
         }
         if encoder == "longer":
+            # Paper LONGER: user global + CLS + candidate global. Keep scene on
+            # the LONGER user-global path for both RankMixer and MDL-RankMixer;
+            # MDL still also routes scene through scenario tokens.
+            user_global_inputs = (
+                list(CORE_USER_GLOBAL_FIELDS) if include_scene_user_global else []
+            )
+            user_global_tokens = 1 if user_global_inputs else 0
             sequence.update(
                 {
-                    "target_inputs": [],
-                    "rankmixer_summary_tokens": 1,
+                    "target_inputs": list(CORE_ITEM_FIELDS),
+                    # user(+0/1) + cls(1) + candidate(1)
+                    "rankmixer_summary_tokens": 2 + user_global_tokens,
+                    # Paper d≈32; independent of RankMixer token_dim=768.
+                    "longer_dim": 32,
+                    "longer_num_heads": 4,
+                    "longer_hidden_dim": 64,
                     "longer_query_tokens": min(32, max_length),
                     "longer_self_layers": 1,
                     "longer_token_merge": 1,
                     "longer_inner_layers": 0,
                     "longer_output": "summary",
-                    "longer_user_global_inputs": [],
-                    "longer_user_global_tokens": 0,
+                    "longer_user_global_inputs": user_global_inputs,
+                    "longer_user_global_tokens": user_global_tokens,
                     "longer_cls_tokens": 1,
-                    "longer_candidate_global_tokens": 0,
+                    "longer_candidate_global_tokens": 1,
+                }
+            )
+        elif encoder == "stca":
+            sequence.update(
+                {
+                    # Candidate-side item attributes construct x_t. History
+                    # fields and positional inputs continue through the common
+                    # per-event embedding path to construct X.
+                    "target_inputs": list(CORE_ITEM_FIELDS),
+                    "rankmixer_summary_tokens": 1,
+                    # Paper example d=256; packed into RankMixer then sliced.
+                    "stca_dim": 256,
+                    "stca_layers": 4,
+                    "stca_num_heads": 16,
+                    "stca_expansion_ratio": 4,
+                    # Keep an explicit sharing identity for tooling that
+                    # inspects parameter groups independently of merge groups.
+                    "stca_parameter_group": "main_history",
+                    # Raw UPS stores action families in separate list columns.
+                    # Merge them into one chronological history, retain a
+                    # learned action-type embedding per stream, and emit the
+                    # paper's single z token through the first member.
+                    "stca_history_group": "main_history",
                 }
             )
         result.append(sequence)
@@ -1301,6 +2032,7 @@ def _task_prior_sequence(
     *,
     length_quantile: str,
     max_sequence_length: int | None,
+    target_inputs: Sequence[str],
 ) -> dict[str, Any]:
     source_name = str(source_sequence["name"])
     fields: list[dict[str, Any]] = []
@@ -1338,9 +2070,82 @@ def _task_prior_sequence(
         ),
         "truncation": "head",
         "sequence_order": "newest_to_oldest",
-        "encoder": "mean_pool",
+        "encoder": "attention_pool",
+        "pool_dim": 32,
+        "target_inputs": list(target_inputs),
         "time_delta_field": TIME_DELTA_FIELD,
         "null_anchor_field": "goods_id_hn",
+        "fields": fields,
+    }
+
+
+def _scenario_prior_sequence(
+    scenario_name: str,
+    source_sequence: Mapping[str, Any],
+    values: ReportValues,
+    *,
+    length_quantile: str,
+    max_sequence_length: int | None,
+    logical_name: str | None = None,
+    encoder: str = "mean_pool",
+    target_inputs: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Clone a backbone UPS into an independent scenario-scope prior.
+
+    Same physical columns as the feature-scope LONGER stream, but:
+    - ``embedding_scope: scenario`` with independent embedding tables
+    - ``mean_pool`` for global history or target-aware ``attention_pool`` for
+      the shared scene-conditioned concrete history
+    so domain priors do not reuse candidate-aware backbone LONGER summaries.
+    """
+
+    source_name = str(source_sequence["name"])
+    fields: list[dict[str, Any]] = []
+    for raw_field in source_sequence.get("fields", []):
+        field_name = str(raw_field["name"])
+        source = str(raw_field["source"])
+        if field_name == "time" or source.endswith("_x_time"):
+            fields.append(
+                {
+                    "name": TIME_DELTA_FIELD,
+                    "kind": "dense",
+                    "source": f"{source_name}_x_{TIME_DELTA_FIELD}",
+                    "dimension": 1,
+                }
+            )
+            continue
+        bucket, dimension = values.categorical(source, shared=False)
+        fields.append(
+            {
+                "name": field_name,
+                "kind": "categorical",
+                "source": source,
+                "embedding_dim": dimension,
+                "encoding": _encoding(bucket=bucket),
+            }
+        )
+    return {
+        "name": (
+            logical_name
+            if logical_name is not None
+            else _scenario_prior_sequence_name(scenario_name, source_name)
+        ),
+        "embedding_scope": "scenario",
+        "max_length": _sequence_max_length(
+            source_name,
+            values,
+            length_quantile=length_quantile,
+            max_sequence_length=max_sequence_length,
+        ),
+        "truncation": "head",
+        "sequence_order": "newest_to_oldest",
+        "encoder": encoder,
+        "pool_dim": 32,
+        "target_inputs": list(target_inputs),
+        "time_delta_field": TIME_DELTA_FIELD,
+        "null_anchor_field": (
+            "flat_q_hash_hn" if source_name == "flatten_query_hash" else "goods_id_hn"
+        ),
         "fields": fields,
     }
 
@@ -1350,12 +2155,25 @@ def _align_rankmixer_input_width(
     main_sequence_count: int,
     *,
     token_count: int,
-    token_dim: int,
+    sequence_encoded_dim: int,
     shared_sources: set[str],
+    dedicated_sequence_tokens: bool = False,
+    omit_scene_features: bool = True,
 ) -> dict[str, Any] | None:
+    from src.config import (
+        DEAD_CONSTANT_FEATURE_NAMES,
+        is_dead_constant_feature_name,
+        is_request_scene_feature_name,
+    )
+
     main_features = features[:EXPECTED_FEATURE_COUNT]
     input_width = 0
     for feature in main_features:
+        name = str(feature.get("name", ""))
+        if is_dead_constant_feature_name(name):
+            continue
+        if omit_scene_features and is_request_scene_feature_name(name):
+            continue
         if feature.get("kind") == "dense":
             width = int(feature.get("dimension", 1))
             if feature.get("presence", True):
@@ -1363,17 +2181,46 @@ def _align_rankmixer_input_width(
             input_width += width
         else:
             input_width += int(feature["embedding_dim"])
-    input_width += main_sequence_count * token_dim
-    remainder = input_width % token_count
+    alignment_token_count = token_count
+    if dedicated_sequence_tokens:
+        alignment_token_count -= main_sequence_count
+        if alignment_token_count <= 0:
+            raise ValueError(
+                "dedicated sequence tokens must leave at least one ordinary "
+                "RankMixer feature token"
+            )
+    else:
+        input_width += main_sequence_count * sequence_encoded_dim
+    remainder = input_width % alignment_token_count
     if remainder == 0:
         return None
-    increment = token_count - remainder
-    candidates = [
-        feature
-        for feature in main_features
-        if feature.get("kind") != "dense"
-        and str(feature["source"]) not in shared_sources
-    ]
+    increment = alignment_token_count - remainder
+    # Prefer not to spend packing slack on profile-driven shapes — those dims
+    # are intentional. When nearly every main feature is profile-driven (growth
+    # recommendation covers the full contract), fall back to the smallest
+    # non-shared locked table so width alignment can still succeed.
+    locked_profile_shapes = set(PROFILE_DRIVEN_EMBEDDING_SHAPES)
+
+    def _alignment_candidates(*, allow_locked: bool) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for feature in main_features:
+            if feature.get("kind") == "dense":
+                continue
+            name = str(feature["name"])
+            if str(feature["source"]) in shared_sources:
+                continue
+            if name in DEAD_CONSTANT_FEATURE_NAMES:
+                continue
+            if omit_scene_features and is_request_scene_feature_name(name):
+                continue
+            if not allow_locked and name in locked_profile_shapes:
+                continue
+            out.append(feature)
+        return out
+
+    candidates = _alignment_candidates(allow_locked=False)
+    if not candidates:
+        candidates = _alignment_candidates(allow_locked=True)
     target = (
         min(
             candidates,
@@ -1386,7 +2233,9 @@ def _align_rankmixer_input_width(
         else None
     )
     if target is None:
-        raise ValueError("cannot align RankMixer input width without changing a shared table")
+        raise ValueError(
+            "cannot align RankMixer input width without changing a shared table"
+        )
     before = int(target["embedding_dim"])
     target["embedding_dim"] = before + increment
     return {
@@ -1396,6 +2245,7 @@ def _align_rankmixer_input_width(
         "increment": increment,
         "input_width_before": input_width,
         "input_width_after": input_width + increment,
+        "alignment_token_count": alignment_token_count,
     }
 
 
@@ -1484,6 +2334,13 @@ def fine_config_name(coarse_name: str) -> str:
 
     path = Path(coarse_name)
     return f"{path.stem}_fine{path.suffix}"
+
+
+PRODUCTION_CONFIG_NAMES = tuple(
+    name
+    for coarse_name in PRODUCTION_COARSE_CONFIG_NAMES
+    for name in (coarse_name, fine_config_name(coarse_name))
+)
 
 
 def derive_fine_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -1585,18 +2442,31 @@ def derive_fine_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         )
         if not isinstance(search_token, Mapping):
             raise ValueError("MDL coarse payload must declare a search scenario token")
-        important = list(search_token["important_inputs"])
-        shared_priors = list(MDL_SCENARIO_SHARED_PRIORS)
+        global_token = next(
+            (
+                token
+                for token in scenario_tokens
+                if isinstance(token, Mapping) and token.get("name") == "global"
+            ),
+            None,
+        )
+        if not isinstance(global_token, Mapping):
+            raise ValueError("MDL coarse payload must declare a global scenario token")
+        specific_priors = [
+            str(name)
+            for name in search_token.get("prior_inputs", [])
+            if str(name) not in INDEPENDENT_COARSE_SCENARIO_PRIORS
+        ]
         tokenization["scenario_tokens"] = [
             {
                 "name": AUTO_SCENARIO_NAME,
-                "important_inputs": important,
-                "prior_inputs": ["scenario_prior_scene_id_hn", *shared_priors],
+                "important_inputs": list(search_token["important_inputs"]),
+                "prior_inputs": ["scenario_prior_scene_id_hn", *specific_priors],
             },
             {
                 "name": "global",
-                "important_inputs": list(important),
-                "prior_inputs": list(shared_priors),
+                "important_inputs": list(global_token["important_inputs"]),
+                "prior_inputs": list(global_token["prior_inputs"]),
             },
         ]
 
@@ -1605,7 +2475,9 @@ def derive_fine_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def render_fine_sibling(coarse_text: str, payload: Mapping[str, Any], *, coarse_name: str) -> str:
+def render_fine_sibling(
+    coarse_text: str, payload: Mapping[str, Any], *, coarse_name: str
+) -> str:
     """Render a fine-grained sibling YAML, preserving production header style."""
 
     header_lines: list[str] = []
@@ -1624,7 +2496,9 @@ def render_fine_sibling(coarse_text: str, payload: Mapping[str, Any], *, coarse_
             )
             continue
         if line.startswith("# Production training config for "):
-            model = line.removeprefix("# Production training config for ").split(";", 1)[0]
+            model = line.removeprefix("# Production training config for ").split(
+                ";", 1
+            )[0]
             rewritten.append(
                 f"# Fine sibling of configs/{coarse_name} ({model}); "
                 "default training still uses the coarse YAML."
@@ -1698,7 +2572,7 @@ def _reader_config(*, training: bool) -> dict[str, Any]:
         "scanner_batch_rows": 64,
         "pin_memory": True,
         "coalesce_pinned_tensors": True,
-        "device_prefetch_batches": 0,
+        "device_prefetch_batches": 1,
         "shard_unit": "row_group",
         "validate_prehashed_nonzero": False,
         "trusted_input": True,
@@ -1735,10 +2609,7 @@ def _split_config(
         "context_indices",
         "target_indices",
         *OPTIONAL_FEATURE_COLUMNS,
-        *(
-            f"{ups_type}_x_indices"
-            for ups_type in adapter_options["ups_types"]
-        ),
+        *(f"{ups_type}_x_indices" for ups_type in adapter_options["ups_types"]),
     ]
     if not training:
         optional_columns.append("example_ids")
@@ -1791,7 +2662,9 @@ def _iter_categorical_entries(payload: Mapping[str, Any]):
             yield f"{sequence_name}.{field['name']}", field
 
 
-def _categorical_entries_by_name(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+def _categorical_entries_by_name(
+    payload: Mapping[str, Any]
+) -> dict[str, dict[str, Any]]:
     entries: dict[str, dict[str, Any]] = {}
     for name, entry in _iter_categorical_entries(payload):
         if name in entries:
@@ -1807,9 +2680,13 @@ def _find_feature(payload: Mapping[str, Any], name: str) -> dict[str, Any]:
     raise KeyError(f"feature {name!r} not found")
 
 
-def _find_sequence_field(payload: Mapping[str, Any], qualified_name: str) -> dict[str, Any]:
+def _find_sequence_field(
+    payload: Mapping[str, Any], qualified_name: str
+) -> dict[str, Any]:
     if "." not in qualified_name:
-        raise KeyError(f"sequence field {qualified_name!r} must be qualified as sequence.field")
+        raise KeyError(
+            f"sequence field {qualified_name!r} must be qualified as sequence.field"
+        )
     sequence_name, field_name = qualified_name.split(".", 1)
     for sequence in payload["sequences"]:
         if sequence["name"] != sequence_name:
@@ -1976,7 +2853,9 @@ def _physical_table_count(payload: Mapping[str, Any]) -> int:
     )
 
 
-def _sequence_has_field(payload: Mapping[str, Any], sequence_name: str, field_name: str) -> bool:
+def _sequence_has_field(
+    payload: Mapping[str, Any], sequence_name: str, field_name: str
+) -> bool:
     for sequence in payload["sequences"]:
         if sequence["name"] != sequence_name:
             continue
@@ -2043,7 +2922,9 @@ def _assert_independent_coarse_scenario_priors(payload: Mapping[str, Any]) -> No
         feature = features.get(name)
         if feature is None:
             raise ValueError(f"missing independent coarse scenario prior {name!r}")
-        encoding = _require_mapping(feature.get("encoding"), f"features.{name}.encoding")
+        encoding = _require_mapping(
+            feature.get("encoding"), f"features.{name}.encoding"
+        )
         if encoding.get("share_embedding", False):
             raise ValueError(
                 f"coarse scenario prior {name!r} must use an independent table"
@@ -2062,9 +2943,7 @@ def _assert_independent_coarse_scenario_priors(payload: Mapping[str, Any]) -> No
                 f"num_buckets={COARSE_SCENE_PRIOR_NUM_BUCKETS}"
             )
         if int(encoding.get("padding_id", -1)) != 0:
-            raise ValueError(
-                f"coarse scenario prior {name!r} must use padding_id=0"
-            )
+            raise ValueError(f"coarse scenario prior {name!r} must use padding_id=0")
         if str(feature.get("source")) != COARSE_SCENE_PRIOR_ID_COLUMN:
             raise ValueError(
                 f"coarse scenario prior {name!r} must source "
@@ -2072,33 +2951,101 @@ def _assert_independent_coarse_scenario_priors(payload: Mapping[str, Any]) -> No
             )
 
 
+def _assert_independent_task_priors(payload: Mapping[str, Any]) -> None:
+    """Task prior categorical fields must not share embedding tables."""
+
+    sequences = {
+        str(sequence["name"]): sequence
+        for sequence in payload["sequences"]
+        if isinstance(sequence, Mapping)
+    }
+    for sequence_name in PHASE2_TASK_PRIOR_SEQUENCES:
+        sequence = sequences.get(sequence_name)
+        if sequence is None:
+            raise ValueError(f"missing task prior sequence {sequence_name!r}")
+        for field in sequence.get("fields", []):
+            if not isinstance(field, Mapping):
+                continue
+            if field.get("kind") != "categorical":
+                continue
+            field_name = str(field["name"])
+            encoding = _require_mapping(
+                field.get("encoding"),
+                f"sequences.{sequence_name}.fields.{field_name}.encoding",
+            )
+            if encoding.get("share_embedding", False):
+                raise ValueError(
+                    f"task prior {sequence_name}.{field_name} must use an "
+                    "independent embedding table"
+                )
+            if "share_with" in encoding:
+                raise ValueError(
+                    f"task prior {sequence_name}.{field_name} must not declare "
+                    "share_with"
+                )
+
+
+def _assert_independent_scenario_history_priors(payload: Mapping[str, Any]) -> None:
+    """Scenario-history priors must keep independent evidence embeddings."""
+
+    for sequence in payload["sequences"]:
+        if not isinstance(sequence, Mapping):
+            continue
+        name = str(sequence.get("name", ""))
+        if not (name.startswith("scenario_") and name.endswith("_prior")):
+            continue
+        if sequence.get("embedding_scope") != "scenario":
+            raise ValueError(
+                f"scenario history prior {name!r} must use embedding_scope=scenario"
+            )
+        encoder = sequence.get("encoder")
+        if encoder not in {"mean_pool", "attention_pool"}:
+            raise ValueError(
+                f"scenario history prior {name!r} must use encoder=mean_pool "
+                "or attention_pool"
+            )
+        if encoder == "attention_pool" and not sequence.get("target_inputs"):
+            raise ValueError(
+                f"scenario history prior {name!r} attention_pool requires "
+                "target_inputs"
+            )
+        for field in sequence.get("fields", []):
+            if not isinstance(field, Mapping):
+                continue
+            if field.get("kind") != "categorical":
+                continue
+            field_name = str(field["name"])
+            encoding = _require_mapping(
+                field.get("encoding"),
+                f"sequences.{name}.fields.{field_name}.encoding",
+            )
+            if encoding.get("share_embedding", False):
+                raise ValueError(
+                    f"scenario history prior {name}.{field_name} must use an "
+                    "independent embedding table"
+                )
+            if "share_with" in encoding:
+                raise ValueError(
+                    f"scenario history prior {name}.{field_name} must not declare "
+                    "share_with"
+                )
+
+
 def _apply_phase2_mdl_priors(payload: dict[str, Any]) -> None:
-    """MDL-only prior alias merges; requires the three task-prior sequences."""
+    """MDL-only Phase 2 prior policy; requires the three task-prior sequences.
+
+    Task priors stay independent. Scenario-history priors stay independent.
+    Coarse scenario id priors stay independent; legacy fine-grained
+    scenario-prior aliases may still share onto scene_id_hn.
+    """
 
     if not _payload_has_task_priors(payload):
         raise ValueError(
             "Phase 2 MDL prior profile requires task_fst_cart_prior, "
             "task_upid_pay_prior, and task_cateid_filter_prior sequences"
         )
-    for alias in PHASE2_SPEC_SHARE_ALIASES:
-        _share_embedding(payload, alias, "cart_long.spec_hn")
-    for alias in PHASE2_SKU_LIST_SHARE_ALIASES:
-        _share_embedding(payload, alias, "cart_long.sku_ids_hn")
-
-    for field_name in PHASE2_BUY_PRIOR_SHARE_FIELDS:
-        alias = f"task_cateid_filter_prior.{field_name}"
-        base = f"task_upid_pay_prior.{field_name}"
-        if not _sequence_has_field(payload, "task_cateid_filter_prior", field_name):
-            continue
-        if not _sequence_has_field(payload, "task_upid_pay_prior", field_name):
-            continue
-        _share_embedding(payload, alias, base)
-
-    for sequence_name in PHASE2_TASK_PRIOR_SEQUENCES:
-        for field_name, base_name in PHASE2_TASK_PRIOR_BASE_SHARES.items():
-            if not _sequence_has_field(payload, sequence_name, field_name):
-                continue
-            _share_embedding(payload, f"{sequence_name}.{field_name}", base_name)
+    _assert_independent_task_priors(payload)
+    _assert_independent_scenario_history_priors(payload)
 
     feature_names = {str(feature["name"]) for feature in payload["features"]}
     if PHASE2_INDEPENDENT_SCENARIO_PRIORS & feature_names:
@@ -2134,7 +3081,6 @@ def _apply_phase2_shared(payload: dict[str, Any]) -> None:
 
 def _apply_phase2_dim_compression(payload: dict[str, Any]) -> None:
     _set_embedding_shape(payload, "goods_id_hn", embedding_dim=48)
-    _set_embedding_shape(payload, "uid_or_bg_hn", embedding_dim=48)
     _set_embedding_shape(payload, "sku_id_hn", embedding_dim=48)
     _set_embedding_shape(payload, "origin_query_hash_hn", embedding_dim=32)
     _set_embedding_shape(payload, "query_hash_hn", embedding_dim=32)
@@ -2168,8 +3114,52 @@ def _apply_phase2_shared_dim_query_bucket(payload: dict[str, Any]) -> None:
 def _apply_phase2_shared_dim_aggressive_bucket(payload: dict[str, Any]) -> None:
     _apply_phase2_shared_dim_query_bucket(payload)
     _set_embedding_shape(payload, "goods_id_hn", num_buckets=1 << 26)
-    _set_embedding_shape(payload, "uid_or_bg_hn", num_buckets=1 << 25)
     _set_embedding_shape(payload, "sku_id_hn", num_buckets=1 << 25)
+    _propagate_shared_shapes(payload)
+    _validate_share_graph(payload)
+
+
+def _is_mdl_independent_prior_table(table_name: str) -> bool:
+    """True for scenario_*_prior / task_*_prior sequence fields."""
+
+    if "." not in table_name:
+        return False
+    sequence_name, _field_name = table_name.split(".", 1)
+    if sequence_name.startswith("task_") and sequence_name.endswith("_prior"):
+        return True
+    return sequence_name.startswith("scenario_") and sequence_name.endswith("_prior")
+
+
+def _apply_profile_driven_embedding_shapes(payload: dict[str, Any]) -> None:
+    """Apply growth-aware profile targets; match by table name or source."""
+
+    shapes = {
+        **PROFILE_DRIVEN_EMBEDDING_SHAPES,
+        **PROFILE_DRIVEN_SEQUENCE_SHAPES,
+    }
+    entries = _categorical_entries_by_name(payload)
+    for table_name, entry in entries.items():
+        encoding = entry.get("encoding") or {}
+        if encoding.get("share_embedding"):
+            continue
+        source = str(entry.get("source") or table_name)
+        shape = shapes.get(table_name) or shapes.get(source)
+        if shape is None and "." in table_name:
+            shape = shapes.get(table_name.split(".", 1)[1])
+        if shape is None:
+            continue
+        num_buckets, embedding_dim = int(shape[0]), int(shape[1])
+        if _is_mdl_independent_prior_table(table_name):
+            field_name = table_name.split(".", 1)[1]
+            cap = PRIOR_INDEPENDENT_BUCKET_CAPS.get(field_name)
+            if cap is not None:
+                num_buckets = min(num_buckets, int(cap))
+        _set_embedding_shape(
+            payload,
+            table_name,
+            num_buckets=num_buckets,
+            embedding_dim=embedding_dim,
+        )
     _propagate_shared_shapes(payload)
     _validate_share_graph(payload)
 
@@ -2183,8 +3173,7 @@ def apply_embedding_profile(payload: dict[str, Any], profile: str) -> dict[str, 
         )
     if profile == "baseline":
         _validate_share_graph(payload)
-        return payload
-    if profile == "shared":
+    elif profile == "shared":
         _apply_phase2_shared(payload)
     elif profile == "shared_dim":
         _apply_phase2_shared_dim(payload)
@@ -2192,6 +3181,9 @@ def apply_embedding_profile(payload: dict[str, Any], profile: str) -> dict[str, 
         _apply_phase2_shared_dim_query_bucket(payload)
     else:
         _apply_phase2_shared_dim_aggressive_bucket(payload)
+    # Always finish with profile-driven L1/L2/L3 shapes so regenerated YAMLs
+    # match production (and so query/goods compression tiers do not undo them).
+    _apply_profile_driven_embedding_shapes(payload)
     return payload
 
 
@@ -2217,7 +3209,11 @@ def _embedding_memory_summary(
         if encoding.get("share_embedding"):
             continue
         tables.append(
-            (str(feature["name"]), int(encoding["num_buckets"]), int(feature["embedding_dim"]))
+            (
+                str(feature["name"]),
+                int(encoding["num_buckets"]),
+                int(feature["embedding_dim"]),
+            )
         )
     for sequence in payload["sequences"]:
         for field in sequence["fields"]:
@@ -2246,7 +3242,9 @@ def _embedding_memory_summary(
             (bucket + 1) * dimension * 4 for _name, bucket, dimension in tables
         )
     else:
-        optimizer_state_bytes = sum((bucket + 1) * 4 for _name, bucket, _dimension in tables)
+        optimizer_state_bytes = sum(
+            (bucket + 1) * 4 for _name, bucket, _dimension in tables
+        )
     ideal_per_gpu = (weight_bytes + optimizer_state_bytes) / gpu_count
     table_specs = [
         EmbeddingTableSpec(
@@ -2334,11 +3332,10 @@ def build_config(
     embedding_weight_dtype: str = "bf16",
     sparse_optimizer: str = "rowwise_adagrad",
     embedding_profile: str = "shared_dim",
+    sequence_encoder: str = "longer",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if model_name not in SUPPORTED_MODELS:
-        raise ValueError(
-            "model_name must be one of " + ", ".join(SUPPORTED_MODELS)
-        )
+        raise ValueError("model_name must be one of " + ", ".join(SUPPORTED_MODELS))
     if length_quantile not in {"p95", "p99", "max"}:
         raise ValueError("length_quantile must be p95, p99, or max")
     if max_sequence_length is not None and max_sequence_length <= 0:
@@ -2359,11 +3356,27 @@ def build_config(
         raise ValueError(
             "embedding_profile must be one of " + ", ".join(EMBEDDING_PROFILES)
         )
+    if sequence_encoder not in RANKMIXER_SEQUENCE_ENCODERS:
+        raise ValueError(
+            "sequence_encoder must be one of " + ", ".join(RANKMIXER_SEQUENCE_ENCODERS)
+        )
+    if (
+        model_name not in {"rankmixer", "mdl_rankmixer"}
+        and sequence_encoder != "longer"
+    ):
+        raise ValueError(
+            "sequence_encoder is only selectable for rankmixer or mdl_rankmixer"
+        )
 
     raw_features = sample.get("features")
     raw_sequences = sample.get("sequences")
-    if not isinstance(raw_features, list) or len(raw_features) != EXPECTED_FEATURE_COUNT:
-        raise ValueError(f"sample fixture must contain exactly {EXPECTED_FEATURE_COUNT} features")
+    if (
+        not isinstance(raw_features, list)
+        or len(raw_features) != EXPECTED_FEATURE_COUNT
+    ):
+        raise ValueError(
+            f"sample fixture must contain exactly {EXPECTED_FEATURE_COUNT} features"
+        )
     if not isinstance(raw_sequences, list):
         raise ValueError("sample fixture sequences must be a list")
     sequence_names = tuple(str(sequence.get("name")) for sequence in raw_sequences)
@@ -2397,16 +3410,19 @@ def build_config(
         values,
         length_quantile=length_quantile,
         max_sequence_length=max_sequence_length,
-        encoder="raw" if onetrans_family else "longer",
+        encoder="raw" if onetrans_family else sequence_encoder,
         sequence_length_caps=(
             ONETRANS_SEQUENCE_LENGTH_CAPS if onetrans_family else None
         ),
+        # Keep scene_id_hn on LONGER user-global for RankMixer and MDL-RankMixer.
+        include_scene_user_global=True,
     )
 
-    scenario_important_names: list[str] = []
+    scenario_important_by_source: dict[str, str] = {}
     scenario_prior_names: dict[str, str] = {}
     auto_scenario_prior_name: str | None = None
-    task_important_names: list[str] = []
+    scenario_impression_prior_names: list[str] = []
+    task_important_by_source: dict[str, str] = {}
     use_coarse_scenes = not auto_discover_scenes
     production_search_scene_ids: frozenset[int] | None = None
     if use_coarse_scenes:
@@ -2423,7 +3439,11 @@ def build_config(
         for source in SCENARIO_IMPORTANT_FIELDS:
             name = f"scenario_important_{source}"
             features.append(_independent_feature(name, source, "scenario", values))
-            scenario_important_names.append(name)
+            scenario_important_by_source[source] = name
+        for source in SCENARIO_IMPRESSION_PRIOR_FIELDS:
+            name = f"scenario_prior_{source}"
+            features.append(_independent_feature(name, source, "scenario", values))
+            scenario_impression_prior_names.append(name)
         if auto_discover_scenes:
             auto_scenario_prior_name = "scenario_prior_scene_id_hn"
             features.append(
@@ -2446,9 +3466,39 @@ def build_config(
         for source in TASK_IMPORTANT_FIELDS:
             name = f"task_important_{source}"
             features.append(_independent_feature(name, source, "task", values))
-            task_important_names.append(name)
+            task_important_by_source[source] = name
 
     sequence_by_name = {str(sequence["name"]): sequence for sequence in raw_sequences}
+    scenario_prior_sequences = (
+        [
+            _scenario_prior_sequence(
+                "conditioned",
+                sequence_by_name["clk_long"],
+                values,
+                length_quantile=length_quantile,
+                max_sequence_length=max_sequence_length,
+                logical_name=SCENARIO_CONDITIONED_HISTORY_PRIOR,
+                encoder="attention_pool",
+                target_inputs=(
+                    scenario_important_by_source["scene_id_hn"],
+                    scenario_important_by_source["page_sn_hn"],
+                ),
+            ),
+            # Request-only global scenario hist (no candidate LONGER leakage).
+            *[
+                _scenario_prior_sequence(
+                    "global",
+                    sequence_by_name[ups],
+                    values,
+                    length_quantile=length_quantile,
+                    max_sequence_length=max_sequence_length,
+                )
+                for ups in SCENARIO_SHARED_PRIOR_UPS
+            ],
+        ]
+        if mdl_family
+        else []
+    )
     task_prior_sequences = (
         [
             _task_prior_sequence(
@@ -2457,23 +3507,48 @@ def build_config(
                 values,
                 length_quantile=length_quantile,
                 max_sequence_length=max_sequence_length,
+                target_inputs=tuple(
+                    task_important_by_source[source]
+                    for source in TASK_IMPORTANT_FIELDS_BY_TASK[task]
+                ),
             )
             for task, ups in MDL_TASK_PRIOR_SOURCES.items()
         ]
         if mdl_family
         else []
     )
-    sequences = [*main_sequences, *task_prior_sequences]
+    sequences = [
+        *main_sequences,
+        *scenario_prior_sequences,
+        *task_prior_sequences,
+    ]
+    if rankmixer_family and sequence_encoder == "longer" and main_sequences:
+        sequence_encoded_dim = (
+            int(main_sequences[0]["rankmixer_summary_tokens"])
+            * int(main_sequences[0]["longer_dim"])
+            * int(main_sequences[0]["longer_token_merge"])
+        )
+        align_sequence_count = len(main_sequences)
+    elif rankmixer_family and sequence_encoder == "stca" and main_sequences:
+        # History-group owner emits one packed z; other UPS columns merge into it.
+        sequence_encoded_dim = int(main_sequences[0].get("stca_dim", 256)) * int(
+            main_sequences[0].get("rankmixer_summary_tokens", 1)
+        )
+        align_sequence_count = 1
+    else:
+        sequence_encoded_dim = 768
+        align_sequence_count = len(main_sequences)
 
     adjustment = (
         _align_rankmixer_input_width(
             features,
-            len(main_sequences),
+            align_sequence_count,
             token_count=32,
-            token_dim=768,
+            sequence_encoded_dim=sequence_encoded_dim,
             shared_sources=set(values.source_to_group),
+            dedicated_sequence_tokens=sequence_encoder == "stca",
         )
-        if rankmixer_family
+        if rankmixer_family and sequence_encoder == "stca"
         else None
     )
 
@@ -2489,17 +3564,29 @@ def build_config(
         if mdl_family:
             if auto_scenario_prior_name is None:  # Defensive type narrowing.
                 raise RuntimeError("auto scenario prior was not constructed")
-            scenario_priors = list(MDL_SCENARIO_SHARED_PRIORS)
+            global_priors = _scenario_global_prior_inputs()
+            auto_important = [
+                scenario_important_by_source[source]
+                for source in SCENARIO_IMPORTANT_FIELDS_BY_TOKEN["search"]
+            ]
+            global_important = [
+                scenario_important_by_source[source]
+                for source in SCENARIO_IMPORTANT_FIELDS_BY_TOKEN["global"]
+            ]
             scenario_tokens = [
                 {
                     "name": AUTO_SCENARIO_NAME,
-                    "important_inputs": scenario_important_names,
-                    "prior_inputs": [auto_scenario_prior_name, *scenario_priors],
+                    "important_inputs": auto_important,
+                    "prior_inputs": [
+                        auto_scenario_prior_name,
+                        *scenario_impression_prior_names,
+                        SCENARIO_CONDITIONED_HISTORY_PRIOR,
+                    ],
                 },
                 {
                     "name": "global",
-                    "important_inputs": scenario_important_names,
-                    "prior_inputs": scenario_priors,
+                    "important_inputs": global_important,
+                    "prior_inputs": global_priors,
                 },
             ]
         else:
@@ -2513,14 +3600,20 @@ def build_config(
             "auto_discover": False,
         }
         if mdl_family:
-            scenario_priors = list(MDL_SCENARIO_SHARED_PRIORS)
+            global_priors = _scenario_global_prior_inputs()
             scenario_tokens = [
                 {
                     "name": scenario_name,
-                    "important_inputs": scenario_important_names,
+                    "important_inputs": [
+                        scenario_important_by_source[source]
+                        for source in SCENARIO_IMPORTANT_FIELDS_BY_TOKEN[
+                            scenario_name
+                        ]
+                    ],
                     "prior_inputs": [
                         scenario_prior_names[scenario_name],
-                        *scenario_priors,
+                        *scenario_impression_prior_names,
+                        SCENARIO_CONDITIONED_HISTORY_PRIOR,
                     ],
                 }
                 for scenario_name in SCENARIO_NAMES
@@ -2528,8 +3621,11 @@ def build_config(
             scenario_tokens.append(
                 {
                     "name": "global",
-                    "important_inputs": scenario_important_names,
-                    "prior_inputs": scenario_priors,
+                    "important_inputs": [
+                        scenario_important_by_source[source]
+                        for source in SCENARIO_IMPORTANT_FIELDS_BY_TOKEN["global"]
+                    ],
+                    "prior_inputs": global_priors,
                 }
             )
         else:
@@ -2538,7 +3634,10 @@ def build_config(
         [
             {
                 "name": task,
-                "important_inputs": task_important_names,
+                "important_inputs": [
+                    task_important_by_source[source]
+                    for source in TASK_IMPORTANT_FIELDS_BY_TASK[task]
+                ],
                 "prior_inputs": [f"task_{task}_prior"],
             }
             for task in EXPECTED_LABELS
@@ -2564,20 +3663,19 @@ def build_config(
         str(sequence["name"]): int(sequence["max_length"])
         for sequence in main_sequences
     }
-    for task, ups in MDL_TASK_PRIOR_SOURCES.items():
-        prior_name = f"task_{task}_prior"
-        prior = next(
-            (
-                sequence
-                for sequence in task_prior_sequences
-                if sequence["name"] == prior_name
-            ),
-            None,
-        )
-        if prior is None:
+    for prior in (*scenario_prior_sequences, *task_prior_sequences):
+        # Scenario/task priors reuse UPS physical columns; keep adapter caps
+        # large enough for the longest clone of each source stream.
+        source_ups = None
+        for field in prior.get("fields", []):
+            source = str(field.get("source", ""))
+            if "_x_" in source:
+                source_ups = source.split("_x_", 1)[0]
+                break
+        if source_ups is None or source_ups not in adapter_sequence_limits:
             continue
-        adapter_sequence_limits[ups] = max(
-            int(adapter_sequence_limits[ups]),
+        adapter_sequence_limits[source_ups] = max(
+            int(adapter_sequence_limits[source_ups]),
             int(prior["max_length"]),
         )
     adapter_options = _adapter_options(
@@ -2602,10 +3700,7 @@ def build_config(
                     for field in sequence["fields"]
                     if str(field["source"]) not in derived_time_columns
                 ),
-                *(
-                    f"{ups_type}_x_time"
-                    for ups_type in adapter_options["ups_types"]
-                ),
+                *(f"{ups_type}_x_time" for ups_type in adapter_options["ups_types"]),
             ]
         )
     )
@@ -2637,14 +3732,29 @@ def build_config(
             sequence_input_columns,
             training=False,
         )
+    if rankmixer_family and sequence_encoder == "stca":
+        # RLB is part of the paper's STCA stack, not an optional attention
+        # micro-optimization. Store one request-side payload and attach the
+        # candidate→request map consumed by both STCA and its request-balanced
+        # objective. Keep every established non-STCA input pipeline unchanged.
+        data["train"]["reader"]["deduplicate_request_features"] = True
+        if "test" in data:
+            data["test"]["reader"]["deduplicate_request_features"] = True
 
     total_main_sequence_length = sum(
         int(sequence["max_length"]) for sequence in main_sequences
     )
+    total_scenario_prior_length = sum(
+        int(sequence["max_length"]) for sequence in scenario_prior_sequences
+    )
     total_task_prior_length = sum(
         int(sequence["max_length"]) for sequence in task_prior_sequences
     )
-    total_sequence_length = total_main_sequence_length + total_task_prior_length
+    total_sequence_length = (
+        total_main_sequence_length
+        + total_scenario_prior_length
+        + total_task_prior_length
+    )
     if batch_size is None:
         raw_batch = max(8, event_token_budget_per_gpu // max(1, total_sequence_length))
         resolved_batch_size = min(256, _power_of_two_floor(raw_batch))
@@ -2657,25 +3767,62 @@ def build_config(
             raise ValueError("batch_size must be positive")
         resolved_batch_size = batch_size
 
-    if rankmixer_family:
-        tokenization: dict[str, Any] = {
+    if rankmixer_family and sequence_encoder == "longer":
+        declared_main_names = [str(feature["name"]) for feature in raw_features]
+        grouped_main_names = [
+            name
+            for _group_name, inputs in RANKMIXER_SEMANTIC_FEATURE_GROUPS
+            for name in inputs
+        ]
+        if len(grouped_main_names) != len(set(grouped_main_names)):
+            raise ValueError("RankMixer semantic feature groups contain duplicates")
+        if set(grouped_main_names) != set(declared_main_names):
+            missing = sorted(set(declared_main_names) - set(grouped_main_names))
+            extra = sorted(set(grouped_main_names) - set(declared_main_names))
+            raise ValueError(
+                "RankMixer semantic feature groups must partition the main contract; "
+                f"missing={missing}, extra={extra}"
+            )
+        tokenization = {
+            "feature_tokenizer": "groupwise",
+            "omit_scene_features": True,
+            "feature_tokens": [
+                {"name": name, "inputs": list(inputs)}
+                for name, inputs in RANKMIXER_SEMANTIC_FEATURE_GROUPS
+            ]
+            + [
+                {"name": f"history_{name}", "inputs": [name]}
+                for name in EXPECTED_UPS_TYPES
+            ],
+        }
+    elif rankmixer_family:
+        # STCA emits one dedicated z token and retains the flat RankMixer
+        # fallback so the remaining 31 slices keep the fixed 32-token budget.
+        tokenization = {
             "feature_tokenizer": "rankmixer",
             "num_feature_tokens": 32,
+            "omit_scene_features": True,
             "feature_token_inputs": [
-                *[str(feature["name"]) for feature in raw_features],
-                *list(EXPECTED_UPS_TYPES),
+                *[
+                    str(feature["name"])
+                    for feature in raw_features
+                    if str(feature["name"]) not in DEAD_CONSTANT_FEATURE_NAMES
+                ],
+                str(main_sequences[0]["name"]),
             ],
         }
     else:
         tokenization = {
             "feature_tokenizer": "auto_split",
             "num_feature_tokens": ONETRANS_NS_TOKENS,
+            "omit_scene_features": True,
             "feature_token_inputs": [
-                str(feature["name"]) for feature in raw_features
+                str(feature["name"])
+                for feature in raw_features
+                if str(feature["name"]) not in DEAD_CONSTANT_FEATURE_NAMES
             ],
             "sequence_tokens": [
-                {"name": name, "inputs": [name]}
-                for name in EXPECTED_UPS_TYPES
+                {"name": name, "inputs": [name]} for name in EXPECTED_UPS_TYPES
             ],
         }
     if mdl_family:
@@ -2702,7 +3849,8 @@ def build_config(
             "use_global_scenario_token": mdl_family,
             "use_task_feature_interaction": mdl_family,
             "use_scenario_feature_interaction": mdl_family,
-            "mdl_feature_interaction": "direct_ffn",
+            "mdl_feature_interaction": "residual_ffn",
+            "scene_feature_bias": "none",
             "use_request_cache": True,
         }
         onetrans_s_token_capacity: int | None = None
@@ -2724,9 +3872,7 @@ def build_config(
             "sequence_fusion": "intent_ordered",
             "ns_tokenizer": "auto_split",
             "num_ns_tokens": ONETRANS_NS_TOKENS,
-            "max_position_embeddings": (
-                onetrans_s_token_capacity + ONETRANS_NS_TOKENS
-            ),
+            "max_position_embeddings": (onetrans_s_token_capacity + ONETRANS_NS_TOKENS),
             "use_sep_tokens": True,
             "use_pyramid": True,
             "pyramid_round_to": 32,
@@ -2736,7 +3882,8 @@ def build_config(
             "use_global_scenario_token": mdl_family,
             "use_task_feature_interaction": mdl_family,
             "use_scenario_feature_interaction": mdl_family,
-            "mdl_feature_interaction": "direct_ffn",
+            "mdl_feature_interaction": "residual_ffn",
+            "scene_feature_bias": "none",
             "use_request_cache": True,
         }
         if model_name == "mdl_onetrans":
@@ -2746,6 +3893,10 @@ def build_config(
                     "experimental_model_acknowledged": True,
                 }
             )
+    if mdl_family:
+        # Default to the published MDL token propagation. Experiments that
+        # remove the important/prior -> readout residual bypass opt into split.
+        model["mdl_token_state"] = "coupled"
 
     payload: dict[str, Any] = {
         "runtime": {
@@ -2756,7 +3907,16 @@ def build_config(
             "require_compact_sequence_batches": False,
             "allow_tf32": True,
             "activation_checkpoint": "none",
+            # RankMixer dense-stack CUDA graphs exist (opt-in). Keep default
+            # false until DDP+graph soak is clean on PCIe fabrics.
+            "cuda_graph_backbone": False,
             "attention_backend": "flash",
+            # The STCA SwiGLU is token-wise; bounded chunks preserve the exact
+            # equation while avoiding an r*d activation over every 10k token at
+            # once. Other encoders retain their established unchunked default.
+            "sequence_projection_chunk_tokens": (
+                65536 if rankmixer_family and sequence_encoder == "stca" else 0
+            ),
             "distributed": "ddp",
             "nproc_per_node": gpu_count,
             "master_addr": "127.0.0.1",
@@ -2815,7 +3975,15 @@ def build_config(
             "sparse_parameter_server_adapter": None,
             "dense_clip_norm": 1.0,
             "sparse_clip_norm": 1.0,
-            "loss_reduction": "mean_per_task",
+            # STCA's Request Level Batching objective first averages targets
+            # within a request and then averages requests (paper Eq. 8).
+            # Preserve the established candidate-wise reduction for every
+            # existing encoder profile.
+            "loss_reduction": (
+                "mean_per_request_per_task"
+                if rankmixer_family and sequence_encoder == "stca"
+                else "mean_per_task"
+            ),
             # Avoid a CUDA scalar readback on every production step.
             "log_every_steps": 100,
             "quick_eval": {
@@ -2838,10 +4006,11 @@ def build_config(
         # Dim/bucket profiles can change feature widths after the initial align.
         adjustment = _align_rankmixer_input_width(
             payload["features"],
-            len(main_sequences),
+            align_sequence_count,
             token_count=32,
-            token_dim=768,
+            sequence_encoded_dim=sequence_encoded_dim,
             shared_sources=set(values.source_to_group),
+            dedicated_sequence_tokens=sequence_encoder == "stca",
         )
 
     # Validate the exact in-memory config before any output file is replaced.
@@ -2856,6 +4025,7 @@ def build_config(
     )
     summary = {
         "model_name": model_name,
+        "sequence_encoder": (sequence_encoder if rankmixer_family else "raw"),
         "embedding_profile": embedding_profile,
         "physical_embedding_tables": memory["unique_tables"],
         "profile": {
@@ -2879,16 +4049,22 @@ def build_config(
         "item_feature_count": EXPECTED_FEATURE_COUNT - CONTEXT_FEATURE_COUNT,
         "bag_feature_count": len(bag_fields),
         "main_ups_count": len(main_sequences),
+        "scenario_prior_count": len(scenario_prior_sequences),
         "task_prior_count": len(task_prior_sequences),
         "sequence_length_quantile": length_quantile,
         "main_sequence_max_lengths": {
             sequence["name"]: sequence["max_length"] for sequence in main_sequences
+        },
+        "scenario_prior_max_lengths": {
+            sequence["name"]: sequence["max_length"]
+            for sequence in scenario_prior_sequences
         },
         "task_prior_max_lengths": {
             sequence["name"]: sequence["max_length"]
             for sequence in task_prior_sequences
         },
         "total_main_sequence_length": total_main_sequence_length,
+        "total_scenario_prior_length": total_scenario_prior_length,
         "total_task_prior_length": total_task_prior_length,
         "total_encoded_sequence_length": total_sequence_length,
         "onetrans_s_token_capacity": onetrans_s_token_capacity,
@@ -2909,7 +4085,9 @@ def render_config(payload: Mapping[str, Any], summary: Mapping[str, Any]) -> str
         else f"{adjustment['feature']} {adjustment['before']}->{adjustment['after']}"
     )
     memory = summary["embedding_memory"]
-    estimate_mode = summary["profile"].get("settings", {}).get("mode") == "name_heuristic"
+    estimate_mode = (
+        summary["profile"].get("settings", {}).get("mode") == "name_heuristic"
+    )
     sizing_comment = (
         "# IMPORTANT: buckets/dimensions/lengths are name-only estimates; replace them after profiling."
         if estimate_mode
@@ -2925,9 +4103,7 @@ def render_config(payload: Mapping[str, Any], summary: Mapping[str, Any]) -> str
         f"# Raw scene_id -> model index: {summary['scene_id_to_index']}",
     ]
     if model_name in {"rankmixer", "mdl_rankmixer"}:
-        comments.append(
-            f"# RankMixer divisibility adjustment: {adjustment_comment}"
-        )
+        comments.append(f"# RankMixer divisibility adjustment: {adjustment_comment}")
     else:
         comments.append(
             "# OneTrans capacity includes intent separators but excludes NS tokens: "
@@ -2954,6 +4130,151 @@ def render_config(payload: Mapping[str, Any], summary: Mapping[str, Any]) -> str
     )
 
 
+def merge_production_contract(
+    generated: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Restore a generated model contract while retaining production tuning.
+
+    Model/features/tokenization/data-column contracts come from ``generated``.
+    Runtime, optimizer/training, input paths, and reader throughput tuning come
+    from the existing production YAML. Feature/sequence sizing remains part of
+    the generated contract: retaining it from a stale YAML can silently restore
+    deleted fields, obsolete profile caps, or incompatible sharing layouts.
+    """
+
+    result = deepcopy(dict(generated))
+
+    for key in ("runtime", "training"):
+        value = current.get(key)
+        if isinstance(value, Mapping):
+            result[key] = deepcopy(dict(value))
+
+    result_data = result.get("data")
+    current_data = current.get("data")
+    if isinstance(result_data, dict) and isinstance(current_data, Mapping):
+        current_schema_policy = current_data.get("schema_policy")
+        if isinstance(current_schema_policy, Mapping):
+            result_data["schema_policy"] = deepcopy(dict(current_schema_policy))
+        for split_name in ("train", "test"):
+            result_split = result_data.get(split_name)
+            current_split = current_data.get(split_name)
+            if not isinstance(result_split, dict) or not isinstance(
+                current_split, Mapping
+            ):
+                continue
+            if isinstance(current_split.get("inputs"), list):
+                result_split["inputs"] = deepcopy(current_split["inputs"])
+            if isinstance(current_split.get("reader"), Mapping):
+                result_split["reader"] = deepcopy(dict(current_split["reader"]))
+            result_adapter = result_split.get("adapter")
+            current_adapter = current_split.get("adapter")
+            if isinstance(result_adapter, dict) and isinstance(
+                current_adapter, Mapping
+            ):
+                result_options = result_adapter.get("options")
+                current_options = current_adapter.get("options")
+                if isinstance(result_options, dict) and isinstance(
+                    current_options, Mapping
+                ):
+                    if "compact_request_lists" in current_options:
+                        result_options["compact_request_lists"] = bool(
+                            current_options["compact_request_lists"]
+                        )
+
+    config = AppConfig.from_mapping(result)
+    config.validate()
+    return result
+
+
+def render_refreshed_production_config(
+    current_text: str,
+    payload: Mapping[str, Any],
+    *,
+    model_name: str,
+) -> str:
+    """Render a refreshed contract while preserving the production header."""
+
+    header_lines: list[str] = []
+    for line in current_text.splitlines():
+        if line.startswith("#") or (not line.strip() and header_lines):
+            header_lines.append(line)
+            continue
+        break
+    rewritten: list[str] = []
+    for line in header_lines:
+        if line.startswith("# Adapter grouping:"):
+            rewritten.append(
+                "# Adapter grouping: context_features=47 request-axis; "
+                "item_features=100 candidate-axis."
+            )
+            continue
+        if line.startswith("# MDL token state:"):
+            continue
+        rewritten.append(line)
+    if model_name in {"mdl_rankmixer", "mdl_onetrans"}:
+        rewritten.append(
+            "# MDL token state: coupled is the paper-faithful residual path; "
+            "use --mdl-token-state split for the no-bypass variant."
+        )
+    if rewritten and rewritten[-1].strip():
+        rewritten.append("")
+    body = yaml.safe_dump(
+        dict(payload),
+        sort_keys=False,
+        allow_unicode=True,
+        width=100,
+    )
+    return "\n".join(rewritten) + body
+
+
+def refresh_production_contracts(
+    configs_dir: Path,
+    sample: Mapping[str, Any],
+    report: Mapping[str, Any],
+    *,
+    dry_run: bool = False,
+) -> list[Path]:
+    """Refresh all coarse/fine production contracts without losing ops tuning."""
+
+    written: list[Path] = []
+    for model_name in SUPPORTED_MODELS:
+        for fine in (False, True):
+            config_name = f"{model_name}{'_fine' if fine else ''}.yaml"
+            config_path = configs_dir / config_name
+            if not config_path.is_file():
+                raise FileNotFoundError(
+                    f"missing production config to refresh: {config_path}"
+                )
+            current_text = config_path.read_text(encoding="utf-8")
+            current_payload = yaml.safe_load(current_text)
+            if not isinstance(current_payload, Mapping):
+                raise ValueError(f"{config_path} must contain a mapping")
+            generated, _summary = build_config(
+                sample,
+                report,
+                model_name=model_name,
+                auto_discover_scenes=fine,
+            )
+            merged = merge_production_contract(generated, current_payload)
+            rendered = render_refreshed_production_config(
+                current_text,
+                merged,
+                model_name=model_name,
+            )
+            if dry_run:
+                sys.stdout.write(f"--- {config_path} ---\n")
+                sys.stdout.write(rendered)
+                if not rendered.endswith("\n"):
+                    sys.stdout.write("\n")
+            else:
+                temporary = config_path.with_suffix(config_path.suffix + ".tmp")
+                temporary.write_text(rendered, encoding="utf-8")
+                temporary.replace(config_path)
+            written.append(config_path)
+    return written
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -2967,6 +4288,15 @@ def main() -> int:
         choices=SUPPORTED_MODELS,
         default="mdl_rankmixer",
         help="Model surface to generate (default: mdl_rankmixer).",
+    )
+    parser.add_argument(
+        "--sequence-encoder",
+        choices=RANKMIXER_SEQUENCE_ENCODERS,
+        default="longer",
+        help=(
+            "Main RankMixer sequence encoder (default: longer). "
+            "STCA leaves MDL task-prior mean pooling unchanged."
+        ),
     )
     sizing = parser.add_mutually_exclusive_group(required=False)
     sizing.add_argument("--report", type=Path)
@@ -2983,7 +4313,9 @@ def main() -> int:
     parser.add_argument("--summary-output", type=Path)
     parser.add_argument("--train-input", action="append")
     parser.add_argument("--test-input", action="append")
-    parser.add_argument("--length-quantile", choices=("p95", "p99", "max"), default="p99")
+    parser.add_argument(
+        "--length-quantile", choices=("p95", "p99", "max"), default="p99"
+    )
     parser.add_argument("--max-sequence-length", type=int)
     parser.add_argument("--max-bag-length", type=int)
     parser.add_argument("--embedding-budget-gib-per-gpu", type=float, default=80.0)
@@ -3027,6 +4359,16 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--refresh-production-contracts",
+        action="store_true",
+        help=(
+            "Regenerate all eight coarse/fine production model contracts while "
+            "preserving each YAML's runtime, training, input paths, reader "
+            "throughput tuning. Feature/sequence sizing comes from the selected "
+            "report or the builder's checked-in profile policy."
+        ),
+    )
+    parser.add_argument(
         "--configs-dir",
         type=Path,
         default=Path("configs"),
@@ -3048,6 +4390,38 @@ def main() -> int:
             file=sys.stderr,
         )
         return 0
+    if args.refresh_production_contracts:
+        try:
+            sample = _load_mapping(args.sample, kind="yaml")
+            report = (
+                _load_mapping(args.report, kind="json")
+                if args.report is not None
+                else build_name_estimate_report(sample)
+            )
+            written = refresh_production_contracts(
+                args.configs_dir,
+                sample,
+                report,
+                dry_run=args.dry_run,
+            )
+        except (
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            yaml.YAMLError,
+        ) as error:
+            parser.error(str(error))
+        print(
+            json.dumps(
+                {"refreshed": [str(path) for path in written]},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 0
     if args.report is None and not args.estimate_from_names:
         parser.error("one of the arguments --report --estimate-from-names is required")
     try:
@@ -3059,13 +4433,17 @@ def main() -> int:
         )
         # Verify the file-backed scanner parser agrees with the generator's
         # in-memory parser before consuming its group reports.
-        file_spec = load_profile_spec(args.sample, context_feature_count=CONTEXT_FEATURE_COUNT)
+        file_spec = load_profile_spec(
+            args.sample, context_feature_count=CONTEXT_FEATURE_COUNT
+        )
         memory_spec = profile_spec_from_mapping(
             sample,
             context_feature_count=CONTEXT_FEATURE_COUNT,
         )
         if file_spec != memory_spec:
-            raise ValueError("internal sample parser disagrees with profile scanner grouping")
+            raise ValueError(
+                "internal sample parser disagrees with profile scanner grouping"
+            )
         if not args.auto_discover_scenes:
             validate_production_search_scene_ids(SEARCH_SCENE_IDS)
         payload, summary = build_config(
@@ -3085,6 +4463,7 @@ def main() -> int:
             embedding_weight_dtype=args.embedding_weight_dtype,
             sparse_optimizer=args.sparse_optimizer,
             embedding_profile=args.embedding_profile,
+            sequence_encoder=args.sequence_encoder,
         )
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))

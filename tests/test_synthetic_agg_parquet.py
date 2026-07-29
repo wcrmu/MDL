@@ -42,7 +42,7 @@ class SyntheticAggParquetTest(unittest.TestCase):
             )
             parquet_path = next(output_dir.glob("*.parquet"))
             self.assertEqual(len(pq.read_schema(parquet_path)), 300)
-            self.assertEqual(manifest.projected_columns, 293)
+            self.assertEqual(manifest.projected_columns, 271)
             self.assertEqual(manifest.candidates, 4)
             self.assertGreater(manifest.projected_compressed_bytes, 0)
 
@@ -82,8 +82,11 @@ class SyntheticAggParquetTest(unittest.TestCase):
         override, bucket = _recommended_yaml_override(path, 40, lengths)
 
         self.assertIsNotNone(bucket)
-        self.assertEqual(bucket["workload_length"], 4308)
-        self.assertEqual(bucket["max_length"], 6144)
+        # Independent scenario/task priors have their own encoders and
+        # activations, so the sum-based memory bucket must count them rather
+        # than only the nine backbone histories.
+        self.assertEqual(bucket["workload_length"], 11476)
+        self.assertIsNone(bucket["max_length"])
         rendered = override["data"]["train"]["reader"]["length_buckets"]
         self.assertEqual(rendered[bucket["bucket_index"]]["batch_size"], 40)
 

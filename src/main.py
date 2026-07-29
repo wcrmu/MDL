@@ -134,7 +134,13 @@ _TRAINING_OVERRIDE_FIELDS = (
 
 _RUNTIME_OVERRIDE_FIELDS = ("activation_checkpoint", "cuda_graph_backbone")
 
-_MODEL_OVERRIDE_FIELDS = ("mdl_feature_interaction",)
+_MODEL_OVERRIDE_FIELDS = (
+    "mdl_feature_interaction",
+    "mdl_token_state",
+    "scene_feature_bias",
+)
+
+_TOKENIZATION_OVERRIDE_FIELDS = ("omit_scene_features",)
 
 
 def _scale_length_buckets(buckets: tuple, old_batch_size: int, new_batch_size: int) -> tuple:
@@ -225,6 +231,20 @@ def _apply_model_overrides(config, args: argparse.Namespace):
     return replace(config, model=model)
 
 
+def _apply_tokenization_overrides(config, args: argparse.Namespace):
+    """Apply optional CLI tokenization overrides."""
+
+    updates: dict[str, object] = {}
+    for field_name in _TOKENIZATION_OVERRIDE_FIELDS:
+        value = getattr(args, field_name, None)
+        if value is not None:
+            updates[field_name] = value
+    if not updates:
+        return config
+    tokenization = replace(config.tokenization, **updates)
+    return replace(config, tokenization=tokenization)
+
+
 def _load_config(args: argparse.Namespace):
     config = load_app_config(args.config)
     if any(
@@ -246,6 +266,10 @@ def _load_config(args: argparse.Namespace):
         config = _apply_runtime_overrides(config, args)
     if any(getattr(args, name, None) is not None for name in _MODEL_OVERRIDE_FIELDS):
         config = _apply_model_overrides(config, args)
+    if any(
+        getattr(args, name, None) is not None for name in _TOKENIZATION_OVERRIDE_FIELDS
+    ):
+        config = _apply_tokenization_overrides(config, args)
     return config
 
 
@@ -405,9 +429,47 @@ def _add_model_override_args(parser: argparse.ArgumentParser) -> None:
         choices=["direct_ffn", "residual_ffn"],
         default=None,
         help=(
-            "override model.mdl_feature_interaction: direct_ffn matches MDL "
-            "Eq. 6 (FFN replaces mixed tokens); residual_ffn keeps RankMixer "
-            "residual+LayerNorm after the FFN"
+            "override model.mdl_feature_interaction (default residual_ffn: "
+            "RankMixer residual+LayerNorm after FFN). Use direct_ffn for MDL "
+            "Eq. 6 (FFN replaces mixed tokens)."
+        ),
+    )
+    parser.add_argument(
+        "--mdl-token-state",
+        choices=["coupled", "split"],
+        default=None,
+        help=(
+            "override model.mdl_token_state. coupled (default) preserves the "
+            "published MDL path where the important/prior token is query, "
+            "residual state, and readout. split keeps that token query-only "
+            "and uses a separate readout state, removing the prior-to-readout "
+            "residual bypass"
+        ),
+    )
+    parser.add_argument(
+        "--scene-feature-bias",
+        choices=["none", "additive", "film"],
+        default=None,
+        help=(
+            "override model.scene_feature_bias (default none). additive / film "
+            "condition feature tokens on the active scenario before domain "
+            "attention (MDL ablation option C); requires mdl_* + scenario tokens"
+        ),
+    )
+
+
+def _add_tokenization_override_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--omit-scene-features",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "set tokenization.omit_scene_features (default true in schema). "
+            "When enabled, request-axis scene fields (scene_id_hn / "
+            "scene_impr_* / scene_clk_*_hit) leave RankMixer feature tokens and "
+            "OneTrans NS; they still feed scenario tokens / LONGER. Candidate "
+            "goods×scene crosses (scene_adj_* / goods_scene_*) stay in the pack. "
+            "Use --no-omit-scene-features to keep request scene fields in the pack."
         ),
     )
 
@@ -417,6 +479,19 @@ def _cmd_validate_config(args: argparse.Namespace) -> int:
     print(f"config: OK ({args.config})")
     print(f"model: {config.model.name}")
     print(f"mdl_feature_interaction: {config.model.mdl_feature_interaction}")
+    print(f"mdl_token_state: {config.model.mdl_token_state}")
+    print(f"scene_feature_bias: {config.model.scene_feature_bias}")
+    print(f"omit_scene_features: {config.tokenization.omit_scene_features}")
+    if config.tokenization.omit_scene_features:
+        resolved = config.resolved.tokenization
+        print(
+            "resolved_feature_token_count: "
+            f"{resolved.feature_token_count}"
+        )
+        print(
+            "resolved_feature_token_inputs: "
+            f"{len(resolved.feature_token_inputs)}"
+        )
     print(f"features: {len(config.features)}")
     print(f"train_inputs: {len(config.data.train.inputs)}")
     if config.data.test is not None:
@@ -701,6 +776,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_training_override_args(validate)
     _add_runtime_override_args(validate)
     _add_model_override_args(validate)
+    _add_tokenization_override_args(validate)
     validate.set_defaults(func=_cmd_validate_config)
 
     profile = subparsers.add_parser("profile")
@@ -711,6 +787,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_training_override_args(profile)
     _add_runtime_override_args(profile)
     _add_model_override_args(profile)
+    _add_tokenization_override_args(profile)
     profile.set_defaults(func=_cmd_profile)
 
     fit_vocab = subparsers.add_parser("fit-vocab")
@@ -734,6 +811,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_training_override_args(train)
     _add_runtime_override_args(train)
     _add_model_override_args(train)
+    _add_tokenization_override_args(train)
     train.set_defaults(func=_cmd_train)
 
     benchmark = subparsers.add_parser("benchmark")
@@ -804,6 +882,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_data_input_args(benchmark)
     _add_runtime_override_args(benchmark)
     _add_model_override_args(benchmark)
+    _add_tokenization_override_args(benchmark)
     benchmark.set_defaults(func=_cmd_benchmark)
 
     predict = subparsers.add_parser("predict")
@@ -815,6 +894,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_training_override_args(predict)
     _add_runtime_override_args(predict)
     _add_model_override_args(predict)
+    _add_tokenization_override_args(predict)
     predict.set_defaults(func=_cmd_predict)
 
     evaluate = subparsers.add_parser("evaluate")
@@ -834,6 +914,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_training_override_args(evaluate)
     _add_runtime_override_args(evaluate)
     _add_model_override_args(evaluate)
+    _add_tokenization_override_args(evaluate)
     evaluate.set_defaults(func=_cmd_evaluate)
 
     return parser

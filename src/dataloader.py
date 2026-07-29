@@ -1,4 +1,6 @@
-from __future__ import annotations  # Defer annotation evaluation for forward references.
+from __future__ import (
+    annotations,
+)  # Defer annotation evaluation for forward references.
 
 """Parquet-to-PyTorch data pipeline.
 
@@ -66,6 +68,18 @@ class _LazyTorchModule:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._load(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "_mod":
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._load(), name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name == "_mod":
+            object.__delattr__(self, name)
+            return
+        delattr(self._load(), name)
 
 
 torch = _LazyTorchModule()  # type: ignore[assignment]
@@ -136,10 +150,7 @@ _PREHASHED_GATHER_POOL_WORKERS = 0
 def _prehashed_gather_pool(workers: int) -> ThreadPoolExecutor:
     global _PREHASHED_GATHER_POOL, _PREHASHED_GATHER_POOL_WORKERS
     workers = max(1, int(workers))
-    if (
-        _PREHASHED_GATHER_POOL is None
-        or _PREHASHED_GATHER_POOL_WORKERS != workers
-    ):
+    if _PREHASHED_GATHER_POOL is None or _PREHASHED_GATHER_POOL_WORKERS != workers:
         if _PREHASHED_GATHER_POOL is not None:
             _PREHASHED_GATHER_POOL.shutdown(wait=False, cancel_futures=True)
         _PREHASHED_GATHER_POOL = ThreadPoolExecutor(
@@ -320,9 +331,7 @@ def call_with_timeout(
     )
     thread.start()
     if not done.wait(timeout_sec):
-        raise RemoteIoTimeoutError(
-            f"{description} timed out after {timeout_sec:.1f}s"
-        )
+        raise RemoteIoTimeoutError(f"{description} timed out after {timeout_sec:.1f}s")
     if error_box:
         raise error_box[0]
     return result_box[0]
@@ -540,7 +549,9 @@ def close_hdfs_native_file(
     try:
         call_with_timeout(close, timeout_sec, description=description)
     except RemoteIoTimeoutError:
-        logger.warning("%s timed out after %.1fs; abandoning handle", description, timeout_sec)
+        logger.warning(
+            "%s timed out after %.1fs; abandoning handle", description, timeout_sec
+        )
     except BaseException as error:
         logger.warning("%s failed: %s", description, error)
 
@@ -713,7 +724,9 @@ def iter_parquet_record_batches(
                 lambda: iter(parquet_file.iter_batches(**kwargs)),
                 policy,
                 description=f"{label} (start)",
-                timeout_sec=policy.open_timeout if policy.enabled else policy.op_timeout,
+                timeout_sec=policy.open_timeout
+                if policy.enabled
+                else policy.op_timeout,
             )
         except BaseException as error:
             if maybe_skip_or_raise(error, policy, description=f"{label} (start)"):
@@ -862,7 +875,9 @@ def _input_uri_scheme(item: str) -> str:
 def _split_uri_without_query_or_fragment(item: str) -> Any:
     parsed = urlsplit(item)
     if parsed.query or parsed.fragment:
-        raise ValueError(f"parquet input URI must not include query or fragment: {item!r}")
+        raise ValueError(
+            f"parquet input URI must not include query or fragment: {item!r}"
+        )
     return parsed
 
 
@@ -950,7 +965,9 @@ def _local_input_pattern(item: str) -> str:
         return item
     parsed = _split_uri_without_query_or_fragment(item)
     if parsed.netloc not in {"", "localhost"}:
-        raise ValueError(f"only local file:// parquet input URIs are supported: {item!r}")
+        raise ValueError(
+            f"only local file:// parquet input URIs are supported: {item!r}"
+        )
     return unquote(parsed.path)
 
 
@@ -969,7 +986,9 @@ def _discover_local_input(item: str, filesystem: Any) -> list[ParquetInputRef]:
     local_item = _local_input_pattern(item)
     path = Path(local_item)
     if path.is_dir():
-        return [_local_ref(match, filesystem) for match in sorted(path.rglob("*.parquet"))]
+        return [
+            _local_ref(match, filesystem) for match in sorted(path.rglob("*.parquet"))
+        ]
     matches = sorted(Path(match) for match in glob.glob(local_item, recursive=True))
     if matches:
         return [_local_ref(match, filesystem) for match in matches if match.is_file()]
@@ -1028,7 +1047,9 @@ def _match_remote_glob(path: str, pattern: str) -> bool:
 def _remote_ref(remote: _RemoteInput, fs_path: str) -> ParquetInputRef:
     normalized_path = _normalize_remote_path(fs_path)
     return ParquetInputRef(
-        canonical_uri=_canonical_remote_uri(remote.scheme, remote.authority, normalized_path),
+        canonical_uri=_canonical_remote_uri(
+            remote.scheme, remote.authority, normalized_path
+        ),
         filesystem_key=remote.filesystem_key,
         fs_path=normalized_path,
         filesystem=remote.filesystem,
@@ -1067,7 +1088,9 @@ def _discover_remote_glob(remote: _RemoteInput, item: str) -> list[ParquetInputR
     return refs
 
 
-def _discover_remote_input(item: str, filesystems: dict[str, Any]) -> list[ParquetInputRef]:
+def _discover_remote_input(
+    item: str, filesystems: dict[str, Any]
+) -> list[ParquetInputRef]:
     pafs = _require_pyarrow_fs()
     remote = _remote_input_from_uri(item, filesystems)
     if _has_glob_meta(remote.fs_path):
@@ -1125,7 +1148,9 @@ def discover_parquet_inputs(inputs: Iterable[str | Path]) -> list[ParquetInputRe
 
 def schema_fingerprint(schema: Any) -> str:
     """Hash logical field names/types/nullability; ignores physical layout."""
-    payload = "\n".join(f"{field.name}:{field.type}:{field.nullable}" for field in schema)
+    payload = "\n".join(
+        f"{field.name}:{field.type}:{field.nullable}" for field in schema
+    )
     return sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -1134,7 +1159,9 @@ def _coerce_parquet_input_ref(path: str | Path | ParquetInputRef) -> ParquetInpu
         return path
     refs = discover_parquet_inputs([os.fspath(path)])
     if len(refs) != 1:
-        raise ValueError(f"expected exactly one parquet file, discovered {len(refs)} from {path!r}")
+        raise ValueError(
+            f"expected exactly one parquet file, discovered {len(refs)} from {path!r}"
+        )
     return refs[0]
 
 
@@ -1205,8 +1232,7 @@ def validate_matching_schemas(
     if not refs:
         raise ValueError("paths must not be empty")
     fingerprints = {
-        ref: schema_fingerprint(parquet_schema(ref, policy=policy))
-        for ref in refs
+        ref: schema_fingerprint(parquet_schema(ref, policy=policy)) for ref in refs
     }
     expected = next(iter(fingerprints.values()))
     mismatched = [
@@ -1234,8 +1260,7 @@ def _eager_schema_validation_refs(
         return [refs[0]]
     last = len(refs) - 1
     indices = {
-        round(index * last / (sample_count - 1))
-        for index in range(sample_count)
+        round(index * last / (sample_count - 1)) for index in range(sample_count)
     }
     return [refs[index] for index in sorted(indices)]
 
@@ -1293,7 +1318,9 @@ class _ByteBudget:
         with self.condition:
             self.used -= max(1, amount)
             if self.used < 0:
-                raise RuntimeError("prefetch byte budget was released more than reserved")
+                raise RuntimeError(
+                    "prefetch byte budget was released more than reserved"
+                )
             self.condition.notify_all()
 
     def wake_all(self) -> None:
@@ -1340,7 +1367,9 @@ def required_columns_for_split(
     return sorted(columns)
 
 
-def _scan_columns_for_split(split: ParquetSplitConfig, flat_columns: list[str]) -> list[str]:
+def _scan_columns_for_split(
+    split: ParquetSplitConfig, flat_columns: list[str]
+) -> list[str]:
     """Return raw Parquet scan columns for a split.
 
     ``ParquetScanner`` interprets an empty list as "read all columns" when
@@ -1464,7 +1493,9 @@ def _load_file_metadata_cache(
             ref.filesystem_key,
             prototype=ref.filesystem,
         )
-        meta_policy = replace(io_policy, pre_buffer=False) if io_policy.enabled else io_policy
+        meta_policy = (
+            replace(io_policy, pre_buffer=False) if io_policy.enabled else io_policy
+        )
         if io_policy.enabled:
             parquet_file, native_file = open_parquet_via_native(
                 filesystem=filesystem,
@@ -1558,7 +1589,9 @@ def _load_metadata_cache(
 
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = {
-            executor.submit(_load_file_metadata_cache, ref, scan_columns, io_policy): ref
+            executor.submit(
+                _load_file_metadata_cache, ref, scan_columns, io_policy
+            ): ref
             for ref in paths
         }
         for future in as_completed(futures):
@@ -1589,7 +1622,9 @@ def _build_lpt_shard_plan(
             scan_order += 1
 
     # Prefer compressed-byte weights; fall back to row counts if any RG lacks bytes.
-    use_row_weights = all(item.compressed_bytes is not None for _, item in ordered_items)
+    use_row_weights = all(
+        item.compressed_bytes is not None for _, item in ordered_items
+    )
     weight_source = "compressed_bytes" if use_row_weights else "num_rows"
     weighted_items: list[tuple[int, _RowGroupMetadata, int]] = []
     for order, item in ordered_items:
@@ -1614,7 +1649,11 @@ def _build_lpt_shard_plan(
     for order, item, weight in weighted_items:
         rank = min(
             range(world_size),
-            key=lambda candidate: (rank_totals[candidate], rank_counts[candidate], candidate),
+            key=lambda candidate: (
+                rank_totals[candidate],
+                rank_counts[candidate],
+                candidate,
+            ),
         )
         rank_totals[rank] += weight
         rank_counts[rank] += 1
@@ -1718,6 +1757,7 @@ class ParquetScanner:
     plan so differently sized row groups are distributed more evenly while
     retaining deterministic scan order inside each rank.
     """
+
     def __init__(
         self,
         split: ParquetSplitConfig,
@@ -1745,7 +1785,10 @@ class ParquetScanner:
                 f"unsupported reader.shard_unit {requested_shard_unit!r}; "
                 "expected file, row_group, or record_batch"
             )
-        if shard_world_size > 1 and self._effective_shard_unit() not in {"file", "row_group"}:
+        if shard_world_size > 1 and self._effective_shard_unit() not in {
+            "file",
+            "row_group",
+        }:
             raise ValueError(
                 f"unsupported reader.shard_unit {requested_shard_unit!r} "
                 "for distributed scanning"
@@ -1769,9 +1812,7 @@ class ParquetScanner:
             # comparable across rank-local subsets.
             anchor = global_schema_refs[0]
             local_refs = global_schema_refs[shard_rank::shard_world_size]
-            schema_refs = list(
-                dict.fromkeys([anchor, *local_refs])
-            )
+            schema_refs = list(dict.fromkeys([anchor, *local_refs]))
         else:
             schema_refs = global_schema_refs
         validate_matching_schemas(schema_refs, policy=self._io_policy)
@@ -1780,7 +1821,9 @@ class ParquetScanner:
             # (the agg indices are absent from req files). Project optional
             # columns only when the split schema contains them, while still
             # failing early for a missing mandatory input.
-            schema_names = set(parquet_schema(schema_refs[0], policy=self._io_policy).names)
+            schema_names = set(
+                parquet_schema(schema_refs[0], policy=self._io_policy).names
+            )
             missing = [
                 column
                 for column in self.columns
@@ -1887,7 +1930,9 @@ class ParquetScanner:
         counts = defaultdict(int)
         for item in plan.work_items:
             counts[item.rank] += 1
-        empty_rank_count = sum(1 for rank in range(self.shard_world_size) if counts[rank] == 0)
+        empty_rank_count = sum(
+            1 for rank in range(self.shard_world_size) if counts[rank] == 0
+        )
         if empty_rank_count == 0:
             return
         effective_rank_count = self.shard_world_size - empty_rank_count
@@ -1907,7 +1952,9 @@ class ParquetScanner:
         """Row groups owned by this rank, sorted for deterministic in-rank scan order."""
         plan = self._get_shard_plan()
         assigned = [item for item in plan.work_items if item.rank == self.shard_rank]
-        assigned.sort(key=lambda item: (item.input_ref.canonical_uri, item.local_row_group_index))
+        assigned.sort(
+            key=lambda item: (item.input_ref.canonical_uri, item.local_row_group_index)
+        )
         return assigned
 
     def _prefetch_active_workers(self, row_group_count: int) -> int:
@@ -1924,7 +1971,9 @@ class ParquetScanner:
         """Split ``prefetch_batches`` across workers as evenly as possible."""
         prefetch_batches = self.split.reader.prefetch_batches
         base, remainder = divmod(prefetch_batches, active_workers)
-        return [base + (1 if index < remainder else 0) for index in range(active_workers)]
+        return [
+            base + (1 if index < remainder else 0) for index in range(active_workers)
+        ]
 
     def _iter_row_group_record_batches_sync(
         self,
@@ -2023,9 +2072,7 @@ class ParquetScanner:
             return
 
         capacities = self._prefetch_queue_capacities(active_workers)
-        byte_capacity = max(
-            1, self.split.reader.max_prefetch_bytes // active_workers
-        )
+        byte_capacity = max(1, self.split.reader.max_prefetch_bytes // active_workers)
         slots = [
             _PrefetchSlot(
                 index=index,
@@ -2054,7 +2101,10 @@ class ParquetScanner:
                 work_item = work_items[next_assign_index]
                 slot = slots[slot_index]
 
-                def run_worker(item: _RowGroupWorkItem = work_item, target_slot: _PrefetchSlot = slot) -> None:
+                def run_worker(
+                    item: _RowGroupWorkItem = work_item,
+                    target_slot: _PrefetchSlot = slot,
+                ) -> None:
                     self._row_group_worker(item, target_slot, stop_event)
 
                 slot.thread = threading.Thread(
@@ -2079,7 +2129,9 @@ class ParquetScanner:
                 assignment_error = error
                 stop_event.set()
 
-        assignment_thread = threading.Thread(target=assignment_loop, name="parquet-prefetch-assign", daemon=True)
+        assignment_thread = threading.Thread(
+            target=assignment_loop, name="parquet-prefetch-assign", daemon=True
+        )
         assignment_thread.start()
 
         try:
@@ -2106,7 +2158,11 @@ class ParquetScanner:
                     try:
                         item = slot.queue.get(timeout=0.1)
                     except queue.Empty:
-                        if slot.thread is not None and not slot.thread.is_alive() and slot.queue.empty():
+                        if (
+                            slot.thread is not None
+                            and not slot.thread.is_alive()
+                            and slot.queue.empty()
+                        ):
                             if slot.error is not None:
                                 raise slot.error
                             break
@@ -2146,7 +2202,9 @@ class ParquetScanner:
                 slot.error = None
             slot_for_item.clear()
 
-    def _iter_row_group_record_batches(self, stop_event: threading.Event) -> Iterator[Any]:
+    def _iter_row_group_record_batches(
+        self, stop_event: threading.Event
+    ) -> Iterator[Any]:
         """Dispatch to sync or prefetch row-group readers based on configuration."""
         work_items = self._assigned_row_group_work_items()
         if self.split.reader.prefetch_batches <= 0:
@@ -2244,9 +2302,7 @@ class ParquetScanner:
             return
 
         capacities = self._prefetch_queue_capacities(active_workers)
-        byte_capacity = max(
-            1, self.split.reader.max_prefetch_bytes // active_workers
-        )
+        byte_capacity = max(1, self.split.reader.max_prefetch_bytes // active_workers)
         slots = [
             _PrefetchSlot(
                 index=index,
@@ -2382,7 +2438,9 @@ class ParquetScanner:
             return
         yield from self._iter_file_record_batches_prefetch(self.paths, stop_event)
 
-    def _iter_dataset_record_batches(self, stop_event: threading.Event) -> Iterator[Any]:
+    def _iter_dataset_record_batches(
+        self, stop_event: threading.Event
+    ) -> Iterator[Any]:
         """Backward-compatible alias for file-sharded scans."""
 
         yield from self._iter_file_record_batches(stop_event)
@@ -2425,7 +2483,9 @@ class ParquetScanner:
             close = getattr(iterator, "close", None)
             if callable(close):
                 close()
-        return ScanStats(files=len(self.paths), record_batches=record_batches, rows=rows)
+        return ScanStats(
+            files=len(self.paths), record_batches=record_batches, rows=rows
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2834,9 +2894,7 @@ def _request_value_maps(
                 f"request_value_maps contains non-request column {column!r}"
             )
         if not isinstance(raw_mapping, Mapping) or not raw_mapping:
-            raise ValueError(
-                f"request_value_maps.{column} must be a non-empty object"
-            )
+            raise ValueError(f"request_value_maps.{column} must be a non-empty object")
         mapping: dict[Any, int] = {}
         for source, target in raw_mapping.items():
             if isinstance(target, bool) or not isinstance(target, int) or target < 0:
@@ -2915,9 +2973,9 @@ def _adapter_derived_request_sources(options: Mapping[str, Any]) -> frozenset[st
 def _adapter_request_level_sources(options: Mapping[str, Any]) -> set[str]:
     """Sources tensorized from the request axis (context + derived request cols)."""
 
-    return {
-        str(source) for source in options.get("context_features", ())
-    } | set(_adapter_derived_request_sources(options))
+    return {str(source) for source in options.get("context_features", ())} | set(
+        _adapter_derived_request_sources(options)
+    )
 
 
 def _coarse_scene_plan(
@@ -2927,7 +2985,11 @@ def _coarse_scene_plan(
     raw_ids = options.get("search_scene_ids")
     if raw_ids is None:
         return None
-    if isinstance(raw_ids, (str, bytes)) or not isinstance(raw_ids, Sequence) or not raw_ids:
+    if (
+        isinstance(raw_ids, (str, bytes))
+        or not isinstance(raw_ids, Sequence)
+        or not raw_ids
+    ):
         raise ValueError("adapter option 'search_scene_ids' must be a non-empty list")
     search_scene_ids: set[int] = set()
     for value in raw_ids:
@@ -2953,9 +3015,7 @@ def _coarse_scene_plan(
     prior_id_column = str(
         options.get("coarse_scene_prior_id_column", COARSE_SCENE_PRIOR_ID_COLUMN)
     )
-    unlisted_policy = str(
-        options.get("unlisted_scene_policy", "recommendation")
-    )
+    unlisted_policy = str(options.get("unlisted_scene_policy", "recommendation"))
     if unlisted_policy not in {"recommendation", "error"}:
         raise ValueError(
             "adapter option 'unlisted_scene_policy' must be 'recommendation' or 'error'"
@@ -3118,10 +3178,12 @@ class FeatureCardinalityAuditor:
         return {
             "raw_rows_seen": self.raw_rows_seen,
             "scalar_stats": {
-                name: stats.to_payload() for name, stats in sorted(self.scalar_stats.items())
+                name: stats.to_payload()
+                for name, stats in sorted(self.scalar_stats.items())
             },
             "bag_stats": {
-                name: stats.to_payload() for name, stats in sorted(self.bag_stats.items())
+                name: stats.to_payload()
+                for name, stats in sorted(self.bag_stats.items())
             },
         }
 
@@ -3323,7 +3385,7 @@ def _scalarize_column_values(
     if (
         auditor is None
         and not validate_contract
-        and values
+        and len(values) > 0
         and all(
             isinstance(value, np.ndarray) and value.shape == (1,) for value in values
         )
@@ -3397,9 +3459,7 @@ def _candidate_count_req(
     for column in [*item_features, *label_columns]:
         if column not in row or row[column] is None:
             continue
-        observed[column] = len(
-            _as_list(row[column], column=column, row_index=raw_row)
-        )
+        observed[column] = len(_as_list(row[column], column=column, row_index=raw_row))
     if not observed:
         raise ValueError(
             f"cannot infer candidate count for req raw row {raw_row}; "
@@ -3538,8 +3598,7 @@ def _req_context_value(
     if len(outer) == 1:
         return outer[0]
     if not validate_contract or all(
-        item is None
-        or (isinstance(item, (list, tuple, np.ndarray)) and len(item) == 1)
+        item is None or (isinstance(item, (list, tuple, np.ndarray)) and len(item) == 1)
         for item in outer
     ):
         return [None if item is None else item[0] for item in outer]
@@ -3836,10 +3895,7 @@ def _arrow_array_to_pylist(pa: Any, array: Any) -> list[Any]:
                             )
                 result.append(nested)
             return result
-    if not (
-        pa.types.is_integer(child_type)
-        or pa.types.is_floating(child_type)
-    ):
+    if not (pa.types.is_integer(child_type) or pa.types.is_floating(child_type)):
         return array.to_pylist()
     if child.null_count:
         return array.to_pylist()
@@ -3890,15 +3946,10 @@ def _arrow_list_array_to_numpy_rows(pa: Any, array: Any) -> list[Any] | None:
     if array.null_count:
         is_null = array.is_null().to_numpy(zero_copy_only=False)
         return [
-            None
-            if is_null[index]
-            else values[offsets[index] : offsets[index + 1]]
+            None if is_null[index] else values[offsets[index] : offsets[index + 1]]
             for index in range(len(array))
         ]
-    return [
-        values[offsets[index] : offsets[index + 1]]
-        for index in range(len(array))
-    ]
+    return [values[offsets[index] : offsets[index + 1]] for index in range(len(array))]
 
 
 def _adapter_table_to_python(
@@ -3996,7 +4047,8 @@ def _time_deltas(
                     for event_time in event_times
                 ]
             return _vectorized_time_delta_transform(
-                np.asarray(request_time, dtype=np.int64) - event_times.astype(np.int64, copy=False),
+                np.asarray(request_time, dtype=np.int64)
+                - event_times.astype(np.int64, copy=False),
                 transform=transform,
             )
         if not event_times:
@@ -4124,7 +4176,11 @@ def _output_array(
         return pa.array(values, type=pa.list_(pa.float32()))
     if column in bag_features or column in sequence_columns:
         return pa.array(values, type=pa.list_(pa.int64()))
-    if column in scalar_features or column in label_columns or column in integer_request_columns:
+    if (
+        column in scalar_features
+        or column in label_columns
+        or column in integer_request_columns
+    ):
         return pa.array(values, type=pa.int64())
     return pa.array(values)
 
@@ -4225,7 +4281,9 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
             details.append("missing tasks: " + ", ".join(missing))
         if unknown:
             details.append("unknown tasks: " + ", ".join(unknown))
-        raise ValueError("adapter label_masks must match labels exactly; " + "; ".join(details))
+        raise ValueError(
+            "adapter label_masks must match labels exactly; " + "; ".join(details)
+        )
     label_missing_values = _label_missing_values(options, labels)
     if any(label_missing_values.values()) and not label_masks:
         raise ValueError(
@@ -4257,7 +4315,9 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     if isinstance(aligned_groups_raw, (str, bytes)) or not isinstance(
         aligned_groups_raw, Sequence
     ):
-        raise ValueError("adapter option 'aligned_multivalue_groups' must be a list of lists")
+        raise ValueError(
+            "adapter option 'aligned_multivalue_groups' must be a list of lists"
+        )
     aligned_groups = tuple(
         tuple(str(item) for item in group) for group in aligned_groups_raw
     )
@@ -4281,7 +4341,9 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         )
     if not bag_features <= context_set | item_set:
         unknown = sorted(bag_features - context_set - item_set)
-        raise ValueError("multivalue_features contains unknown fields: " + ", ".join(unknown))
+        raise ValueError(
+            "multivalue_features contains unknown fields: " + ", ".join(unknown)
+        )
     for group in aligned_groups:
         if not group or not set(group) <= bag_features:
             raise ValueError(
@@ -4306,7 +4368,11 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     generated_candidate_columns = frozenset(
         [
             *candidate_metadata_columns,
-            *(() if candidate_position_column is None else (candidate_position_column,)),
+            *(
+                ()
+                if candidate_position_column is None
+                else (candidate_position_column,)
+            ),
         ]
     )
     expected_generated_count = len(candidate_metadata_columns) + int(
@@ -4321,15 +4387,12 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         ups: tuple(
             column
             for column in required
-            if column.startswith(f"{ups}_x_")
-            and column != time_delta_outputs.get(ups)
+            if column.startswith(f"{ups}_x_") and column != time_delta_outputs.get(ups)
         )
         for ups in ups_types
     }
     sequence_columns = frozenset(
-        column
-        for columns in sequence_columns_by_type.values()
-        for column in columns
+        column for columns in sequence_columns_by_type.values() for column in columns
     )
     time_delta_columns = frozenset(time_delta_outputs.values())
     derived_request_columns = (
@@ -4435,9 +4498,7 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
             + ", ".join(unknown_required)
         )
     compact_list_columns = frozenset(
-        (bag_features & context_set)
-        | sequence_columns
-        | time_delta_columns
+        (bag_features & context_set) | sequence_columns | time_delta_columns
     )
     raw_sequence_columns = frozenset(
         {
@@ -4450,7 +4511,11 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
             *integer_request_columns,
             *derived_request_columns,
             *label_mask_columns,
-            *(() if candidate_position_column is None else (candidate_position_column,)),
+            *(
+                ()
+                if candidate_position_column is None
+                else (candidate_position_column,)
+            ),
         }
     )
     return _MdlRankMixerAdapterPlan(
@@ -4569,7 +4634,10 @@ def build_arrow_axis_source(
             raise ValueError(f"missing control column {canonical!r}")
         return table[physical].to_pylist()
 
-    if "context_indices" not in physical_columns or "target_indices" not in physical_columns:
+    if (
+        "context_indices" not in physical_columns
+        or "target_indices" not in physical_columns
+    ):
         raise ValueError(
             "arrow_axis path requires agg layout with context_indices and target_indices"
         )
@@ -4858,10 +4926,9 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
     soft_cardinality_audit = bool(
         cardinality_auditor is not None and cardinality_auditor.soft
     )
-    raw_sample_already_validated = (
-        isinstance(runtime_cache, dict)
-        and runtime_cache.get("mdl_rankmixer_raw_sample_validated", False)
-    )
+    raw_sample_already_validated = isinstance(
+        runtime_cache, dict
+    ) and runtime_cache.get("mdl_rankmixer_raw_sample_validated", False)
     # Soft cardinality audit already walks every configured field; skip the
     # one-row hard warm-up so the first multi-valued scalar does not abort the
     # aggregate report.
@@ -4898,13 +4965,10 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             request_id_column=str(axis_request_id_column),
         )
 
-    first_batch_already_adapted = (
-        isinstance(runtime_cache, dict)
-        and runtime_cache.get("mdl_rankmixer_first_batch_adapted", False)
+    first_batch_already_adapted = isinstance(runtime_cache, dict) and runtime_cache.get(
+        "mdl_rankmixer_first_batch_adapted", False
     )
-    complete_label_contract = not label_masks and not any(
-        label_missing_values.values()
-    )
+    complete_label_contract = not label_masks and not any(label_missing_values.values())
     # Under trusted_input the producer owns schema/shape correctness, so skip
     # per-row structure and payload diagnostics on the hot path. Non-trusted
     # runs keep both checks (and the one-row sample warm-up above).
@@ -5241,10 +5305,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                     agg=is_agg,
                     validate_contract=validate_row_contract,
                 )
-                if (
-                    coarse_scene is not None
-                    and column == coarse_scene.raw_scene_column
-                ):
+                if coarse_scene is not None and column == coarse_scene.raw_scene_column:
                     coarse_index, coarse_prior_id = coarse_scene_ids(
                         value,
                         coarse_scene.search_scene_ids,
@@ -5275,11 +5336,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             # Trusted + flattened UPS rows are NumPy views. Build one index
             # array per UPS and fancy-index every aligned column, instead of
             # ~100× ``_select_sequence`` call/listcomp overhead per request.
-            use_numpy_seq = (
-                not validate_structure
-                and not validate_payload
-                and is_agg
-            )
+            use_numpy_seq = not validate_structure and not validate_payload and is_agg
             for ups in ups_types:
                 selected_positions = (
                     membership_positions[ups][request_index] if is_agg else None
@@ -5287,10 +5344,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                 expected_length = membership_lengths.get(ups)
                 max_length = sequence_max_lengths.get(ups)
                 pos_index: Any = None
-                if (
-                    use_numpy_seq
-                    and selected_positions is not None
-                ):
+                if use_numpy_seq and selected_positions is not None:
                     if max_length is not None:
                         selected_positions = selected_positions[:max_length]
                     if selected_positions:
@@ -5493,9 +5547,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
             for column in label_output_columns:
                 axis_label_features[column].extend(normalized_labels[column])
             for column in label_mask_output_columns:
-                axis_label_mask_features[column].extend(
-                    normalized_label_masks[column]
-                )
+                axis_label_mask_features[column].extend(normalized_label_masks[column])
         else:
             for column in request_output_columns:
                 output[column].extend(
@@ -5687,11 +5739,15 @@ def run_feature_cardinality_audit(
                     break
                 take = min(remaining, int(raw_table.num_rows))
                 table = (
-                    raw_table if take == raw_table.num_rows else raw_table.slice(0, take)
+                    raw_table
+                    if take == raw_table.num_rows
+                    else raw_table.slice(0, take)
                 )
                 auditor.note_raw_rows(table.num_rows)
                 result = adapter(table, context=context)
-                for _flat in _normalize_adapter_result(result, adapter_name, split_name):
+                for _flat in _normalize_adapter_result(
+                    result, adapter_name, split_name
+                ):
                     del _flat
                 remaining -= take
         finally:
@@ -5703,7 +5759,10 @@ def run_feature_cardinality_audit(
         )
 
     if world_size > 1:
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
             raise RuntimeError(
                 "feature cardinality audit requires an initialized process group "
                 f"when world_size={world_size}"
@@ -5749,7 +5808,9 @@ def run_feature_cardinality_audit(
     return auditor
 
 
-def _normalize_adapter_result(result: Any, adapter_name: str, split_name: str) -> Iterator[Any]:
+def _normalize_adapter_result(
+    result: Any, adapter_name: str, split_name: str
+) -> Iterator[Any]:
     pa, _pc, _ds, _pq = _require_pyarrow()
 
     if isinstance(result, (AdaptedAxisBundle, ArrowAxisSource)):
@@ -5760,9 +5821,7 @@ def _normalize_adapter_result(result: Any, adapter_name: str, split_name: str) -
         return
     if isinstance(result, RuntimeIterable):
         for index, table in enumerate(result):
-            if not isinstance(
-                table, (pa.Table, AdaptedAxisBundle, ArrowAxisSource)
-            ):
+            if not isinstance(table, (pa.Table, AdaptedAxisBundle, ArrowAxisSource)):
                 raise TypeError(
                     f"parquet adapter {adapter_name!r} for split {split_name!r} returned "
                     f"item {index} of type {type(table).__name__}; expected pyarrow.Table"
@@ -5790,11 +5849,7 @@ def _is_arrow_list_type(pa: Any, arrow_type: Any) -> bool:
 
 def _table_list_columns(table: Any) -> set[str]:
     pa, _pc, _ds, _pq = _require_pyarrow()
-    return {
-        field.name
-        for field in table.schema
-        if _is_arrow_list_type(pa, field.type)
-    }
+    return {field.name for field in table.schema if _is_arrow_list_type(pa, field.type)}
 
 
 def _validate_sequence_contract(config: AppConfig, table: Any, split_name: str) -> None:
@@ -5898,10 +5953,7 @@ def _validate_complete_label_contract(
         if column not in required_set:
             continue
         array = _column_array(table, column)
-        if not (
-            pa.types.is_integer(array.type)
-            or pa.types.is_floating(array.type)
-        ):
+        if not (pa.types.is_integer(array.type) or pa.types.is_floating(array.type)):
             raise ValueError(
                 f"adapter output label {column!r} for task {task!r} must be numeric 0/1"
             )
@@ -6128,22 +6180,23 @@ def _iter_adapted_flat_tables(
 
     adapter_workers = scanner.split.reader.adapter_workers
     if adapter_workers > 0 and adapter_name != "identity":
-        adapted_results: Iterable[tuple[int, list[Any]]] = (
-            _iter_process_adapter_results(
-                limited_raw_tables(),
-                adapter_name=adapter_name,
-                context=context,
-                worker_count=adapter_workers,
-                max_pending=max(
-                    adapter_workers,
-                    min(
-                        max(adapter_workers, scanner.split.reader.prefetch_batches),
-                        adapter_workers * 2,
-                    ),
+        adapted_results: Iterable[
+            tuple[int, list[Any]]
+        ] = _iter_process_adapter_results(
+            limited_raw_tables(),
+            adapter_name=adapter_name,
+            context=context,
+            worker_count=adapter_workers,
+            max_pending=max(
+                adapter_workers,
+                min(
+                    max(adapter_workers, scanner.split.reader.prefetch_batches),
+                    adapter_workers * 2,
                 ),
-            )
+            ),
         )
     else:
+
         def sequential_results() -> Iterator[tuple[int, list[Any]]]:
             for raw_table in limited_raw_tables():
                 result = adapter(raw_table, context=context)
@@ -6200,6 +6253,7 @@ def _iter_adapted_flat_tables(
         close = getattr(adapted_iterator, "close", None)
         if callable(close):
             close()
+
 
 def iter_flat_tables(
     config: AppConfig,
@@ -6266,7 +6320,6 @@ def iter_adapted_axis_bundles(
     Size ``<= 1`` disables prefetch (purely synchronous).
     """
 
-
     split = _split_for_name(config, split_name)
     if split.request_id is None:
         raise ValueError("iter_adapted_axis_bundles requires split.request_id")
@@ -6300,33 +6353,30 @@ def iter_adapted_axis_bundles(
     expected_type = ArrowAxisSource if arrow_axis else AdaptedAxisBundle
     runtime_cache_options = {
         "axis_request_id_column": split.request_id,
-        **(
-            {"arrow_axis": True}
-            if arrow_axis
-            else {"axis_separated": True}
-        ),
+        **({"arrow_axis": True} if arrow_axis else {"axis_separated": True}),
     }
 
     def produce() -> Iterator[Any]:
         adapter_workers = split.reader.adapter_workers
         if adapter_workers > 0 and adapter_name != "identity":
-            adapted_results: Iterable[tuple[int, list[Any]]] = (
-                _iter_process_adapter_results(
-                    scanner.iter_tables(),
-                    adapter_name=adapter_name,
-                    context=context,
-                    worker_count=adapter_workers,
-                    max_pending=max(
-                        adapter_workers * 2,
-                        min(
-                            max(adapter_workers * 2, split.reader.prefetch_batches),
-                            adapter_workers * 4,
-                        ),
+            adapted_results: Iterable[
+                tuple[int, list[Any]]
+            ] = _iter_process_adapter_results(
+                scanner.iter_tables(),
+                adapter_name=adapter_name,
+                context=context,
+                worker_count=adapter_workers,
+                max_pending=max(
+                    adapter_workers * 2,
+                    min(
+                        max(adapter_workers * 2, split.reader.prefetch_batches),
+                        adapter_workers * 4,
                     ),
-                    runtime_cache_options=runtime_cache_options,
-                )
+                ),
+                runtime_cache_options=runtime_cache_options,
             )
         else:
+
             def sequential_results() -> Iterator[tuple[int, list[Any]]]:
                 for raw_table in scanner.iter_tables():
                     if not raw_table.num_rows:
@@ -6378,9 +6428,7 @@ def iter_adapted_axis_bundles(
     import queue as queue_mod
     import threading
 
-    out_queue: queue_mod.Queue[Any] = queue_mod.Queue(
-        maxsize=int(producer_queue_size)
-    )
+    out_queue: queue_mod.Queue[Any] = queue_mod.Queue(maxsize=int(producer_queue_size))
     error_holder: list[BaseException] = []
 
     def worker() -> None:
@@ -6487,10 +6535,7 @@ def _column_array(table: Any, column: str) -> Any:
         return chunked.combine_chunks()
     if chunked.num_chunks == 1:
         return chunked.chunk(0)
-    if not all(
-        pa.types.is_dictionary(chunk.type)
-        for chunk in chunked.chunks
-    ):
+    if not all(pa.types.is_dictionary(chunk.type) for chunk in chunked.chunks):
         return chunked.combine_chunks()
     dictionaries: list[Any] = []
     shifted_indices: list[Any] = []
@@ -6520,7 +6565,9 @@ def _safe_table_take(table: Any, indices: Any) -> Any:
     if hasattr(indices, "numpy") and not isinstance(indices, pa.Array):
         index_array = pa.array(indices.numpy(), type=pa.int64())
     elif isinstance(indices, pa.Array):
-        index_array = indices.cast(pa.int64()) if indices.type != pa.int64() else indices
+        index_array = (
+            indices.cast(pa.int64()) if indices.type != pa.int64() else indices
+        )
     else:
         index_array = pa.array(indices, type=pa.int64())
     if len(index_array) == 0:
@@ -6590,9 +6637,8 @@ def _identity_array_tensor(
     min_max = pc.min_max(array).as_py()
     minimum = min_max.get("min") if min_max is not None else None
     maximum = min_max.get("max") if min_max is not None else None
-    invalid_bounds = (
-        (minimum is not None and int(minimum) < 0)
-        or (maximum is not None and int(maximum) >= encoding.num_buckets)
+    invalid_bounds = (minimum is not None and int(minimum) < 0) or (
+        maximum is not None and int(maximum) >= encoding.num_buckets
     )
     if invalid_bounds and encoding.out_of_range == "error":
         raise ValueError(
@@ -6752,7 +6798,9 @@ def _list_truncate_array(array: Any, max_length: int, *, truncation: str) -> Any
         within = np.arange(total, dtype=np.int64) - np.repeat(
             np.cumsum(take_n) - take_n, take_n
         )
-        flat = pc.take(array.values, pa.array(starts[row_ids] + within, type=pa.int64()))
+        flat = pc.take(
+            array.values, pa.array(starts[row_ids] + within, type=pa.int64())
+        )
     new_offsets = np.empty(len(take_n) + 1, dtype=np.int64)
     new_offsets[0] = 0
     np.cumsum(take_n, out=new_offsets[1:])
@@ -6845,13 +6893,17 @@ def _dense_feature_value(
             return 0.0, 0.0
         return float(value), 1.0
     if not isinstance(value, (list, tuple)):
-        raise ValueError(f"dense feature expected {dimension} values, got scalar {value!r}")
+        raise ValueError(
+            f"dense feature expected {dimension} values, got scalar {value!r}"
+        )
     if len(value) != dimension:
         raise ValueError(f"dense feature expected {dimension} values, got {len(value)}")
     return [0.0 if item is None else float(item) for item in value], 1.0
 
 
-def _tensorize_dense(feature: FeatureConfig, values: list[Any]) -> Tensor | dict[str, Tensor]:
+def _tensorize_dense(
+    feature: FeatureConfig, values: list[Any]
+) -> Tensor | dict[str, Tensor]:
     """Build a ``[batch, dim]`` float tensor; optionally attach presence."""
     normalized = [_dense_feature_value(value, feature.dimension) for value in values]
     filled = [item[0] for item in normalized]
@@ -6865,9 +6917,7 @@ def _tensorize_dense(feature: FeatureConfig, values: list[Any]) -> Tensor | dict
     return tensor
 
 
-def _numeric_column_with_presence(
-    table: Any, column: str
-) -> tuple[Tensor, Tensor]:
+def _numeric_column_with_presence(table: Any, column: str) -> tuple[Tensor, Tensor]:
     """Convert a scalar numeric column to values + presence, null→0 / presence 0."""
     array = _column_array(table, column)
     try:
@@ -6901,7 +6951,9 @@ def _numeric_column_with_presence(
         )
 
 
-def _tensorize_dense_column(feature: FeatureConfig, table: Any) -> Tensor | dict[str, Tensor]:
+def _tensorize_dense_column(
+    feature: FeatureConfig, table: Any
+) -> Tensor | dict[str, Tensor]:
     # Scalar columns use the Arrow/NumPy fast path; vector columns require
     # row-level shape validation before tensor construction.
     if feature.dimension == 1:
@@ -7209,11 +7261,10 @@ def _gather_abs_windows_prehashed_padded(
             f"pre_hashed input {feature_name!r} contains non-null zero values"
         )
     encoded = (normalized & (int(num_buckets) - 1)) + 1
-    if (
-        int(lengths.min(initial=0)) == max_length
-        and total == n_rows * max_length
-    ):
-        return torch.from_numpy(np.ascontiguousarray(encoded.reshape(n_rows, max_length)))
+    if int(lengths.min(initial=0)) == max_length and total == n_rows * max_length:
+        return torch.from_numpy(
+            np.ascontiguousarray(encoded.reshape(n_rows, max_length))
+        )
     out = (
         np.zeros((n_rows, max_length), dtype=np.int64)
         if padding_id == 0
@@ -7280,10 +7331,7 @@ def _gather_abs_windows_dense_padded(
         flat = np.concatenate(views)
     values = flat.astype(np.float32, copy=False)
     if dimension <= 1:
-        if (
-            int(lengths.min(initial=0)) == max_length
-            and total == n_rows * max_length
-        ):
+        if int(lengths.min(initial=0)) == max_length and total == n_rows * max_length:
             return torch.from_numpy(
                 np.ascontiguousarray(values.reshape(n_rows, max_length))
             )
@@ -7440,14 +7488,17 @@ def _tensorize_direct_sequence(
         }
 
     if sequence.null_anchor_field is not None:
-        arrays, reference_offsets, reference_base, reference_stop = (
-            _compact_direct_sequence_by_anchor(
-                arrays,
-                reference_offsets,
-                reference_base,
-                reference_stop,
-                anchor_field=sequence.null_anchor_field,
-            )
+        (
+            arrays,
+            reference_offsets,
+            reference_base,
+            reference_stop,
+        ) = _compact_direct_sequence_by_anchor(
+            arrays,
+            reference_offsets,
+            reference_base,
+            reference_stop,
+            anchor_field=sequence.null_anchor_field,
         )
 
     raw_lengths = reference_offsets[1:] - reference_offsets[:-1]
@@ -7508,9 +7559,13 @@ def _dense_vector(value: Any, dimension: int) -> list[float]:
     if dimension == 1 and not isinstance(value, (list, tuple)):
         return [float(value)]
     if not isinstance(value, (list, tuple)):
-        raise ValueError(f"dense sequence field expected {dimension} values, got scalar {value!r}")
+        raise ValueError(
+            f"dense sequence field expected {dimension} values, got scalar {value!r}"
+        )
     if len(value) != dimension:
-        raise ValueError(f"dense sequence field expected {dimension} values, got {len(value)}")
+        raise ValueError(
+            f"dense sequence field expected {dimension} values, got {len(value)}"
+        )
     return [0.0 if item is None else float(item) for item in value]
 
 
@@ -7528,7 +7583,9 @@ def _sequence_rows(
     """
     if not sequence.fields:
         return {}, []
-    values_by_field = {field.name: _column_values(table, field.source) for field in sequence.fields}
+    values_by_field = {
+        field.name: _column_values(table, field.source) for field in sequence.fields
+    }
     batch_size = len(next(iter(values_by_field.values())))
     rows_by_field = {field.name: [] for field in sequence.fields}
     lengths: list[int] = []
@@ -7550,7 +7607,9 @@ def _sequence_rows(
             raw_items_by_field,
             anchor_field=sequence.null_anchor_field,
         )
-        row_length = len(next(iter(raw_items_by_field.values()))) if raw_items_by_field else 0
+        row_length = (
+            len(next(iter(raw_items_by_field.values()))) if raw_items_by_field else 0
+        )
         start, end = _sequence_bounds(row_length or 0, sequence)
         lengths.append(end - start)
         for field in sequence.fields:
@@ -7609,11 +7668,12 @@ def _tensorize_multi_field_sequence(
             )
         elif field.kind == "dense":
             encoded_dense = [
-                [_dense_vector(item, field.dimension) for item in row]
-                for row in rows
+                [_dense_vector(item, field.dimension) for item in row] for row in rows
             ]
             zero = [0.0] * field.dimension
-            padded_dense = [row + [zero] * (max_length - len(row)) for row in encoded_dense]
+            padded_dense = [
+                row + [zero] * (max_length - len(row)) for row in encoded_dense
+            ]
             tensor_fields[field.name] = (
                 torch.tensor(padded_dense, dtype=torch.float32)
                 if max_length > 0
@@ -7663,7 +7723,9 @@ def _load_scenario_discovery_cache(
     raw_values = payload.get("values")
     if not isinstance(raw_values, list) or not raw_values:
         raise ValueError(f"scenario discovery cache {path} has invalid values")
-    if any(isinstance(value, bool) or not isinstance(value, int) for value in raw_values):
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) for value in raw_values
+    ):
         raise ValueError(f"scenario discovery cache {path} must contain integer values")
     values = tuple(sorted(set(raw_values)))
     if len(values) != len(raw_values):
@@ -7844,7 +7906,9 @@ def resolve_auto_scenarios(
     )
     if not values:
         raise ValueError("auto scenario resolution requires at least one value")
-    if any(isinstance(value, bool) or not isinstance(value, Integral) for value in values):
+    if any(
+        isinstance(value, bool) or not isinstance(value, Integral) for value in values
+    ):
         raise ValueError("auto scenario values must be integers")
     ordered = tuple(sorted({int(value) for value in values}))
     if len(ordered) != len(values):
@@ -7908,8 +7972,7 @@ def resolve_auto_scenarios(
             expanded_features.append(feature)
             continue
         expanded_features.extend(
-            replace(template_feature, name=feature_name(value))
-            for value in ordered
+            replace(template_feature, name=feature_name(value)) for value in ordered
         )
     expanded_tokens = [
         replace(
@@ -7963,15 +8026,15 @@ def _encode_scenario_item(
     if value is None:
         raise ValueError(f"scenario value is null at row {row_index}")
     if isinstance(value, bool):
-        raise ValueError(f"scenario value must be a name or integer id at row {row_index}, got bool")
+        raise ValueError(
+            f"scenario value must be a name or integer id at row {row_index}, got bool"
+        )
     if isinstance(value, Integral):
         raw_name = str(int(value))
         if source_encoding != "index" and raw_name in scenario_to_id:
             return scenario_to_id[raw_name]
         if source_encoding == "raw":
-            raise ValueError(
-                f"unknown raw scenario id {int(value)} at row {row_index}"
-            )
+            raise ValueError(f"unknown raw scenario id {int(value)} at row {row_index}")
         index = int(value)
         if 0 <= index < scenario_count:
             return index
@@ -8038,7 +8101,9 @@ def _scenario_tensor(
     scenario_count = len(config.scenarios.names)
     if config.scenarios.source is None:
         if scenario_count != 1:
-            raise ValueError("scenarios.source is required when multiple scenarios are configured")
+            raise ValueError(
+                "scenarios.source is required when multiple scenarios are configured"
+            )
         # Single-scenario models default every row to scenario index 0.
         return torch.zeros(batch_size, dtype=torch.long)
 
@@ -8058,16 +8123,18 @@ def _scenario_tensor(
             items = value
         else:
             items = [value]
-        row_indices.append([
-            _encode_scenario_item(
-                item,
-                scenario_to_id,
-                scenario_count,
-                row_index,
-                config.scenarios.source_encoding,
-            )
-            for item in items
-        ])
+        row_indices.append(
+            [
+                _encode_scenario_item(
+                    item,
+                    scenario_to_id,
+                    scenario_count,
+                    row_index,
+                    config.scenarios.source_encoding,
+                )
+                for item in items
+            ]
+        )
 
     if saw_list_value:
         # List-valued cells produce a multi-hot mask over configured scenarios.
@@ -8086,7 +8153,9 @@ def _group_ids(split: ParquetSplitConfig, table: Any, batch_size: int) -> list[s
         return ["" for _ in range(batch_size)]
     if source not in table.column_names:
         raise ValueError(f"missing configured group-id column {source!r}")
-    return ["" if value is None else str(value) for value in _column_values(table, source)]
+    return [
+        "" if value is None else str(value) for value in _column_values(table, source)
+    ]
 
 
 def _prediction_keys(split: ParquetSplitConfig, table: Any) -> dict[str, list[Any]]:
@@ -8150,8 +8219,6 @@ def _request_deduplication_plan(
                 request_index[request_id] = existing
                 unique_positions.append(row_index)
             candidate_to_request.append(existing)
-    if len(unique_positions) == table.num_rows:
-        return None
     take_table = table
     if columns is not None:
         names = set(table.column_names)
@@ -8163,7 +8230,11 @@ def _request_deduplication_plan(
                 "request feature deduplication projected an empty column set"
             )
         take_table = table.select(selected_columns)
-    selected = _safe_table_take(take_table, unique_positions)
+    selected = (
+        take_table
+        if len(unique_positions) == table.num_rows
+        else _safe_table_take(take_table, unique_positions)
+    )
     return selected, torch.tensor(candidate_to_request, dtype=torch.long)
 
 
@@ -8217,7 +8288,10 @@ def _tensorize_python_categorical_values(
                 dtype=bool,
             )
 
-        normalized = np.empty(array.size if isinstance(values, np.ndarray) else len(values), dtype=np.int64)
+        normalized = np.empty(
+            array.size if isinstance(values, np.ndarray) else len(values),
+            dtype=np.int64,
+        )
         nulls = np.zeros(normalized.size, dtype=bool)
         for index, value in enumerate(values):
             if value is None:
@@ -8246,9 +8320,8 @@ def _tensorize_python_categorical_values(
         present = normalized[~nulls]
         minimum = int(present.min()) if present.size else None
         maximum = int(present.max()) if present.size else None
-        invalid_bounds = (
-            (minimum is not None and minimum < 0)
-            or (maximum is not None and maximum >= encoding.num_buckets)
+        invalid_bounds = (minimum is not None and minimum < 0) or (
+            maximum is not None and maximum >= encoding.num_buckets
         )
         if invalid_bounds and encoding.out_of_range == "error":
             raise ValueError(
@@ -8256,9 +8329,7 @@ def _tensorize_python_categorical_values(
                 f"[0, {encoding.num_buckets}): min={minimum}, max={maximum}"
             )
         if invalid_bounds:
-            valid = (normalized >= 0) & (
-                normalized < encoding.num_buckets
-            )
+            valid = (normalized >= 0) & (normalized < encoding.num_buckets)
             normalized = np.where(
                 valid,
                 normalized,
@@ -8281,9 +8352,7 @@ def _tensorize_python_categorical_values(
                 f"pre_hashed input {categorical_input.name!r} contains "
                 "non-null zero values"
             )
-        encoded_values = (
-            np.bitwise_and(normalized, encoding.num_buckets - 1) + 1
-        )
+        encoded_values = np.bitwise_and(normalized, encoding.num_buckets - 1) + 1
         if nulls.any():
             encoded_values[nulls] = int(encoding.padding_id)
         return torch.from_numpy(encoded_values)
@@ -8413,9 +8482,7 @@ def _gather_bag_from_sequence_column_batch(
     else:
         unique_list = unique_for_row.tolist()
         views = [
-            values_by_unique[unique_list[index]][
-                start_list[index] : stop_list[index]
-            ]
+            values_by_unique[unique_list[index]][start_list[index] : stop_list[index]]
             for index in range(n_rows)
             if start_list[index] < stop_list[index]
         ]
@@ -8465,9 +8532,7 @@ def _tensorize_python_categorical_bag(
                     f"pre_hashed input {categorical_input.name!r} contains "
                     "non-null zero values"
                 )
-            encoded = (
-                np.bitwise_and(normalized, int(encoding.num_buckets) - 1) + 1
-            )
+            encoded = np.bitwise_and(normalized, int(encoding.num_buckets) - 1) + 1
             if not encoded.flags.c_contiguous:
                 encoded = np.ascontiguousarray(encoded)
             return {
@@ -8516,7 +8581,12 @@ def _tensorize_python_categorical_bag(
     if ndarray_rows:
         lengths_arr = np.empty(n_rows, dtype=np.int64)
         pieces: list[np.ndarray] = []
-        empty = np.empty(0, dtype=getattr(first, "dtype", np.int64) if isinstance(first, np.ndarray) else np.int64)
+        empty = np.empty(
+            0,
+            dtype=getattr(first, "dtype", np.int64)
+            if isinstance(first, np.ndarray)
+            else np.int64,
+        )
         for index, row in enumerate(values):
             if row is None:
                 pieces.append(empty)
@@ -8532,19 +8602,13 @@ def _tensorize_python_categorical_bag(
                 elif truncation == "head":
                     row = row[:max_length]
                 else:
-                    raise ValueError(
-                        f"unsupported list truncation {truncation!r}"
-                    )
+                    raise ValueError(f"unsupported list truncation {truncation!r}")
                 length = int(max_length)
             pieces.append(row)
             lengths_arr[index] = length
         if ndarray_rows:
             total = int(lengths_arr.sum())
-            flat = (
-                np.concatenate(pieces)
-                if total
-                else empty
-            )
+            flat = np.concatenate(pieces) if total else empty
             categorical_input = config.resolved.categorical_input_by_name[feature.name]
             return {
                 "values": _tensorize_python_categorical_values(
@@ -8577,9 +8641,7 @@ def _tensorize_python_categorical_bag(
             elif truncation == "head":
                 row = row[:max_length]
             else:
-                raise ValueError(
-                    f"unsupported list truncation {truncation!r}"
-                )
+                raise ValueError(f"unsupported list truncation {truncation!r}")
         rows.append(row)
         lengths.append(len(row))
     if rows and all(isinstance(row, np.ndarray) for row in rows):
@@ -8627,8 +8689,8 @@ def _tensorize_axis_sequence(
 
     selections = selection_plan.selections
     compacted = selection_plan.compacted_lengths
-    n_plan_rows = int(compacted.shape[0]) if hasattr(compacted, "shape") else len(
-        compacted
+    n_plan_rows = (
+        int(compacted.shape[0]) if hasattr(compacted, "shape") else len(compacted)
     )
     total_tokens = int(compacted.sum()) if n_plan_rows else 0
     all_ranges = bool(getattr(selection_plan, "selections_are_ranges", False))
@@ -8675,8 +8737,12 @@ def _tensorize_axis_sequence(
                     if column_index is None:
                         shared_unique_idx[:] = np.arange(n_rows, dtype=np.int16)
                         for row_index in range(n_rows):
-                            base = int(columns[row_index].offsets[int(slots[row_index])])
-                            shared_abs_lo[row_index] = base + int(range_starts[row_index])
+                            base = int(
+                                columns[row_index].offsets[int(slots[row_index])]
+                            )
+                            shared_abs_lo[row_index] = base + int(
+                                range_starts[row_index]
+                            )
                             shared_abs_hi[row_index] = base + int(range_ends[row_index])
                     else:
                         shared_unique_idx[:] = column_index
@@ -8684,7 +8750,9 @@ def _tensorize_axis_sequence(
                             reqs = np.flatnonzero(column_index == unique_idx)
                             if reqs.size == 0:
                                 continue
-                            bases = column.offsets[slots[reqs].astype(np.int64, copy=False)]
+                            bases = column.offsets[
+                                slots[reqs].astype(np.int64, copy=False)
+                            ]
                             shared_abs_lo[reqs] = bases + range_starts[reqs]
                             shared_abs_hi[reqs] = bases + range_ends[reqs]
                 else:
@@ -8694,9 +8762,7 @@ def _tensorize_axis_sequence(
                             if column_index is None
                             else int(column_index[row_index])
                         )
-                        base = int(
-                            columns[unique_idx].offsets[int(slots[row_index])]
-                        )
+                        base = int(columns[unique_idx].offsets[int(slots[row_index])])
                         shared_unique_idx[row_index] = unique_idx
                         shared_abs_lo[row_index] = base + int(indices[0])
                         shared_abs_hi[row_index] = base + int(indices[1])
@@ -8774,6 +8840,7 @@ def _tensorize_axis_sequence(
             )
 
     if len(parallel_prehashed) >= 6:
+
         def _parallel_prehashed_one(
             item: tuple[Any, Any, Sequence[np.ndarray]],
         ) -> tuple[str, Tensor]:
@@ -9055,32 +9122,22 @@ def _tensorize_axis_sequence(
                     if (
                         isinstance(indices, tuple)
                         and len(indices) == 2
-                        and not isinstance(
-                            indices[0], (list, tuple, np.ndarray)
-                        )
+                        and not isinstance(indices[0], (list, tuple, np.ndarray))
                     ):
                         rel_start = int(indices[0])
                         rel_end = int(indices[1])
-                        pieces.append(
-                            column.values[base + rel_start : base + rel_end]
-                        )
+                        pieces.append(column.values[base + rel_start : base + rel_end])
                         continue
                     if len(indices) == 0:
                         pieces.append(column.values[base:base])
                     else:
                         pieces.append(
-                            column.values[
-                                base + np.asarray(indices, dtype=np.int64)
-                            ]
+                            column.values[base + np.asarray(indices, dtype=np.int64)]
                         )
                 selected = (
                     np.concatenate(pieces)
                     if pieces and any(piece.size for piece in pieces)
-                    else (
-                        pieces[0][:0]
-                        if pieces
-                        else np.empty(0, dtype=sample_dtype)
-                    )
+                    else (pieces[0][:0] if pieces else np.empty(0, dtype=sample_dtype))
                 )
             selected_ready = True
         else:
@@ -9105,23 +9162,17 @@ def _tensorize_axis_sequence(
                     if (
                         isinstance(indices, tuple)
                         and len(indices) == 2
-                        and not isinstance(
-                            indices[0], (list, tuple, np.ndarray)
-                        )
+                        and not isinstance(indices[0], (list, tuple, np.ndarray))
                     ):
                         rel_start = int(indices[0])
                         rel_end = int(indices[1])
-                        pieces.append(
-                            column.values[base + rel_start : base + rel_end]
-                        )
+                        pieces.append(column.values[base + rel_start : base + rel_end])
                         continue
                     if len(indices) == 0:
                         pieces.append(column.values[base:base])
                     else:
                         pieces.append(
-                            column.values[
-                                base + np.asarray(indices, dtype=np.int64)
-                            ]
+                            column.values[base + np.asarray(indices, dtype=np.int64)]
                         )
                     continue
 
@@ -9144,11 +9195,7 @@ def _tensorize_axis_sequence(
                 selected = (
                     np.concatenate(pieces)
                     if pieces and any(piece.size for piece in pieces)
-                    else (
-                        pieces[0][:0]
-                        if pieces
-                        else np.empty(0, dtype=np.int64)
-                    )
+                    else (pieces[0][:0] if pieces else np.empty(0, dtype=np.int64))
                 )
             else:
                 full_rows = True
@@ -9162,9 +9209,7 @@ def _tensorize_axis_sequence(
                     if (
                         isinstance(indices, tuple)
                         and len(indices) == 2
-                        and not isinstance(
-                            indices[0], (list, tuple, np.ndarray)
-                        )
+                        and not isinstance(indices[0], (list, tuple, np.ndarray))
                     ):
                         rel_start = int(indices[0])
                         rel_end = int(indices[1])
@@ -9184,9 +9229,7 @@ def _tensorize_axis_sequence(
                             full_rows = False
                 if ndarray_rows:
                     built: list[np.ndarray] = []
-                    for items, indices in zip(
-                        normalized_rows, resolved_indices
-                    ):
+                    for items, indices in zip(normalized_rows, resolved_indices):
                         row_arr = items  # type: ignore[assignment]
                         if full_rows:
                             built.append(row_arr)  # type: ignore[arg-type]
@@ -9199,31 +9242,21 @@ def _tensorize_axis_sequence(
                     selected = (
                         np.concatenate(built)
                         if built and any(piece.size for piece in built)
-                        else (
-                            built[0][:0]
-                            if built
-                            else np.empty(0, dtype=np.int64)
-                        )
+                        else (built[0][:0] if built else np.empty(0, dtype=np.int64))
                     )
                 elif full_rows:
                     selected = list(chain.from_iterable(normalized_rows))
                 else:
                     selected = []
-                    for items, indices in zip(
-                        normalized_rows, resolved_indices
-                    ):
+                    for items, indices in zip(normalized_rows, resolved_indices):
                         if isinstance(indices, slice):
                             selected.extend(items[indices])
                         else:
-                            selected.extend(
-                                items[int(index)] for index in indices
-                            )
+                            selected.extend(items[int(index)] for index in indices)
 
         if field.kind == "categorical":
             qualified = field.qualified_name(sequence.name)
-            categorical_input = config.resolved.categorical_input_by_name[
-                qualified
-            ]
+            categorical_input = config.resolved.categorical_input_by_name[qualified]
             flat_values = _tensorize_python_categorical_values(
                 config,
                 categorical_input,
@@ -9250,8 +9283,7 @@ def _tensorize_axis_sequence(
                         )
                 else:
                     scalar_values = [
-                        0.0 if value is None else float(value)
-                        for value in selected
+                        0.0 if value is None else float(value) for value in selected
                     ]
                     flat_values = torch.tensor(
                         (
@@ -9275,15 +9307,18 @@ def _tensorize_axis_sequence(
                 )
                 padding_value = 0.0
         if shared_pad_indices is None and max_length > 0 and lengths.numel() > 0:
-            all_full = bool((lengths == max_length).all().item()) and int(
-                flat_values.size(0)
-            ) == int(lengths.numel()) * max_length
+            all_full = (
+                bool((lengths == max_length).all().item())
+                and int(flat_values.size(0)) == int(lengths.numel()) * max_length
+            )
             if not all_full:
                 positions = _cached_arange(max_length).unsqueeze(0)
                 shared_pad_mask = positions < lengths.unsqueeze(1)
                 shared_pad_indices = (
-                    starts.unsqueeze(1) + positions
-                ).clamp(min=0, max=max(int(flat_values.size(0)) - 1, 0)).reshape(-1)
+                    (starts.unsqueeze(1) + positions)
+                    .clamp(min=0, max=max(int(flat_values.size(0)) - 1, 0))
+                    .reshape(-1)
+                )
         tensor_fields[field.name] = _gather_padded_sequence(
             flat_values,
             starts,
@@ -9320,9 +9355,7 @@ def _scenario_values_tensor(
             f"missing configured scenario column {config.scenarios.source!r}"
         )
 
-    scenario_to_id = {
-        name: index for index, name in enumerate(config.scenarios.names)
-    }
+    scenario_to_id = {name: index for index, name in enumerate(config.scenarios.names)}
     row_indices: list[list[int]] = []
     saw_list_value = False
     for row_index, value in enumerate(values):
@@ -9364,16 +9397,13 @@ def axis_batch_to_feature_batch(
 ) -> FeatureBatch:
     """Construct a FeatureBatch directly from a packed three-axis payload."""
 
-
     if not isinstance(axis_batch, PreparedAxisBatch):
         raise TypeError(
             "axis_batch_to_feature_batch requires PreparedAxisBatch, got "
             f"{type(axis_batch).__name__}"
         )
     active_split = config.data.train if split is None else split
-    validate_prehashed_nonzero = (
-        active_split.reader.validate_prehashed_nonzero
-    )
+    validate_prehashed_nonzero = active_split.reader.validate_prehashed_nonzero
     row_indices = axis_batch.request_row_indices
     features: dict[str, Any] = {}
     bag_window_cache: dict[
@@ -9395,9 +9425,7 @@ def axis_batch_to_feature_batch(
         # Broadcast metadata may appear on both axes; prefer candidate then.
         request_level = in_request and not in_candidate
         source_values = (
-            axis_batch.request_values
-            if request_level
-            else axis_batch.candidate_values
+            axis_batch.request_values if request_level else axis_batch.candidate_values
         )
         values = source_values[feature.source]
         if feature.kind == "categorical":
@@ -9437,9 +9465,7 @@ def axis_batch_to_feature_batch(
         else:
             raise ValueError(f"unsupported feature kind {feature.kind!r}")
         features[feature.name] = (
-            _indexed_request_value(value, row_indices)
-            if request_level
-            else value
+            _indexed_request_value(value, row_indices) if request_level else value
         )
 
     for sequence in config.sequences:
@@ -9464,8 +9490,7 @@ def axis_batch_to_feature_batch(
     label_mask = None
     label_columns = active_split.labels
     if label_columns and all(
-        column in axis_batch.candidate_values
-        for column in label_columns.values()
+        column in axis_batch.candidate_values for column in label_columns.values()
     ):
         label_names = list(label_columns)
         label_tensors: list[Tensor] = []
@@ -9479,10 +9504,7 @@ def axis_batch_to_feature_batch(
             else:
                 label_tensors.append(
                     torch.tensor(
-                        [
-                            0.0 if value is None else float(value)
-                            for value in raw
-                        ],
+                        [0.0 if value is None else float(value) for value in raw],
                         dtype=torch.float32,
                     )
                 )
@@ -9500,16 +9522,11 @@ def axis_batch_to_feature_batch(
                 raw = axis_batch.candidate_values[column]
                 if isinstance(raw, np.ndarray):
                     arr = raw.astype(np.float32, copy=False)
-                    mask_tensors.append(
-                        torch.from_numpy(np.ascontiguousarray(arr))
-                    )
+                    mask_tensors.append(torch.from_numpy(np.ascontiguousarray(arr)))
                 else:
                     mask_tensors.append(
                         torch.tensor(
-                            [
-                                0.0 if value is None else float(value)
-                                for value in raw
-                            ],
+                            [0.0 if value is None else float(value) for value in raw],
                             dtype=torch.float32,
                         )
                     )
@@ -9523,9 +9540,7 @@ def axis_batch_to_feature_batch(
         if group_source is None:
             group_ids = ["" for _ in range(axis_batch.n_candidates)]
         elif group_source not in axis_batch.candidate_values:
-            raise ValueError(
-                f"missing configured group-id column {group_source!r}"
-            )
+            raise ValueError(f"missing configured group-id column {group_source!r}")
         else:
             group_ids = [
                 "" if value is None else str(value)
@@ -9632,8 +9647,7 @@ def table_to_feature_batch(
     features: dict[str, Any] = {}
     for feature in config.features:
         request_level = (
-            request_row_indices is not None
-            and feature.source in request_level_sources
+            request_row_indices is not None and feature.source in request_level_sources
         )
         source_table = request_table if request_level else table
         if feature.kind == "categorical":
@@ -9682,10 +9696,15 @@ def table_to_feature_batch(
     labels = None
     label_mask = None
     label_columns = active_split.labels
-    if label_columns and all(column in table.column_names for column in label_columns.values()):
+    if label_columns and all(
+        column in table.column_names for column in label_columns.values()
+    ):
         label_names = list(label_columns)
         labels = torch.stack(
-            [_numeric_column_tensor(table, label_columns[name], torch.float32) for name in label_names],
+            [
+                _numeric_column_tensor(table, label_columns[name], torch.float32)
+                for name in label_names
+            ],
             dim=1,
         )
         mask_columns = active_split.label_masks
@@ -9714,7 +9733,9 @@ def table_to_feature_batch(
             batch_size,
             trusted_input=active_split.reader.trusted_input,
         ),
-        group_id=_group_ids(active_split, table, batch_size) if include_group_id else [],
+        group_id=_group_ids(active_split, table, batch_size)
+        if include_group_id
+        else [],
         prediction_keys=_prediction_keys(active_split, table),
     )
 
@@ -9727,7 +9748,9 @@ def table_to_feature_batch(
 def _map_feature_value(value: Any, tensor_fn: Callable[[Tensor], Tensor]) -> Any:
     """Apply a device or memory operation recursively to nested tensor leaves."""
     if isinstance(value, dict):
-        return {key: _map_feature_value(child, tensor_fn) for key, child in value.items()}
+        return {
+            key: _map_feature_value(child, tensor_fn) for key, child in value.items()
+        }
     if isinstance(value, torch.Tensor):
         return tensor_fn(value)
     return value
@@ -9812,9 +9835,7 @@ def pin_feature_batch(
         # fresh pinned storage and remap views. Cloning off shared-memory first
         # releases /dev/shm quickly under tiny container shm caps.
         pinned_buffers = tuple(
-            buffer.detach().clone().pin_memory()
-            if not buffer.is_pinned()
-            else buffer
+            buffer.detach().clone().pin_memory() if not buffer.is_pinned() else buffer
             for buffer in batch._packed_buffers
         )
         pinned_by_dtype = {buffer.dtype: buffer for buffer in pinned_buffers}
@@ -9899,7 +9920,9 @@ def move_feature_batch(
             )
             for key, value in batch.features.items()
         },
-        labels=None if batch.labels is None else batch.labels.to(device, non_blocking=non_blocking),
+        labels=None
+        if batch.labels is None
+        else batch.labels.to(device, non_blocking=non_blocking),
         label_mask=(
             None
             if batch.label_mask is None
@@ -9918,6 +9941,7 @@ def move_feature_batch(
 # PreparedAxisBatch / SequenceSelectionPlan feed the Arrow-free tensorizer.
 # Controlled by reader.agg_direct_mode (default legacy).
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class DirectPipelineStats:
@@ -10012,9 +10036,8 @@ class RequestGroupBlock:
         to release that reference.
         """
 
-        return (
-            self.candidate_offset + self.candidate_count
-            == len(self.candidate_positions)
+        return self.candidate_offset + self.candidate_count == len(
+            self.candidate_positions
         )
 
 
@@ -10246,7 +10269,9 @@ def build_sequence_selection_plan(
 
         anchor_flags = None
         if anchor_source is not None:
-            _length, anchor_array = _list_row_length_and_array(table[anchor_source], row)
+            _length, anchor_array = _list_row_length_and_array(
+                table[anchor_source], row
+            )
             anchor_flags = _list_value_is_null_flags(anchor_array, row)
 
         kept, pre_len, compact_len = row_sequence_selection_after_truncate_then_compact(
@@ -10317,7 +10342,9 @@ def build_axis_sequence_selection_plan(
         row = column[slot]
         return 0 if row is None else len(row)
 
-    def _anchor_null_mask(column: Any, slot: int, list_length: int) -> np.ndarray | None:
+    def _anchor_null_mask(
+        column: Any, slot: int, list_length: int
+    ) -> np.ndarray | None:
         if list_length == 0:
             return np.asarray([], dtype=bool)
         values = getattr(column, "values", None)
@@ -10460,9 +10487,8 @@ def build_axis_sequence_selection_plan(
                 expected_pre_length = block.pre_compaction_sequence_lengths.get(
                     sequence.name
                 )
-                if (
-                    expected_pre_length is not None
-                    and int(expected_pre_length) != int(pre_lengths_arr[request_index])
+                if expected_pre_length is not None and int(expected_pre_length) != int(
+                    pre_lengths_arr[request_index]
                 ):
                     raise RuntimeError(
                         f"sequence {sequence.name!r} pre-compaction length changed "
@@ -10505,25 +10531,20 @@ def build_axis_sequence_selection_plan(
                 raise ValueError(
                     f"sequence source {anchor_source!r} missing from axis bundle"
                 ) from error
-            anchor_is_null = _anchor_null_mask(
-                anchor_column, request_slot, list_length
-            )
+            anchor_is_null = _anchor_null_mask(anchor_column, request_slot, list_length)
 
-        kept, pre_length, compacted_length = (
-            row_sequence_selection_after_truncate_then_compact(
-                list_length=list_length,
-                anchor_is_null=anchor_is_null,
-                max_length=max_length,
-                truncation=truncation,
-            )
+        (
+            kept,
+            pre_length,
+            compacted_length,
+        ) = row_sequence_selection_after_truncate_then_compact(
+            list_length=list_length,
+            anchor_is_null=anchor_is_null,
+            max_length=max_length,
+            truncation=truncation,
         )
-        expected_pre_length = block.pre_compaction_sequence_lengths.get(
-            sequence.name
-        )
-        if (
-            expected_pre_length is not None
-            and int(expected_pre_length) != pre_length
-        ):
+        expected_pre_length = block.pre_compaction_sequence_lengths.get(sequence.name)
+        if expected_pre_length is not None and int(expected_pre_length) != pre_length:
             raise RuntimeError(
                 f"sequence {sequence.name!r} pre-compaction length changed "
                 f"between bucket and pack for request {block.request_id!r}: "
@@ -10563,7 +10584,6 @@ def build_axis_sequence_selection_plan(
         range_starts=range_starts_arr if selections_are_ranges else None,
         range_ends=range_ends_arr if selections_are_ranges else None,
     )
-
 
 
 def table_pre_compaction_sequence_lengths(
@@ -10773,7 +10793,9 @@ def iter_packed_request_groups(
                 buffered = []
                 buffered_rows = 0
             yield (block.slice_candidates(0, batch_size),)
-            block = block.slice_candidates(batch_size, block.candidate_count - batch_size)
+            block = block.slice_candidates(
+                batch_size, block.candidate_count - batch_size
+            )
         if not block.candidate_count:
             continue
         if buffered_rows and buffered_rows + block.candidate_count > batch_size:
@@ -11061,9 +11083,7 @@ def share_compact_list_offsets(
         matched = None
         offsets = column.offsets
         for candidate in unique_offsets:
-            if candidate.shape == offsets.shape and np.array_equal(
-                candidate, offsets
-            ):
+            if candidate.shape == offsets.shape and np.array_equal(candidate, offsets):
                 matched = candidate
                 break
         if matched is None:
@@ -11130,9 +11150,7 @@ class SourceRegistry:
         self._next_id += 1
         self._sources[source_id] = payload
         self._refcount[source_id] = 0
-        self.peak_retained_sources = max(
-            self.peak_retained_sources, len(self._sources)
-        )
+        self.peak_retained_sources = max(self.peak_retained_sources, len(self._sources))
         return source_id
 
     def get(self, source_id: int) -> Any:
@@ -11249,9 +11267,7 @@ def request_group_blocks_from_axis_bundle(
                 continue
             source = sequence.fields[0].source
             if source not in bundle.sequence_features:
-                raise ValueError(
-                    f"sequence source {source!r} missing from axis bundle"
-                )
+                raise ValueError(f"sequence source {source!r} missing from axis bundle")
             seq_column = bundle.sequence_features[source]
             if isinstance(seq_column, CompactListColumn):
                 length = seq_column.row_length(stable_group_order)
@@ -11487,8 +11503,7 @@ def prepare_packed_axis_batch(
                 )
                 continue
             rows = [
-                bundle.sequence_features[name][slot]
-                for bundle, slot in request_order
+                bundle.sequence_features[name][slot] for bundle, slot in request_order
             ]
             request_values[name] = tuple(rows)
             continue
@@ -11700,10 +11715,7 @@ def prepare_packed_axis_batch(
     for source_id in unique_source_ids:
         bundle = bundles[source_id]
         dense_by_source.append(
-            {
-                name: getattr(bundle, candidate_maps[name])[name]
-                for name in dense_names
-            }
+            {name: getattr(bundle, candidate_maps[name])[name] for name in dense_names}
         )
     reqs_by_unique = [
         np.flatnonzero(shared_candidate_index == unique_idx)
@@ -11836,13 +11848,9 @@ def materialize_packed_axis_bundles(
                 elif name in bundle.label_features:
                     candidate_rows[name].append(bundle.label_features[name][cand])
                 elif name in bundle.label_mask_features:
-                    candidate_rows[name].append(
-                        bundle.label_mask_features[name][cand]
-                    )
+                    candidate_rows[name].append(bundle.label_mask_features[name][cand])
                 elif name in bundle.candidate_metadata:
-                    candidate_rows[name].append(
-                        bundle.candidate_metadata[name][cand]
-                    )
+                    candidate_rows[name].append(bundle.candidate_metadata[name][cand])
                 elif name in bundle.request_features:
                     candidate_rows[name].append(
                         bundle.request_features[name][bundle_slot]
@@ -12079,9 +12087,7 @@ def _gather_request_axis_cells(
     offsets = array.offsets.to_numpy(zero_copy_only=False)
     values = array.values
     nested = pa.types.is_list(values.type) or pa.types.is_large_list(values.type)
-    inner_offsets = (
-        values.offsets.to_numpy(zero_copy_only=False) if nested else None
-    )
+    inner_offsets = values.offsets.to_numpy(zero_copy_only=False) if nested else None
     flat = values.values if nested else None
 
     for i, (raw_row, local) in enumerate(zip(raw_rows, locals_)):
@@ -12107,9 +12113,7 @@ def _gather_request_axis_cells(
             elif e == s + 1:
                 out[i] = flat[s].as_py()
             else:
-                raise ValueError(
-                    f"single-valued feature has inner length {e - s}"
-                )
+                raise ValueError(f"single-valued feature has inner length {e - s}")
         else:
             if loc >= (stop - start):
                 raise ValueError(
@@ -12190,9 +12194,7 @@ def _gather_candidate_axis_cells(
                 elif e == s + 1:
                     out[out_i] = flat[s].as_py()
                 else:
-                    raise ValueError(
-                        f"single-valued feature has inner length {e - s}"
-                    )
+                    raise ValueError(f"single-valued feature has inner length {e - s}")
         return out
 
     for row, items in by_row.items():
@@ -12244,9 +12246,7 @@ def _take_sequence_tokens(
             row_values = flat
         else:
             # Uneven inner lengths: materialize selected positions only.
-            selected = [
-                row_values[int(pos)].as_py() for pos in positions.tolist()
-            ]
+            selected = [row_values[int(pos)].as_py() for pos in positions.tolist()]
             return [
                 item[0]
                 if isinstance(item, list) and len(item) == 1
@@ -12417,13 +12417,15 @@ def _sequence_selection_plan_from_request_values(
                 count=list_length,
             )
 
-        kept, pre_length, compacted_length = (
-            row_sequence_selection_after_truncate_then_compact(
-                list_length=list_length,
-                anchor_is_null=anchor_is_null,
-                max_length=sequence.max_length,
-                truncation=sequence.truncation,
-            )
+        (
+            kept,
+            pre_length,
+            compacted_length,
+        ) = row_sequence_selection_after_truncate_then_compact(
+            list_length=list_length,
+            anchor_is_null=anchor_is_null,
+            max_length=sequence.max_length,
+            truncation=sequence.truncation,
         )
         expected_pre_length = block.pre_compaction_sequence_lengths.get(sequence.name)
         if expected_pre_length is not None and int(expected_pre_length) != pre_length:
@@ -12549,9 +12551,7 @@ def _index_request_cell(row_cell: Any, local: int, *, bag: bool) -> Any:
         cell = row_cell[local]
     else:
         if local != 0:
-            raise ValueError(
-                f"scalar request-axis cell cannot index local={local}"
-            )
+            raise ValueError(f"scalar request-axis cell cannot index local={local}")
         cell = row_cell
     if bag:
         if cell is None:
@@ -12574,14 +12574,11 @@ def _index_request_cell(row_cell: Any, local: int, *, bag: bool) -> Any:
         if not cell:
             return None
         if len(cell) != 1:
-            raise ValueError(
-                f"single-valued feature has inner length {len(cell)}"
-            )
+            raise ValueError(f"single-valued feature has inner length {len(cell)}")
         return cell[0]
     if isinstance(cell, np.generic):
         return cell.item()
     return cell
-
 
 
 def _index_candidate_cell(row_cell: Any, local: int, *, bag: bool) -> Any:
@@ -12617,9 +12614,7 @@ def _index_candidate_cell(row_cell: Any, local: int, *, bag: bool) -> Any:
         if not cell:
             return None
         if len(cell) != 1:
-            raise ValueError(
-                f"single-valued feature has inner length {len(cell)}"
-            )
+            raise ValueError(f"single-valued feature has inner length {len(cell)}")
         return cell[0]
     if isinstance(cell, np.generic):
         return cell.item()
@@ -12894,10 +12889,7 @@ def materialize_arrow_axis_source(source: ArrowAxisSource) -> AdaptedAxisBundle:
 
     candidate_metadata: dict[str, tuple[Any, ...]] = {}
     for name in source.candidate_metadata_columns:
-        if (
-            name == "candidate_position"
-            and plan.candidate_positions is not None
-        ):
+        if name == "candidate_position" and plan.candidate_positions is not None:
             candidate_metadata[name] = tuple(
                 int(v) for v in plan.candidate_positions.tolist()
             )
@@ -12968,5 +12960,3 @@ def prepare_packed_arrow_axis_batch(
         request_id_column=request_id_column,
         candidate_request_columns=candidate_request_columns,
     )
-
-

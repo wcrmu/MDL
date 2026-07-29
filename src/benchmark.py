@@ -465,6 +465,11 @@ def _environment(config: AppConfig, context: DistributedContext) -> dict[str, An
         ),
         "onetrans_batched_ns": config.runtime.onetrans_batched_ns,
         "activation_checkpoint": config.runtime.activation_checkpoint,
+        "cuda_graph_backbone": bool(
+            getattr(config.runtime, "cuda_graph_backbone", False)
+        ),
+        "compile": bool(getattr(config.runtime, "compile", False)),
+        "compile_mode": getattr(config.runtime, "compile_mode", None),
         "gradient_accumulation_steps": (
             config.training.gradient_accumulation_steps
         ),
@@ -473,6 +478,11 @@ def _environment(config: AppConfig, context: DistributedContext) -> dict[str, An
             config.training.dense_optimizer_foreach_bucket_mb
         ),
         "model_name": config.model.name,
+        "mdl_token_state": getattr(config.model, "mdl_token_state", None),
+        "mdl_feature_interaction": getattr(
+            config.model, "mdl_feature_interaction", None
+        ),
+        "scene_feature_bias": getattr(config.model, "scene_feature_bias", None),
         "embedding_distribution": config.training.embedding_distribution,
         "dense_distribution": config.training.dense_distribution,
         "data_reader": {

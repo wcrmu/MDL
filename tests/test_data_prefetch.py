@@ -48,7 +48,9 @@ from src.train import (
 
 
 class LengthBucketTest(unittest.TestCase):
-    def test_streaming_shuffle_is_deterministic_and_preserves_exact_coverage(self) -> None:
+    def test_streaming_shuffle_is_deterministic_and_preserves_exact_coverage(
+        self,
+    ) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(root / "configs" / "reference" / "default.yaml")
         train_split = replace(
@@ -80,11 +82,7 @@ class LengthBucketTest(unittest.TestCase):
                         True,
                     )
                 )
-            return [
-                value
-                for table in output
-                for value in table["row_id"].to_pylist()
-            ]
+            return [value for table in output for value in table["row_id"].to_pylist()]
 
         first = shuffled()
         self.assertEqual(first, shuffled())
@@ -202,7 +200,9 @@ class LengthBucketTest(unittest.TestCase):
         self.assertEqual(maximum.tolist(), [2, 1])
         self.assertEqual(summed.tolist(), [4, 2])
 
-    def test_request_bucket_computes_shared_length_once_and_does_not_split(self) -> None:
+    def test_request_bucket_computes_shared_length_once_and_does_not_split(
+        self,
+    ) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(root / "configs" / "reference" / "default.yaml")
         buckets = (
@@ -238,7 +238,9 @@ class LengthBucketTest(unittest.TestCase):
             }
         )
 
-        with patch("src.train.iter_candidate_tables", return_value=iter([table])), patch(
+        with patch(
+            "src.train.iter_candidate_tables", return_value=iter([table])
+        ), patch(
             "src.train._table_effective_sequence_lengths",
             wraps=_table_effective_sequence_lengths,
         ) as lengths:
@@ -253,7 +255,9 @@ class LengthBucketTest(unittest.TestCase):
 
 
 class EagerSchemaValidationTest(unittest.TestCase):
-    def test_full_flat_contract_is_validated_only_on_the_first_nonempty_batch(self) -> None:
+    def test_full_flat_contract_is_validated_only_on_the_first_nonempty_batch(
+        self,
+    ) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(root / "configs" / "reference" / "default.yaml")
         tables = [pa.table({"value": [1]}), pa.table({"value": [2]})]
@@ -264,8 +268,12 @@ class EagerSchemaValidationTest(unittest.TestCase):
         context = SimpleNamespace()
 
         with (
-            patch("src.dataloader._validate_flat_table_static_contract") as validate_static,
-            patch("src.dataloader._validate_complete_label_contract") as validate_labels,
+            patch(
+                "src.dataloader._validate_flat_table_static_contract"
+            ) as validate_static,
+            patch(
+                "src.dataloader._validate_complete_label_contract"
+            ) as validate_labels,
         ):
             actual = list(
                 _iter_adapted_flat_tables(
@@ -294,8 +302,12 @@ class EagerSchemaValidationTest(unittest.TestCase):
         scanner = SimpleNamespace(split=split, iter_tables=lambda: iter(tables))
 
         with (
-            patch("src.dataloader._validate_flat_table_static_contract") as validate_static,
-            patch("src.dataloader._validate_complete_label_contract") as validate_labels,
+            patch(
+                "src.dataloader._validate_flat_table_static_contract"
+            ) as validate_static,
+            patch(
+                "src.dataloader._validate_complete_label_contract"
+            ) as validate_labels,
         ):
             actual = list(
                 _iter_adapted_flat_tables(
@@ -318,7 +330,9 @@ class EagerSchemaValidationTest(unittest.TestCase):
             [3, 2],
         )
 
-    def test_row_group_sharding_covers_rows_exactly_once_across_eight_ranks(self) -> None:
+    def test_row_group_sharding_covers_rows_exactly_once_across_eight_ranks(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             expected = list(range(24))
             for file_index in range(4):
@@ -401,7 +415,9 @@ class EagerSchemaValidationTest(unittest.TestCase):
         self.assertEqual(len(selected), 64)
         self.assertIs(selected[0], refs[0])
         self.assertIs(selected[-1], refs[-1])
-        self.assertEqual(selected, sorted(selected, key=lambda item: item.canonical_uri))
+        self.assertEqual(
+            selected, sorted(selected, key=lambda item: item.canonical_uri)
+        )
 
     def test_all_mode_keeps_every_file(self) -> None:
         refs = self._refs(5)
@@ -440,7 +456,9 @@ class EagerSchemaValidationTest(unittest.TestCase):
                 opened.append(str(fs_path))
                 return real_parquet_file(fs_path, **kwargs)
 
-            with patch("pyarrow.parquet.ParquetFile", side_effect=tracking_parquet_file):
+            with patch(
+                "pyarrow.parquet.ParquetFile", side_effect=tracking_parquet_file
+            ):
                 with patch("pyarrow.dataset.dataset") as dataset_factory:
                     rows = [
                         value
@@ -464,7 +482,9 @@ class EagerSchemaValidationTest(unittest.TestCase):
             (),
             {"reader": ReaderConfig(num_workers=8, prefetch_batches=8)},
         )()
-        scanner._io_policy = RemoteIoPolicy.from_reader(scanner.split.reader, remote=True)
+        scanner._io_policy = RemoteIoPolicy.from_reader(
+            scanner.split.reader, remote=True
+        )
         self.assertTrue(scanner._filesystem_is_remote())
         self.assertEqual(scanner._prefetch_active_workers(8), 4)
 
@@ -494,11 +514,32 @@ class EagerSchemaValidationTest(unittest.TestCase):
 
 
 class RequestDeduplicationTest(unittest.TestCase):
+    def test_unique_requests_keep_an_explicit_identity_mapping(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "rankmixer.yaml")
+        split = replace(
+            config.data.train,
+            reader=replace(
+                config.data.train.reader,
+                deduplicate_request_features=True,
+            ),
+        )
+        request_column = split.request_id or "search_id"
+        table = pa.table(
+            {
+                request_column: ["r0", "r1", "r2"],
+                "value": [10, 20, 30],
+            }
+        )
+
+        selected, row_indices = _request_deduplication_plan(split, table)
+
+        self.assertIs(selected, table)
+        self.assertEqual(row_indices.tolist(), [0, 1, 2])
+
     def test_stably_selects_one_row_per_request(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(
-            root / "configs" / "rankmixer.yaml"
-        )
+        config = load_app_config(root / "configs" / "rankmixer.yaml")
         split = replace(
             config.data.train,
             reader=replace(
@@ -571,7 +612,9 @@ class RequestDeduplicationTest(unittest.TestCase):
 
         selected, row_indices = _request_deduplication_plan(split, table)
 
-        self.assertEqual(selected[split.request_id or "search_id"].to_pylist(), ["r0", "r1"])
+        self.assertEqual(
+            selected[split.request_id or "search_id"].to_pylist(), ["r0", "r1"]
+        )
         self.assertEqual(row_indices.tolist(), [0, 0, 1, 1])
         self.assertEqual(
             _flatten_array_values(selected["bag"]),
@@ -787,11 +830,11 @@ class DevicePrefetchTest(unittest.TestCase):
 
 
 class ByteBudgetTest(unittest.TestCase):
-    def test_prepared_batch_estimate_supports_dictionary_encoded_list_bags(self) -> None:
+    def test_prepared_batch_estimate_supports_dictionary_encoded_list_bags(
+        self,
+    ) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_app_config(
-            root / "configs" / "rankmixer.yaml"
-        )
+        config = load_app_config(root / "configs" / "rankmixer.yaml")
         feature = next(
             item
             for item in config.features

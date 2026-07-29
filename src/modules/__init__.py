@@ -5,6 +5,13 @@ from .attention import (
     RankMixerTokenMixing,
 )
 from .mlp import PerTokenFFN, StackedPerTokenFFN
+from .stca import (
+    STCAInputLayer,
+    STCASequenceCache,
+    STCASequenceEncoder,
+    SingleQueryTargetAttention,
+    SwiGLUFFN,
+)
 
 __all__ = [
     "DomainAwareAttention",
@@ -13,4 +20,9 @@ __all__ = [
     "StackedPerTokenFFN",
     "RankMixerDomainInteraction",
     "RankMixerTokenMixing",
+    "STCAInputLayer",
+    "STCASequenceCache",
+    "STCASequenceEncoder",
+    "SingleQueryTargetAttention",
+    "SwiGLUFFN",
 ]

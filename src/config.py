@@ -6,9 +6,16 @@ The YAML surface should stay stable. Internal helpers build the model-facing vie
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, field, fields as dataclass_fields, is_dataclass
+from dataclasses import (
+    dataclass,
+    field,
+    fields as dataclass_fields,
+    is_dataclass,
+    replace,
+)
 from functools import cached_property
 import importlib
+import math
 from pathlib import Path
 from types import MappingProxyType, UnionType
 from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
@@ -22,10 +29,7 @@ class _FrozenMapping(Mapping[Any, Any]):
     __slots__ = ("_data",)
 
     def __init__(self, values: Mapping[Any, Any]) -> None:
-        data = {
-            key: _deep_freeze_config_value(value)
-            for key, value in values.items()
-        }
+        data = {key: _deep_freeze_config_value(value) for key, value in values.items()}
         object.__setattr__(self, "_data", MappingProxyType(data))
 
     def __getitem__(self, key: Any) -> Any:
@@ -129,9 +133,10 @@ PoolingNullPolicy = Literal[
 # Sequence encoder choices; individual values target different model paths.
 SequenceEncoderType = Literal[
     "raw",  # Preserve event-level tokens for OneTrans; required by the OneTrans family.
-    "attention_pool",  # Produce a learned attention-pooled sequence summary.
+    "attention_pool",  # DIN-style target-aware attention pool; requires target_inputs.
     "mean_pool",  # Produce a masked mean-pooled sequence summary.
     "longer",  # Use LONGER sequence encoding; required by model.name=longer.
+    "stca",  # Use stacked target-to-history cross attention for RankMixer.
 ]
 LongerOutputType = Literal[
     "full",  # Expose global and recent-query states (paper/reference behavior).
@@ -152,6 +157,8 @@ LRScheduleType = Literal[
 LossReductionType = Literal[
     "sum",  # Sum all valid label losses across tasks and examples.
     "mean_per_task",  # Mean each task over its valid labels, then sum task means.
+    # Mean targets inside each request, then mean requests for every task (STCA RLB Eq.).
+    "mean_per_request_per_task",
 ]
 
 # OneTrans-family choices: model.name=onetrans or experimental mdl_onetrans.
@@ -174,6 +181,22 @@ DTSITrainingOutputType = Literal[
 MDLFeatureInteractionType = Literal[
     "direct_ffn",  # Replace the mixed feature state with the MDL-style FFN output (MDL Eq. 6).
     "residual_ffn",  # Apply original RankMixer-style residual addition and LayerNorm after the FFN.
+]
+
+# Controls whether an MDL domain token is one coupled prompt/state/readout
+# (published MDL) or whether its prompt is kept query-only while a separate
+# recurrent state carries evidence to the prediction head.
+MDLTokenStateType = Literal[
+    "coupled",  # Published MDL: initialized domain token is Q, residual state, and readout.
+    "split",  # Important/prior prompt affects readout only through attention.
+]
+
+# Optional scene conditioning on feature / NS tokens before domain attention.
+# none keeps the paper split (scenario is prompt only); additive / film are ablations.
+SceneFeatureBiasType = Literal[
+    "none",  # No explicit scene bias on features (default).
+    "additive",  # h <- h + b(s) from the active scenario token.
+    "film",  # h <- (1+γ(s)) ⊙ h + β(s) from the active scenario token.
 ]
 
 
@@ -247,7 +270,9 @@ class CategoricalEncodingConfig:
     share_embedding: bool = False
 
     @classmethod
-    def from_mapping(cls, payload: dict[str, Any] | None) -> "CategoricalEncodingConfig | None":
+    def from_mapping(
+        cls, payload: dict[str, Any] | None
+    ) -> "CategoricalEncodingConfig | None":
         if payload is None:
             return None
         if not isinstance(payload, dict):
@@ -268,11 +293,20 @@ class CategoricalEncodingConfig:
         }
         unknown = sorted(set(payload) - allowed)
         if unknown:
-            raise ValueError("inline categorical encoding contains unknown keys: " + ", ".join(unknown))
+            raise ValueError(
+                "inline categorical encoding contains unknown keys: "
+                + ", ".join(unknown)
+            )
         explicit_type = payload.get("type")
         explicit_encoding = payload.get("encoding")
-        if explicit_type is not None and explicit_encoding is not None and explicit_type != explicit_encoding:
-            raise ValueError("inline categorical encoding type and encoding must match when both are set")
+        if (
+            explicit_type is not None
+            and explicit_encoding is not None
+            and explicit_type != explicit_encoding
+        ):
+            raise ValueError(
+                "inline categorical encoding type and encoding must match when both are set"
+            )
         encoding = explicit_type or explicit_encoding
         if encoding is None:
             raise ValueError("inline categorical encoding requires type")
@@ -282,7 +316,13 @@ class CategoricalEncodingConfig:
         return cls(**values)
 
     def validate(self, path: str) -> None:
-        if self.encoding not in {"vocab", "hash", "pre_hashed", "identity", "shared_vocab"}:
+        if self.encoding not in {
+            "vocab",
+            "hash",
+            "pre_hashed",
+            "identity",
+            "shared_vocab",
+        }:
             raise ValueError(f"{path}.type is invalid")
         if self.encoding == "vocab":
             if not self.artifact:
@@ -293,7 +333,9 @@ class CategoricalEncodingConfig:
                 raise ValueError(f"{path}.max_size must be positive")
         if self.encoding == "hash":
             if self.num_buckets is None or self.num_buckets <= 0:
-                raise ValueError(f"{path}.num_buckets must be positive for hash encoding")
+                raise ValueError(
+                    f"{path}.num_buckets must be positive for hash encoding"
+                )
         if self.encoding == "pre_hashed":
             _validate_pre_hashed(
                 num_buckets=self.num_buckets,
@@ -338,7 +380,9 @@ class ParquetAdapterConfig(_DeeplyImmutableConfig):
     options: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_mapping(cls, payload: dict[str, Any] | None) -> "ParquetAdapterConfig | None":
+    def from_mapping(
+        cls, payload: dict[str, Any] | None
+    ) -> "ParquetAdapterConfig | None":
         if payload is None:
             return None
         if not isinstance(payload, dict):
@@ -346,7 +390,9 @@ class ParquetAdapterConfig(_DeeplyImmutableConfig):
         input_columns = payload.get("input_columns")
         if input_columns is not None:
             if isinstance(input_columns, str):
-                raise ValueError("data split adapter.input_columns must be a list of column names")
+                raise ValueError(
+                    "data split adapter.input_columns must be a list of column names"
+                )
             input_columns = tuple(input_columns)
         optional_input_columns = payload.get("optional_input_columns", ())
         if isinstance(optional_input_columns, str):
@@ -368,18 +414,25 @@ class ParquetAdapterConfig(_DeeplyImmutableConfig):
                 "and return a flat pyarrow.Table or an iterable of flat tables."
             )
         if ":" not in self.callable:
-            raise ValueError(f"{path}.callable must use 'package.module:function' format")
+            raise ValueError(
+                f"{path}.callable must use 'package.module:function' format"
+            )
         module_name, attribute_name = self.callable.split(":", 1)
         if not module_name or not attribute_name:
-            raise ValueError(f"{path}.callable must use 'package.module:function' format")
+            raise ValueError(
+                f"{path}.callable must use 'package.module:function' format"
+            )
         if self.input_columns is not None:
-            if not all(isinstance(column, str) and column for column in self.input_columns):
-                raise ValueError(f"{path}.input_columns must contain non-empty column names")
+            if not all(
+                isinstance(column, str) and column for column in self.input_columns
+            ):
+                raise ValueError(
+                    f"{path}.input_columns must contain non-empty column names"
+                )
             if len(set(self.input_columns)) != len(self.input_columns):
                 raise ValueError(f"{path}.input_columns must not contain duplicates")
         if not all(
-            isinstance(column, str) and column
-            for column in self.optional_input_columns
+            isinstance(column, str) and column for column in self.optional_input_columns
         ):
             raise ValueError(
                 f"{path}.optional_input_columns must contain non-empty column names"
@@ -389,9 +442,7 @@ class ParquetAdapterConfig(_DeeplyImmutableConfig):
                 f"{path}.optional_input_columns must not contain duplicates"
             )
         if self.input_columns is None and self.optional_input_columns:
-            raise ValueError(
-                f"{path}.optional_input_columns requires input_columns"
-            )
+            raise ValueError(f"{path}.optional_input_columns requires input_columns")
         overlap = set(self.input_columns or ()) & set(self.optional_input_columns)
         if overlap:
             raise ValueError(
@@ -403,11 +454,15 @@ class ParquetAdapterConfig(_DeeplyImmutableConfig):
         try:
             module = importlib.import_module(module_name)
         except Exception as error:
-            raise ValueError(f"{path}.callable could not import module {module_name!r}: {error}") from error
+            raise ValueError(
+                f"{path}.callable could not import module {module_name!r}: {error}"
+            ) from error
         target: Any = module
         for part in attribute_name.split("."):
             if not part:
-                raise ValueError(f"{path}.callable must not contain empty attribute path segments")
+                raise ValueError(
+                    f"{path}.callable must not contain empty attribute path segments"
+                )
             try:
                 target = getattr(target, part)
             except AttributeError as error:
@@ -416,7 +471,9 @@ class ParquetAdapterConfig(_DeeplyImmutableConfig):
                     f"in module {module_name!r}"
                 ) from error
         if not callable(target):
-            raise ValueError(f"{path}.callable target {self.callable!r} is not callable")
+            raise ValueError(
+                f"{path}.callable target {self.callable!r} is not callable"
+            )
 
 
 @dataclass(frozen=True)
@@ -434,7 +491,9 @@ class LengthBucketConfig:
 
     def validate(self) -> None:
         if self.max_length is not None and self.max_length <= 0:
-            raise ValueError("reader.length_buckets.max_length must be positive or null")
+            raise ValueError(
+                "reader.length_buckets.max_length must be positive or null"
+            )
         if self.batch_size <= 0:
             raise ValueError("reader.length_buckets.batch_size must be positive")
 
@@ -474,7 +533,9 @@ class ReaderConfig(_DeeplyImmutableConfig):
     # replaces hundreds of tiny DMA operations for wide recommendation batches.
     coalesce_pinned_tensors: bool = False
     # Number of already-copied CUDA batches kept ahead of the training loop.
-    # Zero preserves the synchronous transfer path.
+    # Zero preserves the synchronous H2D path. When host_prepare_prefetch > 0,
+    # this is a pure H2D side-stream stage (process child already prepared the
+    # host FeatureBatch); both may be positive together.
     device_prefetch_batches: int = 0
     # When true, FeatureBatch tensorize/pin runs after backward so it overlaps
     # in-flight GPU backward kernels on the same thread (no GIL fight with
@@ -484,6 +545,7 @@ class ReaderConfig(_DeeplyImmutableConfig):
     # Run pack+tensorize in a spawn child and feed shared-memory FeatureBatches
     # through a queue of this depth. Avoids GIL contention with training; 0
     # keeps prepare in-process. Requires pin_memory when CUDA training pins.
+    # Combines with device_prefetch_batches as prepare→H2D→train pipeline.
     host_prepare_prefetch: int = 0
     # Repeated candidates from one request can share Context and UPS tensors.
     # The adapter remains responsible for declaring context feature membership.
@@ -548,7 +610,9 @@ class ReaderConfig(_DeeplyImmutableConfig):
         values = dict(payload)
         # Keep removed YAML keys explicit so old configs fail with a useful message.
         if "batch_size_candidates" in values:
-            raise ValueError("reader.batch_size_candidates was removed; use training.batch_size")
+            raise ValueError(
+                "reader.batch_size_candidates was removed; use training.batch_size"
+            )
         if "batch_size_rows" in values:
             if "scanner_batch_rows" in values:
                 raise ValueError(
@@ -583,8 +647,13 @@ class ReaderConfig(_DeeplyImmutableConfig):
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise ValueError(f"reader.{field_name} must be a boolean")
-        if type(self.host_prepare_prefetch) is not int or self.host_prepare_prefetch < 0:
-            raise ValueError("reader.host_prepare_prefetch must be a non-negative integer")
+        if (
+            type(self.host_prepare_prefetch) is not int
+            or self.host_prepare_prefetch < 0
+        ):
+            raise ValueError(
+                "reader.host_prepare_prefetch must be a non-negative integer"
+            )
         if self.cardinality_audit_raw_rows is not None and (
             type(self.cardinality_audit_raw_rows) is not int
             or self.cardinality_audit_raw_rows < 0
@@ -594,16 +663,15 @@ class ReaderConfig(_DeeplyImmutableConfig):
             )
         if self.device_prefetch_batches < 0:
             raise ValueError("reader.device_prefetch_batches must be non-negative")
-        if (
-            self.host_prepare_prefetch > 0
-            and self.device_prefetch_batches > 0
-        ):
-            raise ValueError(
-                "reader.host_prepare_prefetch and reader.device_prefetch_batches "
-                "cannot both be positive"
-            )
+        # host_prepare_prefetch (process pack/tensorize) and
+        # device_prefetch_batches (CUDA H2D side-stream) form a two-stage
+        # pipeline when both are positive. The old mutual exclusion existed
+        # because device_prefetch used to call in-process prepare on a GIL
+        # thread; process-host prepare removes that contention.
         if self.shard_unit not in {"file", "row_group", "record_batch"}:
-            raise ValueError("reader.shard_unit must be file, row_group, or record_batch")
+            raise ValueError(
+                "reader.shard_unit must be file, row_group, or record_batch"
+            )
         if self.length_bucket_metric not in {"max", "sum"}:
             raise ValueError("reader.length_bucket_metric must be max or sum")
         if self.agg_direct_mode not in {"legacy", "direct", "direct_arrow", "compare"}:
@@ -611,7 +679,9 @@ class ReaderConfig(_DeeplyImmutableConfig):
                 "reader.agg_direct_mode must be legacy, direct, direct_arrow, or compare"
             )
         if type(self.shuffle_buffer_rows) is not int or self.shuffle_buffer_rows < 0:
-            raise ValueError("reader.shuffle_buffer_rows must be a non-negative integer")
+            raise ValueError(
+                "reader.shuffle_buffer_rows must be a non-negative integer"
+            )
         if type(self.shuffle_seed) is not int or self.shuffle_seed < 0:
             raise ValueError("reader.shuffle_seed must be a non-negative integer")
         if self.scanner_batch_rows is not None and self.scanner_batch_rows <= 0:
@@ -620,7 +690,11 @@ class ReaderConfig(_DeeplyImmutableConfig):
             raise ValueError("reader.eager_schema_validation must be all or sample")
         if self.schema_validation_samples <= 0:
             raise ValueError("reader.schema_validation_samples must be positive")
-        for timeout_name in ("hdfs_op_timeout", "hdfs_open_timeout", "hdfs_retry_base_sec"):
+        for timeout_name in (
+            "hdfs_op_timeout",
+            "hdfs_open_timeout",
+            "hdfs_retry_base_sec",
+        ):
             timeout_value = getattr(self, timeout_name)
             if type(timeout_value) not in {int, float} or timeout_value <= 0:
                 raise ValueError(f"reader.{timeout_name} must be a positive number")
@@ -630,20 +704,24 @@ class ReaderConfig(_DeeplyImmutableConfig):
             raise ValueError("reader.hdfs_file_lock must be a boolean")
         if self.on_hdfs_failure not in {"fail", "skip"}:
             raise ValueError("reader.on_hdfs_failure must be fail or skip")
-        if type(self.worker_stagger_sec) not in {int, float} or self.worker_stagger_sec < 0:
+        if (
+            type(self.worker_stagger_sec) not in {int, float}
+            or self.worker_stagger_sec < 0
+        ):
             raise ValueError("reader.worker_stagger_sec must be a non-negative number")
         if type(self.hdfs_pre_buffer) is not bool:
             raise ValueError("reader.hdfs_pre_buffer must be a boolean")
-        if type(self.hdfs_close_timeout) not in {int, float} or self.hdfs_close_timeout <= 0:
+        if (
+            type(self.hdfs_close_timeout) not in {int, float}
+            or self.hdfs_close_timeout <= 0
+        ):
             raise ValueError("reader.hdfs_close_timeout must be a positive number")
         previous = 0
         saw_catch_all = False
         for index, bucket in enumerate(self.length_buckets):
             bucket.validate()
             if saw_catch_all:
-                raise ValueError(
-                    "reader.length_buckets catch-all entry must be last"
-                )
+                raise ValueError("reader.length_buckets catch-all entry must be last")
             if bucket.max_length is None:
                 saw_catch_all = True
             elif bucket.max_length <= previous:
@@ -796,7 +874,9 @@ class ParquetSplitConfig(_DeeplyImmutableConfig):
                     f"data.{name}.reader.deduplicate_request_features requires request_id"
                 )
             context_features = (
-                None if self.adapter is None else self.adapter.options.get("context_features")
+                None
+                if self.adapter is None
+                else self.adapter.options.get("context_features")
             )
             if (
                 self.format != "adapter_parquet"
@@ -823,7 +903,10 @@ class ParquetSplitConfig(_DeeplyImmutableConfig):
             if unknown:
                 details.append("unknown label masks: " + ", ".join(unknown))
             if details:
-                raise ValueError(f"data.{name}.label_masks must match labels exactly; " + "; ".join(details))
+                raise ValueError(
+                    f"data.{name}.label_masks must match labels exactly; "
+                    + "; ".join(details)
+                )
         for output_name, source in self.prediction_keys.items():
             if not isinstance(output_name, str) or not output_name:
                 raise ValueError(
@@ -862,7 +945,9 @@ class DataConfig:
             raise ValueError("data must be an object")
         return cls(
             train=ParquetSplitConfig.from_mapping(payload["train"]),
-            test=ParquetSplitConfig.from_mapping(payload["test"]) if "test" in payload else None,
+            test=ParquetSplitConfig.from_mapping(payload["test"])
+            if "test" in payload
+            else None,
             schema_policy=SchemaPolicy.from_mapping(payload.get("schema_policy")),
         )
 
@@ -910,7 +995,9 @@ class FeatureConfig:
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "FeatureConfig":
         values = dict(payload)
-        values["encoding"] = CategoricalEncodingConfig.from_mapping(values.get("encoding"))
+        values["encoding"] = CategoricalEncodingConfig.from_mapping(
+            values.get("encoding")
+        )
         return cls(**values)
 
     def validate(self) -> None:
@@ -930,13 +1017,19 @@ class FeatureConfig:
         if self.dimension <= 0:
             raise ValueError(f"feature {self.name!r} dimension must be positive")
         if self.kind != "dense" and self.dimension != 1:
-            raise ValueError(f"feature {self.name!r} dimension is only supported for dense features")
+            raise ValueError(
+                f"feature {self.name!r} dimension is only supported for dense features"
+            )
         if self.embedding_dim is not None and self.embedding_dim <= 0:
             raise ValueError(f"feature {self.name!r} embedding_dim must be positive")
         if self.kind == "dense" and self.embedding_dim is not None:
-            raise ValueError(f"feature {self.name!r} embedding_dim is only supported for categorical features")
+            raise ValueError(
+                f"feature {self.name!r} embedding_dim is only supported for categorical features"
+            )
         if self.kind != "categorical" and self.encoding is not None:
-            raise ValueError(f"feature {self.name!r} encoding is only supported for categorical features")
+            raise ValueError(
+                f"feature {self.name!r} encoding is only supported for categorical features"
+            )
         if self.encoding is not None:
             self.encoding.validate(f"features.{self.name}.encoding")
         if self.max_length is not None and self.max_length <= 0:
@@ -950,7 +1043,9 @@ class FeatureConfig:
                 f"feature {self.name!r} pooling_null_policy must be exclude or include_as_padding"
             )
         if self.kind != "categorical" and self.pooling != "none":
-            raise ValueError(f"feature {self.name!r} pooling is only supported for categorical features")
+            raise ValueError(
+                f"feature {self.name!r} pooling is only supported for categorical features"
+            )
         if self.pooling == "none" and self.pooling_null_policy != "exclude":
             raise ValueError(
                 f"feature {self.name!r} pooling_null_policy requires pooling=mean"
@@ -987,7 +1082,9 @@ class SequenceFieldConfig:
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "SequenceFieldConfig":
         values = dict(payload)
-        values["encoding"] = CategoricalEncodingConfig.from_mapping(values.get("encoding"))
+        values["encoding"] = CategoricalEncodingConfig.from_mapping(
+            values.get("encoding")
+        )
         return cls(**values)
 
     def qualified_name(self, sequence_name: str) -> str:
@@ -998,21 +1095,29 @@ class SequenceFieldConfig:
         if not self.name:
             raise ValueError(f"sequence {sequence_name!r} field.name is required")
         if "." in self.name:
-            raise ValueError(f"sequence {sequence_name!r} field name must not contain '.'")
+            raise ValueError(
+                f"sequence {sequence_name!r} field name must not contain '.'"
+            )
         if self.kind not in {"categorical", "dense"}:
             raise ValueError(
                 f"sequence {sequence_name!r} field {self.name!r} kind must be categorical or dense"
             )
         if not self.source:
-            raise ValueError(f"sequence {sequence_name!r} field {self.name!r} source is required")
+            raise ValueError(
+                f"sequence {sequence_name!r} field {self.name!r} source is required"
+            )
         if self.dimension <= 0:
-            raise ValueError(f"sequence {sequence_name!r} field {self.name!r} dimension must be positive")
+            raise ValueError(
+                f"sequence {sequence_name!r} field {self.name!r} dimension must be positive"
+            )
         if self.kind == "categorical" and self.dimension != 1:
             raise ValueError(
                 f"sequence {sequence_name!r} categorical field {self.name!r} must have dimension 1"
             )
         if self.embedding_dim is not None and self.embedding_dim <= 0:
-            raise ValueError(f"sequence {sequence_name!r} field {self.name!r} embedding_dim must be positive")
+            raise ValueError(
+                f"sequence {sequence_name!r} field {self.name!r} embedding_dim must be positive"
+            )
         if self.kind == "dense" and self.embedding_dim is not None:
             raise ValueError(
                 f"sequence {sequence_name!r} dense field {self.name!r} must not set embedding_dim"
@@ -1022,7 +1127,9 @@ class SequenceFieldConfig:
                 f"sequence {sequence_name!r} field {self.name!r} encoding is only supported for categorical fields"
             )
         if self.encoding is not None:
-            self.encoding.validate(f"sequences.{sequence_name}.fields.{self.name}.encoding")
+            self.encoding.validate(
+                f"sequences.{sequence_name}.fields.{self.name}.encoding"
+            )
 
 
 @dataclass(frozen=True)
@@ -1046,13 +1153,39 @@ class SequenceConfig(_DeeplyImmutableConfig):
     # canonicalizes both choices to oldest_to_newest before causal attention.
     sequence_order: SequenceOrderType = "oldest_to_newest"
     # raw leaves event-level modeling to OneTrans. attention_pool and mean_pool
-    # are summary baselines; longer is the paper-aligned standalone encoder path.
+    # are summary baselines; LONGER and STCA are paper-aligned encoder paths.
     encoder: SequenceEncoderType = "attention_pool"
-    # Scalar features used as target context for LONGER query construction.
+    # Scalar features used as target context for LONGER/STCA query construction.
     target_inputs: tuple[str, ...] = ()
     # Number of fixed summary slices exposed to RankMixer token packing.
     rankmixer_summary_tokens: int = 1
+    # Working width for mean_pool / attention_pool summaries. Independent of
+    # RankMixer token_dim; DomainTokenProjector / feature packing project later.
+    pool_dim: int = 32
+    # STCA-specific parameters. ``stca_num_heads=None`` inherits model.num_heads.
+    # The paper's strong operating point uses M=4 and r=4. Working width is
+    # independent of RankMixer token_dim; z is packed and projected by the
+    # feature tokenizer (paper example d=256).
+    stca_dim: int = 256
+    stca_layers: int = 4
+    stca_num_heads: int | None = None
+    stca_expansion_ratio: int = 4
+    # Optional weight-sharing group for split action-family streams. The paper
+    # has one STCA; production schemas may expose that history as many columns.
+    stca_parameter_group: str | None = None
+    # Optional chronological merge group. Members are concatenated, sorted by
+    # time_delta, and encoded as the paper's one (video, action-type) history.
+    # The first member in config order owns the single downstream z token.
+    stca_history_group: str | None = None
     # LONGER-specific query/self-attention parameters. Ignored by simpler encoders.
+    # Working width inside LONGER (paper d≈32). Independent of RankMixer token_dim;
+    # summary outputs are packed at this width and projected by the feature tokenizer.
+    longer_dim: int = 32
+    # None inherits model.num_heads when it divides longer_dim; otherwise a
+    # divisor of longer_dim (preferring 8/4/2/1) is chosen at resolve time.
+    longer_num_heads: int | None = None
+    # None uses 4 * longer_dim (paper-style FFN width relative to d).
+    longer_hidden_dim: int | None = None
     longer_query_tokens: int = 32
     longer_self_layers: int = 1
     longer_token_merge: int = 1
@@ -1097,6 +1230,16 @@ class SequenceConfig(_DeeplyImmutableConfig):
             encoder=payload.get("encoder", "attention_pool"),
             target_inputs=tuple(payload.get("target_inputs", [])),
             rankmixer_summary_tokens=payload.get("rankmixer_summary_tokens", 1),
+            pool_dim=payload.get("pool_dim", 32),
+            stca_dim=payload.get("stca_dim", 256),
+            stca_layers=payload.get("stca_layers", 4),
+            stca_num_heads=payload.get("stca_num_heads"),
+            stca_expansion_ratio=payload.get("stca_expansion_ratio", 4),
+            stca_parameter_group=payload.get("stca_parameter_group"),
+            stca_history_group=payload.get("stca_history_group"),
+            longer_dim=payload.get("longer_dim", 32),
+            longer_num_heads=payload.get("longer_num_heads"),
+            longer_hidden_dim=payload.get("longer_hidden_dim"),
             longer_query_tokens=payload.get("longer_query_tokens", 32),
             longer_self_layers=payload.get("longer_self_layers", 1),
             longer_token_merge=payload.get("longer_token_merge", 1),
@@ -1107,7 +1250,9 @@ class SequenceConfig(_DeeplyImmutableConfig):
             ),
             longer_user_global_tokens=payload.get("longer_user_global_tokens", 0),
             longer_cls_tokens=payload.get("longer_cls_tokens", 0),
-            longer_candidate_global_tokens=payload.get("longer_candidate_global_tokens"),
+            longer_candidate_global_tokens=payload.get(
+                "longer_candidate_global_tokens"
+            ),
             timestamp_field=payload.get("timestamp_field"),
             time_delta_field=payload.get("time_delta_field"),
             null_anchor_field=payload.get("null_anchor_field"),
@@ -1116,7 +1261,43 @@ class SequenceConfig(_DeeplyImmutableConfig):
     def resolved_longer_candidate_global_tokens(self) -> int:
         if self.longer_candidate_global_tokens is not None:
             return self.longer_candidate_global_tokens
-        return self.rankmixer_summary_tokens - self.longer_user_global_tokens - self.longer_cls_tokens
+        return (
+            self.rankmixer_summary_tokens
+            - self.longer_user_global_tokens
+            - self.longer_cls_tokens
+        )
+
+    def resolved_longer_num_heads(self, model_num_heads: int) -> int:
+        if self.longer_num_heads is not None:
+            return self.longer_num_heads
+        if self.longer_dim % model_num_heads == 0:
+            return model_num_heads
+        for heads in (8, 4, 2, 1):
+            if self.longer_dim % heads == 0:
+                return heads
+        raise ValueError(
+            f"sequence {self.name!r} longer_dim={self.longer_dim} has no valid head count"
+        )
+
+    def resolved_longer_hidden_dim(self) -> int:
+        if self.longer_hidden_dim is not None:
+            return self.longer_hidden_dim
+        return 4 * self.longer_dim
+
+    def longer_encoded_width(self) -> int:
+        """Packed width of one LONGER sequence into RankMixer feature concat."""
+        merged_dim = self.longer_dim * self.longer_token_merge
+        if self.longer_output == "summary":
+            return self.rankmixer_summary_tokens * merged_dim
+        return (self.rankmixer_summary_tokens + self.longer_query_tokens) * merged_dim
+
+    def stca_encoded_width(self) -> int:
+        """Packed width of one STCA z into RankMixer feature concat."""
+        return self.stca_dim * self.rankmixer_summary_tokens
+
+    def pool_encoded_width(self) -> int:
+        """Width of a mean_pool / attention_pool summary vector."""
+        return self.pool_dim * self.rankmixer_summary_tokens
 
     def validate(self, scalar_feature_names: set[str]) -> None:
         if not self.name:
@@ -1135,35 +1316,134 @@ class SequenceConfig(_DeeplyImmutableConfig):
             raise ValueError(
                 f"sequence {self.name!r} sequence_order must be oldest_to_newest or newest_to_oldest"
             )
-        if self.encoder not in {"raw", "attention_pool", "mean_pool", "longer"}:
+        if self.encoder not in {
+            "raw",
+            "attention_pool",
+            "mean_pool",
+            "longer",
+            "stca",
+        }:
             raise ValueError(
                 f"sequence {self.name!r} encoder must be raw, attention_pool, "
-                "mean_pool, or longer"
+                "mean_pool, longer, or stca"
             )
         if self.rankmixer_summary_tokens <= 0:
-            raise ValueError(f"sequence {self.name!r} rankmixer_summary_tokens must be positive")
+            raise ValueError(
+                f"sequence {self.name!r} rankmixer_summary_tokens must be positive"
+            )
+        if self.pool_dim <= 0:
+            raise ValueError(f"sequence {self.name!r} pool_dim must be positive")
         if self.encoder != "longer" and self.rankmixer_summary_tokens != 1:
             raise ValueError(
                 f"sequence {self.name!r} rankmixer_summary_tokens > 1 requires encoder=longer"
             )
+        if self.stca_dim <= 0:
+            raise ValueError(f"sequence {self.name!r} stca_dim must be positive")
+        if self.stca_layers <= 0:
+            raise ValueError(f"sequence {self.name!r} stca_layers must be positive")
+        if self.stca_num_heads is not None and self.stca_num_heads <= 0:
+            raise ValueError(
+                f"sequence {self.name!r} stca_num_heads must be positive or null"
+            )
+        if self.encoder == "stca" and self.stca_num_heads is not None:
+            if self.stca_dim % self.stca_num_heads != 0:
+                raise ValueError(
+                    f"sequence {self.name!r} stca_dim must be divisible by "
+                    f"stca_num_heads: {self.stca_dim} % {self.stca_num_heads} != 0"
+                )
+        if self.stca_expansion_ratio <= 0:
+            raise ValueError(
+                f"sequence {self.name!r} stca_expansion_ratio must be positive"
+            )
+        if self.stca_parameter_group is not None:
+            if (
+                not isinstance(self.stca_parameter_group, str)
+                or not self.stca_parameter_group
+            ):
+                raise ValueError(
+                    f"sequence {self.name!r} stca_parameter_group must be a "
+                    "non-empty string or null"
+                )
+            if "." in self.stca_parameter_group:
+                raise ValueError(
+                    f"sequence {self.name!r} stca_parameter_group must not "
+                    "contain '.'"
+                )
+            if self.encoder != "stca":
+                raise ValueError(
+                    f"sequence {self.name!r} stca_parameter_group requires "
+                    "encoder=stca"
+                )
+        if self.stca_history_group is not None:
+            if (
+                not isinstance(self.stca_history_group, str)
+                or not self.stca_history_group
+            ):
+                raise ValueError(
+                    f"sequence {self.name!r} stca_history_group must be a "
+                    "non-empty string or null"
+                )
+            if "." in self.stca_history_group:
+                raise ValueError(
+                    f"sequence {self.name!r} stca_history_group must not " "contain '.'"
+                )
+            if self.encoder != "stca":
+                raise ValueError(
+                    f"sequence {self.name!r} stca_history_group requires "
+                    "encoder=stca"
+                )
+        if self.encoder in {"stca", "attention_pool"} and not self.target_inputs:
+            raise ValueError(
+                f"sequence {self.name!r} encoder={self.encoder} requires target_inputs"
+            )
+        if self.longer_dim <= 0:
+            raise ValueError(f"sequence {self.name!r} longer_dim must be positive")
+        if self.longer_num_heads is not None and self.longer_num_heads <= 0:
+            raise ValueError(
+                f"sequence {self.name!r} longer_num_heads must be positive or null"
+            )
+        if self.longer_hidden_dim is not None and self.longer_hidden_dim <= 0:
+            raise ValueError(
+                f"sequence {self.name!r} longer_hidden_dim must be positive or null"
+            )
         if self.longer_query_tokens <= 0:
-            raise ValueError(f"sequence {self.name!r} longer_query_tokens must be positive")
+            raise ValueError(
+                f"sequence {self.name!r} longer_query_tokens must be positive"
+            )
         if self.longer_self_layers < 0:
-            raise ValueError(f"sequence {self.name!r} longer_self_layers must be non-negative")
+            raise ValueError(
+                f"sequence {self.name!r} longer_self_layers must be non-negative"
+            )
         if self.longer_token_merge <= 0:
-            raise ValueError(f"sequence {self.name!r} longer_token_merge must be positive")
+            raise ValueError(
+                f"sequence {self.name!r} longer_token_merge must be positive"
+            )
         if self.longer_inner_layers < 0:
-            raise ValueError(f"sequence {self.name!r} longer_inner_layers must be non-negative")
+            raise ValueError(
+                f"sequence {self.name!r} longer_inner_layers must be non-negative"
+            )
         if self.longer_output not in {"full", "summary"}:
-            raise ValueError(f"sequence {self.name!r} longer_output must be full or summary")
+            raise ValueError(
+                f"sequence {self.name!r} longer_output must be full or summary"
+            )
         if self.encoder != "longer" and self.longer_output != "full":
             raise ValueError(
                 f"sequence {self.name!r} longer_output=summary requires encoder=longer"
             )
+        if self.encoder == "longer" and self.longer_num_heads is not None:
+            if self.longer_dim % self.longer_num_heads != 0:
+                raise ValueError(
+                    f"sequence {self.name!r} longer_dim must be divisible by "
+                    f"longer_num_heads: {self.longer_dim} % {self.longer_num_heads} != 0"
+                )
         if self.longer_user_global_tokens < 0:
-            raise ValueError(f"sequence {self.name!r} longer_user_global_tokens must be non-negative")
+            raise ValueError(
+                f"sequence {self.name!r} longer_user_global_tokens must be non-negative"
+            )
         if self.longer_cls_tokens < 0:
-            raise ValueError(f"sequence {self.name!r} longer_cls_tokens must be non-negative")
+            raise ValueError(
+                f"sequence {self.name!r} longer_cls_tokens must be non-negative"
+            )
         candidate_global_tokens = self.resolved_longer_candidate_global_tokens()
         if candidate_global_tokens < 0:
             raise ValueError(
@@ -1180,7 +1460,9 @@ class SequenceConfig(_DeeplyImmutableConfig):
                     f"sequence {self.name!r} LONGER global token counts must sum to "
                     f"rankmixer_summary_tokens={self.rankmixer_summary_tokens}, got {total_global_tokens}"
                 )
-            if bool(self.longer_user_global_inputs) != (self.longer_user_global_tokens > 0):
+            if bool(self.longer_user_global_inputs) != (
+                self.longer_user_global_tokens > 0
+            ):
                 raise ValueError(
                     f"sequence {self.name!r} longer_user_global_inputs and "
                     "longer_user_global_tokens must either both be configured or both be empty"
@@ -1196,16 +1478,19 @@ class SequenceConfig(_DeeplyImmutableConfig):
         for field_config in self.fields:
             field_config.validate(self.name)
             if field_config.name in field_names:
-                raise ValueError(f"duplicate field {field_config.name!r} in sequence {self.name!r}")
+                raise ValueError(
+                    f"duplicate field {field_config.name!r} in sequence {self.name!r}"
+                )
             field_names.add(field_config.name)
         fields_by_name = {item.name: item for item in self.fields}
         if (
-            self.encoder == "longer"
+            self.encoder in {"longer", "stca"}
             and self.time_delta_field is not None
             and len(self.fields) == 1
         ):
             raise ValueError(
-                f"sequence {self.name!r} LONGER input requires at least one item/side field "
+                f"sequence {self.name!r} {self.encoder.upper()} input requires "
+                "at least one item/side field "
                 "in addition to time_delta_field"
             )
         for option_name, field_name in (
@@ -1226,14 +1511,18 @@ class SequenceConfig(_DeeplyImmutableConfig):
                 raise ValueError(
                     f"sequence {self.name!r} {option_name} must reference a scalar dense field"
                 )
-        missing_targets = [name for name in self.target_inputs if name not in scalar_feature_names]
+        missing_targets = [
+            name for name in self.target_inputs if name not in scalar_feature_names
+        ]
         if missing_targets:
             raise ValueError(
                 f"sequence {self.name!r} target_inputs references unknown scalar features: "
                 + ", ".join(missing_targets)
             )
         missing_user_globals = [
-            name for name in self.longer_user_global_inputs if name not in scalar_feature_names
+            name
+            for name in self.longer_user_global_inputs
+            if name not in scalar_feature_names
         ]
         if missing_user_globals:
             raise ValueError(
@@ -1289,10 +1578,14 @@ class ScenarioConfig(_DeeplyImmutableConfig):
         if len(set(self.names)) != len(self.names):
             raise ValueError("scenarios.names must not contain duplicates")
         if "global" in self.names:
-            raise ValueError("scenarios.names must not contain reserved scenario name 'global'")
+            raise ValueError(
+                "scenarios.names must not contain reserved scenario name 'global'"
+            )
         if self.source is not None:
             if not isinstance(self.source, str) or not self.source:
-                raise ValueError("scenarios.source must be null or a non-empty column name")
+                raise ValueError(
+                    "scenarios.source must be null or a non-empty column name"
+                )
         if self.source_encoding not in {"auto", "raw", "index"}:
             raise ValueError("scenarios.source_encoding must be auto, raw, or index")
         if type(self.auto_discover) is not bool:
@@ -1318,7 +1611,9 @@ class ScenarioConfig(_DeeplyImmutableConfig):
                     "scenarios.names must be [__auto__] when auto_discover=true"
                 )
         if len(self.names) > 1 and self.source is None:
-            raise ValueError("scenarios.source is required when multiple scenarios are configured")
+            raise ValueError(
+                "scenarios.source is required when multiple scenarios are configured"
+            )
 
 
 @dataclass(frozen=True)
@@ -1338,7 +1633,9 @@ class TokenGroupConfig(_DeeplyImmutableConfig):
         if not self.name:
             raise ValueError(f"tokenization.{section} token name is required")
         if not self.inputs:
-            raise ValueError(f"tokenization.{section}.{self.name} inputs must not be empty")
+            raise ValueError(
+                f"tokenization.{section}.{self.name} inputs must not be empty"
+            )
         missing = [name for name in self.inputs if name not in feature_names]
         if missing:
             raise ValueError(
@@ -1380,7 +1677,9 @@ class DomainTokenConfig(_DeeplyImmutableConfig):
             raise ValueError(f"tokenization.{section} token name is required")
         inputs = self.resolved_inputs()
         if not inputs:
-            raise ValueError(f"tokenization.{section}.{self.name} inputs must not be empty")
+            raise ValueError(
+                f"tokenization.{section}.{self.name} inputs must not be empty"
+            )
         missing = [name for name in inputs if name not in feature_names]
         if missing:
             raise ValueError(
@@ -1388,6 +1687,110 @@ class DomainTokenConfig(_DeeplyImmutableConfig):
                 + ", ".join(missing)
             )
 
+
+def is_scene_related_feature_name(name: str) -> bool:
+    """Return True for scene-id / scene-stat features used as ordinary inputs.
+
+    Matches ``scene_id_hn``, ``scene_*``, ``*_scene_*``, and ``goods_scene_*``.
+    Scenario/task prior feature names that happen to contain ``scene`` are also
+    matched; callers must only apply this filter to feature/NS token inputs, not
+    to ``embedding_scope=scenario|task`` prior wiring.
+    """
+
+    return (
+        name == "scene_id_hn"
+        or name.startswith("scene_")
+        or name.startswith("goods_scene_")
+        or "_scene_" in name
+    )
+
+
+# Request-axis scene fields (adapter context). These are omitted from the main
+# feature/NS pack when ``omit_scene_features`` is on, and (except dead constants)
+# should feed scenario tokens instead. Candidate-axis ``scene_adj_*`` /
+# ``goods_scene_*`` stay in the item feature pack — they are goods×scene crosses.
+REQUEST_SCENE_FEATURE_NAMES = frozenset(
+    {
+        "scene_id_hn",
+        "scene_clk_cnt_15d_hit_hn",
+        "scene_impr_cnt_15d_hn",
+        "scene_impr_cnt_15d_hit_hn",
+    }
+)
+
+# Profile distinct≈1 closed constants. Always dropped from the feature/NS pack
+# and from encoder inclusion; prefer removing them from configs entirely.
+DEAD_CONSTANT_FEATURE_NAMES = frozenset(
+    {
+        "scene_clk_cnt_15d_hit_hn",
+        "clk_7d_page_elsns_hn",
+        "c_adj_cart_cvr_15d_hn",
+        "c_adj_ctr_15d_hn",
+        "c_adj_ordr_cvr_15d_hn",
+        "c_cart_cnt_15d_hn",
+        "c_clk_cnt_15d_hn",
+        "c_impr_cnt_15d_hn",
+        "c_ordr_cnt_15d_hn",
+        "c_simi_adj_cart_cvr_15d_hn",
+        "c_simi_adj_ctr_15d_hn",
+        "c_simi_cart_cnt_15d_hn",
+        "c_simi_clk_cnt_15d_hn",
+        "c_simi_impr_cnt_15d_hn",
+        "idx_c_simi_adj_cart_cvr_15d_hn",
+        "idx_c_simi_adj_ctr_15d_hn",
+        "idx_c_simi_cart_cnt_15d_hn",
+        "idx_c_simi_clk_cnt_15d_hn",
+        "idx_c_simi_impr_cnt_15d_hn",
+        # distinct≈2 near-constants: zero FE value, still occupied pack slots
+        "ad_id_bin_hn",
+        "ups_in_cart_2h_sku_cur_prices_hn",
+    }
+)
+
+
+def is_request_scene_feature_name(name: str) -> bool:
+    """True for request-axis scene fields (not goods×scene candidate crosses)."""
+
+    return name in REQUEST_SCENE_FEATURE_NAMES
+
+
+def is_dead_constant_feature_name(name: str) -> bool:
+    """True for profile distinct≈1 fields that should never enter the pack."""
+
+    return name in DEAD_CONSTANT_FEATURE_NAMES
+
+
+def filter_scene_related_feature_names(
+    names: Sequence[str],
+) -> tuple[str, ...]:
+    """Drop request-axis scene names while preserving order.
+
+    Used by ``omit_scene_features``: only request-side scene identity/stats leave
+    the feature pack. Candidate-side scene crosses remain as item features.
+    """
+
+    return tuple(name for name in names if not is_request_scene_feature_name(name))
+
+
+def filter_dead_constant_feature_names(
+    names: Sequence[str],
+) -> tuple[str, ...]:
+    """Drop distinct≈1 dead constants while preserving order."""
+
+    return tuple(name for name in names if not is_dead_constant_feature_name(name))
+
+
+def filter_feature_pack_names(
+    names: Sequence[str],
+    *,
+    omit_scene_features: bool,
+) -> tuple[str, ...]:
+    """Apply omit-scene (request-axis) then dead-constant filters."""
+
+    filtered = tuple(names)
+    if omit_scene_features:
+        filtered = filter_scene_related_feature_names(filtered)
+    return filter_dead_constant_feature_names(filtered)
 
 
 @dataclass(frozen=True)
@@ -1405,6 +1808,10 @@ class TokenizationConfig(_DeeplyImmutableConfig):
     num_feature_tokens: int | None = None
     # Ordered input list for auto_split/rankmixer. Empty means all tokenizable inputs.
     feature_token_inputs: tuple[str, ...] = ()
+    # When True, request-axis scene fields stay available for scenario tokens /
+    # LONGER globals but are omitted from feature-token (RankMixer) and NS
+    # (OneTrans auto_split) packs. Candidate-axis goods×scene crosses remain.
+    omit_scene_features: bool = True
     # Optional explicit feature token groups for groupwise tokenization.
     feature_tokens: tuple[TokenGroupConfig, ...] = ()
     # S-token groups for OneTrans-style sequence tokenization.
@@ -1427,6 +1834,14 @@ class TokenizationConfig(_DeeplyImmutableConfig):
             feature_tokenizer=payload.get("feature_tokenizer", "groupwise"),
             num_feature_tokens=payload.get("num_feature_tokens"),
             feature_token_inputs=tuple(payload.get("feature_token_inputs", [])),
+            omit_scene_features=bool(
+                payload["omit_scene_features"]
+                if "omit_scene_features" in payload
+                else payload.get(
+                    "exclude_scene_features_from_feature_tokens",
+                    True,
+                )
+            ),
             feature_tokens=tuple(
                 TokenGroupConfig.from_mapping(item)
                 for item in payload.get("feature_tokens", [])
@@ -1447,9 +1862,7 @@ class TokenizationConfig(_DeeplyImmutableConfig):
                 DomainTokenConfig.from_mapping(item)
                 for item in payload.get("task_tokens", [])
             ),
-            scenario_token_inputs=tuple(
-                payload.get("scenario_token_inputs", [])
-            ),
+            scenario_token_inputs=tuple(payload.get("scenario_token_inputs", [])),
             task_token_inputs=tuple(payload.get("task_token_inputs", [])),
         )
 
@@ -1478,7 +1891,9 @@ class TokenizationConfig(_DeeplyImmutableConfig):
         features: Sequence[FeatureConfig],
         sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[str]:
-        resolved = resolve_tokenization(self, features, self._sequences(sequences), [], [])
+        resolved = resolve_tokenization(
+            self, features, self._sequences(sequences), [], []
+        )
         return list(resolved.feature_token_inputs)
 
     def resolved_feature_token_count(
@@ -1486,7 +1901,9 @@ class TokenizationConfig(_DeeplyImmutableConfig):
         features: Sequence[FeatureConfig],
         sequences: Sequence[SequenceConfig] | None = None,
     ) -> int:
-        resolved = resolve_tokenization(self, features, self._sequences(sequences), [], [])
+        resolved = resolve_tokenization(
+            self, features, self._sequences(sequences), [], []
+        )
         return resolved.feature_token_count
 
     def resolved_feature_tokens(
@@ -1494,7 +1911,9 @@ class TokenizationConfig(_DeeplyImmutableConfig):
         features: Sequence[FeatureConfig],
         sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[TokenGroupConfig]:
-        resolved = resolve_tokenization(self, features, self._sequences(sequences), [], [])
+        resolved = resolve_tokenization(
+            self, features, self._sequences(sequences), [], []
+        )
         return [group.as_token_group() for group in resolved.feature_token_groups]
 
     def resolved_sequence_tokens(
@@ -1502,7 +1921,9 @@ class TokenizationConfig(_DeeplyImmutableConfig):
         features: Sequence[FeatureConfig],
         sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[TokenGroupConfig]:
-        resolved = resolve_tokenization(self, features, self._sequences(sequences), [], [])
+        resolved = resolve_tokenization(
+            self, features, self._sequences(sequences), [], []
+        )
         return [group.as_token_group() for group in resolved.sequence_token_groups]
 
     def resolved_ns_tokens(
@@ -1510,7 +1931,9 @@ class TokenizationConfig(_DeeplyImmutableConfig):
         features: Sequence[FeatureConfig],
         sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[TokenGroupConfig]:
-        resolved = resolve_tokenization(self, features, self._sequences(sequences), [], [])
+        resolved = resolve_tokenization(
+            self, features, self._sequences(sequences), [], []
+        )
         return [group.as_token_group() for group in resolved.scalar_token_groups]
 
     def resolved_scenario_inputs(
@@ -1518,7 +1941,9 @@ class TokenizationConfig(_DeeplyImmutableConfig):
         features: Sequence[FeatureConfig],
         sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[str]:
-        resolved = resolve_tokenization(self, features, self._sequences(sequences), [], [])
+        resolved = resolve_tokenization(
+            self, features, self._sequences(sequences), [], []
+        )
         return list(resolved.scenario_token_inputs)
 
     def resolved_task_inputs(
@@ -1526,7 +1951,9 @@ class TokenizationConfig(_DeeplyImmutableConfig):
         features: Sequence[FeatureConfig],
         sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[str]:
-        resolved = resolve_tokenization(self, features, self._sequences(sequences), [], [])
+        resolved = resolve_tokenization(
+            self, features, self._sequences(sequences), [], []
+        )
         return list(resolved.task_token_inputs)
 
     def resolved_scenario_tokens(
@@ -1535,7 +1962,9 @@ class TokenizationConfig(_DeeplyImmutableConfig):
         scenario_names: Sequence[str],
         sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[DomainTokenConfig]:
-        resolved = resolve_tokenization(self, features, self._sequences(sequences), scenario_names, [])
+        resolved = resolve_tokenization(
+            self, features, self._sequences(sequences), scenario_names, []
+        )
         return [token.as_domain_token() for token in resolved.scenario_token_specs]
 
     def resolved_task_tokens(
@@ -1544,7 +1973,9 @@ class TokenizationConfig(_DeeplyImmutableConfig):
         task_names: Sequence[str],
         sequences: Sequence[SequenceConfig] | None = None,
     ) -> list[DomainTokenConfig]:
-        resolved = resolve_tokenization(self, features, self._sequences(sequences), [], task_names)
+        resolved = resolve_tokenization(
+            self, features, self._sequences(sequences), [], task_names
+        )
         return [token.as_domain_token() for token in resolved.task_token_specs]
 
     def _validate_unique_domain_token_names(
@@ -1571,7 +2002,9 @@ class TokenizationConfig(_DeeplyImmutableConfig):
         scenario_names: Sequence[str],
         task_names: Sequence[str],
     ) -> None:
-        validate_tokenization_config(self, features, sequences, scenario_names, task_names)
+        validate_tokenization_config(
+            self, features, sequences, scenario_names, task_names
+        )
 
 
 @dataclass(frozen=True)
@@ -1628,20 +2061,36 @@ class VocabFeatureStrategy:
         return cls(**payload)
 
     def validate(self, feature_name: str) -> None:
-        if self.encoding not in {"vocab", "hash", "pre_hashed", "identity", "shared_vocab"}:
-            raise ValueError(f"vocab_strategy.features.{feature_name}.encoding is invalid")
+        if self.encoding not in {
+            "vocab",
+            "hash",
+            "pre_hashed",
+            "identity",
+            "shared_vocab",
+        }:
+            raise ValueError(
+                f"vocab_strategy.features.{feature_name}.encoding is invalid"
+            )
         if not self.source:
-            raise ValueError(f"vocab_strategy.features.{feature_name}.source is required")
+            raise ValueError(
+                f"vocab_strategy.features.{feature_name}.source is required"
+            )
         if self.encoding == "vocab":
             if not self.artifact:
                 raise ValueError(f"vocab feature {feature_name!r} requires artifact")
             if self.min_count is not None and self.min_count <= 0:
-                raise ValueError(f"vocab feature {feature_name!r} min_count must be positive")
+                raise ValueError(
+                    f"vocab feature {feature_name!r} min_count must be positive"
+                )
             if self.max_size is not None and self.max_size <= 0:
-                raise ValueError(f"vocab feature {feature_name!r} max_size must be positive")
+                raise ValueError(
+                    f"vocab feature {feature_name!r} max_size must be positive"
+                )
         if self.encoding == "hash":
             if self.num_buckets is None or self.num_buckets <= 0:
-                raise ValueError(f"hash feature {feature_name!r} requires positive num_buckets")
+                raise ValueError(
+                    f"hash feature {feature_name!r} requires positive num_buckets"
+                )
         if self.encoding == "pre_hashed":
             _validate_pre_hashed(
                 num_buckets=self.num_buckets,
@@ -1666,7 +2115,9 @@ class VocabFeatureStrategy:
                     "share_embedding=true"
                 )
         if self.encoding == "shared_vocab" and not self.share_with:
-            raise ValueError(f"shared_vocab feature {feature_name!r} requires share_with")
+            raise ValueError(
+                f"shared_vocab feature {feature_name!r} requires share_with"
+            )
 
 
 @dataclass(frozen=True)
@@ -1691,11 +2142,15 @@ class VocabStrategy(_DeeplyImmutableConfig):
 
     def validate(self) -> None:
         if self.defaults.oov_id != 0 or self.defaults.padding_id != 0:
-            raise ValueError("vocab_strategy defaults must reserve id 0 for OOV and padding")
+            raise ValueError(
+                "vocab_strategy defaults must reserve id 0 for OOV and padding"
+            )
         if self.defaults.fit_split != "train":
             raise ValueError("vocab_strategy.defaults.fit_split must be train")
         if self.defaults.unseen_policy not in {"oov", "error"}:
-            raise ValueError("vocab_strategy.defaults.unseen_policy must be oov or error")
+            raise ValueError(
+                "vocab_strategy.defaults.unseen_policy must be oov or error"
+            )
         for name, strategy in self.features.items():
             strategy.validate(name)
 
@@ -1766,9 +2221,7 @@ class RuntimeConfig:
         values = dict(payload)
         legacy_checkpoint = values.get("activation_checkpoint")
         if isinstance(legacy_checkpoint, bool):
-            values["activation_checkpoint"] = (
-                "full" if legacy_checkpoint else "none"
-            )
+            values["activation_checkpoint"] = "full" if legacy_checkpoint else "none"
         return cls(**values)
 
     def validate(self) -> None:
@@ -1832,9 +2285,7 @@ class RuntimeConfig:
         if self.precision not in {"fp32", "bf16", "fp16"}:
             raise ValueError("runtime.precision must be fp32, bf16, or fp16")
         if self.compile_mode not in {"default", "reduce-overhead"}:
-            raise ValueError(
-                "runtime.compile_mode must be default or reduce-overhead"
-            )
+            raise ValueError("runtime.compile_mode must be default or reduce-overhead")
         if self.attention_backend not in {"auto", "sdpa", "flash"}:
             raise ValueError("runtime.attention_backend must be auto, sdpa, or flash")
         if self.varlen_packing not in {"fixed", "compact"}:
@@ -1845,7 +2296,9 @@ class RuntimeConfig:
             )
         if self.attention_backend == "flash":
             if not self.device.startswith("cuda"):
-                raise ValueError("runtime.attention_backend=flash requires a CUDA device")
+                raise ValueError(
+                    "runtime.attention_backend=flash requires a CUDA device"
+                )
             if self.precision not in {"bf16", "fp16"}:
                 raise ValueError(
                     "runtime.attention_backend=flash requires BF16 or FP16 precision"
@@ -1890,9 +2343,19 @@ class ModelConfig:
     # means a zero update.
     use_task_feature_interaction: bool = True
     use_scenario_feature_interaction: bool = True
-    # direct_ffn uses the FFN output directly; residual_ffn applies a second
-    # residual connection and LayerNorm around the FFN.
-    mdl_feature_interaction: MDLFeatureInteractionType = "direct_ffn"
+    # residual_ffn (default) applies a second residual + LayerNorm after the
+    # FFN; direct_ffn replaces the mixed feature state with the FFN output
+    # (MDL Eq. 6 / paper ablation).
+    mdl_feature_interaction: MDLFeatureInteractionType = "residual_ffn"
+    # coupled is the published MDL propagation: the important/prior-derived
+    # token is simultaneously query, recurrent residual state, and readout.
+    # split retains the same prompt and priors for routing, but propagates a
+    # separate learned state so prompt content cannot bypass attention into
+    # the final task-token readout.
+    mdl_token_state: MDLTokenStateType = "coupled"
+    # Optional scene conditioning on feature tokens (MDL ablation option C).
+    # Default none: scenario stays on the prompt/domain path only.
+    scene_feature_bias: SceneFeatureBiasType = "none"
     # Local request-cache support for sequence encoders.
     use_request_cache: bool = False
     # Experimental mdl_onetrans only. None keeps the conservative NS-only MDL
@@ -1939,7 +2402,13 @@ class ModelConfig:
         return cls(**payload)
 
     def validate(self) -> None:
-        if self.name not in {"rankmixer", "mdl_rankmixer", "onetrans", "mdl_onetrans", "longer"}:
+        if self.name not in {
+            "rankmixer",
+            "mdl_rankmixer",
+            "onetrans",
+            "mdl_onetrans",
+            "longer",
+        }:
             raise ValueError(
                 "model.name must be rankmixer, mdl_rankmixer, onetrans, mdl_onetrans, or longer"
             )
@@ -1969,6 +2438,48 @@ class ModelConfig:
             raise ValueError(
                 "model.mdl_feature_interaction must be direct_ffn or residual_ffn"
             )
+        if self.mdl_token_state not in {"coupled", "split"}:
+            raise ValueError("model.mdl_token_state must be coupled or split")
+        if self.scene_feature_bias not in {"none", "additive", "film"}:
+            raise ValueError(
+                "model.scene_feature_bias must be none, additive, or film"
+            )
+        if self.mdl_token_state == "split":
+            if self.name not in {"mdl_rankmixer", "mdl_onetrans"}:
+                raise ValueError(
+                    "model.mdl_token_state=split requires mdl_rankmixer or mdl_onetrans"
+                )
+            if not (self.use_task_tokens or self.use_scenario_tokens):
+                raise ValueError(
+                    "model.mdl_token_state=split requires task or scenario tokens"
+                )
+            if self.use_task_tokens and not self.use_task_feature_interaction:
+                raise ValueError(
+                    "model.mdl_token_state=split requires "
+                    "use_task_feature_interaction=true when task tokens are enabled"
+                )
+            if (
+                self.use_scenario_tokens
+                and not self.use_scenario_feature_interaction
+            ):
+                raise ValueError(
+                    "model.mdl_token_state=split requires "
+                    "use_scenario_feature_interaction=true when scenario tokens are enabled"
+                )
+            if self.scene_feature_bias != "none":
+                raise ValueError(
+                    "model.mdl_token_state=split requires scene_feature_bias=none; "
+                    "otherwise the scenario prompt still reaches feature/readout content directly"
+                )
+        if self.scene_feature_bias != "none":
+            if self.name not in {"mdl_rankmixer", "mdl_onetrans"}:
+                raise ValueError(
+                    "model.scene_feature_bias requires mdl_rankmixer or mdl_onetrans"
+                )
+            if not self.use_scenario_tokens:
+                raise ValueError(
+                    "model.scene_feature_bias requires use_scenario_tokens=true"
+                )
         if self.first_domain_sequence_layer is not None:
             if type(self.first_domain_sequence_layer) is not int:
                 raise ValueError(
@@ -1988,24 +2499,33 @@ class ModelConfig:
             raise ValueError("model.ns_tokenizer must be auto_split or groupwise")
         if self.num_ns_tokens is not None and self.num_ns_tokens <= 0:
             raise ValueError("model.num_ns_tokens must be positive")
-        if self.max_position_embeddings is not None and self.max_position_embeddings <= 0:
+        if (
+            self.max_position_embeddings is not None
+            and self.max_position_embeddings <= 0
+        ):
             raise ValueError("model.max_position_embeddings must be positive")
         if self.final_s_tokens is not None and self.final_s_tokens < 0:
             raise ValueError("model.final_s_tokens must be non-negative")
         if self.sequence_fusion not in {"timestamp_aware", "intent_ordered"}:
-            raise ValueError("model.sequence_fusion must be timestamp_aware or intent_ordered")
+            raise ValueError(
+                "model.sequence_fusion must be timestamp_aware or intent_ordered"
+            )
         if self.rankmixer_ffn_type not in {"dense", "sparse_moe"}:
             raise ValueError("model.rankmixer_ffn_type must be dense or sparse_moe")
         if self.sparse_moe_num_experts <= 0:
             raise ValueError("model.sparse_moe_num_experts must be positive")
         if self.sparse_moe_inference_threshold < 0.0:
-            raise ValueError("model.sparse_moe_inference_threshold must be non-negative")
+            raise ValueError(
+                "model.sparse_moe_inference_threshold must be non-negative"
+            )
         if not 0.0 < self.sparse_moe_target_active_ratio <= 1.0:
             raise ValueError("model.sparse_moe_target_active_ratio must be in (0, 1]")
         if self.sparse_moe_regularization_initial <= 0.0:
             raise ValueError("model.sparse_moe_regularization_initial must be positive")
         if self.sparse_moe_regularization_multiplier <= 1.0:
-            raise ValueError("model.sparse_moe_regularization_multiplier must be greater than 1")
+            raise ValueError(
+                "model.sparse_moe_regularization_multiplier must be greater than 1"
+            )
         if self.sparse_moe_loss_weight < 0.0:
             raise ValueError("model.sparse_moe_loss_weight must be non-negative")
         if self.sparse_moe_dtsi_training_output not in {
@@ -2042,9 +2562,7 @@ class EmbeddingShardingConfig:
     table_wise_max_rows: int = 65536
 
     @classmethod
-    def from_mapping(
-        cls, payload: dict[str, Any] | None
-    ) -> "EmbeddingShardingConfig":
+    def from_mapping(cls, payload: dict[str, Any] | None) -> "EmbeddingShardingConfig":
         if payload is None:
             return cls()
         return cls(**payload)
@@ -2199,7 +2717,9 @@ class TrainingConfig:
     embedding_validate_indices: bool = True
     # Compatibility selector for the replicated path or an out-of-scope
     # external adapter. embedding_distribution selects built-in owner sharding.
-    sparse_update_mode: Literal["ddp_synced_adagrad", "external_parameter_server"] = "ddp_synced_adagrad"
+    sparse_update_mode: Literal[
+        "ddp_synced_adagrad", "external_parameter_server"
+    ] = "ddp_synced_adagrad"
     sparse_parameter_server_adapter: str | None = None
     # Optional gradient clipping for dense and sparse parameter groups.
     dense_clip_norm: float | None = None
@@ -2226,9 +2746,7 @@ class TrainingConfig:
             values.get("embedding_sharding")
         )
         values["ddp"] = DDPConfig.from_mapping(values.get("ddp"))
-        values["quick_eval"] = QuickEvalConfig.from_mapping(
-            values.get("quick_eval")
-        )
+        values["quick_eval"] = QuickEvalConfig.from_mapping(values.get("quick_eval"))
         return cls(**values)
 
     def validate(self) -> None:
@@ -2253,11 +2771,15 @@ class TrainingConfig:
             raise ValueError("training.lr_decay_steps must be positive")
         if self.lr_schedule == "cosine" and self.lr_decay_steps is not None:
             if self.lr_decay_steps <= self.lr_warmup_steps:
-                raise ValueError("training.lr_decay_steps must be greater than training.lr_warmup_steps")
+                raise ValueError(
+                    "training.lr_decay_steps must be greater than training.lr_warmup_steps"
+                )
         if not 0.0 <= self.lr_min_ratio <= 1.0:
             raise ValueError("training.lr_min_ratio must be in [0, 1]")
         if self.dense_optimizer != "rmsprop":
-            raise ValueError("training.dense_optimizer must be rmsprop for paper alignment")
+            raise ValueError(
+                "training.dense_optimizer must be rmsprop for paper alignment"
+            )
         if not 0.0 <= self.rmsprop_alpha < 1.0:
             raise ValueError("training.rmsprop_alpha must be in [0, 1)")
         if self.rmsprop_momentum < 0.0:
@@ -2278,7 +2800,9 @@ class TrainingConfig:
         if self.adagrad_weight_decay < 0.0:
             raise ValueError("training.adagrad_weight_decay must be non-negative")
         if self.adagrad_initial_accumulator_value < 0.0:
-            raise ValueError("training.adagrad_initial_accumulator_value must be non-negative")
+            raise ValueError(
+                "training.adagrad_initial_accumulator_value must be non-negative"
+            )
         if self.adagrad_eps <= 0.0:
             raise ValueError("training.adagrad_eps must be positive")
         if (
@@ -2304,7 +2828,10 @@ class TrainingConfig:
         self.embedding_sharding.validate()
         self.ddp.validate()
         self.quick_eval.validate()
-        if self.embedding_distribution == "sharded" and not self.embedding_sparse_gradients:
+        if (
+            self.embedding_distribution == "sharded"
+            and not self.embedding_sparse_gradients
+        ):
             raise ValueError(
                 "training.embedding_sparse_gradients must be true for sharded embeddings"
             )
@@ -2316,11 +2843,17 @@ class TrainingConfig:
                 "training.embedding_distribution=sharded uses the built-in owner-based "
                 "implementation and is incompatible with external_parameter_server"
             )
-        if self.sparse_update_mode not in {"ddp_synced_adagrad", "external_parameter_server"}:
+        if self.sparse_update_mode not in {
+            "ddp_synced_adagrad",
+            "external_parameter_server",
+        }:
             raise ValueError(
                 "training.sparse_update_mode must be ddp_synced_adagrad or external_parameter_server"
             )
-        if self.sparse_update_mode == "external_parameter_server" and not self.sparse_parameter_server_adapter:
+        if (
+            self.sparse_update_mode == "external_parameter_server"
+            and not self.sparse_parameter_server_adapter
+        ):
             raise ValueError(
                 "training.sparse_parameter_server_adapter is required when sparse_update_mode is external_parameter_server"
             )
@@ -2328,15 +2861,25 @@ class TrainingConfig:
             raise ValueError("training.dense_clip_norm must be positive")
         if self.sparse_clip_norm is not None and self.sparse_clip_norm <= 0:
             raise ValueError("training.sparse_clip_norm must be positive")
-        if self.loss_reduction not in {"sum", "mean_per_task"}:
-            raise ValueError("training.loss_reduction must be sum or mean_per_task")
+        if self.loss_reduction not in {
+            "sum",
+            "mean_per_task",
+            "mean_per_request_per_task",
+        }:
+            raise ValueError(
+                "training.loss_reduction must be sum, mean_per_task, "
+                "or mean_per_request_per_task"
+            )
         if self.embedding_weight_dtype not in {"fp32", "bf16"}:
             raise ValueError("training.embedding_weight_dtype must be fp32 or bf16")
         if type(self.embedding_collect_stats) is not bool:
             raise ValueError("training.embedding_collect_stats must be a boolean")
         if type(self.embedding_validate_indices) is not bool:
             raise ValueError("training.embedding_validate_indices must be a boolean")
-        if self.embedding_weight_dtype == "bf16" and self.embedding_distribution != "sharded":
+        if (
+            self.embedding_weight_dtype == "bf16"
+            and self.embedding_distribution != "sharded"
+        ):
             raise ValueError(
                 "training.embedding_weight_dtype=bf16 currently requires "
                 "embedding_distribution=sharded so Adagrad state remains FP32"
@@ -2368,8 +2911,7 @@ class AppConfig(_DeeplyImmutableConfig):
             FeatureConfig.from_mapping(item) for item in payload.get("features", [])
         )
         sequences = tuple(
-            SequenceConfig.from_mapping(item)
-            for item in payload.get("sequences", [])
+            SequenceConfig.from_mapping(item) for item in payload.get("sequences", [])
         )
         return cls(
             data=DataConfig.from_mapping(payload["data"]),
@@ -2786,9 +3328,7 @@ def categorical_input_names(config: AppConfig) -> set[str]:
     """Categorical inputs that must have vocab_strategy entries."""
 
     return {
-        feature.name
-        for feature in config.features
-        if feature.kind == "categorical"
+        feature.name for feature in config.features if feature.kind == "categorical"
     } | {
         field.qualified_name(sequence.name)
         for sequence in config.sequences
@@ -2889,7 +3429,9 @@ def _resolved_categorical_input(
                 f"vocab_strategy.features.{name}.source {legacy.source!r} does not match "
                 f"logical source {source!r}"
             )
-        encoding = _resolved_encoding_from_config(legacy, f"vocab_strategy.features.{name}")
+        encoding = _resolved_encoding_from_config(
+            legacy, f"vocab_strategy.features.{name}"
+        )
     else:
         raise ValueError(f"missing encoding for categorical input {name!r}")
     return ResolvedCategoricalInput(
@@ -2902,7 +3444,9 @@ def _resolved_categorical_input(
     )
 
 
-def resolve_encoding_strategies(config: AppConfig) -> tuple[ResolvedCategoricalInput, ...]:
+def resolve_encoding_strategies(
+    config: AppConfig,
+) -> tuple[ResolvedCategoricalInput, ...]:
     """Resolve categorical encodings from exactly one config source per input."""
 
     inputs: list[ResolvedCategoricalInput] = []
@@ -2940,9 +3484,13 @@ def resolve_encoding_strategies(config: AppConfig) -> tuple[ResolvedCategoricalI
     by_name = {item.name: item for item in inputs}
     if len(by_name) != len(inputs):
         raise ValueError("duplicate categorical input names are not allowed")
-    unknown = sorted(name for name in config.vocab_strategy.features if name not in by_name)
+    unknown = sorted(
+        name for name in config.vocab_strategy.features if name not in by_name
+    )
     if unknown:
-        raise ValueError("vocab_strategy contains unknown categorical inputs: " + ", ".join(unknown))
+        raise ValueError(
+            "vocab_strategy contains unknown categorical inputs: " + ", ".join(unknown)
+        )
 
     resolved_base: dict[str, str] = {}
 
@@ -3039,6 +3587,35 @@ def _default_domain_inputs(
     return ()
 
 
+def _filter_scene_related_token_groups(
+    groups: Sequence[ResolvedTokenGroup],
+) -> tuple[ResolvedTokenGroup, ...]:
+    filtered: list[ResolvedTokenGroup] = []
+    for group in groups:
+        input_refs = filter_scene_related_feature_names(group.input_refs)
+        if not input_refs:
+            continue
+        filtered.append(ResolvedTokenGroup(name=group.name, input_refs=input_refs))
+    return tuple(filtered)
+
+
+def _filter_feature_pack_token_groups(
+    groups: Sequence[ResolvedTokenGroup],
+    *,
+    omit_scene_features: bool,
+) -> tuple[ResolvedTokenGroup, ...]:
+    filtered: list[ResolvedTokenGroup] = []
+    for group in groups:
+        input_refs = filter_feature_pack_names(
+            group.input_refs,
+            omit_scene_features=omit_scene_features,
+        )
+        if not input_refs:
+            continue
+        filtered.append(ResolvedTokenGroup(name=group.name, input_refs=input_refs))
+    return tuple(filtered)
+
+
 def _feature_token_groups(
     tokenization: TokenizationConfig,
     features: Sequence[FeatureConfig],
@@ -3046,10 +3623,15 @@ def _feature_token_groups(
 ) -> tuple[ResolvedTokenGroup, ...]:
     # Explicit groups win. Otherwise each tokenizable input becomes its own group.
     if tokenization.feature_tokens:
-        return tuple(_resolved_group(group) for group in tokenization.feature_tokens)
-    return tuple(
-        ResolvedTokenGroup(name=name, input_refs=(name,))
-        for name in tokenizable_input_names(features, sequences)
+        groups = tuple(_resolved_group(group) for group in tokenization.feature_tokens)
+    else:
+        groups = tuple(
+            ResolvedTokenGroup(name=name, input_refs=(name,))
+            for name in tokenizable_input_names(features, sequences)
+        )
+    return _filter_feature_pack_token_groups(
+        groups,
+        omit_scene_features=tokenization.omit_scene_features,
     )
 
 
@@ -3082,7 +3664,9 @@ def _scalar_token_groups(
         return tuple(
             _resolved_group(group)
             for group in tokenization.feature_tokens
-            if all(name in by_name and name not in sequence_names for name in group.inputs)
+            if all(
+                name in by_name and name not in sequence_names for name in group.inputs
+            )
         )
     return tuple(
         ResolvedTokenGroup(name=feature.name, input_refs=(feature.name,))
@@ -3102,14 +3686,21 @@ def _scenario_tokens(
     if tokenization.scenario_tokens:
         if not scenario_names:
             # Compatibility path for legacy callers that ask for tokens without AppConfig.
-            return tuple(_resolved_domain_token(token) for token in tokenization.scenario_tokens)
+            return tuple(
+                _resolved_domain_token(token) for token in tokenization.scenario_tokens
+            )
         by_name = {token.name: token for token in tokenization.scenario_tokens}
         missing = [name for name in scenario_names if name not in by_name]
         if missing:
-            raise ValueError("tokenization.scenario_tokens missing scenarios: " + ", ".join(missing))
+            raise ValueError(
+                "tokenization.scenario_tokens missing scenarios: " + ", ".join(missing)
+            )
         extras = sorted(set(by_name) - set(scenario_names) - {"global"})
         if extras:
-            raise ValueError("tokenization.scenario_tokens contains unknown scenarios: " + ", ".join(extras))
+            raise ValueError(
+                "tokenization.scenario_tokens contains unknown scenarios: "
+                + ", ".join(extras)
+            )
         tokens = [_resolved_domain_token(by_name[name]) for name in scenario_names]
         if "global" in by_name:
             tokens.append(_resolved_domain_token(by_name["global"]))
@@ -3124,7 +3715,9 @@ def _scenario_tokens(
         return tuple(tokens)
 
     return tuple(
-        ResolvedDomainToken(name=name, input_refs=scenario_inputs, direct_input_refs=scenario_inputs)
+        ResolvedDomainToken(
+            name=name, input_refs=scenario_inputs, direct_input_refs=scenario_inputs
+        )
         for name in [*scenario_names, "global"]
     )
 
@@ -3138,18 +3731,26 @@ def _task_tokens(
     if tokenization.task_tokens:
         if not task_names:
             # Compatibility path for legacy callers that ask for tokens without AppConfig.
-            return tuple(_resolved_domain_token(token) for token in tokenization.task_tokens)
+            return tuple(
+                _resolved_domain_token(token) for token in tokenization.task_tokens
+            )
         by_name = {token.name: token for token in tokenization.task_tokens}
         missing = [name for name in task_names if name not in by_name]
         if missing:
-            raise ValueError("tokenization.task_tokens missing tasks: " + ", ".join(missing))
+            raise ValueError(
+                "tokenization.task_tokens missing tasks: " + ", ".join(missing)
+            )
         extras = sorted(set(by_name) - set(task_names))
         if extras:
-            raise ValueError("tokenization.task_tokens contains unknown tasks: " + ", ".join(extras))
+            raise ValueError(
+                "tokenization.task_tokens contains unknown tasks: " + ", ".join(extras)
+            )
         return tuple(_resolved_domain_token(by_name[name]) for name in task_names)
 
     return tuple(
-        ResolvedDomainToken(name=name, input_refs=task_inputs, direct_input_refs=task_inputs)
+        ResolvedDomainToken(
+            name=name, input_refs=task_inputs, direct_input_refs=task_inputs
+        )
         for name in task_names
     )
 
@@ -3162,21 +3763,37 @@ def resolve_tokenization(
     task_names: Sequence[str],
 ) -> ResolvedTokenization:
     # Build the complete token layout without changing the raw YAML object.
-    feature_token_inputs = tuple(tokenization.feature_token_inputs or tokenizable_input_names(features, sequences))
+    feature_token_inputs = filter_feature_pack_names(
+        tuple(
+            tokenization.feature_token_inputs
+            or tokenizable_input_names(features, sequences)
+        ),
+        omit_scene_features=tokenization.omit_scene_features,
+    )
     feature_groups = _feature_token_groups(tokenization, features, sequences)
+    scalar_groups = _filter_feature_pack_token_groups(
+        _scalar_token_groups(tokenization, features, sequences),
+        omit_scene_features=tokenization.omit_scene_features,
+    )
     if tokenization.feature_tokenizer in {"auto_split", "rankmixer"}:
-        feature_token_count = tokenization.num_feature_tokens or len(feature_token_inputs)
+        feature_token_count = tokenization.num_feature_tokens or len(
+            feature_token_inputs
+        )
     else:
         feature_token_count = len(feature_groups)
-    scenario_inputs = _default_domain_inputs(tokenization.scenario_token_inputs, features, sequences)
-    task_inputs = _default_domain_inputs(tokenization.task_token_inputs, features, sequences)
+    scenario_inputs = _default_domain_inputs(
+        tokenization.scenario_token_inputs, features, sequences
+    )
+    task_inputs = _default_domain_inputs(
+        tokenization.task_token_inputs, features, sequences
+    )
     return ResolvedTokenization(
         feature_tokenizer=tokenization.feature_tokenizer,
         feature_token_inputs=feature_token_inputs,
         feature_token_count=feature_token_count,
         feature_token_groups=feature_groups,
         sequence_token_groups=_sequence_token_groups(tokenization, sequences),
-        scalar_token_groups=_scalar_token_groups(tokenization, features, sequences),
+        scalar_token_groups=scalar_groups,
         scenario_token_inputs=scenario_inputs,
         task_token_inputs=task_inputs,
         scenario_token_specs=_scenario_tokens(
@@ -3189,6 +3806,108 @@ def resolve_tokenization(
         task_token_specs=_task_tokens(tokenization, task_names, task_inputs),
         sequence_names=tuple(sequence.name for sequence in sequences),
     )
+
+
+def _largest_compatible_feature_token_count(
+    input_dim: int,
+    token_dim: int,
+    preferred: int,
+) -> int:
+    """Pick a RankMixer token count compatible with packing, near ``preferred``."""
+
+    if input_dim <= 0 or token_dim <= 0:
+        raise ValueError("input_dim and token_dim must be positive")
+    limit = math.gcd(input_dim, token_dim)
+    if limit <= 0:
+        raise ValueError("no compatible feature token count for RankMixer packing")
+    # Prefer the configured count when it already packs cleanly.
+    if preferred > 0 and input_dim % preferred == 0 and token_dim % preferred == 0:
+        return preferred
+    divisors = [
+        candidate for candidate in range(1, limit + 1) if limit % candidate == 0
+    ]
+    if not divisors:
+        raise ValueError("no compatible feature token count for RankMixer packing")
+    # Stay as close as possible to the YAML token count (prefer not increasing).
+    not_above = [candidate for candidate in divisors if candidate <= preferred]
+    if not_above:
+        return max(not_above)
+    return min(divisors)
+
+
+def maybe_adjust_rankmixer_feature_token_count(
+    resolved: ResolvedTokenization,
+    *,
+    encoded_input_dims: Mapping[str, int],
+    token_dim: int,
+    model_name: str,
+    sequences: Sequence[SequenceConfig] | None = None,
+) -> ResolvedTokenization:
+    """Auto-fix num tokens when scene exclusion breaks RankMixer slice packing."""
+
+    if model_name not in {"rankmixer", "mdl_rankmixer"}:
+        return resolved
+    if resolved.feature_tokenizer != "rankmixer":
+        return resolved
+    preferred = int(resolved.feature_token_count)
+    stca_names = {
+        sequence.name
+        for sequence in (sequences or ())
+        if sequence.encoder == "stca"
+    }
+    dedicated_inputs = [
+        name
+        for name in resolved.feature_token_inputs
+        if name in stca_names
+    ]
+    regular_inputs = [
+        name
+        for name in resolved.feature_token_inputs
+        if name not in stca_names
+    ]
+    if dedicated_inputs:
+        # Dedicated STCA z tokens sit outside the packed regular slice.
+        regular_dim = sum(int(encoded_input_dims[name]) for name in regular_inputs)
+        dedicated_count = len(dedicated_inputs)
+
+        def _compatible(count: int) -> bool:
+            regular_slots = count - dedicated_count
+            return (
+                count > dedicated_count
+                and token_dim % count == 0
+                and regular_slots > 0
+                and regular_dim % regular_slots == 0
+            )
+
+        if preferred > 0 and _compatible(preferred):
+            return resolved
+        # Prefer divisors of token_dim near the configured count.
+        candidates = [
+            candidate
+            for candidate in range(dedicated_count + 1, token_dim + 1)
+            if _compatible(candidate)
+        ]
+        if not candidates:
+            raise ValueError(
+                "no compatible feature token count for RankMixer packing with "
+                f"dedicated STCA tokens: regular_dim={regular_dim}, "
+                f"dedicated={dedicated_count}, token_dim={token_dim}"
+            )
+        not_above = [candidate for candidate in candidates if candidate <= preferred]
+        adjusted = max(not_above) if not_above else min(candidates)
+        if adjusted == preferred:
+            return resolved
+        return replace(resolved, feature_token_count=adjusted)
+
+    input_dim = sum(
+        int(encoded_input_dims[name]) for name in resolved.feature_token_inputs
+    )
+    if preferred > 0 and input_dim % preferred == 0 and token_dim % preferred == 0:
+        return resolved
+    adjusted = _largest_compatible_feature_token_count(input_dim, token_dim, preferred)
+    if adjusted == preferred:
+        return resolved
+    return replace(resolved, feature_token_count=adjusted)
 
 
 def resolve_categorical_embedding_dims(
@@ -3226,13 +3945,17 @@ def resolve_categorical_embedding_dims(
         elif name in feature_by_name:
             feature = feature_by_name[name]
             if feature.kind != "categorical":
-                raise ValueError(f"vocab strategy {name!r} references non-categorical feature")
+                raise ValueError(
+                    f"vocab strategy {name!r} references non-categorical feature"
+                )
             dim = feature.embedding_dim or config.model.embedding_dim
         elif name in sequence_fields:
             field_config = sequence_fields[name]
             dim = field_config.embedding_dim or config.model.embedding_dim
         else:
-            raise ValueError(f"vocab strategy references unknown categorical input {name!r}")
+            raise ValueError(
+                f"vocab strategy references unknown categorical input {name!r}"
+            )
         resolving.remove(name)
         resolved[name] = dim
         return dim
@@ -3255,15 +3978,15 @@ def resolve_encoded_input_dims(
             dims[feature.name] = categorical_dims[feature.name]
     for sequence in config.sequences:
         if sequence.encoder == "longer":
-            merged_dim = config.model.token_dim * sequence.longer_token_merge
-            if sequence.longer_output == "summary":
-                dims[sequence.name] = sequence.rankmixer_summary_tokens * merged_dim
-            else:
-                dims[sequence.name] = (
-                    sequence.rankmixer_summary_tokens + sequence.longer_query_tokens
-                ) * merged_dim
+            dims[sequence.name] = sequence.longer_encoded_width()
+        elif sequence.encoder == "stca":
+            dims[sequence.name] = sequence.stca_encoded_width()
+        elif sequence.encoder in {"mean_pool", "attention_pool"}:
+            dims[sequence.name] = sequence.pool_encoded_width()
         else:
-            dims[sequence.name] = config.model.token_dim * sequence.rankmixer_summary_tokens
+            dims[sequence.name] = (
+                config.model.token_dim * sequence.rankmixer_summary_tokens
+            )
     return dims
 
 
@@ -3271,35 +3994,54 @@ def resolve_app_config(config: AppConfig) -> ResolvedConfig:
     # Build all derived values in one place so validation and model setup agree.
     categorical_inputs = resolve_encoding_strategies(config)
     categorical_input_by_name = {item.name: item for item in categorical_inputs}
-    categorical_dims = resolve_categorical_embedding_dims(config, categorical_input_by_name)
+    categorical_dims = resolve_categorical_embedding_dims(
+        config, categorical_input_by_name
+    )
+    encoded_input_dims = resolve_encoded_input_dims(config, categorical_dims)
+    tokenization = resolve_tokenization(
+        config.tokenization,
+        config.features,
+        config.sequences,
+        config.scenarios.names,
+        config.task_names,
+    )
+    # Pack filters (omit-scene / dead constants) may change input width; keep
+    # RankMixer token_count compatible with token_dim packing.
+    tokenization = maybe_adjust_rankmixer_feature_token_count(
+        tokenization,
+        encoded_input_dims=encoded_input_dims,
+        token_dim=config.model.token_dim,
+        model_name=config.model.name,
+        sequences=config.sequences,
+    )
+    sequence_names = {sequence.name for sequence in config.sequences}
+    scalar_feature_names = tuple(
+        name
+        for name in tokenization.feature_token_inputs
+        if name not in sequence_names
+    )
     return ResolvedConfig(
-        tokenization=resolve_tokenization(
-            config.tokenization,
-            config.features,
-            config.sequences,
-            config.scenarios.names,
-            config.task_names,
-        ),
+        tokenization=tokenization,
         categorical_embedding_dims=categorical_dims,
-        encoded_input_dims=resolve_encoded_input_dims(config, categorical_dims),
+        encoded_input_dims=encoded_input_dims,
         categorical_input_names=set(categorical_input_by_name),
         categorical_inputs=categorical_inputs,
         categorical_input_by_name=categorical_input_by_name,
-        scalar_feature_names=tuple(
-            feature.name
-            for feature in config.features
-            if feature.embedding_scope in {"feature", "shared"}
-        ),
+        scalar_feature_names=scalar_feature_names,
     )
 
 
 # Cross-section validation stays outside the raw dataclass declarations.
-def _validate_token_group(group: ResolvedTokenGroup, input_names: set[str], section: str) -> None:
+def _validate_token_group(
+    group: ResolvedTokenGroup, input_names: set[str], section: str
+) -> None:
     # Token groups may be raw YAML groups or generated defaults; validate both.
     if not group.name:
         raise ValueError(f"tokenization.{section} token name is required")
     if not group.input_refs:
-        raise ValueError(f"tokenization.{section}.{group.name} inputs must not be empty")
+        raise ValueError(
+            f"tokenization.{section}.{group.name} inputs must not be empty"
+        )
     missing = [name for name in group.input_refs if name not in input_names]
     if missing:
         raise ValueError(
@@ -3308,11 +4050,15 @@ def _validate_token_group(group: ResolvedTokenGroup, input_names: set[str], sect
         )
 
 
-def _validate_domain_token(token: ResolvedDomainToken, input_names: set[str], section: str) -> None:
+def _validate_domain_token(
+    token: ResolvedDomainToken, input_names: set[str], section: str
+) -> None:
     if not token.name:
         raise ValueError(f"tokenization.{section} token name is required")
     if not token.input_refs:
-        raise ValueError(f"tokenization.{section}.{token.name} inputs must not be empty")
+        raise ValueError(
+            f"tokenization.{section}.{token.name} inputs must not be empty"
+        )
     missing = [name for name in token.input_refs if name not in input_names]
     if missing:
         raise ValueError(
@@ -3321,7 +4067,9 @@ def _validate_domain_token(token: ResolvedDomainToken, input_names: set[str], se
         )
 
 
-def _validate_unique_group_names(groups: tuple[ResolvedTokenGroup, ...], section: str) -> None:
+def _validate_unique_group_names(
+    groups: tuple[ResolvedTokenGroup, ...], section: str
+) -> None:
     names: set[str] = set()
     for group in groups:
         if group.name in names:
@@ -3329,7 +4077,9 @@ def _validate_unique_group_names(groups: tuple[ResolvedTokenGroup, ...], section
         names.add(group.name)
 
 
-def _validate_unique_domain_names(tokens: tuple[ResolvedDomainToken, ...], section: str) -> None:
+def _validate_unique_domain_names(
+    tokens: tuple[ResolvedDomainToken, ...], section: str
+) -> None:
     names: set[str] = set()
     for token in tokens:
         if token.name in names:
@@ -3345,27 +4095,49 @@ def validate_tokenization_config(
     task_names: Sequence[str],
 ) -> None:
     # Validate both raw token declarations and their resolved defaults.
-    input_names = {feature.name for feature in features} | {sequence.name for sequence in sequences}
+    input_names = {feature.name for feature in features} | {
+        sequence.name for sequence in sequences
+    }
     all_sequence_names = {sequence.name for sequence in sequences}
     active_sequence_names = sequence_input_names(sequences)
-    tokenization._validate_unique_domain_token_names(tokenization.scenario_tokens, "scenario_tokens")
-    tokenization._validate_unique_domain_token_names(tokenization.task_tokens, "task_tokens")
+    tokenization._validate_unique_domain_token_names(
+        tokenization.scenario_tokens, "scenario_tokens"
+    )
+    tokenization._validate_unique_domain_token_names(
+        tokenization.task_tokens, "task_tokens"
+    )
     if tokenization.feature_tokenizer not in {"groupwise", "rankmixer", "auto_split"}:
-        raise ValueError("tokenization.feature_tokenizer must be groupwise, rankmixer, or auto_split")
-    if tokenization.num_feature_tokens is not None and tokenization.num_feature_tokens <= 0:
+        raise ValueError(
+            "tokenization.feature_tokenizer must be groupwise, rankmixer, or auto_split"
+        )
+    if (
+        tokenization.num_feature_tokens is not None
+        and tokenization.num_feature_tokens <= 0
+    ):
         raise ValueError("tokenization.num_feature_tokens must be positive")
 
-    resolved = resolve_tokenization(tokenization, features, sequences, scenario_names, task_names)
+    resolved = resolve_tokenization(
+        tokenization, features, sequences, scenario_names, task_names
+    )
     if tokenization.feature_tokenizer in {"auto_split", "rankmixer"}:
         if tokenization.feature_tokens:
-            raise ValueError("tokenization.feature_tokens cannot be used when feature_tokenizer is auto_split or rankmixer")
+            raise ValueError(
+                "tokenization.feature_tokens cannot be used when feature_tokenizer is auto_split or rankmixer"
+            )
         if tokenization.num_feature_tokens is None:
-            raise ValueError("tokenization.num_feature_tokens is required when feature_tokenizer is auto_split or rankmixer")
+            raise ValueError(
+                "tokenization.num_feature_tokens is required when feature_tokenizer is auto_split or rankmixer"
+            )
         if not resolved.feature_token_inputs:
             raise ValueError("tokenization.feature_token_inputs must not be empty")
-        missing = [name for name in resolved.feature_token_inputs if name not in input_names]
+        missing = [
+            name for name in resolved.feature_token_inputs if name not in input_names
+        ]
         if missing:
-            raise ValueError("tokenization.feature_token_inputs references unknown inputs: " + ", ".join(missing))
+            raise ValueError(
+                "tokenization.feature_token_inputs references unknown inputs: "
+                + ", ".join(missing)
+            )
 
     for section, groups in (
         ("feature_tokens", resolved.feature_token_groups),
@@ -3386,7 +4158,9 @@ def validate_tokenization_config(
             if section == "ns_tokens" and any(
                 name in all_sequence_names for name in group.input_refs
             ):
-                raise ValueError(f"tokenization.ns_tokens.{group.name} must not include sequence inputs")
+                raise ValueError(
+                    f"tokenization.ns_tokens.{group.name} must not include sequence inputs"
+                )
 
     for section, inputs in (
         ("scenario_token_inputs", resolved.scenario_token_inputs),
@@ -3396,7 +4170,10 @@ def validate_tokenization_config(
             raise ValueError(f"tokenization.{section} must not be empty")
         missing = [name for name in inputs if name not in input_names]
         if missing:
-            raise ValueError(f"tokenization.{section} references unknown inputs: " + ", ".join(missing))
+            raise ValueError(
+                f"tokenization.{section} references unknown inputs: "
+                + ", ".join(missing)
+            )
 
     for section, tokens in (
         ("scenario_tokens", resolved.scenario_token_specs),
@@ -3454,10 +4231,7 @@ def _validate_mdl_domain_priors(config: AppConfig, resolved: ResolvedConfig) -> 
         feature.name: feature.embedding_scope for feature in config.features
     }
     input_scopes.update(
-        {
-            sequence.name: sequence.embedding_scope
-            for sequence in config.sequences
-        }
+        {sequence.name: sequence.embedding_scope for sequence in config.sequences}
     )
 
     def validate_family(
@@ -3570,10 +4344,7 @@ def resolve_onetrans_max_position_embeddings(
         if group_lengths:
             inferred_s_tokens += max(group_lengths)
 
-    if (
-        config.model.sequence_fusion == "intent_ordered"
-        and config.model.use_sep_tokens
-    ):
+    if config.model.sequence_fusion == "intent_ordered" and config.model.use_sep_tokens:
         inferred_s_tokens += max(
             len(resolved.tokenization.sequence_token_groups) - 1,
             0,
@@ -3622,12 +4393,23 @@ def validate_app_config(config: AppConfig) -> None:
         if sequence.name in sequence_names:
             raise ValueError(f"duplicate sequence name {sequence.name!r}")
         if sequence.name in feature_names:
-            raise ValueError(f"sequence name {sequence.name!r} conflicts with a feature name")
+            raise ValueError(
+                f"sequence name {sequence.name!r} conflicts with a feature name"
+            )
         sequence_names.add(sequence.name)
     config.scenarios.validate()
     config.model.validate()
     config.runtime.validate()
     config.training.validate()
+    if (
+        config.training.loss_reduction == "mean_per_request_per_task"
+        and not config.data.train.reader.deduplicate_request_features
+    ):
+        raise ValueError(
+            "training.loss_reduction=mean_per_request_per_task requires "
+            "data.train.reader.deduplicate_request_features=true so each "
+            "candidate carries an unambiguous candidate-to-request mapping"
+        )
     if config.training.quick_eval.enabled:
         quick_eval_split = (
             config.data.train
@@ -3662,8 +4444,7 @@ def validate_app_config(config: AppConfig) -> None:
         if (
             split is None
             or split.adapter is None
-            or split.adapter.callable
-            != "src.dataloader:adapt_mdl_rankmixer_parquet"
+            or split.adapter.callable != "src.dataloader:adapt_mdl_rankmixer_parquet"
         ):
             continue
         sequence_limits = split.adapter.options.get("sequence_max_lengths", {})
@@ -3716,7 +4497,10 @@ def validate_app_config(config: AppConfig) -> None:
                         f"must be >= sequences.{sequence.name}.max_length "
                         f"({sequence.max_length}) because that sequence consumes {ups}"
                     )
-    if config.model.name in {"onetrans", "mdl_onetrans"} and config.model.sequence_fusion == "timestamp_aware":
+    if (
+        config.model.name in {"onetrans", "mdl_onetrans"}
+        and config.model.sequence_fusion == "timestamp_aware"
+    ):
         for group in resolved.tokenization.sequence_token_groups:
             for input_name in group.input_refs:
                 sequence = sequence_by_name.get(input_name)
@@ -3775,10 +4559,46 @@ def validate_app_config(config: AppConfig) -> None:
         if raw_sequences:
             raise ValueError(
                 "encoder=raw delegates sequence modeling to OneTrans and is only valid for "
-                "model.name=onetrans or mdl_onetrans: "
-                + ", ".join(raw_sequences)
+                "model.name=onetrans or mdl_onetrans: " + ", ".join(raw_sequences)
             )
     for sequence in config.sequences:
+        if sequence.encoder == "stca":
+            if config.model.name not in {"rankmixer", "mdl_rankmixer"}:
+                raise ValueError(
+                    f"sequence {sequence.name!r} encoder=stca is only supported by "
+                    "model.name=rankmixer or mdl_rankmixer"
+                )
+            stca_heads = sequence.stca_num_heads or config.model.num_heads
+            if sequence.stca_dim % stca_heads != 0:
+                raise ValueError(
+                    f"sequence {sequence.name!r} STCA requires stca_dim to "
+                    f"be divisible by its resolved head count: "
+                    f"{sequence.stca_dim} % {stca_heads} != 0"
+                )
+            if sequence.max_length is None:
+                raise ValueError(
+                    f"paper-aligned STCA sequence {sequence.name!r} requires "
+                    "max_length so a learned position is fused into every event"
+                )
+            if sequence.time_delta_field is None:
+                raise ValueError(
+                    f"paper-aligned STCA sequence {sequence.name!r} requires "
+                    "time_delta_field; the paper's strong operating point adds "
+                    "request-time minus event-time side information"
+                )
+            keeps_recent_suffix = (
+                sequence.sequence_order == "oldest_to_newest"
+                and sequence.truncation == "tail"
+            ) or (
+                sequence.sequence_order == "newest_to_oldest"
+                and sequence.truncation == "head"
+            )
+            if not keeps_recent_suffix:
+                raise ValueError(
+                    f"paper-aligned STCA sequence {sequence.name!r} must retain "
+                    "the most recent temporal suffix: use oldest_to_newest + tail "
+                    "or newest_to_oldest + head"
+                )
         if sequence.encoder == "longer" and sequence.max_length is None:
             raise ValueError(
                 f"paper-aligned LONGER sequence {sequence.name!r} requires max_length so recent-k "
@@ -3788,6 +4608,105 @@ def validate_app_config(config: AppConfig) -> None:
             raise ValueError(
                 f"paper-aligned LONGER sequence {sequence.name!r} requires time_delta_field; "
                 "declare a scalar dense sequence field containing absolute time difference"
+            )
+        if sequence.encoder == "longer":
+            longer_heads = sequence.resolved_longer_num_heads(config.model.num_heads)
+            if sequence.longer_dim % longer_heads != 0:
+                raise ValueError(
+                    f"sequence {sequence.name!r} longer_dim must be divisible by "
+                    f"resolved longer_num_heads: {sequence.longer_dim} % {longer_heads} != 0"
+                )
+    stca_group_signatures: dict[
+        str,
+        tuple[int, int, int, int, tuple[str, ...]],
+    ] = {}
+    for sequence in config.sequences:
+        parameter_group = sequence.stca_parameter_group
+        if sequence.encoder != "stca" or parameter_group is None:
+            continue
+        signature = (
+            sequence.stca_dim,
+            sequence.stca_layers,
+            sequence.stca_num_heads or config.model.num_heads,
+            sequence.stca_expansion_ratio,
+            sequence.target_inputs,
+        )
+        previous = stca_group_signatures.setdefault(parameter_group, signature)
+        if previous != signature:
+            raise ValueError(
+                f"STCA parameter group {parameter_group!r} has incompatible "
+                "(dim, layers, heads, expansion_ratio, target_inputs) settings: "
+                f"{previous} versus {signature}"
+            )
+    stca_history_groups: dict[str, list[SequenceConfig]] = {}
+    for sequence in config.sequences:
+        if sequence.stca_history_group is not None:
+            stca_history_groups.setdefault(
+                sequence.stca_history_group,
+                [],
+            ).append(sequence)
+    feature_inputs = (
+        {
+            input_name
+            for token_group in resolved.tokenization.feature_token_groups
+            for input_name in token_group.input_refs
+        }
+        if config.tokenization.feature_tokenizer == "groupwise"
+        else set(resolved.tokenization.feature_token_inputs)
+    )
+    domain_inputs: set[str] = set()
+    if config.model.use_scenario_tokens:
+        domain_inputs.update(
+            input_name
+            for token in resolved.tokenization.scenario_token_specs
+            for input_name in token.input_refs
+        )
+    if config.model.use_task_tokens:
+        domain_inputs.update(
+            input_name
+            for token in resolved.tokenization.task_token_specs
+            for input_name in token.input_refs
+        )
+    downstream_inputs = feature_inputs | domain_inputs
+    for history_group, members in stca_history_groups.items():
+        owner = members[0]
+        signature = (
+            owner.stca_dim,
+            owner.stca_layers,
+            owner.stca_num_heads or config.model.num_heads,
+            owner.stca_expansion_ratio,
+            owner.target_inputs,
+        )
+        incompatible = [
+            member.name
+            for member in members[1:]
+            if (
+                member.stca_dim,
+                member.stca_layers,
+                member.stca_num_heads or config.model.num_heads,
+                member.stca_expansion_ratio,
+                member.target_inputs,
+            )
+            != signature
+        ]
+        if incompatible:
+            raise ValueError(
+                f"STCA history group {history_group!r} has incompatible members: "
+                + ", ".join(incompatible)
+            )
+        if owner.name not in feature_inputs:
+            raise ValueError(
+                f"STCA history group {history_group!r} requires its first member "
+                f"{owner.name!r} in tokenization.feature_token_inputs"
+            )
+        duplicate_outputs = [
+            member.name for member in members[1:] if member.name in downstream_inputs
+        ]
+        if duplicate_outputs:
+            raise ValueError(
+                f"STCA history group {history_group!r} emits one z through "
+                f"{owner.name!r}; remove other members from "
+                "downstream token inputs: " + ", ".join(duplicate_outputs)
             )
     # Model-specific checks use resolved values because defaults affect token counts.
     feature_token_count = resolved.tokenization.feature_token_count
@@ -3806,30 +4725,98 @@ def validate_app_config(config: AppConfig) -> None:
                 "sequences[0].longer_self_layers: "
                 f"{config.model.num_layers} != {expected_layers}"
             )
-    if config.model.name in {"rankmixer", "mdl_rankmixer"} and config.tokenization.feature_tokenizer == "rankmixer":
-        input_dim = sum(resolved.encoded_input_dims[name] for name in resolved.tokenization.feature_token_inputs)
-        if input_dim % feature_token_count != 0:
+    stca_feature_inputs = {
+        sequence.name
+        for sequence in config.sequences
+        if sequence.encoder == "stca" and sequence.name in feature_inputs
+    }
+    if stca_feature_inputs and config.tokenization.feature_tokenizer == "auto_split":
+        raise ValueError(
+            "STCA requires feature_tokenizer=rankmixer or groupwise so packed z "
+            "shares the RankMixer feature-token path"
+        )
+    if stca_feature_inputs and config.tokenization.feature_tokenizer == "groupwise":
+        groups_by_input = {
+            input_name: group
+            for group in resolved.tokenization.feature_token_groups
+            for input_name in group.input_refs
+            if input_name in stca_feature_inputs
+        }
+        invalid_groups = [
+            name
+            for name in stca_feature_inputs
+            if name not in groups_by_input
+            or groups_by_input[name].input_refs != (name,)
+        ]
+        if invalid_groups:
             raise ValueError(
-                "rankmixer tokenization requires equal-width input slices: "
-                f"sum(feature_token_inputs)={input_dim}, "
-                f"num_feature_tokens={feature_token_count}. "
-                "The input width must be divisible by the token count; each slice is then "
-                "projected independently to model.token_dim."
+                "each STCA z must occupy a singleton groupwise feature token: "
+                + ", ".join(sorted(invalid_groups))
             )
-    if config.model.name in {"rankmixer", "mdl_rankmixer"} and config.model.token_dim % feature_token_count != 0:
+    if (
+        config.model.name in {"rankmixer", "mdl_rankmixer"}
+        and config.tokenization.feature_tokenizer == "rankmixer"
+    ):
+        ordered_inputs = list(resolved.tokenization.feature_token_inputs)
+        dedicated_stca_inputs = [
+            name for name in ordered_inputs if name in stca_feature_inputs
+        ]
+        regular_inputs = [
+            name for name in ordered_inputs if name not in stca_feature_inputs
+        ]
+        if ordered_inputs != [*regular_inputs, *dedicated_stca_inputs]:
+            raise ValueError(
+                "rankmixer STCA z inputs must form an ordered suffix of "
+                "tokenization.feature_token_inputs so each z remains one "
+                "dedicated target-aware token"
+            )
+        regular_token_count = feature_token_count - len(dedicated_stca_inputs)
+        if regular_token_count < 0:
+            raise ValueError(
+                "rankmixer has more dedicated STCA z inputs than feature tokens"
+            )
+        regular_input_dim = sum(
+            resolved.encoded_input_dims[name] for name in regular_inputs
+        )
+        if (
+            (regular_token_count == 0 and regular_input_dim != 0)
+            or (regular_token_count > 0 and regular_input_dim == 0)
+            or (
+                regular_token_count > 0 and regular_input_dim % regular_token_count != 0
+            )
+        ):
+            raise ValueError(
+                "rankmixer tokenization requires ordinary feature inputs to "
+                "divide evenly across the non-STCA token positions: "
+                f"regular_input_dim={regular_input_dim}, "
+                f"regular_token_count={regular_token_count}. Each STCA z uses "
+                "one separate token and is projected independently."
+            )
+    if (
+        config.model.name in {"rankmixer", "mdl_rankmixer"}
+        and config.model.token_dim % feature_token_count != 0
+    ):
         raise ValueError(
             "model.token_dim must be divisible by the resolved feature token count "
             f"for {config.model.name}: {config.model.token_dim} % {feature_token_count} != 0"
         )
     if config.model.name in {"onetrans", "mdl_onetrans"}:
         if not resolved.tokenization.sequence_token_groups:
-            raise ValueError(f"model.name={config.model.name!r} requires at least one sequence token")
-        if config.model.ns_tokenizer == "auto_split" and not resolved.scalar_feature_names:
+            raise ValueError(
+                f"model.name={config.model.name!r} requires at least one sequence token"
+            )
+        if (
+            config.model.ns_tokenizer == "auto_split"
+            and not resolved.scalar_feature_names
+        ):
             raise ValueError(
                 f"model.name={config.model.name!r} with model.ns_tokenizer=auto_split "
                 "requires at least one scalar feature with embedding_scope feature or shared"
             )
-        if config.model.ns_tokenizer == "groupwise" and not resolved.tokenization.scalar_token_groups:
+        if (
+            config.model.ns_tokenizer == "groupwise"
+            and not resolved.tokenization.scalar_token_groups
+        ):
             raise ValueError(
                 f"model.name={config.model.name!r} with model.ns_tokenizer=groupwise "
                 "requires tokenization.ns_tokens or scalar feature inputs"
@@ -3868,7 +4855,9 @@ def _load_config_mapping(
     if parent_ref is None:
         return payload
     if not isinstance(parent_ref, str) or not parent_ref:
-        raise ValueError(f"config {resolved_path} extends must be a non-empty path string")
+        raise ValueError(
+            f"config {resolved_path} extends must be a non-empty path string"
+        )
     parent_path = Path(parent_ref)
     if not parent_path.is_absolute():
         parent_path = resolved_path.parent / parent_path

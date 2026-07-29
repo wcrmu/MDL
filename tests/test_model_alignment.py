@@ -61,6 +61,7 @@ def _rankmixer_config() -> SimpleNamespace:
             num_heads=2,
             ffn_activation="gelu",
             mdl_feature_interaction="direct_ffn",
+            mdl_token_state="coupled",
             use_task_tokens=True,
             use_scenario_tokens=True,
             use_global_scenario_token=True,
@@ -214,6 +215,27 @@ class RankMixerAlignmentTest(unittest.TestCase):
         )
         torch.testing.assert_close(tokens, expected)
 
+    def test_paper_tokenizer_zero_pads_non_divisible_regular_width(self) -> None:
+        tokenizer = RankMixerSliceTokenizer(
+            input_names=["all_features"],
+            input_dims={"all_features": 5},
+            num_tokens=2,
+            token_dim=4,
+        )
+        with torch.no_grad():
+            tokenizer.projection.weight.zero_()
+            tokenizer.projection.bias.zero_()
+            tokenizer.projection.weight[:, :3, :3] = torch.eye(3).unsqueeze(0)
+        values = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]])
+
+        tokens = tokenizer({"all_features": values})
+
+        expected = torch.tensor(
+            [[[1.0, 2.0, 3.0, 0.0], [4.0, 5.0, 0.0, 0.0]]]
+        )
+        self.assertEqual(tokenizer.regular_padded_dim, 6)
+        torch.testing.assert_close(tokens, expected)
+
 
 class MDLFeatureInteractionAlignmentTest(unittest.TestCase):
     def _block(self, mode: str) -> MDLRankMixerBlock:
@@ -293,6 +315,133 @@ class MDLFeatureInteractionAlignmentTest(unittest.TestCase):
         )
         expected = expected_scenario_average.unsqueeze(1).expand(-1, 2, -1)
         torch.testing.assert_close(actual_tasks, expected)
+
+
+class MDLTokenStateAlignmentTest(unittest.TestCase):
+    class _ZeroDomainAttention(nn.Module):
+        def forward(
+            self,
+            domain_tokens: Tensor,
+            feature_tokens: Tensor,
+        ) -> tuple[Tensor, None]:
+            del feature_tokens
+            return torch.zeros_like(domain_tokens), None
+
+    class _ZeroSequenceAttention(nn.Module):
+        def forward(
+            self,
+            domain_tokens: Tensor,
+            sequence_tokens: Tensor,
+            sequence_mask: Tensor,
+        ) -> Tensor:
+            del sequence_tokens, sequence_mask
+            return torch.zeros_like(domain_tokens)
+
+    @staticmethod
+    def _zero_ffns(block: nn.Module) -> None:
+        with torch.no_grad():
+            for module in (block.scenario_ffn, block.task_ffn):
+                assert module is not None
+                for parameter in module.parameters():
+                    parameter.zero_()
+
+    def test_coupled_mode_preserves_published_prompt_residual(self) -> None:
+        config = _rankmixer_config()
+        config.model.mdl_token_state = "coupled"
+        block = MDLRankMixerBlock(
+            config,
+            ModelMetadata(feature_token_count=2, scenario_count=1, task_count=1),
+        )
+        block.scenario_attention = self._ZeroDomainAttention()
+        block.task_attention = self._ZeroDomainAttention()
+        self._zero_ffns(block)
+
+        scenario_prompt = torch.randn(2, 2, 4)
+        task_prompt = torch.randn(2, 1, 4)
+        _features, actual_scenarios, actual_tasks = block(
+            torch.randn(2, 2, 4),
+            scenario_prompt,
+            task_prompt,
+            torch.ones(2, 1),
+        )
+
+        torch.testing.assert_close(actual_scenarios, scenario_prompt)
+        expected_task = task_prompt + scenario_prompt.mean(dim=1, keepdim=True)
+        torch.testing.assert_close(actual_tasks, expected_task)
+
+    def test_split_mode_blocks_prompt_when_attention_updates_are_zero(self) -> None:
+        config = _rankmixer_config()
+        config.model.mdl_token_state = "split"
+        block = MDLRankMixerBlock(
+            config,
+            ModelMetadata(feature_token_count=2, scenario_count=1, task_count=1),
+        )
+        block.scenario_attention = self._ZeroDomainAttention()
+        block.task_attention = self._ZeroDomainAttention()
+        self._zero_ffns(block)
+
+        feature_tokens = torch.randn(2, 2, 4)
+        scenario_state = torch.randn(2, 2, 4)
+        task_state = torch.randn(2, 1, 4)
+        scenario_mask = torch.ones(2, 1)
+        prompts_a = (torch.randn(2, 2, 4), torch.randn(2, 1, 4))
+        prompts_b = (torch.randn(2, 2, 4), torch.randn(2, 1, 4))
+
+        _features, scenarios_a, tasks_a = block(
+            feature_tokens,
+            scenario_state,
+            task_state,
+            scenario_mask,
+            prompts_a[0],
+            prompts_a[1],
+        )
+        _features, scenarios_b, tasks_b = block(
+            feature_tokens,
+            scenario_state,
+            task_state,
+            scenario_mask,
+            prompts_b[0],
+            prompts_b[1],
+        )
+
+        torch.testing.assert_close(scenarios_a, scenarios_b)
+        torch.testing.assert_close(tasks_a, tasks_b)
+        torch.testing.assert_close(scenarios_a, scenario_state)
+        expected_task = task_state + scenario_state.mean(dim=1, keepdim=True)
+        torch.testing.assert_close(tasks_a, expected_task)
+
+    def test_split_onetrans_gate_cannot_copy_prompt_when_updates_are_zero(self) -> None:
+        config = _rankmixer_config()
+        config.model.mdl_token_state = "split"
+        block = MDLDomainBlock(
+            config,
+            ModelMetadata(feature_token_count=2, scenario_count=1, task_count=1),
+            use_sequence_attention=True,
+        )
+        block.scenario_attention = self._ZeroDomainAttention()
+        block.task_attention = self._ZeroDomainAttention()
+        block.scenario_sequence_attention = self._ZeroSequenceAttention()
+        block.task_sequence_attention = self._ZeroSequenceAttention()
+        self._zero_ffns(block)
+
+        scenario_state = torch.randn(2, 2, 4)
+        task_state = torch.randn(2, 1, 4)
+        common_args = (
+            torch.randn(2, 2, 4),
+            torch.randn(2, 3, 4),
+            torch.ones(2, 3, dtype=torch.bool),
+            scenario_state,
+            task_state,
+            torch.ones(2, 1),
+        )
+        prompts_a = (torch.randn(2, 2, 4), torch.randn(2, 1, 4))
+        prompts_b = (torch.randn(2, 2, 4), torch.randn(2, 1, 4))
+
+        scenarios_a, tasks_a = block(*common_args, *prompts_a)
+        scenarios_b, tasks_b = block(*common_args, *prompts_b)
+
+        torch.testing.assert_close(scenarios_a, scenarios_b)
+        torch.testing.assert_close(tasks_a, tasks_b)
 
 
 class MDLAblationAlignmentTest(unittest.TestCase):
@@ -749,6 +898,43 @@ class MDLAblationAlignmentTest(unittest.TestCase):
 
 
 class MDLLossAlignmentTest(unittest.TestCase):
+    def test_request_reduction_matches_paper_user_then_target_average(self) -> None:
+        # Request 0 contributes three targets while request 1 contributes one.
+        # Eq. (8) gives both requests equal weight rather than weighting request
+        # 0 three times as heavily.
+        request_one_logit = torch.log(torch.expm1(torch.tensor(2.0)))
+        logits = torch.tensor(
+            [[0.0], [0.0], [0.0], [request_one_logit]],
+            requires_grad=True,
+        )
+        batch = FeatureBatch(
+            features={
+                "history": {
+                    "row_indices": torch.tensor([0, 0, 0, 1], dtype=torch.long)
+                }
+            },
+            labels=torch.zeros(4, 1),
+            label_mask=None,
+            scenario_id=torch.zeros(4, dtype=torch.long),
+            group_id=[],
+        )
+
+        request_mean, _numerator, _denominator = _loss_terms_from_batch(
+            {"logits": logits},
+            batch,
+            loss_reduction="mean_per_request_per_task",
+        )
+        candidate_mean, _numerator, _denominator = _loss_terms_from_batch(
+            {"logits": logits},
+            batch,
+            loss_reduction="mean_per_task",
+        )
+
+        unit = torch.log(torch.tensor(2.0))
+        torch.testing.assert_close(request_mean, (unit + 2.0) / 2.0)
+        torch.testing.assert_close(candidate_mean, (3.0 * unit + 2.0) / 4.0)
+        self.assertFalse(torch.isclose(request_mean, candidate_mean))
+
     def test_sum_reduction_preserves_masked_sample_and_task_weight(self) -> None:
         logits = torch.zeros(2, 2)
         batch = FeatureBatch(
@@ -1382,6 +1568,14 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
         config = replace(
             base,
             sequences=sequences,
+            vocab_strategy=replace(
+                base.vocab_strategy,
+                features={
+                    name: strategy
+                    for name, strategy in base.vocab_strategy.features.items()
+                    if not name.startswith("hist.")
+                },
+            ),
             tokenization=replace(
                 base.tokenization,
                 sequence_tokens=[
@@ -1488,6 +1682,14 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
         config = replace(
             base,
             sequences=sequences,
+            vocab_strategy=replace(
+                base.vocab_strategy,
+                features={
+                    name: strategy
+                    for name, strategy in base.vocab_strategy.features.items()
+                    if not name.startswith("hist.")
+                },
+            ),
             tokenization=replace(base.tokenization, sequence_tokens=[group]),
             model=replace(base.model, token_dim=4),
         )
@@ -1548,6 +1750,14 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
             base,
             runtime=replace(base.runtime, attention_backend="sdpa"),
             sequences=[sequence],
+            vocab_strategy=replace(
+                base.vocab_strategy,
+                features={
+                    name: strategy
+                    for name, strategy in base.vocab_strategy.features.items()
+                    if not name.startswith("hist.")
+                },
+            ),
             tokenization=replace(base.tokenization, sequence_tokens=[group]),
             model=replace(base.model, token_dim=4),
         )

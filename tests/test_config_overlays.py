@@ -89,7 +89,7 @@ class ModelConfigOverlayTest(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                sequence.encoder == "mean_pool"
+                sequence.encoder == "attention_pool"
                 for sequence in production.sequences
                 if sequence.name.startswith("task_") and sequence.name.endswith("_prior")
             )
@@ -100,7 +100,28 @@ class ModelConfigOverlayTest(unittest.TestCase):
                 all(name.startswith("task_") for name in token.prior_inputs)
             )
         for token in production.tokenization.scenario_tokens:
-            self.assertTrue({"impr", "clk_long", "view_long"} <= set(token.prior_inputs))
+            if token.name == "global":
+                self.assertEqual(
+                    set(token.prior_inputs),
+                    {
+                        "scenario_global_impr_prior",
+                        "scenario_global_clk_long_prior",
+                        "scenario_global_view_long_prior",
+                    },
+                )
+            else:
+                self.assertIn(
+                    "scenario_conditioned_clk_long_prior",
+                    token.prior_inputs,
+                )
+                self.assertIn(
+                    "scenario_prior_scene_impr_cnt_15d_hn",
+                    token.prior_inputs,
+                )
+                self.assertIn(
+                    "scenario_prior_scene_impr_cnt_15d_hit_hn",
+                    token.prior_inputs,
+                )
 
         rankmixer = load_app_config(
             root / "configs" / "reference" / "rankmixer_paper.yaml"
@@ -108,7 +129,7 @@ class ModelConfigOverlayTest(unittest.TestCase):
         self.assertEqual(rankmixer.model.token_dim, 768)
         self.assertEqual(rankmixer.training.lr_dense, 0.01)
         self.assertEqual(rankmixer.tokenization.feature_tokenizer, "rankmixer")
-        self.assertEqual(rankmixer.resolved.encoded_input_dims["hist"], 33_792)
+        self.assertEqual(rankmixer.resolved.encoded_input_dims["hist"], 1_408)
 
         mdl = load_app_config(
             root / "configs" / "reference" / "mdl_rankmixer_paper.yaml"

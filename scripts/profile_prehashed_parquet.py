@@ -470,7 +470,7 @@ def _physical_axis_sources(
 def profile_spec_from_mapping(
     payload: Mapping[str, Any],
     *,
-    context_feature_count: int = 51,
+    context_feature_count: int = 47,
     source_name: str = "sample config",
 ) -> ProfileSpec:
     raw_features = payload.get("features", [])
@@ -603,7 +603,7 @@ def profile_spec_from_mapping(
 def load_profile_spec(
     config_path: str | Path,
     *,
-    context_feature_count: int = 51,
+    context_feature_count: int = 47,
 ) -> ProfileSpec:
     path = Path(config_path)
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -1313,7 +1313,7 @@ def main() -> int:
         help="Local path or HDFS URI. Repeat to scan multiple partitions.",
     )
     parser.add_argument("--output", type=Path, help="JSON report path; stdout when omitted")
-    parser.add_argument("--context-feature-count", type=int, default=51)
+    parser.add_argument("--context-feature-count", type=int, default=45)
     parser.add_argument("--candidate-buckets", type=_parse_buckets, default=DEFAULT_BUCKETS)
     parser.add_argument("--collision-target", type=float, default=0.01)
     parser.add_argument("--cardinality-headroom", type=float, default=1.5)
