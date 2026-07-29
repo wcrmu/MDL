@@ -498,7 +498,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         self.assertFalse(cateid_goods["encoding"].get("share_embedding", False))
         self.assertNotIn("share_with", upid_goods["encoding"])
         self.assertNotIn("share_with", cateid_goods["encoding"])
-        self.assertEqual(by_name["goods_id_hn"]["embedding_dim"], 64)
+        self.assertEqual(by_name["goods_id_hn"]["embedding_dim"], 32)
 
         self.assertEqual(
             payload["scenarios"],
@@ -841,7 +841,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         by_name = {item["name"]: item for item in payload["features"]}
         self.assertEqual(
             by_name["goods_id_hn"]["encoding"]["num_buckets"],
-            1 << 25,
+            1 << 28,
         )
         self.assertEqual(
             by_name["ups_clkv2_i2i_goods_ids_hit_size"]["encoding"]["num_buckets"],
@@ -1473,7 +1473,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     config.resolved.categorical_embedding_dims["goods_id_hn"],
-                    64,
+                    32,
                 )
                 if model_name in {"mdl_rankmixer", "mdl_onetrans"}:
                     prior_goods = config.resolved.categorical_input_by_name[
@@ -1489,7 +1489,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         config.resolved.categorical_embedding_dims[
                             "task_upid_pay_prior.goods_id_hn"
                         ],
-                        64,
+                        32,
                     )
                     physical = sum(
                         1
@@ -1591,11 +1591,11 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             # planned memory once those overrides apply.
             # Counts include independent global scenario priors + task
             # importants (goods capped at 16M); dead near-constants removed.
-            "baseline": (285, 68.045),
-            "shared": (284, 68.045),
-            "shared_dim": (284, 68.045),
-            "shared_dim_query_bucket": (284, 68.045),
-            "shared_dim_aggressive_bucket": (284, 68.045),
+            "baseline": (285, 65.009),
+            "shared": (284, 65.009),
+            "shared_dim": (284, 65.009),
+            "shared_dim_query_bucket": (284, 65.009),
+            "shared_dim_aggressive_bucket": (284, 65.009),
         }
         for profile, (tables, gib) in expected.items():
             with self.subTest(profile=profile):
@@ -1644,11 +1644,12 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     self.assertIn("phase2", payload["training"]["checkpoint_path"])
                     spec = _find_sequence_field(payload, "cart_long.spec_hn")
                     sku = _find_sequence_field(payload, "cart_long.sku_ids_hn")
-                    self.assertEqual(spec["embedding_dim"], 64)
+                    self.assertEqual(spec["embedding_dim"], 32)
                     self.assertEqual(spec["encoding"]["num_buckets"], 1 << 26)
-                    # Growth-aware recommendation (load-factor + semantic cap).
-                    self.assertEqual(sku["embedding_dim"], 64)
-                    self.assertEqual(sku["encoding"]["num_buckets"], 1 << 27)
+                    # 24-hour growth recommendation (12,000 files), with
+                    # width traded for hash capacity under the H100 budget.
+                    self.assertEqual(sku["embedding_dim"], 32)
+                    self.assertEqual(sku["encoding"]["num_buckets"], 1 << 29)
                     for sequence_name in (
                         "task_fst_cart_prior",
                         "task_upid_pay_prior",
@@ -1663,8 +1664,8 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         )
                         self.assertNotIn("share_with", goods["encoding"])
                         # Independent prior tables stay under PRIOR_INDEPENDENT_BUCKET_CAPS.
-                        self.assertEqual(goods["embedding_dim"], 64)
-                        self.assertEqual(
+                        self.assertEqual(goods["embedding_dim"], 32)
+                        self.assertLessEqual(
                             goods["encoding"]["num_buckets"],
                             1 << 24,
                         )

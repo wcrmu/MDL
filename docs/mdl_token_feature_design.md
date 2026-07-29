@@ -159,7 +159,7 @@ task important 不再复制 locale，也不默认复制 `goods_id`：
 - scenario history 的独立表尺寸跟随 profile 后 backbone 同 raw 字段的
   bucket/dim，独立不再隐含“回退到更大的估计维度”。
 
-当前 coarse MDL 配置约 286 张物理表，规划约 68.05 GiB/GPU
+当前 coarse MDL 配置约 286 张物理表，规划约 65.01 GiB/GPU
 （BF16 + Row-Wise Adagrad，2 GPU）；fine 配置约 284 张。
 
 ## 6. RankMixer feature token 边界

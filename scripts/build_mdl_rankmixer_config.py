@@ -759,11 +759,11 @@ PHASE2_TASK_PRIOR_SEQUENCES = (
 # onto scene_id_hn (fine-grained pre_hashed namespace).
 PHASE2_INDEPENDENT_SCENARIO_PRIORS = INDEPENDENT_COARSE_SCENARIO_PRIORS
 
-# Profile-driven emb/bucket targets from docs/emb_bucket_recommendation_growth.json
-# (Heaps growth 10→100 files, load-factor buckets, dim capped at 64). Applied after
-# name-estimate / Phase-2 tiers so regenerated YAMLs stay aligned.
-# uid_or_bg_hn is intentionally absent (removed from the feature contract).
-PROFILE_DRIVEN_EMBEDDING_SHAPES: dict[str, tuple[int, int]] = {
+# Bootstrap fallback for source distributions that omit repository docs.  In a
+# repository checkout, _load_profile_driven_embedding_shapes replaces this
+# snapshot with the reproducible 12,000-file / 24-hour policy in the JSON
+# report below.
+_BOOTSTRAP_PROFILE_DRIVEN_EMBEDDING_SHAPES: dict[str, tuple[int, int]] = {
     "ad_id_bin_hn": (256, 8),
     "adj_cartcvr_hn": (256, 16),
     "adj_ctr_hn": (256, 16),
@@ -771,42 +771,42 @@ PROFILE_DRIVEN_EMBEDDING_SHAPES: dict[str, tuple[int, int]] = {
     "auto_price_p05_dis": (512, 16),
     "auto_price_p10_dis_hn": (256, 16),
     "auto_sales_p10_dis": (256, 16),
-    "buy_long_spec_vids_hn": (33554432, 64),
+    "buy_long_spec_vids_hn": (33554432, 32),
     "buy_long_x_cat1_id_hn": (256, 16),
     "buy_long_x_cat2_id_hn": (1024, 24),
     "buy_long_x_cat3_id_hn": (16384, 32),
     "buy_long_x_cat4_id_hn": (32768, 32),
     "buy_long_x_cat_id_hn": (131072, 32),
-    "buy_long_x_goods_id_hn": (67108864, 64),
-    "buy_long_x_mall_id_hn": (4194304, 64),
+    "buy_long_x_goods_id_hn": (134217728, 32),
+    "buy_long_x_mall_id_hn": (2097152, 32),
     "buy_long_x_price_hn": (256, 16),
     "buy_long_x_sales_hn": (256, 16),
-    "buy_long_x_sku_ids_hn": (134217728, 64),
-    "buy_long_x_spec_hn": (33554432, 64),
+    "buy_long_x_sku_ids_hn": (268435456, 32),
+    "buy_long_x_spec_hn": (33554432, 32),
     "buy_long_x_timegap_hn": (256, 16),
-    "campaign_id_hn": (8388608, 64),
+    "campaign_id_hn": (8388608, 32),
     "cart_7d_cat1_ids_hn": (256, 16),
     "cart_cnt_1d_hn": (256, 16),
     "cart_cnt_3d_hn": (256, 16),
     "cart_hit_i2i_idx_hn": (256, 16),
     "cart_long_hit_samestyle_i2i_idx_hn": (256, 16),
-    "cart_long_spec_vids_hn": (33554432, 64),
+    "cart_long_spec_vids_hn": (67108864, 32),
     "cart_long_x_cat1_id_hn": (256, 16),
     "cart_long_x_cat2_id_hn": (1024, 24),
     "cart_long_x_cat3_id_hn": (16384, 32),
     "cart_long_x_cat4_id_hn": (65536, 32),
     "cart_long_x_cat_id_hn": (131072, 32),
-    "cart_long_x_goods_id_hn": (134217728, 64),
-    "cart_long_x_mall_id_hn": (4194304, 64),
+    "cart_long_x_goods_id_hn": (268435456, 32),
+    "cart_long_x_mall_id_hn": (4194304, 32),
     "cart_long_x_price_hn": (256, 16),
-    "cart_long_x_sku_ids_hn": (134217728, 64),
-    "cart_long_x_spec_hn": (67108864, 64),
+    "cart_long_x_sku_ids_hn": (536870912, 32),
+    "cart_long_x_spec_hn": (67108864, 32),
     "cart_long_x_timegap_hn": (256, 16),
     "cat1_id_hn": (256, 16),
     "cat2_id_hn": (1024, 24),
-    "cat3_id_hn": (8192, 24),
-    "cat4_id_hn": (32768, 32),
-    "cat_id_hn": (65536, 32),
+    "cat3_id_hn": (16384, 32),
+    "cat4_id_hn": (65536, 32),
+    "cat_id_hn": (131072, 32),
     "clk_1d_cat_cnt_hn": (256, 16),
     "clk_3d_cnt_hn": (256, 16),
     "clk_7d_page_sns_hn": (1024, 24),
@@ -818,8 +818,8 @@ PROFILE_DRIVEN_EMBEDDING_SHAPES: dict[str, tuple[int, int]] = {
     "clk_long_x_cat3_id_hn": (16384, 32),
     "clk_long_x_cat4_id_hn": (65536, 32),
     "clk_long_x_cat_id_hn": (131072, 32),
-    "clk_long_x_goods_id_hn": (134217728, 64),
-    "clk_long_x_mall_id_hn": (4194304, 64),
+    "clk_long_x_goods_id_hn": (268435456, 32),
+    "clk_long_x_mall_id_hn": (4194304, 32),
     "clk_long_x_page_sn_hn": (4096, 24),
     "clk_long_x_price_hn": (256, 16),
     "clk_long_x_sales_hn": (256, 16),
@@ -827,29 +827,29 @@ PROFILE_DRIVEN_EMBEDDING_SHAPES: dict[str, tuple[int, int]] = {
     "create_time_hn": (256, 8),
     "currency_hn": (256, 16),
     "f_goods_view_times_tg_l1_hn": (2048, 24),
-    "flatten_query_hash_x_flat_q_hash_hn": (2097152, 48),
+    "flatten_query_hash_x_flat_q_hash_hn": (2097152, 32),
     "flatten_query_hash_x_timegap_hn": (256, 8),
     "flip_mall_ids_hn": (2097152, 48),
-    "g_prpty_val_id_list_hn": (131072, 32),
-    "g_sku_spec_hash_hn": (16777216, 64),
-    "g_sku_spec_hn": (16777216, 64),
-    "g_sku_spec_unit_list_hn": (8388608, 64),
+    "g_prpty_val_id_list_hn": (131072, 48),
+    "g_sku_spec_hash_hn": (16777216, 32),
+    "g_sku_spec_hn": (33554432, 32),
+    "g_sku_spec_unit_list_hn": (16777216, 32),
     "goods_avlb_sku_num_dis_hn": (256, 16),
     "goods_cluster_id_1w_hn": (32768, 32),
-    "goods_id_hn": (33554432, 64),
-    "goods_name_bigram_hn": (16777216, 64),
-    "goods_ner_infos_hn": (4194304, 64),
+    "goods_id_hn": (268435456, 32),
+    "goods_name_bigram_hn": (33554432, 32),
+    "goods_ner_infos_hn": (4194304, 32),
     "goods_onsale_sku_num_dis_hn": (256, 16),
     "goods_query_emb32v3_cos_hn": (512, 16),
     "goods_scene_clk_cnt_15d_hn": (512, 16),
-    "goods_title_tfidf_term_hash_list_hn": (1048576, 48),
+    "goods_title_tfidf_term_hash_list_hn": (524288, 48),
     "hash_language_site_hn": (256, 16),
     "i2i2cat2_swing_hn": (1024, 24),
-    "i2i_coclk_hn_share": (33554432, 64),
+    "i2i_coclk_hn_share": (33554432, 32),
     "i2i_hit_site_q2i_idx_hn": (256, 16),
-    "i2i_list_amazoni2ifullgmv_hn_share": (16777216, 64),
-    "i2i_list_multimodal_hn_share": (134217728, 64),
-    "i2i_list_swingv3gmv_hn_share": (33554432, 64),
+    "i2i_list_amazoni2ifullgmv_hn_share": (16777216, 32),
+    "i2i_list_multimodal_hn_share": (268435456, 32),
+    "i2i_list_swingv3gmv_hn_share": (33554432, 32),
     "idx_c_adj_cart_cvr_15d_hn": (256, 16),
     "idx_c_adj_ctr_15d_hn": (256, 16),
     "idx_c_adj_ordr_cvr_15d_hn": (256, 16),
@@ -857,9 +857,9 @@ PROFILE_DRIVEN_EMBEDDING_SHAPES: dict[str, tuple[int, int]] = {
     "idx_c_clk_cnt_15d_hn": (256, 16),
     "idx_c_impr_cnt_15d_hn": (256, 16),
     "idx_c_ordr_cnt_15d_hn": (256, 16),
-    "idx_goods_creative_id_hn": (67108864, 64),
+    "idx_goods_creative_id_hn": (33554432, 32),
     "impr_3h_tg_hn": (256, 8),
-    "impr_all_tg_hn": (256, 8),
+    "impr_all_tg_hn": (256, 16),
     "impr_cat_clk_goods_ids_cnt_1d_hn": (4096, 24),
     "impr_clk_6h_cnt_hn": (1024, 24),
     "impr_long_goods_abs_timegap_1d_hn": (256, 8),
@@ -868,18 +868,18 @@ PROFILE_DRIVEN_EMBEDDING_SHAPES: dict[str, tuple[int, int]] = {
     "impr_x_cat3_id_hn": (16384, 32),
     "impr_x_cat4_id_hn": (32768, 32),
     "impr_x_cat_id_hn": (131072, 32),
-    "impr_x_goods_id_hn": (67108864, 64),
+    "impr_x_goods_id_hn": (67108864, 32),
     "impr_x_mall_id_hn": (2097152, 48),
     "impr_x_page_sn_hn": (1024, 24),
     "impr_x_price_hn": (256, 16),
     "impr_x_sales_hn": (256, 16),
     "impr_x_timegap_hn": (256, 8),
     "is_promotion_hn": (256, 8),
-    "language_hn": (256, 8),
+    "language_hn": (256, 16),
     "list_clk_cat1_ids_hn": (256, 16),
     "list_clk_cat_ids_hn": (65536, 32),
-    "main_goods_ids_hn_share": (16777216, 64),
-    "mall_id_hn": (2097152, 48),
+    "main_goods_ids_hn_share": (16777216, 32),
+    "mall_id_hn": (4194304, 32),
     "mid_cmprc_diff_list_dis": (256, 16),
     "mid_goods_prc_list_dis": (256, 16),
     "mkt_prc_hn": (256, 16),
@@ -888,27 +888,27 @@ PROFILE_DRIVEN_EMBEDDING_SHAPES: dict[str, tuple[int, int]] = {
     "nfk_gmv_14d_hn": (256, 16),
     "nfk_price_14d_hn": (256, 16),
     "nfk_sales_14d_hn": (256, 16),
-    "offline_outside_goods_id_list_hn_share": (16777216, 64),
-    "only_semi_swingi2i_cut60_hn_share": (8388608, 64),
-    "opt_id_hn": (4096, 24),
+    "offline_outside_goods_id_list_hn_share": (33554432, 32),
+    "only_semi_swingi2i_cut60_hn_share": (8388608, 32),
+    "opt_id_hn": (4096, 32),
     "ori_price_hn_share": (256, 16),
-    "origin_query_hash_hn": (524288, 48),
+    "origin_query_hash_hn": (1048576, 32),
     "page_elsn_hn": (256, 16),
-    "page_sn_hn": (512, 16),
+    "page_sn_hn": (4096, 24),
     "plat_hn": (256, 8),
-    "price_after_promotion_div_hn": (16384, 32),
+    "price_after_promotion_div_hn": (8192, 32),
     "price_after_promotion_hn": (256, 16),
     "price_bef_coupon_hn": (256, 16),
     "price_hn": (256, 16),
     "promotion_discount_hn": (256, 16),
-    "q2c_cart_15d_hit_val_hn": (32768, 32),
-    "q_hit_good_correct_unigram_hn": (65536, 32),
-    "query_arr_hn": (131072, 32),
-    "query_cat_hn": (16777216, 64),
-    "query_extend_translation_hash_hn": (131072, 32),
-    "query_hash_hn": (131072, 32),
+    "q2c_cart_15d_hit_val_hn": (16384, 32),
+    "q_hit_good_correct_unigram_hn": (65536, 48),
+    "query_arr_hn": (131072, 48),
+    "query_cat_hn": (8388608, 32),
+    "query_extend_translation_hash_hn": (65536, 48),
+    "query_hash_hn": (131072, 48),
     "query_pay_cnt_15d_hn": (256, 16),
-    "query_terms_hash_hn": (131072, 32),
+    "query_terms_hash_hn": (131072, 48),
     "query_tfidf_term_hash_list_hn": (262144, 48),
     "recall_merge_cate1_ids_hn": (256, 16),
     "recall_merge_cate_ids_hn": (131072, 32),
@@ -928,54 +928,55 @@ PROFILE_DRIVEN_EMBEDDING_SHAPES: dict[str, tuple[int, int]] = {
     "search_method_hn": (256, 16),
     "sellr_type_hn": (256, 8),
     "semi_clk_x_cat_id_hn": (65536, 32),
-    "semi_clk_x_goods_id_hn": (8388608, 64),
+    "semi_clk_x_goods_id_hn": (8388608, 32),
     "semi_clk_x_mall_id_hn": (262144, 48),
     "semi_clk_x_page_sn_hn": (1024, 24),
     "semi_clk_x_timegap_hn": (256, 8),
-    "semi_swingi2i_cut30_hn_share": (4194304, 64),
-    "sess_q2q_hash_list_hn": (8388608, 64),
+    "semi_swingi2i_cut30_hn_share": (4194304, 32),
+    "sess_q2q_hash_list_hn": (8388608, 32),
     "show_price_hn": (256, 16),
     "site_id_hn": (256, 16),
-    "site_q2i_good_list_hn_share": (16777216, 64),
+    "site_q2i_good_list_hn_share": (8388608, 32),
     "site_x_asian_code_hn": (512, 16),
     "sku_cart_cnt_7d_hn": (256, 16),
-    "sku_id_hn": (67108864, 64),
+    "sku_id_hn": (134217728, 32),
     "sku_ordr_cnt_1m_hn": (256, 16),
     "sku_price_dis_hn": (256, 16),
     "sku_price_v2_hn": (256, 16),
     "sku_sales_dis_hn": (256, 16),
     "sku_sales_hn": (256, 16),
-    "sku_spec_hash_hn": (16777216, 64),
-    "sku_spec_hn": (16777216, 64),
-    "sku_spec_vids_hn": (8388608, 64),
+    "sku_spec_hash_hn": (16777216, 32),
+    "sku_spec_hn": (16777216, 32),
+    "sku_spec_vids_hn": (16777216, 32),
     "srch_q2i_x_cat1_id_hn": (256, 16),
     "srch_q2i_x_cat2_id_hn": (1024, 24),
     "srch_q2i_x_cat3_id_hn": (8192, 24),
     "srch_q2i_x_cat4_id_hn": (32768, 32),
     "srch_q2i_x_cat_id_hn": (131072, 32),
-    "srch_q2i_x_goods_id_hn": (16777216, 64),
-    "srch_q2i_x_mall_id_hn": (2097152, 48),
+    "srch_q2i_x_goods_id_hn": (16777216, 32),
+    "srch_q2i_x_mall_id_hn": (1048576, 32),
     "srch_q2i_x_timegap_hn": (256, 16),
     "target_gs_last_cart_tg_hn": (256, 16),
     "timezone_hn": (1024, 24),
-    "tit_in_top_query_cnt_hn": (512, 16),
+    "tit_in_top_query_cnt_hn": (512, 24),
     "u_fst_ordr_cnt_mix_d_hn": (512, 16),
+    "uid_or_bg_hn": (16777216, 32),
     "ups_clk_sku_x_cat1_id_hn": (256, 16),
     "ups_clk_sku_x_cat2_id_hn": (1024, 24),
     "ups_clk_sku_x_cat3_id_hn": (8192, 24),
     "ups_clk_sku_x_cat4_id_hn": (32768, 32),
     "ups_clk_sku_x_cat_id_hn": (65536, 32),
-    "ups_clk_sku_x_goods_id_hn": (33554432, 64),
-    "ups_clk_sku_x_mall_id_hn": (2097152, 48),
-    "ups_clk_sku_x_spec_hn": (16777216, 64),
+    "ups_clk_sku_x_goods_id_hn": (33554432, 32),
+    "ups_clk_sku_x_mall_id_hn": (2097152, 32),
+    "ups_clk_sku_x_spec_hn": (33554432, 32),
     "ups_clk_sku_x_timegap_hn": (256, 16),
     "ups_clkv2_i2i_goods_ids_hit_all_size": (256, 16),
     "ups_clkv2_i2i_goods_ids_hit_size": (256, 16),
     "ups_in_cart_2h_sku_cur_prices_hn": (256, 8),
-    "ups_in_cart_goods_hn_share": (16777216, 64),
+    "ups_in_cart_goods_hn_share": (67108864, 32),
     "ups_in_cart_tg_hn": (256, 16),
     "ups_incart_cat1_id_nc_hn": (4096, 24),
-    "ups_query_term_hash_v2_hn": (2097152, 48),
+    "ups_query_term_hash_v2_hn": (2097152, 32),
     "ups_query_tg_hn": (256, 8),
     "ups_search_method_hash_hn": (256, 16),
     "us_ctr_price_dis50_hn": (256, 16),
@@ -996,8 +997,8 @@ PROFILE_DRIVEN_EMBEDDING_SHAPES: dict[str, tuple[int, int]] = {
     "view_long_x_clk_wish_hn": (256, 8),
     "view_long_x_fvid_cv_hn": (256, 8),
     "view_long_x_fvid_ratio_hn": (256, 8),
-    "view_long_x_goods_id_hn": (134217728, 64),
-    "view_long_x_mall_id_hn": (4194304, 64),
+    "view_long_x_goods_id_hn": (268435456, 32),
+    "view_long_x_mall_id_hn": (4194304, 32),
     "view_long_x_page_sn_hn": (4096, 24),
     "view_long_x_price_hn": (256, 16),
     "view_long_x_sales_hn": (256, 16),
@@ -1012,13 +1013,91 @@ PROFILE_DRIVEN_EMBEDDING_SHAPES: dict[str, tuple[int, int]] = {
     "view_long_x_timegap_hn": (256, 16),
     "view_long_x_vid_hn": (256, 8),
 }
-PROFILE_DRIVEN_SEQUENCE_SHAPES: dict[str, tuple[int, int]] = {
-    "cart_long.sku_ids_hn": (134217728, 64),
-    "flatten_query_hash.flat_q_hash_hn": (2097152, 48),
-    "impr.timegap_hn": (256, 8),
-    "view_long.share_hn": (256, 8),
-    "view_long.stay_time_hn": (256, 8),
-    "view_long.vid_hn": (256, 8),
+PROFILE_DRIVEN_RECOMMENDATION_PATH = (
+    REPOSITORY_ROOT / "docs" / "emb_bucket_recommendation_growth.json"
+)
+_PROFILE_DRIVEN_SEQUENCE_SOURCES = {
+    "cart_long.sku_ids_hn": "cart_long_x_sku_ids_hn",
+    "flatten_query_hash.flat_q_hash_hn": "flatten_query_hash_x_flat_q_hash_hn",
+    "impr.timegap_hn": "impr_x_timegap_hn",
+    "view_long.share_hn": "view_long_x_share_hn",
+    "view_long.stay_time_hn": "view_long_x_stay_time_hn",
+    "view_long.vid_hn": "view_long_x_vid_hn",
+}
+
+
+def _load_profile_driven_embedding_shapes() -> dict[str, tuple[int, int]]:
+    """Load the generated 24-hour shape policy and reject stale/malformed data."""
+
+    if not PROFILE_DRIVEN_RECOMMENDATION_PATH.is_file():
+        # Keep the offline builder usable in minimal source distributions that
+        # intentionally omit docs. Repository builds and tests take the checked,
+        # reproducible JSON path above.
+        return dict(_BOOTSTRAP_PROFILE_DRIVEN_EMBEDDING_SHAPES)
+    payload = json.loads(
+        PROFILE_DRIVEN_RECOMMENDATION_PATH.read_text(encoding="utf-8")
+    )
+    if not isinstance(payload, Mapping):
+        raise ValueError(
+            f"{PROFILE_DRIVEN_RECOMMENDATION_PATH} must contain an object"
+        )
+    method = payload.get("method")
+    if not isinstance(method, Mapping):
+        raise ValueError(
+            f"{PROFILE_DRIVEN_RECOMMENDATION_PATH} is missing method metadata"
+        )
+    primary = method.get("primary_horizon")
+    if (
+        int(payload.get("format_version") or 0) < 3
+        or not isinstance(primary, Mapping)
+        or float(primary.get("hours") or 0.0) != 24.0
+        or int(primary.get("files") or 0) != 12_000
+        or not bool(primary.get("used_for_config"))
+    ):
+        raise ValueError(
+            f"{PROFILE_DRIVEN_RECOMMENDATION_PATH} must be the checked "
+            "12,000-file / 24-hour production policy"
+        )
+    raw_shapes = payload.get("recommended_shapes")
+    if not isinstance(raw_shapes, Mapping) or not raw_shapes:
+        raise ValueError(
+            f"{PROFILE_DRIVEN_RECOMMENDATION_PATH} has no recommended_shapes"
+        )
+    shapes: dict[str, tuple[int, int]] = {}
+    for source, raw_shape in raw_shapes.items():
+        if not isinstance(raw_shape, Mapping):
+            raise ValueError(f"recommended_shapes.{source} must be an object")
+        buckets = raw_shape.get("num_buckets")
+        dimension = raw_shape.get("embedding_dim")
+        if (
+            isinstance(buckets, bool)
+            or not isinstance(buckets, int)
+            or buckets <= 0
+            or buckets & (buckets - 1)
+        ):
+            raise ValueError(
+                f"recommended_shapes.{source}.num_buckets must be a "
+                "positive power of two"
+            )
+        if (
+            isinstance(dimension, bool)
+            or not isinstance(dimension, int)
+            or dimension <= 0
+        ):
+            raise ValueError(
+                f"recommended_shapes.{source}.embedding_dim must be positive"
+            )
+        shapes[str(source)] = (buckets, dimension)
+    return shapes
+
+
+# Applied after report/name estimates and Phase-2 tiers, so every regenerated
+# YAML uses the same 10→100→12,000-file policy. Shared roots in this mapping
+# were sized from shared_embedding_groups union cardinality, not the root field.
+PROFILE_DRIVEN_EMBEDDING_SHAPES = _load_profile_driven_embedding_shapes()
+PROFILE_DRIVEN_SEQUENCE_SHAPES = {
+    table_name: PROFILE_DRIVEN_EMBEDDING_SHAPES[source]
+    for table_name, source in _PROFILE_DRIVEN_SEQUENCE_SOURCES.items()
 }
 
 

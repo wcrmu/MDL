@@ -1,5 +1,10 @@
 # Embedding bucket / dim 五档对照
 
+> **状态：历史的 25 字段初筛。** 当前已用完整的 10/100 文件 profile
+> 外推到 24 小时 / 12,000 文件，并覆盖所有字段及 shared union；请以
+> `docs/embedding_shape_24h_audit.md` 和
+> `docs/emb_bucket_recommendation_growth.json` 为准。
+
 对照基准：
 
 - **当前配置**：`configs/mdl_rankmixer.yaml`（与 baseline-fine 一致）

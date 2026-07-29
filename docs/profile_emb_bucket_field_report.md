@@ -1,5 +1,10 @@
 # Profile Emb / Bucket 逐字段替换评估报告
 
+> **状态：已被 10→100→12,000 文件审计替代。** 本文只使用 10 文件 profile，
+> 其中“当前配置”和替换建议均是历史快照。当前权威结果见
+> `docs/embedding_shape_24h_audit.md` 与
+> `docs/emb_bucket_recommendation_growth.json`。
+
 ## 先读这个：10 个文件 vs 线上 1 小时 ~500 个文件
 
 - 本 profile：`max_files=10`，实际扫描 **10** 个文件，`rows_scanned=18720`，`agg_rows=18720`。
