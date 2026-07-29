@@ -7917,11 +7917,15 @@ def resolve_auto_scenarios(
         raise ValueError(
             f"auto scenario values exceed scenarios.max_discovered={scenario.max_discovered}"
         )
-    # Pure RankMixer/OneTrans use raw scenes only for batch routing and
+    # Pure non-MDL backbones use raw scenes only for batch routing and
     # per-scene evaluation; they do not instantiate MDL domain tokens or
-    # scenario-scoped embedding tables.  Resolving their scenario names is
+    # scenario-scoped embedding tables. Resolving their scenario names is
     # therefore only a metadata operation.
-    if config.model.name not in {"mdl_rankmixer", "mdl_onetrans"}:
+    if config.model.name not in {
+        "mdl_rankmixer",
+        "mdl_onetrans",
+        "mdl_mixformer",
+    }:
         resolved = replace(
             config,
             scenarios=replace(

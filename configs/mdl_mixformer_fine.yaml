@@ -1,0 +1,41 @@
+# Fine-grained scene-discovery sibling of configs/mdl_mixformer.yaml.
+extends: mdl_onetrans_fine.yaml
+
+runtime:
+  activation_checkpoint: full
+  sequence_projection_chunk_tokens: 8192
+
+data:
+  train:
+    reader:
+      length_buckets:
+        - {max_length: 2048, batch_size: 96}
+        - {max_length: 4096, batch_size: 64}
+        - {max_length: 6144, batch_size: 40}
+        - {max_length: 8192, batch_size: 24}
+        - {max_length: null, batch_size: 48}
+
+tokenization:
+  feature_tokenizer: rankmixer
+  feature_tokens: []
+  num_feature_tokens: 16
+
+model:
+  name: mdl_mixformer
+  token_dim: 384
+  num_layers: 4
+  num_heads: 12
+  hidden_dim: 1024
+  task_head_hidden_dim: 1024
+  use_pyramid: false
+  final_s_tokens: null
+  first_domain_sequence_layer: null
+  mixformer_user_head_count: null
+  mdl_mixformer_query_conditioning: true
+  experimental_model_acknowledged: true
+
+training:
+  batch_size: 96
+  lr_dense: 0.01
+  dense_optimizer: rmsprop
+

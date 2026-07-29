@@ -119,7 +119,11 @@ def _needs_padded_sdpa_flash(config: AppConfig) -> bool:
     """
 
     model = config.model
-    if model.name not in {"mdl_rankmixer", "mdl_onetrans"}:
+    if model.name not in {
+        "mdl_rankmixer",
+        "mdl_onetrans",
+        "mdl_mixformer",
+    }:
         return False
     task_attention_enabled = (
         model.use_task_tokens and model.use_task_feature_interaction
@@ -4195,12 +4199,16 @@ def train_mdl(
                 include_group_id=False,
             )
         )
+        train_data = getattr(getattr(config, "data", None), "train", None)
+        train_reader = getattr(train_data, "reader", None)
         device_prefetch_depth = (
-            config.data.train.reader.device_prefetch_batches
+            int(getattr(train_reader, "device_prefetch_batches", 0))
             if device.type == "cuda"
             else 0
         )
-        host_prepare_depth = int(config.data.train.reader.host_prepare_prefetch)
+        host_prepare_depth = int(
+            getattr(train_reader, "host_prepare_prefetch", 0)
+        )
         if device_prefetch_depth > 0 and host_prepare_depth <= 0:
             # Device-prefetch thread would call in-process prepare → GIL fight.
             logger.warning(

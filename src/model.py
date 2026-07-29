@@ -47,6 +47,11 @@ from .modules.mlp import (
     SparseMoEPerTokenFFN,
     StackedPerTokenFFN,
 )
+from .modules.mixformer import (
+    MixFormerBlock,
+    MixFormerCrossAttention,
+    MixFormerRequestLayout,
+)
 from .modules.stca import STCASequenceCache, STCASequenceEncoder
 
 
@@ -177,6 +182,17 @@ class OneTransOutput:
     s_token_count: int
     ns_token_count: int
     s_valid_mask: Tensor
+
+
+@dataclass(frozen=True)
+class MixFormerInput:
+    """Tokenized non-sequential heads and request-major behavior sequence."""
+
+    feature_heads: Tensor
+    sequence_tokens: Tensor
+    sequence_valid_mask: Tensor
+    encoded_features: dict[str, Tensor]
+    sequence_row_indices: Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -2006,7 +2022,8 @@ class FeatureEncoderBank(nn.Module):
         default_scalar_feature_names = {
             feature.name
             for feature in config.features
-            if config.model.name in {"mdl_rankmixer", "mdl_onetrans"}
+            if config.model.name
+            in {"mdl_rankmixer", "mdl_onetrans", "mdl_mixformer"}
             or feature.embedding_scope in {"feature", "shared"}
         }
         if included_scalar_feature_names is None:
@@ -2027,6 +2044,9 @@ class FeatureEncoderBank(nn.Module):
         self.sequence_query_projectors = nn.ModuleDict()
         self.sequence_query_projector_keys: dict[str, str] = {}
         self.sequence_user_global_projectors = nn.ModuleDict()
+        self.sequence_user_global_input_names: dict[str, tuple[str, ...]] = {}
+        self.sequence_user_global_token_counts: dict[str, int] = {}
+        self.sequence_neutral_user_global_tokens = nn.ParameterDict()
         self.sequence_queries = nn.ParameterDict()
         self.sequence_cls_tokens = nn.ParameterDict()
         self.sequence_position_embeddings = nn.ModuleDict()
@@ -2205,6 +2225,18 @@ class FeatureEncoderBank(nn.Module):
             )
 
         for sequence in config.sequences:
+            active_user_global_inputs = tuple(
+                name
+                for name in sequence.longer_user_global_inputs
+                if name in self.output_dims
+            )
+            active_user_global_tokens = sequence.longer_user_global_tokens
+            self.sequence_user_global_input_names[
+                sequence.name
+            ] = active_user_global_inputs
+            self.sequence_user_global_token_counts[
+                sequence.name
+            ] = active_user_global_tokens
             step_input_dim = 0
             field_input_dims: dict[str, int] = {}
             for field in sequence.fields:
@@ -2297,7 +2329,7 @@ class FeatureEncoderBank(nn.Module):
             query_token_dim = self.sequence_token_dim
             if sequence.encoder == "longer":
                 user_global_tokens = (
-                    sequence.longer_user_global_tokens + sequence.longer_cls_tokens
+                    active_user_global_tokens + sequence.longer_cls_tokens
                 )
                 longer_encoder = LongerSequenceEncoder(
                     longer_dim,
@@ -2388,18 +2420,29 @@ class FeatureEncoderBank(nn.Module):
                         merged_hidden,
                         config.model.ffn_activation,
                     )
-                if sequence.longer_user_global_tokens > 0:
+                if active_user_global_tokens > 0 and active_user_global_inputs:
                     user_dim = sum(
                         self.output_dims[name]
-                        for name in sequence.longer_user_global_inputs
+                        for name in active_user_global_inputs
                     )
                     self.sequence_user_global_projectors[
                         sequence_key
                     ] = _projection_mlp(
                         user_dim,
-                        sequence.longer_user_global_tokens * query_token_dim,
+                        active_user_global_tokens * query_token_dim,
                         merged_hidden,
                         config.model.ffn_activation,
+                    )
+                elif active_user_global_tokens > 0:
+                    # MDL deliberately removes raw request-scene inputs from
+                    # LONGER. Preserve the configured summary-token partition
+                    # with a learned scene-independent query instead of
+                    # changing candidate/user token counts.
+                    self.sequence_neutral_user_global_tokens[
+                        sequence_key
+                    ] = _normal_parameter(
+                        (1, active_user_global_tokens, query_token_dim),
+                        config.model.init_std,
                     )
                 if sequence.longer_cls_tokens > 0:
                     self.sequence_cls_tokens[sequence_key] = _normal_parameter(
@@ -3328,18 +3371,29 @@ class FeatureEncoderBank(nn.Module):
         sequence_key = self._module_key(sequence.name)
         query_token_dim = self.sequence_longer_encoders[sequence_key].token_dim
         parts: list[Tensor] = []
-        if sequence.longer_user_global_tokens > 0:
-            user_input = torch.cat(
-                [encoded[name] for name in sequence.longer_user_global_inputs],
-                dim=1,
-            )
-            parts.append(
-                self.sequence_user_global_projectors[sequence_key](user_input).view(
-                    batch_size,
-                    sequence.longer_user_global_tokens,
-                    query_token_dim,
+        user_global_inputs = self.sequence_user_global_input_names[sequence.name]
+        user_global_tokens = self.sequence_user_global_token_counts[sequence.name]
+        if user_global_tokens > 0:
+            if user_global_inputs:
+                user_input = torch.cat(
+                    [encoded[name] for name in user_global_inputs],
+                    dim=1,
                 )
-            )
+                parts.append(
+                    self.sequence_user_global_projectors[sequence_key](
+                        user_input
+                    ).view(
+                        batch_size,
+                        user_global_tokens,
+                        query_token_dim,
+                    )
+                )
+            else:
+                parts.append(
+                    self.sequence_neutral_user_global_tokens[sequence_key]
+                    .to(dtype=reference.dtype)
+                    .expand(batch_size, -1, -1)
+                )
         if sequence.longer_cls_tokens > 0:
             parts.append(
                 self.sequence_cls_tokens[sequence_key]
@@ -3571,7 +3625,7 @@ class FeatureEncoderBank(nn.Module):
         user_input_names = {
             name
             for sequence in longer_sequences
-            for name in sequence.longer_user_global_inputs
+            for name in self.sequence_user_global_input_names[sequence.name]
         }
         if preencoded_inputs is None:
             cache_sequence_names: set[str] = set()
@@ -3774,7 +3828,9 @@ class FeatureEncoderBank(nn.Module):
             if not isinstance(value, dict):
                 raise ValueError(f"sequence {sequence.name!r} must be a payload dict")
             if sequence.name in inline_longer_names:
-                user_input_names = set(sequence.longer_user_global_inputs)
+                user_input_names = set(
+                    self.sequence_user_global_input_names[sequence.name]
+                )
                 sequence_preencoded = self._preencode_sharded_inputs(
                     features,
                     scalar_names=user_input_names,
@@ -4710,6 +4766,182 @@ class OneTransTokenizer(nn.Module):
             s_token_count=s_tokens.size(1),
             ns_token_count=ns_tokens.size(1),
             s_valid_mask=s_mask,
+        )
+
+
+class MixFormerFeatureHeadProjector(nn.Module):
+    """Paper input layer: concatenate, evenly split, independently project."""
+
+    def __init__(
+        self,
+        input_names: Sequence[str],
+        input_dims: Mapping[str, int],
+        num_heads: int,
+        head_dim: int,
+        init_std: float,
+    ) -> None:
+        super().__init__()
+        if not input_names:
+            raise ValueError("MixFormer requires non-sequential feature inputs")
+        if num_heads <= 0 or head_dim <= 0:
+            raise ValueError("MixFormer head count and dimension must be positive")
+        self.input_names = tuple(input_names)
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.input_dim = sum(input_dims[name] for name in self.input_names)
+        if self.input_dim % num_heads != 0:
+            raise ValueError(
+                "MixFormer concatenated feature width must divide evenly across heads"
+            )
+        self.input_slice_dim = self.input_dim // num_heads
+        self.weight = _normal_parameter(
+            (num_heads, head_dim, self.input_slice_dim),
+            init_std,
+        )
+
+    def forward(self, encoded: dict[str, Tensor]) -> Tensor:
+        packed = torch.cat([encoded[name] for name in self.input_names], dim=1)
+        if packed.ndim != 2 or packed.size(1) != self.input_dim:
+            raise ValueError(
+                f"MixFormer packed feature width must be {self.input_dim}, "
+                f"got {tuple(packed.shape)}"
+            )
+        sliced = packed.view(
+            packed.size(0),
+            self.num_heads,
+            self.input_slice_dim,
+        )
+        return torch.bmm(
+            sliced.transpose(0, 1),
+            self.weight.transpose(1, 2),
+        ).transpose(0, 1)
+
+
+class MixFormerTokenizer(OneTransTokenizer):
+    """Raw behavior tokenizer plus strict non-sequential embedding split.
+
+    Existing sequence alignment, truncation, intent fusion, request
+    deduplication, and grouped embedding lookup are reused from the project's
+    OneTrans data path.  Only the representation width changes: every action
+    is linearly aligned to ``N * D`` as required by MixFormer cross attention.
+    """
+
+    def __init__(self, config: AppConfig, encoder_bank: FeatureEncoderBank) -> None:
+        super().__init__(config, encoder_bank)
+        resolved = config.resolved.tokenization
+        self.num_feature_heads = int(resolved.feature_token_count)
+        self.feature_head_dim = int(config.model.token_dim)
+        self.sequence_dim = self.num_feature_heads * self.feature_head_dim
+        self.feature_input_names = tuple(resolved.feature_token_inputs)
+        self.feature_projector = MixFormerFeatureHeadProjector(
+            self.feature_input_names,
+            encoder_bank.output_dims,
+            self.num_feature_heads,
+            self.feature_head_dim,
+            config.model.init_std,
+        )
+
+        # The paper represents each action in the N*D cross-attention space.
+        # Current industrial field embeddings do not naturally sum to N*D, so
+        # one bias-free alignment matrix per semantic sequence group is the
+        # minimal data adaptation before the paper's per-layer SwiGLU.
+        self.sequence_projectors = nn.ModuleList(
+            nn.Linear(
+                self._group_input_dim(group),
+                self.sequence_dim,
+                bias=False,
+            )
+            for group in self.sequence_groups
+        )
+        if self.sequence_fusion == "timestamp_aware":
+            self.sequence_type_embeddings = _init_embedding(
+                nn.Embedding(len(self.sequence_groups), self.sequence_dim),
+                config.model.init_std,
+            )
+        else:
+            self.sequence_type_embeddings = None
+        separator_count = (
+            max(len(self.sequence_groups) - 1, 0)
+            if self.sequence_fusion == "intent_ordered" and self.use_sep_tokens
+            else 0
+        )
+        self.sep_tokens = nn.ParameterList(
+            _normal_parameter((1, 1, self.sequence_dim), config.model.init_std)
+            for _ in range(separator_count)
+        )
+
+        # Drop OneTrans's unused NS projection parameters. MixFormer uses the
+        # strict concatenate/split projector above.
+        del self.auto_ns_projection
+        self.ns_projectors = nn.ModuleList()
+        self.ns_input_names = set(self.feature_input_names)
+
+    def forward(
+        self,
+        features: dict[str, Any],
+        request_cache: OneTransRequestCache | None = None,
+        encoded_features: dict[str, Tensor] | None = None,
+        preencoded_inputs: dict[str, Tensor] | None = None,
+    ) -> MixFormerInput:  # type: ignore[override]
+        if preencoded_inputs is None:
+            preencoded_inputs = self._preencode_inputs(
+                features,
+                (
+                    set(self.feature_input_names)
+                    if encoded_features is None
+                    else set()
+                ),
+                include_sequences=request_cache is None,
+            )
+        if request_cache is None and self.config.model.use_request_cache:
+            request_cache = self.precompute_request_cache(
+                features,
+                preencoded_inputs,
+            )
+        encoded = (
+            encoded_features
+            if encoded_features is not None
+            else self.encoder_bank.encode_scalar_features(
+                features,
+                set(self.feature_input_names),
+                preencoded_inputs,
+            )
+        )
+        cache = (
+            self._sequence_token_part(features, preencoded_inputs)
+            if request_cache is None
+            else request_cache
+        )
+        feature_heads = self.feature_projector(encoded)
+        sequence_tokens = cache.s_tokens
+        sequence_mask = cache.s_valid_mask
+        row_indices = self.request_row_indices(features)
+        if row_indices is not None:
+            row_indices = row_indices.to(
+                device=sequence_tokens.device,
+                dtype=torch.long,
+            )
+            if row_indices.numel() != feature_heads.size(0):
+                raise ValueError(
+                    "MixFormer request row_indices must match candidate batch size"
+                )
+        elif sequence_tokens.size(0) == 1 and feature_heads.size(0) != 1:
+            row_indices = torch.zeros(
+                feature_heads.size(0),
+                dtype=torch.long,
+                device=sequence_tokens.device,
+            )
+        elif sequence_tokens.size(0) != feature_heads.size(0):
+            raise ValueError(
+                "MixFormer sequence batch must match candidates unless request "
+                "row_indices are provided"
+            )
+        return MixFormerInput(
+            feature_heads=feature_heads,
+            sequence_tokens=sequence_tokens,
+            sequence_valid_mask=sequence_mask,
+            encoded_features=encoded,
+            sequence_row_indices=row_indices,
         )
 
 
@@ -5977,7 +6209,7 @@ class RankMixerModel(nn.Module):
 
     def _run_rankmixer_blocks(self, feature_tokens: Tensor) -> Tensor:
         if (
-            self._dense_compiled is not None
+            getattr(self, "_dense_compiled", None) is not None
             and self.training
             and not _activation_checkpoint_enabled(
                 self.config.runtime.activation_checkpoint
@@ -6503,7 +6735,11 @@ def _consumed_scalar_feature_names(config: AppConfig) -> set[str]:
         if name not in sequence_names
     }
     active_extra_scopes: set[str] = set()
-    if config.model.name in {"mdl_rankmixer", "mdl_onetrans"}:
+    if config.model.name in {
+        "mdl_rankmixer",
+        "mdl_onetrans",
+        "mdl_mixformer",
+    }:
         if config.model.use_scenario_tokens:
             active_extra_scopes.add("scenario")
         if config.model.use_task_tokens:
@@ -6517,6 +6753,14 @@ def _consumed_scalar_feature_names(config: AppConfig) -> set[str]:
         included.update(sequence.longer_user_global_inputs)
         keep_request.update(sequence.target_inputs)
         keep_request.update(sequence.longer_user_global_inputs)
+    if config.model.name in {
+        "mdl_rankmixer",
+        "mdl_onetrans",
+        "mdl_mixformer",
+    }:
+        # MDL consumes the scenario-important replacements instead of leaking
+        # the request-level scene identifiers through LONGER's global inputs.
+        keep_request.clear()
     return {
         name
         for name in included
@@ -7612,6 +7856,516 @@ class MDLOneTransModel(nn.Module):
         return {"logits": logits}
 
 
+def _build_mixformer_blocks(
+    config: AppConfig,
+    feature_head_count: int,
+) -> nn.ModuleList:
+    return nn.ModuleList(
+        MixFormerBlock(
+            feature_head_count,
+            config.model.token_dim,
+            config.model.hidden_dim,
+            sequence_hidden_dim=config.model.hidden_dim,
+            sequence_chunk_tokens=int(
+                getattr(
+                    config.runtime,
+                    "sequence_projection_chunk_tokens",
+                    0,
+                )
+            ),
+            user_head_count=config.model.mixformer_user_head_count,
+        )
+        for _ in range(config.model.num_layers)
+    )
+
+
+def _mixformer_request_layout(
+    tokenized: MixFormerInput,
+) -> MixFormerRequestLayout | None:
+    row_indices = tokenized.sequence_row_indices
+    if row_indices is None:
+        return None
+    return MixFormerCrossAttention.request_layout(
+        row_indices,
+        tokenized.sequence_tokens.size(0),
+    )
+
+
+class MixFormerModel(nn.Module):
+    """Standalone MixFormer from ``paper/mixformer/main.tex``."""
+
+    def __init__(
+        self,
+        config: AppConfig,
+        vocab_maps: dict[str, dict[str, int]],
+        embedding_dim: int | None = None,
+        embedding_size_override: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.feature_head_count = int(
+            config.resolved.tokenization.feature_token_count
+        )
+        embedding_dim = (
+            config.model.embedding_dim if embedding_dim is None else embedding_dim
+        )
+        self.encoder_bank = FeatureEncoderBank(
+            config,
+            vocab_maps,
+            embedding_dim,
+            build_sequence_summaries=False,
+            included_scalar_feature_names=_consumed_scalar_feature_names(config),
+            embedding_size_override=embedding_size_override,
+        )
+        self.tokenizer = MixFormerTokenizer(config, self.encoder_bank)
+        self.blocks = _build_mixformer_blocks(config, self.feature_head_count)
+        # The paper denotes the stacked head output as a vector in R^(N*D).
+        output_dim = self.feature_head_count * config.model.token_dim
+        self.logit_layers = _build_task_heads(
+            config,
+            output_dim,
+            len(config.task_names),
+        )
+
+    def precompute_request_cache(
+        self,
+        features: dict[str, Any],
+    ) -> OneTransRequestCache:
+        return self.tokenizer.precompute_request_cache(features)
+
+    def _run_blocks(self, tokenized: MixFormerInput) -> Tensor:
+        feature_heads = tokenized.feature_heads
+        request_layout = _mixformer_request_layout(tokenized)
+        row_indices = tokenized.sequence_row_indices
+        for block in self.blocks:
+            if (
+                _activation_checkpoint_enabled(
+                    self.config.runtime.activation_checkpoint
+                )
+                and self.training
+            ):
+
+                def run_block(
+                    current_heads: Tensor,
+                    sequence_tokens: Tensor,
+                    sequence_mask: Tensor,
+                    *,
+                    current_block: MixFormerBlock = block,
+                ) -> Tensor:
+                    return current_block(
+                        current_heads,
+                        sequence_tokens,
+                        sequence_mask,
+                        row_indices,
+                        request_layout=request_layout,
+                    )
+
+                feature_heads = checkpoint(
+                    run_block,
+                    feature_heads,
+                    tokenized.sequence_tokens,
+                    tokenized.sequence_valid_mask,
+                    use_reentrant=False,
+                )
+            else:
+                feature_heads = block(
+                    feature_heads,
+                    tokenized.sequence_tokens,
+                    tokenized.sequence_valid_mask,
+                    row_indices,
+                    request_layout=request_layout,
+                )
+        return feature_heads
+
+    def forward(
+        self,
+        features: dict[str, Any],
+        scenario_id: Tensor,
+        request_cache: OneTransRequestCache | None = None,
+    ) -> dict[str, Tensor]:
+        del scenario_id
+        tokenized = self.tokenizer(features, request_cache=request_cache)
+        feature_heads = self._run_blocks(tokenized)
+        flattened = feature_heads.flatten(start_dim=1)
+        logits = torch.cat(
+            [head(flattened) for head in self.logit_layers],
+            dim=1,
+        )
+        return {"logits": logits}
+
+
+class ScenarioConditionedQueryRouter(nn.Module):
+    """Route the active MDL scenario state into MixFormer query heads.
+
+    A zero-initialized shared scenario delta keeps the initial function exactly
+    equal to MixFormer. Head-specific gates then learn how strongly each
+    semantic query should consume that scenario signal.
+    """
+
+    def __init__(self, num_heads: int, dim: int) -> None:
+        super().__init__()
+        if num_heads <= 0 or dim <= 0:
+            raise ValueError("head count and dimension must be positive")
+        self.num_heads = num_heads
+        self.dim = dim
+        self.context_norm = RMSNorm(dim)
+        self.head_gate = nn.Linear(dim, num_heads)
+        self.context_delta = nn.Linear(dim, dim, bias=False)
+        nn.init.constant_(self.head_gate.bias, -2.0)
+        nn.init.zeros_(self.context_delta.weight)
+
+    def forward(self, queries: Tensor, scenario_context: Tensor) -> Tensor:
+        if queries.ndim != 3 or tuple(queries.shape[1:]) != (
+            self.num_heads,
+            self.dim,
+        ):
+            raise ValueError(
+                f"queries must have shape [batch, {self.num_heads}, {self.dim}]"
+            )
+        if scenario_context.ndim != 2 or scenario_context.shape != (
+            queries.size(0),
+            self.dim,
+        ):
+            raise ValueError(
+                f"scenario_context must have shape [batch, {self.dim}]"
+            )
+        context = self.context_norm(scenario_context)
+        gates = torch.sigmoid(self.head_gate(context)).unsqueeze(-1)
+        delta = self.context_delta(context).unsqueeze(1)
+        return queries + gates * delta
+
+
+class MDLMixFormerBlock(nn.Module):
+    """Scenario-conditioned MixFormer followed by MDL domain propagation."""
+
+    def __init__(self, config: AppConfig, metadata: ModelMetadata) -> None:
+        super().__init__()
+        self.mixformer = MixFormerBlock(
+            metadata.feature_token_count,
+            config.model.token_dim,
+            config.model.hidden_dim,
+            sequence_hidden_dim=config.model.hidden_dim,
+            sequence_chunk_tokens=int(
+                getattr(
+                    config.runtime,
+                    "sequence_projection_chunk_tokens",
+                    0,
+                )
+            ),
+            user_head_count=config.model.mixformer_user_head_count,
+        )
+        _init_domain_interaction_modules(self, config, metadata)
+        self.include_global_scenario = config.model.use_global_scenario_token
+        self.query_router = (
+            ScenarioConditionedQueryRouter(
+                metadata.feature_token_count,
+                config.model.token_dim,
+            )
+            if (
+                config.model.mdl_mixformer_query_conditioning
+                and config.model.use_scenario_tokens
+            )
+            else None
+        )
+
+    def forward(
+        self,
+        feature_heads: Tensor,
+        sequence_tokens: Tensor,
+        sequence_mask: Tensor,
+        scenario_tokens: Tensor,
+        task_tokens: Tensor,
+        scenario_mask: Tensor,
+        scenario_prompts: Tensor | None = None,
+        task_prompts: Tensor | None = None,
+        sequence_row_indices: Tensor | None = None,
+        *,
+        request_layout: MixFormerRequestLayout | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        queries = self.mixformer.query_mixer(feature_heads)
+        if self.query_router is not None:
+            scenario_context = masked_scenario_pool(
+                scenario_tokens,
+                scenario_mask,
+                include_global=self.include_global_scenario,
+                has_global_state=self.include_global_scenario,
+            )
+            queries = self.query_router(queries, scenario_context)
+        attended = self.mixformer.cross_attention(
+            queries,
+            sequence_tokens,
+            sequence_mask,
+            sequence_row_indices,
+            request_layout=request_layout,
+        )
+        feature_heads = self.mixformer.output_fusion(attended)
+        scenario_tokens, task_tokens = _forward_domain_interaction(
+            self,
+            feature_heads,
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
+            scenario_prompts,
+            task_prompts,
+        )
+        return feature_heads, scenario_tokens, task_tokens
+
+
+class MDLMixFormerModel(nn.Module):
+    """Innovative MDL composition over a paper-aligned MixFormer backbone."""
+
+    def __init__(
+        self,
+        config: AppConfig,
+        vocab_maps: dict[str, dict[str, int]],
+        embedding_dim: int | None = None,
+        embedding_size_override: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        resolved_tok = config.resolved.tokenization
+        feature_head_count = int(resolved_tok.feature_token_count)
+        self.metadata = ModelMetadata(
+            feature_token_count=feature_head_count,
+            scenario_count=len(config.scenarios.names),
+            task_count=len(config.task_names),
+        )
+        embedding_dim = (
+            config.model.embedding_dim if embedding_dim is None else embedding_dim
+        )
+        sequence_summaries = _mdl_onetrans_sequence_summary_names(config)
+        self.encoder_bank = FeatureEncoderBank(
+            config,
+            vocab_maps,
+            embedding_dim,
+            build_sequence_summaries=sequence_summaries,
+            included_scalar_feature_names=_mdl_scalar_feature_names(config),
+            embedding_size_override=embedding_size_override,
+        )
+        self.tokenizer = MixFormerTokenizer(config, self.encoder_bank)
+        scenario_specs = _active_scenario_token_specs(
+            config,
+            config.tokenization.resolved_scenario_tokens(
+                config.features,
+                config.scenarios.names,
+                config.sequences,
+            ),
+        )
+        task_specs = (
+            config.tokenization.resolved_task_tokens(
+                config.features,
+                config.task_names,
+                config.sequences,
+            )
+            if config.model.use_task_tokens
+            else []
+        )
+        self.scenario_projector = (
+            DomainTokenProjector(
+                scenario_specs,
+                self.encoder_bank.output_dims,
+                config.model.token_dim,
+                config.model.hidden_dim,
+                activation=config.model.ffn_activation,
+            )
+            if config.model.use_scenario_tokens
+            else None
+        )
+        self.task_projector = (
+            DomainTokenProjector(
+                task_specs,
+                self.encoder_bank.output_dims,
+                config.model.token_dim,
+                config.model.hidden_dim,
+                activation=config.model.ffn_activation,
+            )
+            if config.model.use_task_tokens
+            else None
+        )
+        _init_mdl_readout_seeds(self, config, self.metadata)
+        self.blocks = nn.ModuleList(
+            MDLMixFormerBlock(config, self.metadata)
+            for _ in range(config.model.num_layers)
+        )
+        self.scene_feature_bias = _build_scene_feature_bias(config)
+        _init_mdl_output_modules(self, config, self.metadata)
+
+    def precompute_request_cache(
+        self,
+        features: dict[str, Any],
+    ) -> OneTransRequestCache:
+        return self.tokenizer.precompute_request_cache(features)
+
+    def _run_blocks(
+        self,
+        tokenized: MixFormerInput,
+        scenario_tokens: Tensor,
+        task_tokens: Tensor,
+        scenario_mask: Tensor,
+        scenario_prompts: Tensor,
+        task_prompts: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        feature_heads = tokenized.feature_heads
+        row_indices = tokenized.sequence_row_indices
+        request_layout = _mixformer_request_layout(tokenized)
+        split_state = self.config.model.mdl_token_state == "split"
+        for block in self.blocks:
+            if (
+                _activation_checkpoint_enabled(
+                    self.config.runtime.activation_checkpoint
+                )
+                and self.training
+            ):
+                if split_state:
+
+                    def run_split(
+                        current_heads: Tensor,
+                        sequence_tokens: Tensor,
+                        sequence_mask: Tensor,
+                        current_scenarios: Tensor,
+                        current_tasks: Tensor,
+                        current_scenario_mask: Tensor,
+                        current_scenario_prompts: Tensor,
+                        current_task_prompts: Tensor,
+                        *,
+                        current_block: MDLMixFormerBlock = block,
+                    ) -> tuple[Tensor, Tensor, Tensor]:
+                        return current_block(
+                            current_heads,
+                            sequence_tokens,
+                            sequence_mask,
+                            current_scenarios,
+                            current_tasks,
+                            current_scenario_mask,
+                            current_scenario_prompts,
+                            current_task_prompts,
+                            row_indices,
+                            request_layout=request_layout,
+                        )
+
+                    feature_heads, scenario_tokens, task_tokens = checkpoint(
+                        run_split,
+                        feature_heads,
+                        tokenized.sequence_tokens,
+                        tokenized.sequence_valid_mask,
+                        scenario_tokens,
+                        task_tokens,
+                        scenario_mask,
+                        scenario_prompts,
+                        task_prompts,
+                        use_reentrant=False,
+                    )
+                else:
+
+                    def run_coupled(
+                        current_heads: Tensor,
+                        sequence_tokens: Tensor,
+                        sequence_mask: Tensor,
+                        current_scenarios: Tensor,
+                        current_tasks: Tensor,
+                        current_scenario_mask: Tensor,
+                        *,
+                        current_block: MDLMixFormerBlock = block,
+                    ) -> tuple[Tensor, Tensor, Tensor]:
+                        return current_block(
+                            current_heads,
+                            sequence_tokens,
+                            sequence_mask,
+                            current_scenarios,
+                            current_tasks,
+                            current_scenario_mask,
+                            sequence_row_indices=row_indices,
+                            request_layout=request_layout,
+                        )
+
+                    feature_heads, scenario_tokens, task_tokens = checkpoint(
+                        run_coupled,
+                        feature_heads,
+                        tokenized.sequence_tokens,
+                        tokenized.sequence_valid_mask,
+                        scenario_tokens,
+                        task_tokens,
+                        scenario_mask,
+                        use_reentrant=False,
+                    )
+            else:
+                feature_heads, scenario_tokens, task_tokens = block(
+                    feature_heads,
+                    tokenized.sequence_tokens,
+                    tokenized.sequence_valid_mask,
+                    scenario_tokens,
+                    task_tokens,
+                    scenario_mask,
+                    scenario_prompts if split_state else None,
+                    task_prompts if split_state else None,
+                    row_indices,
+                    request_layout=request_layout,
+                )
+        return feature_heads, scenario_tokens, task_tokens
+
+    def forward(
+        self,
+        features: dict[str, Any],
+        scenario_id: Tensor,
+        request_cache: OneTransRequestCache | None = None,
+    ) -> dict[str, Tensor]:
+        # Selective sequence summaries are used only by configured MDL priors;
+        # raw main histories remain owned by MixFormerTokenizer.
+        encoded = self.encoder_bank(features)
+        tokenized = self.tokenizer(
+            features,
+            request_cache=request_cache,
+            encoded_features=encoded,
+        )
+        feature_heads = tokenized.feature_heads
+        scenario_prompts = (
+            self.scenario_projector(encoded)
+            if self.scenario_projector is not None
+            else _empty_domain_tokens(feature_heads)
+        )
+        task_prompts = (
+            self.task_projector(encoded)
+            if self.task_projector is not None
+            else _empty_domain_tokens(feature_heads)
+        )
+        scenario_tokens = _initial_mdl_domain_state(
+            scenario_prompts,
+            getattr(self, "scenario_readout_seed", None),
+        )
+        task_tokens = _initial_mdl_domain_state(
+            task_prompts,
+            getattr(self, "task_readout_seed", None),
+        )
+        scenario_mask = _scenario_mask_from_ids(
+            scenario_id,
+            self.metadata.scenario_count,
+            validate=getattr(self.config.runtime, "validate_scenario_ids", True),
+        )
+        if self.scene_feature_bias is not None:
+            feature_heads = self.scene_feature_bias(
+                feature_heads,
+                scenario_prompts,
+                scenario_mask,
+            )
+            tokenized = replace(tokenized, feature_heads=feature_heads)
+        feature_heads, scenario_tokens, task_tokens = self._run_blocks(
+            tokenized,
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
+            scenario_prompts,
+            task_prompts,
+        )
+        logits = _mdl_logits(
+            self,
+            feature_heads,
+            scenario_tokens,
+            task_tokens,
+            scenario_mask,
+        )
+        return {"logits": logits}
+
+
 def build_model(
     config: AppConfig,
     vocab_maps: dict[str, dict[str, int]],
@@ -7638,6 +8392,18 @@ def build_model(
         )
     if config.model.name == "mdl_onetrans":
         return MDLOneTransModel(
+            config,
+            vocab_maps,
+            embedding_size_override=embedding_size_override,
+        )
+    if config.model.name == "mixformer":
+        return MixFormerModel(
+            config,
+            vocab_maps,
+            embedding_size_override=embedding_size_override,
+        )
+    if config.model.name == "mdl_mixformer":
+        return MDLMixFormerModel(
             config,
             vocab_maps,
             embedding_size_override=embedding_size_override,

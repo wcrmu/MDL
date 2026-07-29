@@ -92,6 +92,8 @@ ModelName = Literal[
     "mdl_rankmixer",  # MDL scenario/task model with RankMixer feature blocks.
     "onetrans",  # Standalone OneTrans unified S/NS-token model.
     "mdl_onetrans",  # Experimental MDL-OneTrans composition; requires acknowledgement.
+    "mixformer",  # Standalone paper-aligned MixFormer unified query/sequence model.
+    "mdl_mixformer",  # Experimental domain-conditioned MDL-MixFormer composition.
     "longer",  # Standalone LONGER sequence recommendation model.
 ]
 
@@ -2375,6 +2377,13 @@ class ModelConfig:
     use_sep_tokens: bool = True
     final_s_tokens: int | None = None
     sequence_fusion: SequenceFusionType = "intent_ordered"
+    # MixFormer uses feature-token count as N and token_dim as the per-head D.
+    # null is the original MixFormer. Setting a strict interior split enables
+    # the paper's optional UI-MixFormer one-way user-to-item HeadMixing mask.
+    mixformer_user_head_count: int | None = None
+    # MDL-MixFormer innovation: route the active scenario state into the
+    # high-order queries before every sequence cross-attention operation.
+    mdl_mixformer_query_conditioning: bool = True
     rankmixer_ffn_type: RankMixerFFNType = "dense"
     sparse_moe_num_experts: int = 4
     sparse_moe_use_dtsi: bool = True
@@ -2407,10 +2416,13 @@ class ModelConfig:
             "mdl_rankmixer",
             "onetrans",
             "mdl_onetrans",
+            "mixformer",
+            "mdl_mixformer",
             "longer",
         }:
             raise ValueError(
-                "model.name must be rankmixer, mdl_rankmixer, onetrans, mdl_onetrans, or longer"
+                "model.name must be rankmixer, mdl_rankmixer, onetrans, "
+                "mdl_onetrans, mixformer, mdl_mixformer, or longer"
             )
         if self.token_dim <= 0:
             raise ValueError("model.token_dim must be positive")
@@ -2445,9 +2457,14 @@ class ModelConfig:
                 "model.scene_feature_bias must be none, additive, or film"
             )
         if self.mdl_token_state == "split":
-            if self.name not in {"mdl_rankmixer", "mdl_onetrans"}:
+            if self.name not in {
+                "mdl_rankmixer",
+                "mdl_onetrans",
+                "mdl_mixformer",
+            }:
                 raise ValueError(
-                    "model.mdl_token_state=split requires mdl_rankmixer or mdl_onetrans"
+                    "model.mdl_token_state=split requires mdl_rankmixer, "
+                    "mdl_onetrans, or mdl_mixformer"
                 )
             if not (self.use_task_tokens or self.use_scenario_tokens):
                 raise ValueError(
@@ -2472,9 +2489,14 @@ class ModelConfig:
                     "otherwise the scenario prompt still reaches feature/readout content directly"
                 )
         if self.scene_feature_bias != "none":
-            if self.name not in {"mdl_rankmixer", "mdl_onetrans"}:
+            if self.name not in {
+                "mdl_rankmixer",
+                "mdl_onetrans",
+                "mdl_mixformer",
+            }:
                 raise ValueError(
-                    "model.scene_feature_bias requires mdl_rankmixer or mdl_onetrans"
+                    "model.scene_feature_bias requires mdl_rankmixer or "
+                    "mdl_onetrans (or mdl_mixformer)"
                 )
             if not self.use_scenario_tokens:
                 raise ValueError(
@@ -2509,6 +2531,27 @@ class ModelConfig:
         if self.sequence_fusion not in {"timestamp_aware", "intent_ordered"}:
             raise ValueError(
                 "model.sequence_fusion must be timestamp_aware or intent_ordered"
+            )
+        if (
+            self.mixformer_user_head_count is not None
+            and (
+                type(self.mixformer_user_head_count) is not int
+                or self.mixformer_user_head_count <= 0
+            )
+        ):
+            raise ValueError(
+                "model.mixformer_user_head_count must be a positive integer or null"
+            )
+        if type(self.mdl_mixformer_query_conditioning) is not bool:
+            raise ValueError(
+                "model.mdl_mixformer_query_conditioning must be a boolean"
+            )
+        if (
+            self.mixformer_user_head_count is not None
+            and self.name not in {"mixformer", "mdl_mixformer"}
+        ):
+            raise ValueError(
+                "model.mixformer_user_head_count requires mixformer or mdl_mixformer"
             )
         if self.rankmixer_ffn_type not in {"dense", "sparse_moe"}:
             raise ValueError("model.rankmixer_ffn_type must be dense or sparse_moe")
@@ -2546,9 +2589,13 @@ class ModelConfig:
                 "model.sparse_moe_dtsi_training_output explicitly to acknowledge the "
                 "implementation choice"
             )
-        if self.name == "mdl_onetrans" and not self.experimental_model_acknowledged:
+        if (
+            self.name in {"mdl_onetrans", "mdl_mixformer"}
+            and not self.experimental_model_acknowledged
+        ):
             raise ValueError(
-                "model.name=mdl_onetrans is experimental and is not defined by the MDL or OneTrans paper; "
+                f"model.name={self.name} is an experimental composition and is not "
+                "defined by either source paper; "
                 "set model.experimental_model_acknowledged=true to opt in"
             )
 
@@ -4185,7 +4232,11 @@ def validate_tokenization_config(
 
 
 def _validate_mdl_extra_embeddings(config: AppConfig, resolved: ResolvedConfig) -> None:
-    if config.model.name not in {"mdl_rankmixer", "mdl_onetrans"}:
+    if config.model.name not in {
+        "mdl_rankmixer",
+        "mdl_onetrans",
+        "mdl_mixformer",
+    }:
         return
     feature_by_name = {feature.name: feature for feature in config.features}
     for section, tokens, expected_scope in (
@@ -4224,7 +4275,11 @@ def _validate_mdl_domain_priors(config: AppConfig, resolved: ResolvedConfig) -> 
     case while still allowing additional common inputs.
     """
 
-    if config.model.name not in {"mdl_rankmixer", "mdl_onetrans"}:
+    if config.model.name not in {
+        "mdl_rankmixer",
+        "mdl_onetrans",
+        "mdl_mixformer",
+    }:
         return
 
     input_scopes = {
@@ -4498,7 +4553,8 @@ def validate_app_config(config: AppConfig) -> None:
                         f"({sequence.max_length}) because that sequence consumes {ups}"
                     )
     if (
-        config.model.name in {"onetrans", "mdl_onetrans"}
+        config.model.name
+        in {"onetrans", "mdl_onetrans", "mixformer", "mdl_mixformer"}
         and config.model.sequence_fusion == "timestamp_aware"
     ):
         for group in resolved.tokenization.sequence_token_groups:
@@ -4506,10 +4562,16 @@ def validate_app_config(config: AppConfig) -> None:
                 sequence = sequence_by_name.get(input_name)
                 if sequence is not None and sequence.timestamp_field is None:
                     raise ValueError(
-                        f"timestamp-aware OneTrans requires sequences.{sequence.name}.timestamp_field; "
+                        f"timestamp-aware {config.model.name} requires "
+                        f"sequences.{sequence.name}.timestamp_field; "
                         "use model.sequence_fusion=intent_ordered when timestamps are unavailable"
                     )
-    if config.model.name in {"onetrans", "mdl_onetrans"}:
+    if config.model.name in {
+        "onetrans",
+        "mdl_onetrans",
+        "mixformer",
+        "mdl_mixformer",
+    }:
         s_sequence_names = {
             input_name
             for group in resolved.tokenization.sequence_token_groups
@@ -4524,12 +4586,12 @@ def validate_app_config(config: AppConfig) -> None:
         if encoded_s_sequences:
             raise ValueError(
                 f"model.name={config.model.name!r} requires encoder=raw for every "
-                "sequence referenced by tokenization.sequence_tokens because OneTrans "
+                "sequence referenced by tokenization.sequence_tokens because the model "
                 "performs event-level sequence modeling itself; pre-encoding those "
                 "S-stream sequences would recreate an encode-then-interaction path: "
                 + ", ".join(encoded_s_sequences)
             )
-        if config.model.name == "mdl_onetrans":
+        if config.model.name in {"mdl_onetrans", "mdl_mixformer"}:
             prior_only = [
                 sequence.name
                 for sequence in config.sequences
@@ -4539,9 +4601,9 @@ def validate_app_config(config: AppConfig) -> None:
                 sequence = sequence_by_name[name]
                 if sequence.encoder == "raw":
                     raise ValueError(
-                        f"prior-only sequence {name!r} for mdl_onetrans must use a "
+                        f"prior-only sequence {name!r} for {config.model.name} must use a "
                         "summary encoder such as mean_pool; raw is reserved for "
-                        "OneTrans S-stream sequences"
+                        "the event-level sequence stream"
                     )
                 if name in {
                     input_name
@@ -4558,8 +4620,9 @@ def validate_app_config(config: AppConfig) -> None:
         ]
         if raw_sequences:
             raise ValueError(
-                "encoder=raw delegates sequence modeling to OneTrans and is only valid for "
-                "model.name=onetrans or mdl_onetrans: " + ", ".join(raw_sequences)
+                "encoder=raw delegates event-level sequence modeling to the backbone "
+                "and is only valid for onetrans/mixformer families: "
+                + ", ".join(raw_sequences)
             )
     for sequence in config.sequences:
         if sequence.encoder == "stca":
@@ -4793,7 +4856,8 @@ def validate_app_config(config: AppConfig) -> None:
                 "one separate token and is projected independently."
             )
     if (
-        config.model.name in {"rankmixer", "mdl_rankmixer"}
+        config.model.name
+        in {"rankmixer", "mdl_rankmixer", "mixformer", "mdl_mixformer"}
         and config.model.token_dim % feature_token_count != 0
     ):
         raise ValueError(
@@ -4822,6 +4886,60 @@ def validate_app_config(config: AppConfig) -> None:
                 "requires tokenization.ns_tokens or scalar feature inputs"
             )
         resolve_onetrans_max_position_embeddings(config, resolved)
+    if config.model.name in {"mixformer", "mdl_mixformer"}:
+        if not resolved.tokenization.sequence_token_groups:
+            raise ValueError(
+                f"model.name={config.model.name!r} requires at least one sequence token"
+            )
+        if config.tokenization.feature_tokenizer != "rankmixer":
+            raise ValueError(
+                "MixFormer requires tokenization.feature_tokenizer=rankmixer so "
+                "the concatenated non-sequential embedding is evenly sliced before "
+                "independent head projection"
+            )
+        sequence_names = set(sequence_by_name)
+        if not resolved.tokenization.feature_token_inputs:
+            raise ValueError(
+                "MixFormer requires at least one non-sequential feature input"
+            )
+        sequence_feature_inputs = [
+            name
+            for name in resolved.tokenization.feature_token_inputs
+            if name in sequence_names
+        ]
+        if sequence_feature_inputs:
+            raise ValueError(
+                "MixFormer non-sequential feature_token_inputs must not contain "
+                "behavior sequences: " + ", ".join(sequence_feature_inputs)
+            )
+        non_sequence_event_inputs = [
+            input_name
+            for group in resolved.tokenization.sequence_token_groups
+            for input_name in group.input_refs
+            if input_name not in sequence_names
+        ]
+        if non_sequence_event_inputs:
+            raise ValueError(
+                "MixFormer sequence token groups must contain behavior sequences "
+                "only; action side attributes belong inside sequence fields: "
+                + ", ".join(non_sequence_event_inputs)
+            )
+        packed_input_dim = sum(
+            resolved.encoded_input_dims[name]
+            for name in resolved.tokenization.feature_token_inputs
+        )
+        if packed_input_dim % feature_token_count != 0:
+            raise ValueError(
+                "MixFormer requires the concatenated non-sequential embedding width "
+                "to divide evenly across feature heads: "
+                f"{packed_input_dim} % {feature_token_count} != 0"
+            )
+        user_heads = config.model.mixformer_user_head_count
+        if user_heads is not None and user_heads >= feature_token_count:
+            raise ValueError(
+                "model.mixformer_user_head_count must be smaller than the "
+                "resolved feature head count"
+            )
 
 
 def _merge_config_mappings(

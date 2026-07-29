@@ -466,8 +466,8 @@ def _add_tokenization_override_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "set tokenization.omit_scene_features (default true in schema). "
             "When enabled, request-axis scene fields (scene_id_hn / "
-            "scene_impr_* / scene_clk_*_hit) leave RankMixer feature tokens and "
-            "OneTrans NS; they still feed scenario tokens / LONGER. Candidate "
+            "scene_impr_* / scene_clk_*_hit) leave the non-sequential feature "
+            "pack; they still feed scenario tokens / LONGER. Candidate "
             "goods×scene crosses (scene_adj_* / goods_scene_*) stay in the pack. "
             "Use --no-omit-scene-features to keep request scene fields in the pack."
         ),

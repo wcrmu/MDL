@@ -15,11 +15,18 @@ from typing import Any
 
 import yaml
 
-from src.config import load_app_config
+from src.config import _load_config_mapping, load_app_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MODELS = ("rankmixer", "mdl_rankmixer", "onetrans", "mdl_onetrans")
+MODELS = (
+    "rankmixer",
+    "mdl_rankmixer",
+    "onetrans",
+    "mdl_onetrans",
+    "mixformer",
+    "mdl_mixformer",
+)
 MOCK_INPUTS = [
     str(ROOT / "artifacts" / "mock_parquet_full_2x2500_zstd"),
 ]
@@ -27,6 +34,20 @@ BUCKET_SOURCE = ROOT / "artifacts" / "bench_b512_direct.yaml"
 # Absolute ceiling for fixture embeddings on 24GB cards when a name is absent
 # from the capped bench map.
 DEFAULT_MAX_BUCKETS = 65536
+MASTER_PORTS = {
+    "rankmixer": 29611,
+    "mdl_rankmixer": 29612,
+    "onetrans": 29613,
+    "mdl_onetrans": 29614,
+    "mixformer": 29615,
+    "mdl_mixformer": 29616,
+}
+# 24GB mock E2E: production MixFormer batches under-fill the GPU after embedding
+# caps. Scale request batches (and length-bucket sizes) for util measurement only.
+MIXFORMER_E2E_BATCH_SCALE = {
+    "mixformer": 1.5,  # ~84% util @ ~9 GiB
+    "mdl_mixformer": 3.0,  # ~85% util @ ~14 GiB
+}
 
 
 def _feature_bucket_map(path: Path) -> dict[str, int]:
@@ -98,6 +119,49 @@ def _cap_sequence_payload(
     return capped
 
 
+def _scale_int(value: int, scale: float) -> int:
+    return max(8, int(round(int(value) * float(scale))))
+
+
+def _apply_mixformer_e2e_batch_scale(
+    payload: dict[str, Any],
+    model_name: str,
+) -> None:
+    scale = MIXFORMER_E2E_BATCH_SCALE.get(model_name)
+    if scale is None or scale == 1.0:
+        return
+    training = dict(payload.get("training") or {})
+    if "batch_size" in training:
+        training["batch_size"] = _scale_int(int(training["batch_size"]), scale)
+        payload["training"] = training
+    data = dict(payload.get("data") or {})
+    for split_name in ("train", "test"):
+        split = data.get(split_name)
+        if not isinstance(split, dict):
+            continue
+        split = dict(split)
+        reader = dict(split.get("reader") or {})
+        buckets = reader.get("length_buckets")
+        if isinstance(buckets, list):
+            scaled_buckets: list[dict[str, Any]] = []
+            for bucket in buckets:
+                if not isinstance(bucket, dict) or "batch_size" not in bucket:
+                    scaled_buckets.append(bucket)
+                    continue
+                item = dict(bucket)
+                item["batch_size"] = _scale_int(int(bucket["batch_size"]), scale)
+                scaled_buckets.append(item)
+            reader["length_buckets"] = scaled_buckets
+        # Larger MixFormer steps benefit from one extra device-prefetch slot.
+        reader["device_prefetch_batches"] = max(
+            int(reader.get("device_prefetch_batches") or 0),
+            2,
+        )
+        split["reader"] = reader
+        data[split_name] = split
+    payload["data"] = data
+
+
 def build_overlay(
     model_name: str,
     *,
@@ -106,8 +170,8 @@ def build_overlay(
     bucket_map: dict[str, int],
 ) -> Path:
     src = ROOT / "configs" / f"{model_name}.yaml"
-    with src.open("r", encoding="utf-8") as handle:
-        payload = yaml.safe_load(handle)
+    # Resolve ``extends`` so MixFormer overlays inherit the full parent contract.
+    payload = _load_config_mapping(src)
 
     payload["features"] = _cap_feature_payload(list(payload["features"]), bucket_map)
     if "sequences" in payload:
@@ -119,13 +183,22 @@ def build_overlay(
     runtime["nproc_per_node"] = nproc
     runtime["distributed"] = "ddp" if nproc > 1 else "none"
     # Unique ports so parallel model jobs do not collide on 29500.
-    runtime["master_port"] = {
-        "rankmixer": 29611,
-        "mdl_rankmixer": 29612,
-        "onetrans": 29613,
-        "mdl_onetrans": 29614,
-    }.get(model_name, 29500 + hash(model_name) % 1000)
+    runtime["master_port"] = MASTER_PORTS.get(
+        model_name, 29500 + hash(model_name) % 1000
+    )
+    # MixFormer cross-attention is a packed einsum path, not FlashAttention.
+    # Keep the flash SLO for models that actually emit Flash kernels.
+    if model_name in {"mixformer", "mdl_mixformer"}:
+        runtime["attention_backend"] = "sdpa"
     payload["runtime"] = runtime
+
+    # Mock random-init + paper lr_dense=0.01 is numerically unstable for the
+    # experimental MDL-MixFormer path (non-finite task logits within a few
+    # steps). Use a conservative dense LR for E2E util measurement only.
+    if model_name == "mdl_mixformer":
+        training = dict(payload.get("training") or {})
+        training["lr_dense"] = 1.0e-4
+        payload["training"] = training
 
     for split_name in ("train", "test"):
         split = (payload.get("data") or {}).get(split_name)
@@ -141,6 +214,8 @@ def build_overlay(
         reader.setdefault("agg_direct_mode", "direct")
         split["reader"] = reader
         payload.setdefault("data", {})[split_name] = split
+
+    _apply_mixformer_e2e_batch_scale(payload, model_name)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{model_name}_current_e2e.yaml"

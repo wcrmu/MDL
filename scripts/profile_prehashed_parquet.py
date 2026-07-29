@@ -36,6 +36,8 @@ MASK64 = (1 << 64) - 1
 # have to be repeated merely to diagnose that a strict collision target is
 # incompatible with the available embedding-memory budget.
 DEFAULT_BUCKETS = tuple(1 << exponent for exponent in range(10, 37))
+# Must match scripts/build_mdl_rankmixer_config.CONTEXT_FEATURE_COUNT (47/100 split).
+DEFAULT_CONTEXT_FEATURE_COUNT = 47
 DEFAULT_SKU_FIELDS = (
     "sku_id_hn",
     "sku_price_v2_hn",
@@ -470,7 +472,7 @@ def _physical_axis_sources(
 def profile_spec_from_mapping(
     payload: Mapping[str, Any],
     *,
-    context_feature_count: int = 47,
+    context_feature_count: int = DEFAULT_CONTEXT_FEATURE_COUNT,
     source_name: str = "sample config",
 ) -> ProfileSpec:
     raw_features = payload.get("features", [])
@@ -603,7 +605,7 @@ def profile_spec_from_mapping(
 def load_profile_spec(
     config_path: str | Path,
     *,
-    context_feature_count: int = 47,
+    context_feature_count: int = DEFAULT_CONTEXT_FEATURE_COUNT,
 ) -> ProfileSpec:
     path = Path(config_path)
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -1303,7 +1305,7 @@ def _parse_buckets(raw: str) -> tuple[int, ...]:
     return values
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/mdl_rankmixer.yaml"))
     parser.add_argument(
@@ -1313,7 +1315,11 @@ def main() -> int:
         help="Local path or HDFS URI. Repeat to scan multiple partitions.",
     )
     parser.add_argument("--output", type=Path, help="JSON report path; stdout when omitted")
-    parser.add_argument("--context-feature-count", type=int, default=45)
+    parser.add_argument(
+        "--context-feature-count",
+        type=int,
+        default=DEFAULT_CONTEXT_FEATURE_COUNT,
+    )
     parser.add_argument("--candidate-buckets", type=_parse_buckets, default=DEFAULT_BUCKETS)
     parser.add_argument("--collision-target", type=float, default=0.01)
     parser.add_argument("--cardinality-headroom", type=float, default=1.5)
@@ -1323,6 +1329,11 @@ def main() -> int:
     parser.add_argument("--max-files", type=int)
     parser.add_argument("--max-rows", type=int)
     parser.add_argument("--quiet", action="store_true")
+    return parser
+
+
+def main() -> int:
+    parser = build_arg_parser()
     args = parser.parse_args()
     try:
         spec = load_profile_spec(

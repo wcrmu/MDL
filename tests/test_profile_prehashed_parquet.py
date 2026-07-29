@@ -8,7 +8,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 
+from scripts.build_mdl_rankmixer_config import CONTEXT_FEATURE_COUNT
 from scripts.profile_prehashed_parquet import (
+    DEFAULT_CONTEXT_FEATURE_COUNT,
     _bucket_report,
     ContractProfile,
     FieldProfile,
@@ -435,6 +437,26 @@ class PreHashedParquetProfileTest(unittest.TestCase):
         self.assertEqual([item["source"] for item in conflicts], ["scalar_bad_hn"])
         self.assertEqual(conflicts[0]["depth"], 1)
         self.assertEqual(conflicts[0]["max_inner_length"], 4)
+
+    def test_context_feature_count_cli_default_matches_builder_contract(self) -> None:
+        from scripts.profile_prehashed_parquet import build_arg_parser as profile_parser
+        from scripts.recommend_categorical_encodings import (
+            build_arg_parser as recommend_parser,
+        )
+
+        self.assertEqual(DEFAULT_CONTEXT_FEATURE_COUNT, 47)
+        self.assertEqual(DEFAULT_CONTEXT_FEATURE_COUNT, CONTEXT_FEATURE_COUNT)
+
+        # --input is required; omit --context-feature-count to exercise the default.
+        profile_args = profile_parser().parse_args(["--input", "/tmp/unused"])
+        recommend_args = recommend_parser().parse_args(["--input", "/tmp/unused"])
+        self.assertEqual(profile_args.context_feature_count, CONTEXT_FEATURE_COUNT)
+        self.assertEqual(recommend_args.context_feature_count, CONTEXT_FEATURE_COUNT)
+
+        sample = Path("tests/fixtures/mdl_sample.yaml")
+        if sample.exists():
+            spec = load_profile_spec(sample)
+            self.assertEqual(len(spec.context_sources), CONTEXT_FEATURE_COUNT)
 
 
 if __name__ == "__main__":

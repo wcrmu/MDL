@@ -41,6 +41,7 @@ import yaml
 
 from scripts.profile_prehashed_parquet import (  # noqa: E402
     DEFAULT_BUCKETS,
+    DEFAULT_CONTEXT_FEATURE_COUNT,
     MASK64,
     BottomKValues,
     FieldProfile,
@@ -669,7 +670,7 @@ def scan_for_recommendations(
     }
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/mdl_rankmixer.yaml"))
     parser.add_argument(
@@ -679,7 +680,11 @@ def main() -> int:
         help="Local path or HDFS URI. Repeat for multi-day/partition union.",
     )
     parser.add_argument("--output", type=Path, help="JSON report path; stdout when omitted")
-    parser.add_argument("--context-feature-count", type=int, default=51)
+    parser.add_argument(
+        "--context-feature-count",
+        type=int,
+        default=DEFAULT_CONTEXT_FEATURE_COUNT,
+    )
     parser.add_argument("--candidate-buckets", type=_parse_buckets, default=DEFAULT_BUCKETS)
     parser.add_argument("--sample-size", type=int, default=4096)
     parser.add_argument("--hll-precision", type=int, default=12)
@@ -690,6 +695,11 @@ def main() -> int:
     parser.add_argument("--vocab-max-distinct", type=int, default=VOCAB_MAX_DISTINCT_DEFAULT)
     parser.add_argument("--head-tail-distinct", type=int, default=HEAD_TAIL_DISTINCT_DEFAULT)
     parser.add_argument("--quiet", action="store_true")
+    return parser
+
+
+def main() -> int:
+    parser = build_arg_parser()
     args = parser.parse_args()
     try:
         spec = load_profile_spec(

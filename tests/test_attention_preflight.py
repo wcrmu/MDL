@@ -157,6 +157,17 @@ class AttentionCapabilityHelperTest(unittest.TestCase):
                 },
             ),
             ("mdl_onetrans", True, True, None),
+            ("mixformer", False, False, None),
+            ("mdl_mixformer", False, True, None),
+            (
+                "mdl_mixformer",
+                False,
+                False,
+                {
+                    "use_task_feature_interaction": False,
+                    "use_scenario_feature_interaction": False,
+                },
+            ),
         )
         for model_name, expect_varlen, expect_padded, model_overrides in cases:
             with self.subTest(model=model_name, overrides=model_overrides):

@@ -1,0 +1,42 @@
+# Paper-aligned MixFormer over the current coarse-scene industrial data contract.
+# N=16, L=4, D=384 follows the internally consistent MixFormer-small setting
+# (the manuscript prints D=386 although HeadMixing requires D divisible by N).
+extends: onetrans.yaml
+
+runtime:
+  activation_checkpoint: full
+  sequence_projection_chunk_tokens: 8192
+
+data:
+  train:
+    reader:
+      length_buckets:
+        - {max_length: 2048, batch_size: 128}
+        - {max_length: 4096, batch_size: 80}
+        - {max_length: 6144, batch_size: 48}
+        - {max_length: 8192, batch_size: 32}
+        - {max_length: null, batch_size: 64}
+
+tokenization:
+  feature_tokenizer: rankmixer
+  feature_tokens: []
+  num_feature_tokens: 16
+
+model:
+  name: mixformer
+  token_dim: 384
+  num_layers: 4
+  num_heads: 12
+  # The paper does not disclose the SwiGLU intermediate width. 1024 gives a
+  # dense-parameter budget close to MixFormer-small and is feasible on 2xH100.
+  hidden_dim: 1024
+  task_head_hidden_dim: 1024
+  mixformer_user_head_count: null
+  use_pyramid: false
+  final_s_tokens: null
+
+training:
+  batch_size: 128
+  lr_dense: 0.01
+  dense_optimizer: rmsprop
+
