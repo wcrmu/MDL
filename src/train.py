@@ -2533,6 +2533,37 @@ def _terminate_process_group(
         pass
 
 
+def _close_process_queue(ipc_queue: Any) -> None:
+    """Discard an IPC queue without waiting for its feeder thread.
+
+    This is teardown after the producer process has already been terminated.
+    ``Queue.join_thread()`` has no timeout and can wait forever when that
+    producer died in JNI or while flushing a partially written payload.  The
+    parent also retains both pipe endpoints even though it only consumes from
+    the queue, so close them explicitly to wake a device-prefetch thread that
+    may still be blocked in ``Queue.get()``.
+    """
+
+    cancel_join = getattr(ipc_queue, "cancel_join_thread", None)
+    if callable(cancel_join):
+        try:
+            cancel_join()
+        except Exception:
+            pass
+    try:
+        ipc_queue.close()
+    except Exception:
+        pass
+    for endpoint_name in ("_reader", "_writer"):
+        endpoint = getattr(ipc_queue, endpoint_name, None)
+        close_endpoint = getattr(endpoint, "close", None)
+        if callable(close_endpoint):
+            try:
+                close_endpoint()
+            except Exception:
+                pass
+
+
 class _ProcessHostPrepareIterator:
     """Yield FeatureBatches prepared in a spawn child.
 
@@ -2669,6 +2700,10 @@ class _ProcessHostPrepareIterator:
 
     def _abort_stalled_child(self, error: RemoteIoStallError) -> None:
         logger.error("%s", error)
+        # Logging handlers may be buffered by the platform. Emit the root cause
+        # before teardown so a subsequent native/IPC cleanup failure cannot
+        # leave SIGKILL as the only visible line.
+        print(str(error), flush=True)
         self.close()
         abort_rank_for_remote_io_stall(error)
 
@@ -2723,14 +2758,7 @@ class _ProcessHostPrepareIterator:
             return
         self._closed = True
         _terminate_process_group(self._process, grace_sec=5.0, label="host-prepare")
-        try:
-            self._queue.close()
-        except Exception:
-            pass
-        try:
-            self._queue.join_thread()
-        except Exception:
-            pass
+        _close_process_queue(self._queue)
 
     def __del__(self) -> None:
         try:
@@ -2853,9 +2881,10 @@ def _record_feature_batch_stream(
         record(buffer)
 
 
-# Bound CUDA-prefetch teardown. Prefer waiting out in-flight HDFS/open timeouts
-# when possible; abandon rather than hang forever after training stops.
-_DEVICE_PREFETCH_JOIN_TIMEOUT_SEC = 180.0
+# Host teardown actively closes the process queue before joining this thread,
+# so a long HDFS/open timeout no longer has to be paid here. Keep a bounded
+# fallback for CUDA calls that cannot be interrupted from Python.
+_DEVICE_PREFETCH_JOIN_TIMEOUT_SEC = 30.0
 
 
 class _DevicePrefetchIterator:
@@ -2975,6 +3004,15 @@ class _DevicePrefetchIterator:
 
     def close(self) -> None:
         self.stop_event.set()
+        # Unblock a worker currently inside next(self.iterator) before waiting
+        # for it. The old order waited up to 180 seconds first, while the host
+        # iterator could only be closed from that same worker's finally block.
+        close_iterator = getattr(self.iterator, "close", None)
+        if callable(close_iterator):
+            try:
+                close_iterator()
+            except Exception as error:
+                logger.warning("device-prefetch host iterator close failed: %s", error)
         if self.thread is threading.current_thread():
             return
         # Prefer a clean join so CUDA/Arrow teardown does not race the worker.

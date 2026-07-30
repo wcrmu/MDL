@@ -827,7 +827,47 @@ class DevicePrefetchTest(unittest.TestCase):
         self.assertEqual(iterator.device, torch.device("cuda", 3))
         thread_type.return_value.start.assert_called_once_with()
         iterator.close()
-        thread_type.return_value.join.assert_called_once_with(timeout=180.0)
+        thread_type.return_value.join.assert_called_once_with(timeout=30.0)
+
+    def test_close_unblocks_host_iterator_before_joining_worker(self) -> None:
+        release = threading.Event()
+
+        class _BlockingHostIterator:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            def __next__(self):
+                release.wait(timeout=5.0)
+                raise StopIteration
+
+            def close(self) -> None:
+                self.close_calls += 1
+                release.set()
+
+        host_iterator = _BlockingHostIterator()
+        iterator = _DevicePrefetchIterator.__new__(_DevicePrefetchIterator)
+        iterator.iterator = host_iterator
+        iterator.device = torch.device("cuda", 0)
+        iterator._join_timeout_sec = 1.0
+        iterator.stop_event = threading.Event()
+        iterator.queue = queue.Queue(maxsize=1)
+
+        def wait_for_close() -> None:
+            try:
+                next(host_iterator)
+            except StopIteration:
+                pass
+
+        iterator.thread = threading.Thread(
+            target=wait_for_close,
+            daemon=True,
+        )
+        iterator.thread.start()
+
+        iterator.close()
+
+        self.assertEqual(host_iterator.close_calls, 1)
+        self.assertFalse(iterator.thread.is_alive())
 
     def test_close_abandons_hung_worker_after_join_timeout(self) -> None:
         release = threading.Event()

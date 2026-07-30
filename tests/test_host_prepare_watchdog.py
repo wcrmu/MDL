@@ -8,7 +8,10 @@ from unittest.mock import MagicMock, patch
 
 from src.config import LengthBucketConfig, ReaderConfig
 from src.dataloader import RemoteIoStallError
-from src.train import _ProcessHostPrepareIterator, _terminate_process_group
+from src.train import (
+    _ProcessHostPrepareIterator,
+    _terminate_process_group,
+)
 
 
 class HostPrepareWatchdogTest(unittest.TestCase):
@@ -56,16 +59,34 @@ class HostPrepareWatchdogTest(unittest.TestCase):
         with patch("src.train.perf_counter", side_effect=[0.0, 1.0]), patch(
             "src.train.abort_rank_for_remote_io_stall",
             side_effect=_abort,
-        ), patch.object(iterator, "close") as close:
+        ), patch("builtins.print") as print_message, patch.object(
+            iterator, "close"
+        ) as close:
             with self.assertRaises(SystemExit) as raised:
                 next(iterator)
         self.assertEqual(raised.exception.code, 70)
         self.assertEqual(len(aborted), 1)
         self.assertIsInstance(aborted[0], RemoteIoStallError)
         self.assertIn("startup exceeded", str(aborted[0]))
+        print_message.assert_called_once_with(str(aborted[0]), flush=True)
         close.assert_called_once()
         # Avoid __del__ -> real close() racing later tests that patch os.killpg.
         iterator._closed = True
+
+    def test_close_discards_queue_without_unbounded_join(self) -> None:
+        iterator = _ProcessHostPrepareIterator.__new__(_ProcessHostPrepareIterator)
+        iterator._closed = False
+        iterator._process = MagicMock()
+        iterator._process.is_alive.return_value = False
+        iterator._queue = MagicMock()
+
+        iterator.close()
+
+        iterator._queue.cancel_join_thread.assert_called_once_with()
+        iterator._queue.close.assert_called_once_with()
+        iterator._queue._reader.close.assert_called_once_with()
+        iterator._queue._writer.close.assert_called_once_with()
+        iterator._queue.join_thread.assert_not_called()
 
 
 if __name__ == "__main__":
