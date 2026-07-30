@@ -10,14 +10,8 @@ runtime:
   compile_mode: default
   require_compact_sequence_batches: false
   allow_tf32: true
-  activation_checkpoint: full
+  activation_checkpoint: none
   attention_backend: flash
-  # Match mdl_onetrans: compact pack + bounded projection/encoder peaks under
-  # full activation-checkpoint recompute on fat industrial batches.
-  varlen_packing: compact
-  sequence_projection_chunk_tokens: 8192
-  sequence_encoder_chunk_rows: 0
-  sequence_encoder_chunk_tokens: 16384
   distributed: ddp
   nproc_per_node: 2
   master_addr: 127.0.0.1
@@ -48,12 +42,10 @@ data:
       schema_validation_samples: 1
       cardinality_audit_raw_rows: 0
       coalesce_pinned_tensors: true
-      # Extra on-device batch roughly doubles peak HBM under full activation
-      # checkpoint + compact varlen recompute; host queue alone hides prepare.
-      device_prefetch_batches: 0
+      device_prefetch_batches: 1
       deduplicate_request_features: true
       agg_direct_mode: direct
-      host_prepare_prefetch: 2
+      host_prepare_prefetch: 3
       validate_prehashed_nonzero: false
       trusted_input: true
       shuffle_buffer_rows: 512
@@ -69,18 +61,16 @@ data:
       hdfs_close_timeout: 5
       length_bucket_metric: sum
       length_buckets:
-      # Step 1300 still OOMed on H100-80G at 768 with ~12GiB allocator
-      # fragmentation; cut another notch and steepen long buckets.
       - max_length: 2048
-        batch_size: 512
+        batch_size: 1280
       - max_length: 4096
-        batch_size: 256
+        batch_size: 800
       - max_length: 6144
-        batch_size: 160
+        batch_size: 512
       - max_length: 8192
-        batch_size: 96
+        batch_size: 384
       - max_length: null
-        batch_size: 128
+        batch_size: 640
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
       input_columns:
@@ -4444,7 +4434,7 @@ model:
   use_request_cache: true
 training:
   step_watchdog_sec: 600.0
-  batch_size: 512
+  batch_size: 1280
   embedding_distribution: sharded
   dense_distribution: ddp
   embedding_sharding:
@@ -4466,7 +4456,7 @@ training:
   lr_decay_steps: null
   lr_min_ratio: 0.0
   dense_optimizer: rmsprop
-  fused_dense_optimizer: false
+  fused_dense_optimizer: true
   dense_optimizer_foreach_bucket_mb: 128
   rmsprop_alpha: 0.99999
   rmsprop_momentum: 0.0
