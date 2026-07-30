@@ -8,6 +8,12 @@ from pathlib import Path
 import subprocess
 import sys
 
+# Apply before importing torch (via src.train / src.benchmark). Expandable
+# segments cut near-capacity fragmentation OOMs; both names are recognized by
+# current PyTorch allocators (CUDA-specific first, then unified).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 MAIN_SCRIPT = Path(__file__).resolve()
 DEFAULT_DATA_BASE_DIR = (
     "hdfs://temu-data-ns/apps/nothive/warehouse/searchrec/"
@@ -615,6 +621,7 @@ def _launch_ddp_command(args: argparse.Namespace, config) -> int:
     env["MDL_DDP_LAUNCHED"] = "1"
     # Expandable segments let adjacent variable-length batches reuse one CUDA
     # segment instead of failing with free-but-fragmented HBM near capacity.
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     # Probe local CUDA P2P: keep NVLink/P2P when healthy, otherwise fall back
     # via NCCL_IGNORE_DISABLED_P2P / NCCL_P2P_DISABLE (see train.py).
@@ -662,6 +669,9 @@ def _launch_ddp_command(args: argparse.Namespace, config) -> int:
 
 
 def _cmd_train(args: argparse.Namespace) -> int:
+    # Allocator conf is also set at process entry; keep setdefault here for
+    # torchrun workers that import src.train without going through main.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     config = _load_config(args)
     if _effective_distributed_mode(args, config) == "ddp" and not _in_distributed_launcher():
@@ -691,6 +701,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
 
 
 def _cmd_benchmark(args: argparse.Namespace) -> int:
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     config = _load_config(args)
     if _effective_distributed_mode(args, config) == "ddp" and not _in_distributed_launcher():

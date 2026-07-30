@@ -37,7 +37,9 @@ from .modules.attention import (
     _VarlenPacking,
     _call_varlen_attention,
     _sdpa_context,
+    ensure_contiguous,
     masked_scenario_pool,
+    packing_for_masks,
     validate_varlen_inputs,
     varlen_attention_available,
 )
@@ -997,13 +999,12 @@ class LongerSequenceAttentionBlock(nn.Module):
         query_tokens = query.transpose(1, 2)
         key_tokens = key.transpose(1, 2)
         value_tokens = value.transpose(1, 2)
-        query_packing = _VarlenPacking.from_mask(query_valid_mask)
+        query_packing, resolved_key_packing = packing_for_masks(
+            query_valid_mask,
+            key_valid_mask,
+        )
         if key_packing is None:
-            key_packing = (
-                query_packing
-                if query_valid_mask is key_valid_mask
-                else _VarlenPacking.from_mask(key_valid_mask)
-            )
+            key_packing = resolved_key_packing
         if (packed_key is None) != (packed_value is None):
             raise ValueError(
                 "packed LONGER K/V must both be supplied or both be omitted"
@@ -1011,14 +1012,18 @@ class LongerSequenceAttentionBlock(nn.Module):
         compact = self.varlen_packing == "compact"
         packed_query = query_packing.pack(query_tokens, compact=compact)
         if packed_key is None:
-            packed_key = key_packing.pack(key_tokens, compact=compact).contiguous()
-            packed_value = key_packing.pack(value_tokens, compact=compact).contiguous()
+            packed_key = ensure_contiguous(
+                key_packing.pack(key_tokens, compact=compact)
+            )
+            packed_value = ensure_contiguous(
+                key_packing.pack(value_tokens, compact=compact)
+            )
         if packed_query.numel() == 0:
             return torch.zeros_like(query)
         label = "causal" if causal else "full"
         with torch.profiler.record_function(f"longer::flash_varlen_{label}"):
             packed_output = _call_varlen_attention(
-                packed_query.contiguous(),
+                ensure_contiguous(packed_query),
                 packed_key,
                 packed_value,
                 query_packing.cumulative_lengths,
@@ -1167,8 +1172,12 @@ class LongerSequenceAttentionBlock(nn.Module):
         # attend to identical K/V. Pack that large history once and reuse it in
         # both FlashAttention launches instead of gathering it twice.
         with torch.profiler.record_function("longer::pack_mixed_kv"):
-            packed_key = key_packing.pack(key_tokens, compact=compact).contiguous()
-            packed_value = key_packing.pack(value_tokens, compact=compact).contiguous()
+            packed_key = ensure_contiguous(
+                key_packing.pack(key_tokens, compact=compact)
+            )
+            packed_value = ensure_contiguous(
+                key_packing.pack(value_tokens, compact=compact)
+            )
         parts: list[Tensor] = []
         if global_query_count:
             parts.append(
@@ -5470,11 +5479,9 @@ class MixedCausalAttention(nn.Module):
         query_tokens = query.transpose(1, 2)
         key_tokens = key.transpose(1, 2)
         value_tokens = value.transpose(1, 2)
-        query_packing = _VarlenPacking.from_mask(query_valid_mask)
-        key_packing = (
-            query_packing
-            if query_valid_mask is key_valid_mask
-            else _VarlenPacking.from_mask(key_valid_mask)
+        query_packing, key_packing = packing_for_masks(
+            query_valid_mask,
+            key_valid_mask,
         )
         compact = self.varlen_packing == "compact"
         packed_query = query_packing.pack(query_tokens, compact=compact)
@@ -5484,9 +5491,9 @@ class MixedCausalAttention(nn.Module):
             return self.output(self._merge_heads(torch.zeros_like(query)))
         with torch.profiler.record_function("onetrans::flash_varlen_causal"):
             packed_output = _call_varlen_attention(
-                packed_query.contiguous(),
-                packed_key.contiguous(),
-                packed_value.contiguous(),
+                ensure_contiguous(packed_query),
+                ensure_contiguous(packed_key),
+                ensure_contiguous(packed_value),
                 query_packing.cumulative_lengths,
                 key_packing.cumulative_lengths,
                 query_valid_mask.size(1),

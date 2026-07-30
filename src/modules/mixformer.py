@@ -337,7 +337,29 @@ class MixFormerCrossAttention(nn.Module):
         )
 
     def _transform_sequence(self, sequence: Tensor) -> Tensor:
-        normalized = self.sequence_norm(sequence)
+        return self._transform_sequence_slice(sequence, 0, sequence.size(1))
+
+    def _transform_sequence_slice(
+        self,
+        sequence: Tensor,
+        start: int,
+        end: int,
+    ) -> Tensor:
+        """SwiGLU residual on ``sequence[:, start:end]`` → ``[R, L', H, D]``.
+
+        Called from length-chunked attention so the full ``[R, L, N·D]`` history
+        activation never coexists with score workspaces.
+        """
+
+        chunk = sequence[:, start:end]
+        if chunk.size(1) == 0:
+            return chunk.new_empty(
+                chunk.size(0),
+                0,
+                self.num_heads,
+                self.dim,
+            )
+        normalized = self.sequence_norm(chunk)
         flat = normalized.reshape(-1, self.sequence_dim)
         if (
             self.sequence_chunk_tokens > 0
@@ -345,16 +367,16 @@ class MixFormerCrossAttention(nn.Module):
         ):
             update = torch.cat(
                 [
-                    self.sequence_ffn(chunk)
-                    for chunk in flat.split(self.sequence_chunk_tokens, dim=0)
+                    self.sequence_ffn(part)
+                    for part in flat.split(self.sequence_chunk_tokens, dim=0)
                 ],
                 dim=0,
-            ).view_as(sequence)
+            ).view_as(chunk)
         else:
             update = self.sequence_ffn(normalized)
-        return (sequence + update).view(
-            sequence.size(0),
-            sequence.size(1),
+        return (chunk + update).view(
+            chunk.size(0),
+            chunk.size(1),
             self.num_heads,
             self.dim,
         )
@@ -460,14 +482,14 @@ class MixFormerCrossAttention(nn.Module):
     def _context_aligned_chunked(
         self,
         score_query: Tensor,
-        history: Tensor,
+        sequence: Tensor,
         valid_mask: Tensor,
         length_chunk: int,
     ) -> Tensor:
-        """Online-softmax attention along the sequence length axis."""
+        """Online-softmax attention; FFN only the active length slice each step."""
 
         batch, num_heads, dim = score_query.shape
-        length = history.size(1)
+        length = sequence.size(1)
         neg = torch.finfo(torch.float32).min
         running_max = score_query.new_full(
             (batch, num_heads),
@@ -484,7 +506,7 @@ class MixFormerCrossAttention(nn.Module):
         )
         for start in range(0, length, length_chunk):
             end = min(length, start + length_chunk)
-            hist = history[:, start:end]
+            hist = self._transform_sequence_slice(sequence, start, end)
             mask = valid_mask[:, start:end]
             scores = (
                 torch.einsum("bnd,blnd->bnl", score_query, hist) * self.scale
@@ -515,12 +537,12 @@ class MixFormerCrossAttention(nn.Module):
     def _context_grouped_chunked(
         self,
         grouped_query: Tensor,
-        history: Tensor,
+        sequence: Tensor,
         valid_mask: Tensor,
         length_chunk: int,
     ) -> Tensor:
         request_count, max_targets, num_heads, dim = grouped_query.shape
-        length = history.size(1)
+        length = sequence.size(1)
         neg = torch.finfo(torch.float32).min
         running_max = grouped_query.new_full(
             (request_count, max_targets, num_heads),
@@ -537,7 +559,7 @@ class MixFormerCrossAttention(nn.Module):
         )
         for start in range(0, length, length_chunk):
             end = min(length, start + length_chunk)
-            hist = history[:, start:end]
+            hist = self._transform_sequence_slice(sequence, start, end)
             mask = valid_mask[:, start:end]
             scores = (
                 torch.einsum("rmnd,rlnd->rmnl", grouped_query, hist) * self.scale
@@ -568,21 +590,22 @@ class MixFormerCrossAttention(nn.Module):
     def _forward_aligned(
         self,
         score_query: Tensor,
-        history: Tensor,
+        sequence: Tensor,
         valid_mask: Tensor,
     ) -> Tensor:
-        if history.size(0) == 1 and score_query.size(0) != 1:
-            history = history.expand(score_query.size(0), -1, -1, -1)
+        if sequence.size(0) == 1 and score_query.size(0) != 1:
+            sequence = sequence.expand(score_query.size(0), -1, -1)
             valid_mask = valid_mask.expand(score_query.size(0), -1)
-        length_chunk = self._attention_length_chunk(history.size(1))
-        if length_chunk < history.size(1):
+        length_chunk = self._attention_length_chunk(sequence.size(1))
+        if length_chunk < sequence.size(1):
             context = self._context_aligned_chunked(
                 score_query,
-                history,
+                sequence,
                 valid_mask,
                 length_chunk,
             )
         else:
+            history = self._transform_sequence(sequence)
             context = self._context_from_aligned_scores(
                 score_query,
                 history,
@@ -593,7 +616,7 @@ class MixFormerCrossAttention(nn.Module):
     def _forward_grouped(
         self,
         score_query: Tensor,
-        history: Tensor,
+        sequence: Tensor,
         valid_mask: Tensor,
         layout: MixFormerRequestLayout,
     ) -> Tensor:
@@ -615,12 +638,12 @@ class MixFormerCrossAttention(nn.Module):
                 self.dim,
             )
         )
-        length_chunk = self._attention_length_chunk(history.size(1))
+        length_chunk = self._attention_length_chunk(sequence.size(1))
         # Bound padded request×target score storage by walking request rows when
         # the FFN token budget implies the full score tensor would dominate HBM.
         request_chunk = layout.request_count
-        if self.sequence_chunk_tokens > 0 and history.size(1) > 0:
-            tokens_per_request = history.size(1) * max(layout.max_targets, 1)
+        if self.sequence_chunk_tokens > 0 and sequence.size(1) > 0:
+            tokens_per_request = sequence.size(1) * max(layout.max_targets, 1)
             request_chunk = max(
                 1,
                 min(
@@ -638,29 +661,31 @@ class MixFormerCrossAttention(nn.Module):
             for start in range(0, layout.request_count, request_chunk):
                 end = min(layout.request_count, start + request_chunk)
                 query_slice = grouped_query[start:end]
-                hist_slice = history[start:end]
+                seq_slice = sequence[start:end]
                 mask_slice = valid_mask[start:end]
-                if length_chunk < history.size(1):
+                if length_chunk < sequence.size(1):
                     grouped_context[start:end] = self._context_grouped_chunked(
                         query_slice,
-                        hist_slice,
+                        seq_slice,
                         mask_slice,
                         length_chunk,
                     )
                 else:
+                    hist_slice = self._transform_sequence(seq_slice)
                     grouped_context[start:end] = self._context_from_grouped_scores(
                         query_slice,
                         hist_slice,
                         mask_slice,
                     )
-        elif length_chunk < history.size(1):
+        elif length_chunk < sequence.size(1):
             grouped_context = self._context_grouped_chunked(
                 grouped_query,
-                history,
+                sequence,
                 valid_mask,
                 length_chunk,
             )
         else:
+            history = self._transform_sequence(sequence)
             grouped_context = self._context_from_grouped_scores(
                 grouped_query,
                 history,
@@ -695,14 +720,13 @@ class MixFormerCrossAttention(nn.Module):
         )
         if sequence.size(1) == 0:
             return query
-        history = self._transform_sequence(sequence)
         score_query = self._project_query(query)
         if sequence_row_indices is None:
             if request_layout is not None:
                 raise ValueError(
                     "request_layout requires sequence_row_indices"
                 )
-            update = self._forward_aligned(score_query, history, valid_mask.bool())
+            update = self._forward_aligned(score_query, sequence, valid_mask.bool())
         else:
             layout = request_layout
             if layout is None:
@@ -719,7 +743,7 @@ class MixFormerCrossAttention(nn.Module):
                 raise ValueError("request_layout does not match attention inputs")
             update = self._forward_grouped(
                 score_query,
-                history,
+                sequence,
                 valid_mask.bool(),
                 layout,
             )

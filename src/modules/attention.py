@@ -41,6 +41,31 @@ def varlen_attention_backend() -> str | None:
     return None
 
 
+def ensure_contiguous(tensor: Tensor) -> Tensor:
+    """Avoid an extra HBM copy when Flash already received a contiguous view."""
+
+    return tensor if tensor.is_contiguous() else tensor.contiguous()
+
+
+def packing_for_masks(
+    query_valid_mask: Tensor,
+    key_valid_mask: Tensor,
+) -> tuple["_VarlenPacking", "_VarlenPacking"]:
+    """Build Q/K packing, reusing metadata when the masks alias the same storage."""
+
+    query_packing = _VarlenPacking.from_mask(query_valid_mask)
+    if query_valid_mask is key_valid_mask:
+        return query_packing, query_packing
+    if (
+        query_valid_mask.shape == key_valid_mask.shape
+        and query_valid_mask.dtype == key_valid_mask.dtype
+        and query_valid_mask.device == key_valid_mask.device
+        and query_valid_mask.data_ptr() == key_valid_mask.data_ptr()
+    ):
+        return query_packing, query_packing
+    return query_packing, _VarlenPacking.from_mask(key_valid_mask)
+
+
 def validate_varlen_inputs(
     query: Tensor,
     key: Tensor,
@@ -566,8 +591,8 @@ class VariableLengthDomainAttention(nn.Module):
         with torch.profiler.record_function("mdl::flash_varlen_domain_sequence"):
             packed_output = _call_varlen_attention(
                 query_tokens.view(-1, self.num_heads, self.head_dim),
-                key_packing.pack(key_tokens, compact=compact).contiguous(),
-                key_packing.pack(value_tokens, compact=compact).contiguous(),
+                ensure_contiguous(key_packing.pack(key_tokens, compact=compact)),
+                ensure_contiguous(key_packing.pack(value_tokens, compact=compact)),
                 cumulative_query_lengths,
                 key_packing.cumulative_lengths,
                 query_length,
