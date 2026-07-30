@@ -46,10 +46,13 @@ The long history is not copied per candidate.
 - The nine main behavior streams remain raw event streams and retain their
   configured truncation/order/null semantics. Their total configured capacity
   is 2048 events.
-- The source has meaningful time deltas but no common absolute timestamp
-  across all nine streams. Therefore the production configs use the paper's
-  single sequence interface with the project's existing intent-ordered fusion
-  and learned separators instead of inventing a cross-stream chronology.
+- All nine physical streams derive `time_delta_log1p_seconds` from the same
+  request `impr_time`. Since this is a monotonic request-relative clock, the
+  MixFormer profiles globally interleave valid actions by time delta and add a
+  learned stream/type embedding to each action. This realizes the paper's
+  single temporally ordered sequence without inventing absolute timestamps.
+  Separator tokens are disabled because the paper defines only real actions in
+  `S`, and action type is already represented explicitly.
 - Raw action field widths differ by behavior family and do not naturally equal
   `N*D`. A bias-free per-family linear alignment maps the concatenated action
   embedding into `N*D` before the paper's per-layer sequence SwiGLU. This is
@@ -60,9 +63,9 @@ The long history is not copied per candidate.
   consistent `D=384`.
 - The SwiGLU intermediate width is not disclosed. `H=1024` is used. With
   `N=16`, `D=384`, `L=4`, the current three-task production model has about
-  **278.79M dense parameters**, close to the paper's reported 282M
+  **278.80M dense parameters**, close to the paper's reported 282M
   MixFormer-small budget.
-- The coarse `mdl_mixformer` composition has **504.73M dense parameters** with
+- The coarse `mdl_mixformer` composition has **504.74M dense parameters** with
   the current scenario/task domain modules. Sparse embedding tables are not
   included in either count.
 - UI-MixFormer's mask is implemented but disabled in the supplied configs.

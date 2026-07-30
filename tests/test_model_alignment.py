@@ -963,6 +963,71 @@ class MDLLossAlignmentTest(unittest.TestCase):
         torch.testing.assert_close(paper_sum, 3.0 * unit)
         torch.testing.assert_close(balanced_mean, 2.0 * unit)
 
+    def test_task_loss_weights_scale_loss_and_gradients_by_task(self) -> None:
+        logits = torch.zeros(1, 3, requires_grad=True)
+        batch = FeatureBatch(
+            features={},
+            labels=torch.zeros(1, 3),
+            label_mask=None,
+            scenario_id=torch.zeros(1, dtype=torch.long),
+            group_id=[],
+        )
+
+        weighted_loss, _numerator, _denominator = _loss_terms_from_batch(
+            {"logits": logits},
+            batch,
+            loss_reduction="mean_per_task",
+            task_loss_weights=(0.5, 0.01, 0.01),
+        )
+        weighted_loss.backward()
+
+        unit = torch.nn.functional.binary_cross_entropy_with_logits(
+            torch.tensor(0.0),
+            torch.tensor(0.0),
+        )
+        torch.testing.assert_close(weighted_loss, 0.52 * unit)
+        torch.testing.assert_close(
+            logits.grad,
+            torch.tensor([[0.25, 0.005, 0.005]]),
+        )
+
+    def test_task_loss_weights_apply_to_all_loss_reductions(self) -> None:
+        unit = torch.nn.functional.binary_cross_entropy_with_logits(
+            torch.tensor(0.0),
+            torch.tensor(0.0),
+        )
+        for reduction in (
+            "sum",
+            "mean_per_task",
+            "mean_per_request_per_task",
+        ):
+            with self.subTest(reduction=reduction):
+                batch = FeatureBatch(
+                    features=(
+                        {
+                            "history": {
+                                "row_indices": torch.tensor(
+                                    [0],
+                                    dtype=torch.long,
+                                )
+                            }
+                        }
+                        if reduction == "mean_per_request_per_task"
+                        else {}
+                    ),
+                    labels=torch.zeros(1, 3),
+                    label_mask=None,
+                    scenario_id=torch.zeros(1, dtype=torch.long),
+                    group_id=[],
+                )
+                weighted_loss, _numerator, _denominator = _loss_terms_from_batch(
+                    {"logits": torch.zeros(1, 3)},
+                    batch,
+                    loss_reduction=reduction,
+                    task_loss_weights=(0.5, 0.01, 0.01),
+                )
+                torch.testing.assert_close(weighted_loss, 0.52 * unit)
+
     def test_complete_labels_use_implicit_all_observed_weights(self) -> None:
         logits = torch.zeros(2, 2)
         batch = FeatureBatch(
@@ -1548,20 +1613,32 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
         )
         self.assertEqual(first_linear.in_features, raw_sequence_dim)
 
-    def _fusion_tokenizer(self, fusion: str) -> OneTransTokenizer:
+    def _fusion_tokenizer(
+        self,
+        fusion: str,
+        *,
+        relative_time: bool = False,
+    ) -> OneTransTokenizer:
         base = self._base_config()
+        temporal_name = "time_delta" if relative_time else "timestamp"
         sequences = [
             SequenceConfig(
                 name=name,
                 fields=[
                     SequenceFieldConfig(
-                        name="timestamp",
+                        name=temporal_name,
                         kind="dense",
-                        source=f"{name}_timestamp",
+                        source=f"{name}_{temporal_name}",
                     )
                 ],
                 max_length=2,
-                timestamp_field="timestamp",
+                sequence_order=(
+                    "newest_to_oldest"
+                    if relative_time
+                    else "oldest_to_newest"
+                ),
+                timestamp_field=None if relative_time else temporal_name,
+                time_delta_field=temporal_name if relative_time else None,
             )
             for name in ("a", "b")
         ]
@@ -1608,14 +1685,18 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
                 tokenizer.sequence_type_embeddings.weight.zero_()
         return tokenizer
 
-    def _fusion_features(self) -> dict[str, dict[str, Tensor | dict[str, Tensor]]]:
+    def _fusion_features(
+        self,
+        *,
+        temporal_name: str = "timestamp",
+    ) -> dict[str, dict[str, Tensor | dict[str, Tensor]]]:
         return {
             "a": {
                 "event_inputs": torch.tensor(
                     [[[1.0, 0.0, 0.0, 0.0], [3.0, 0.0, 0.0, 0.0]]]
                 ),
                 "mask": torch.ones(1, 2, dtype=torch.bool),
-                "fields": {"timestamp": torch.tensor([[1.0, 3.0]])},
+                "fields": {temporal_name: torch.tensor([[1.0, 3.0]])},
                 "lengths": torch.tensor([2]),
             },
             "b": {
@@ -1623,7 +1704,7 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
                     [[[2.0, 0.0, 0.0, 0.0], [4.0, 0.0, 0.0, 0.0]]]
                 ),
                 "mask": torch.ones(1, 2, dtype=torch.bool),
-                "fields": {"timestamp": torch.tensor([[2.0, 4.0]])},
+                "fields": {temporal_name: torch.tensor([[2.0, 4.0]])},
                 "lengths": torch.tensor([2]),
             },
         }
@@ -1637,6 +1718,40 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
             cache.s_tokens[0, :, 0],
             torch.tensor([1.0, 2.0, 3.0, 4.0]),
         )
+
+    def test_time_delta_aware_fusion_interleaves_oldest_to_newest(self) -> None:
+        tokenizer = self._fusion_tokenizer(
+            "timestamp_aware",
+            relative_time=True,
+        )
+
+        cache = tokenizer.precompute_request_cache(
+            self._fusion_features(temporal_name="time_delta")
+        )
+
+        # Inputs are physically newest-to-oldest and age grows with recency
+        # distance. Fusion canonicalizes the unified sequence oldest-to-newest.
+        torch.testing.assert_close(
+            cache.s_tokens[0, :, 0],
+            torch.tensor([4.0, 3.0, 2.0, 1.0]),
+        )
+
+    def test_timestamp_aware_empty_histories_have_no_pseudo_events(self) -> None:
+        tokenizer = self._fusion_tokenizer(
+            "timestamp_aware",
+            relative_time=True,
+        )
+        features = self._fusion_features(temporal_name="time_delta")
+        for value in features.values():
+            value["event_inputs"] = value["event_inputs"][:, :0, :]
+            value["mask"] = value["mask"][:, :0]
+            value["fields"]["time_delta"] = value["fields"]["time_delta"][:, :0]
+            value["lengths"] = torch.zeros_like(value["lengths"])
+
+        cache = tokenizer.precompute_request_cache(features)
+
+        self.assertEqual(tuple(cache.s_tokens.shape), (1, 0, 4))
+        self.assertEqual(tuple(cache.s_valid_mask.shape), (1, 0))
 
     def test_intent_ordered_fusion_inserts_learned_separator(self) -> None:
         tokenizer = self._fusion_tokenizer("intent_ordered")

@@ -261,6 +261,8 @@ class MixFormerIntegrationTest(unittest.TestCase):
                     embedding_size_override=32,
                 )
                 self.assertIsInstance(model, expected_type)
+                self.assertIsNotNone(model.tokenizer.sequence_type_embeddings)
+                self.assertEqual(len(model.tokenizer.sep_tokens), 0)
                 _replace_id_embeddings_with_synthetic(model)
                 batch = _synthetic_feature_batch(
                     config,
@@ -367,6 +369,18 @@ class MixFormerIntegrationTest(unittest.TestCase):
                 self.assertEqual(
                     len(resolved.tokenization.sequence_token_groups),
                     9,
+                )
+                self.assertEqual(
+                    config.model.sequence_fusion,
+                    "timestamp_aware",
+                )
+                self.assertFalse(config.model.use_sep_tokens)
+                self.assertTrue(
+                    all(
+                        sequence_by_name[name].time_delta_field
+                        == "time_delta_log1p_seconds"
+                        for name in active_sequence_names
+                    )
                 )
                 self.assertEqual(active_sequence_capacity, 2048)
                 self.assertEqual(

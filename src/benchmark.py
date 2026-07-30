@@ -1271,6 +1271,11 @@ def _benchmark_compute(
         options.candidates_per_request,
         options.sequence_lengths,
     )
+    task_loss_weights = torch.tensor(
+        config.ordered_task_loss_weights,
+        device=context.device,
+        dtype=torch.float32,
+    )
     collector = _TraceCollector(options.warmup_steps, options.measured_steps, context.device)
     model_for_forward.train()
 
@@ -1293,6 +1298,7 @@ def _benchmark_compute(
                 batch,
                 moe_loss_weight=config.model.sparse_moe_loss_weight,
                 loss_reduction=config.training.loss_reduction,
+                task_loss_weights=task_loss_weights,
                 rank_active=True,
                 active_rank_count=context.world_size,
             )
@@ -1366,6 +1372,7 @@ def _benchmark_compute(
                     batch,
                     moe_loss_weight=config.model.sparse_moe_loss_weight,
                     loss_reduction=config.training.loss_reduction,
+                    task_loss_weights=task_loss_weights,
                     rank_active=True,
                     active_rank_count=context.world_size,
                 )

@@ -13,6 +13,7 @@ from torch import nn
 from src.embeddings import (
     EmbeddingTableSpec,
     ShardedEmbedding,
+    _partition_group_by_output_bytes,
     embedding_local_bytes,
     grouped_sharded_embedding_lookup,
     plan_embedding_shards,
@@ -303,7 +304,7 @@ def _grouped_lookup_worker(rank: int, world_size: int, port: int) -> None:
 
 
 def _grouped_mixed_dim_lookup_worker(rank: int, world_size: int, port: int) -> None:
-    """Mixed embedding widths must share one packed collective and stay correct."""
+    """Mixed embedding widths must stay correct when routed separately."""
 
     _init_gloo(rank, world_size, port)
     try:
@@ -408,6 +409,140 @@ def _grouped_mixed_dim_lookup_worker(rank: int, world_size: int, port: int) -> N
             )
     finally:
         torch_dist.destroy_process_group()
+
+
+def _grouped_chunked_lookup_worker(rank: int, world_size: int, port: int) -> None:
+    """Rank-identical byte chunks must preserve alias-gradient semantics."""
+
+    _init_gloo(rank, world_size, port)
+    try:
+        checker = getattr(torch.sparse, "check_sparse_tensor_invariants", None)
+        if checker is not None:
+            checker.disable()
+        specs = [
+            EmbeddingTableSpec("user", 13, 4),
+            EmbeddingTableSpec("item", 19, 4),
+        ]
+        plan = plan_embedding_shards(
+            specs,
+            world_size=world_size,
+            strategy="row_wise",
+            table_wise_max_rows=4,
+        )
+        modules = [
+            ShardedEmbedding(
+                spec.num_embeddings,
+                spec.embedding_dim,
+                table_name=spec.name,
+                shard_spec=plan.tables[spec.name],
+            )
+            for spec in specs
+        ]
+        full_weights = [
+            torch.arange(
+                spec.num_embeddings * spec.embedding_dim, dtype=torch.float32
+            ).view(spec.num_embeddings, spec.embedding_dim)
+            / float(10 + index)
+            for index, spec in enumerate(specs)
+        ]
+        for module, weight in zip(modules, full_weights):
+            weight[0].zero_()
+            module.load_full_weight_(weight)
+
+        # Global request sizes are [3, 2, 3, 2]. At 16 bytes/row, an 80-byte
+        # cap deterministically produces two [48 + 32]-byte grouped nodes.
+        # Rank 1 deliberately has smaller local shapes to exercise MAX planning.
+        ids_by_rank = (
+            (
+                torch.tensor([1, 1, 4]),
+                torch.tensor([2, 8]),
+                torch.tensor([4, 7, 0]),
+                torch.tensor([5, 5]),
+            ),
+            (
+                torch.tensor([2, 4]),
+                torch.tensor([3]),
+                torch.tensor([2]),
+                torch.tensor([8, 12]),
+            ),
+        )
+        rank_ids = ids_by_rank[rank]
+        request_modules = (modules[0], modules[1], modules[0], modules[1])
+        actual = grouped_sharded_embedding_lookup(
+            zip(request_modules, rank_ids),
+            max_output_bytes=80,
+        )
+        expected = [
+            F.embedding(ids, full_weights[index % 2], padding_idx=0)
+            for index, ids in enumerate(rank_ids)
+        ]
+        for output, reference in zip(actual, expected):
+            torch.testing.assert_close(output, reference)
+        sum(output.square().sum() for output in actual).backward()
+
+        optimizer = ShardedAdagrad(
+            [module.weight for module in modules],
+            lr=0.15,
+            initial_accumulator_value=0.1,
+        )
+        optimizer.step()
+
+        reference_weights = [
+            weight.clone().requires_grad_(True) for weight in full_weights
+        ]
+        reference_loss = 0.0
+        for requests_for_rank in ids_by_rank:
+            for request_index, ids in enumerate(requests_for_rank):
+                reference_loss = reference_loss + F.embedding(
+                    ids,
+                    reference_weights[request_index % 2],
+                    padding_idx=0,
+                ).square().sum()
+        (reference_loss / float(world_size)).backward()
+        reference_optimizer = torch.optim.Adagrad(
+            reference_weights,
+            lr=0.15,
+            initial_accumulator_value=0.1,
+        )
+        reference_optimizer.step()
+
+        for module, spec, reference_weight in zip(
+            modules, specs, reference_weights
+        ):
+            global_ids = torch.arange(spec.num_embeddings)
+            owned = plan.tables[spec.name].owner(global_ids) == rank
+            torch.testing.assert_close(
+                module.weight.detach(),
+                reference_weight.detach()[owned],
+                rtol=1e-6,
+                atol=1e-6,
+            )
+    finally:
+        torch_dist.destroy_process_group()
+
+
+class GroupedEmbeddingChunkPlanningTest(unittest.TestCase):
+    def test_partitions_by_global_packed_output_bytes(self) -> None:
+        self.assertEqual(
+            _partition_group_by_output_bytes(
+                [0, 1, 2, 3],
+                (3, 2, 3, 2),
+                bytes_per_row=16,
+                max_output_bytes=80,
+            ),
+            [[0, 1], [2, 3]],
+        )
+
+    def test_single_oversized_request_remains_atomic(self) -> None:
+        self.assertEqual(
+            _partition_group_by_output_bytes(
+                [0, 1],
+                (10, 1),
+                bytes_per_row=16,
+                max_output_bytes=80,
+            ),
+            [[0], [1]],
+        )
 
 
 class ShardingPlannerTest(unittest.TestCase):
@@ -554,6 +689,15 @@ class ShardedEmbeddingParityTest(unittest.TestCase):
     def test_grouped_mixed_dims_match_full_table_adagrad(self) -> None:
         torch_mp.start_processes(
             _grouped_mixed_dim_lookup_worker,
+            args=(2, _free_port()),
+            nprocs=2,
+            join=True,
+            start_method="spawn",
+        )
+
+    def test_grouped_byte_chunks_match_full_table_adagrad(self) -> None:
+        torch_mp.start_processes(
+            _grouped_chunked_lookup_worker,
             args=(2, _free_port()),
             nprocs=2,
             join=True,

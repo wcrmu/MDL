@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+import queue
 import tempfile
 import threading
 import time
@@ -826,7 +827,45 @@ class DevicePrefetchTest(unittest.TestCase):
         self.assertEqual(iterator.device, torch.device("cuda", 3))
         thread_type.return_value.start.assert_called_once_with()
         iterator.close()
-        thread_type.return_value.join.assert_called_once_with()
+        thread_type.return_value.join.assert_called_once_with(timeout=180.0)
+
+    def test_close_abandons_hung_worker_after_join_timeout(self) -> None:
+        release = threading.Event()
+
+        class _HungHostIterator:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                release.wait(timeout=5.0)
+                raise StopIteration
+
+            def close(self) -> None:
+                return None
+
+        with patch("src.train.torch.cuda.current_device", return_value=0), patch(
+            "src.train.torch.cuda.set_device"
+        ), patch("src.train.torch.cuda.Stream"):
+            # Avoid starting a real CUDA worker: inject a thread that blocks.
+            iterator = _DevicePrefetchIterator.__new__(_DevicePrefetchIterator)
+            iterator.iterator = _HungHostIterator()
+            iterator.device = torch.device("cuda", 0)
+            iterator._join_timeout_sec = 0.05
+            iterator.stop_event = threading.Event()
+            iterator.queue = queue.Queue(maxsize=1)
+
+            def hang() -> None:
+                release.wait(timeout=5.0)
+
+            iterator.thread = threading.Thread(target=hang, daemon=True)
+            iterator.thread.start()
+            started = time.perf_counter()
+            iterator.close()
+            elapsed = time.perf_counter() - started
+            self.assertTrue(iterator.thread.is_alive())
+            self.assertLess(elapsed, 1.0)
+            release.set()
+            iterator.thread.join(timeout=1.0)
 
 
 class ByteBudgetTest(unittest.TestCase):

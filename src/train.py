@@ -38,16 +38,19 @@ from .dataloader import (
     FeatureBatch,
     PreparedAxisBatch,
     PreparedBatchTable,
+    RemoteIoStallError,
     SourceRegistry,
     _adapter_request_level_sources,
     _coalesce_feature_batch,
     _column_array,
     _require_pyarrow,
     _safe_table_take,
+    abort_rank_for_remote_io_stall,
     axis_batch_to_feature_batch,
     build_packed_request_plan,
     build_request_deduplication_from_pack,
     discover_scenario_values,
+    is_remote_io_stall_error,
     iter_adapted_axis_bundles,
     iter_flat_tables,
     iter_length_bucketed_packs,
@@ -85,6 +88,62 @@ _CONTROL_PROCESS_GROUP: torch_dist.ProcessGroup | None = None
 # survive a slow rank-0 metadata pass; discovery itself is also optimized.
 _PROCESS_GROUP_TIMEOUT = timedelta(minutes=60)
 _BATCH_SEQUENCE_WORK_COLUMN = "__mdl_batch_sequence_work"
+
+
+class _StepWatchdog:
+    """Terminate the process if training stops making optimizer-step progress.
+
+    Silent hangs (blocked HDFS JNI / NCCL waits) leave GPU memory allocated and
+    print no traceback. A daemon watchdog converts that into a hard exit so the
+    job can be restarted.
+    """
+
+    def __init__(self, timeout_sec: float, *, rank: int = 0) -> None:
+        self._timeout_sec = float(timeout_sec)
+        self._rank = int(rank)
+        self._last_progress = perf_counter()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="mdl-step-watchdog",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.beat()
+        self._thread.start()
+        if self._rank == 0:
+            logger.info(
+                "step watchdog armed: exit if no optimizer step for %.0fs",
+                self._timeout_sec,
+            )
+
+    def beat(self) -> None:
+        with self._lock:
+            self._last_progress = perf_counter()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        # Poll often enough to notice stalls promptly without waking every second.
+        interval = min(30.0, max(5.0, self._timeout_sec / 60.0))
+        while not self._stop.wait(interval):
+            with self._lock:
+                stalled = perf_counter() - self._last_progress
+            if stalled < self._timeout_sec:
+                continue
+            message = (
+                f"Train step watchdog: no optimizer step for {stalled:.0f}s "
+                f"(limit={self._timeout_sec:.0f}s) on rank={self._rank}; "
+                "exiting to escape a likely dataloader/NCCL hang"
+            )
+            logger.error(message)
+            print(message, flush=True)
+            # Hard exit: exceptions in this thread cannot unwind the hung main
+            # thread blocked in JNI/NCCL.
+            os._exit(70)
 
 
 def _varlen_attention_reasons(config: AppConfig) -> tuple[str, ...]:
@@ -2302,6 +2361,16 @@ def _host_prepare_process_main(
       so the parent receives already-pinned handles (large ``/dev/shm``).
     """
 
+    # Own a process group so the parent can SIGTERM/SIGKILL the whole tree
+    # (including adapter ProcessPool workers) on idle/startup stall.
+    try:
+        os.setsid()
+    except OSError:
+        try:
+            os.setpgrp()
+        except OSError:
+            pass
+
     os.environ["MDL_HOST_PREPARE_PROCESS"] = "1"
     use_share = ipc_mode == "share"
     shm_free = _dev_shm_free_bytes()
@@ -2371,6 +2440,9 @@ def _host_prepare_process_main(
             if callable(close):
                 close()
     except BaseException as error:  # noqa: BLE001 - propagate to parent
+        if isinstance(error, RemoteIoStallError):
+            queue.put(error)
+            return
         # Pickling a bare exception across spawn drops the child traceback.
         # Embed it in the message so train logs show the real int(None)/etc site.
         import traceback
@@ -2382,6 +2454,81 @@ def _host_prepare_process_main(
         )
 
 
+def _terminate_process_group(
+    process: Any,
+    *,
+    grace_sec: float = 5.0,
+    label: str = "host-prepare",
+) -> None:
+    """SIGTERM the child's process group, then SIGKILL if it refuses to exit."""
+
+    import signal
+
+    if process is None:
+        return
+    try:
+        alive = bool(process.is_alive())
+    except Exception:
+        alive = False
+    if not alive:
+        try:
+            process.join(timeout=0.1)
+        except Exception:
+            pass
+        return
+
+    pid = getattr(process, "pid", None)
+    killed_group = False
+    if pid is not None and hasattr(os, "killpg"):
+        try:
+            os.killpg(int(pid), signal.SIGTERM)
+            killed_group = True
+        except (ProcessLookupError, PermissionError, OSError) as error:
+            logger.warning(
+                "%s killpg(SIGTERM) failed for pid=%s (%s); falling back to terminate()",
+                label,
+                pid,
+                error,
+            )
+    if not killed_group:
+        try:
+            process.terminate()
+        except Exception as error:
+            logger.warning("%s terminate() failed: %s", label, error)
+
+    try:
+        process.join(timeout=max(0.1, float(grace_sec)))
+    except Exception:
+        pass
+    try:
+        still_alive = bool(process.is_alive())
+    except Exception:
+        still_alive = False
+    if not still_alive:
+        return
+
+    logger.warning(
+        "%s still alive after %.1fs SIGTERM; sending SIGKILL",
+        label,
+        grace_sec,
+    )
+    if pid is not None and hasattr(os, "killpg"):
+        try:
+            os.killpg(int(pid), signal.SIGKILL)
+            killed_group = True
+        except (ProcessLookupError, PermissionError, OSError):
+            killed_group = False
+    if not killed_group:
+        try:
+            process.kill()
+        except Exception as error:
+            logger.warning("%s kill() failed: %s", label, error)
+    try:
+        process.join(timeout=max(0.1, float(grace_sec)))
+    except Exception:
+        pass
+
+
 class _ProcessHostPrepareIterator:
     """Yield FeatureBatches prepared in a spawn child.
 
@@ -2391,6 +2538,10 @@ class _ProcessHostPrepareIterator:
     - tiny shm → anonymous memfd; parent materializes pinned packed buffers
 
     Override with ``MDL_HOST_PREPARE_IPC=share|memfd|auto``.
+
+    Parent enforces startup/idle timeouts against the child. A hung JNI read
+    inside the child will not wait for the global step watchdog: the parent
+    kills the process group and aborts the rank with ``REMOTE_IO_STALL``.
     """
 
     _SENTINEL = None
@@ -2415,6 +2566,21 @@ class _ProcessHostPrepareIterator:
         self._pin_memory = bool(pin_memory)
         self._ipc_mode = _host_prepare_ipc_mode()
         self._closed = False
+        split = config.data.train if split_name == "train" else config.data.test
+        reader = split.reader if split is not None else None
+        self._startup_timeout_sec = (
+            None
+            if reader is None
+            else getattr(reader, "host_prepare_startup_timeout_sec", 300.0)
+        )
+        self._idle_timeout_sec = (
+            None
+            if reader is None
+            else getattr(reader, "host_prepare_idle_timeout_sec", 300.0)
+        )
+        self._started_at = perf_counter()
+        self._last_progress_at = self._started_at
+        self._received_item = False
         _configure_host_prepare_tensor_sharing()
         if self._ipc_mode == "share":
             try:
@@ -2426,10 +2592,13 @@ class _ProcessHostPrepareIterator:
                 pass
         if is_main_process():
             logger.info(
-                "host-prepare IPC mode=%s (shm_free=%.1fMiB, pin_memory=%s)",
+                "host-prepare IPC mode=%s (shm_free=%.1fMiB, pin_memory=%s, "
+                "startup_timeout=%s idle_timeout=%s)",
                 self._ipc_mode,
                 (_dev_shm_free_bytes() or 0) / (1024 * 1024),
                 self._pin_memory,
+                self._startup_timeout_sec,
+                self._idle_timeout_sec,
             )
         self._ctx = mp.get_context("spawn")
         self._queue: Any = self._ctx.Queue(maxsize=int(queue_size))
@@ -2465,15 +2634,68 @@ class _ProcessHostPrepareIterator:
     def __iter__(self) -> "_ProcessHostPrepareIterator":
         return self
 
+    def _mark_progress(self) -> None:
+        self._received_item = True
+        self._last_progress_at = perf_counter()
+
+    def _raise_if_child_stalled(self) -> None:
+        now = perf_counter()
+        if (
+            not self._received_item
+            and self._startup_timeout_sec is not None
+            and (now - self._started_at) >= float(self._startup_timeout_sec)
+        ):
+            self._abort_stalled_child(
+                RemoteIoStallError(
+                    f"host-prepare startup exceeded "
+                    f"{float(self._startup_timeout_sec):.0f}s without a batch"
+                )
+            )
+        if (
+            self._received_item
+            and self._idle_timeout_sec is not None
+            and (now - self._last_progress_at) >= float(self._idle_timeout_sec)
+        ):
+            self._abort_stalled_child(
+                RemoteIoStallError(
+                    f"host-prepare idle exceeded "
+                    f"{float(self._idle_timeout_sec):.0f}s since last batch"
+                )
+            )
+
+    def _abort_stalled_child(self, error: RemoteIoStallError) -> None:
+        logger.error("%s", error)
+        self.close()
+        abort_rank_for_remote_io_stall(error)
+
     def __next__(self) -> FeatureBatch:
         if self._closed:
             raise StopIteration
-        item = self._queue.get()
+        while True:
+            try:
+                item = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                if self._closed:
+                    raise StopIteration
+                if not self._process.is_alive() and self._queue.empty():
+                    self.close()
+                    raise RuntimeError(
+                        "host prepare process exited without a terminal queue item"
+                    )
+                self._raise_if_child_stalled()
+                continue
+            break
+        self._mark_progress()
         if item is self._SENTINEL:
             self.close()
             raise StopIteration
+        if isinstance(item, RemoteIoStallError):
+            self.close()
+            abort_rank_for_remote_io_stall(item)
         if isinstance(item, BaseException):
             self.close()
+            if is_remote_io_stall_error(item):
+                abort_rank_for_remote_io_stall(item)
             raise RuntimeError("host prepare process failed") from item
         if isinstance(item, FeatureBatch):
             # Shared-memory path: child already pinned when CUDA was available.
@@ -2496,10 +2718,7 @@ class _ProcessHostPrepareIterator:
         if self._closed:
             return
         self._closed = True
-        process = self._process
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5.0)
+        _terminate_process_group(self._process, grace_sec=5.0, label="host-prepare")
         try:
             self._queue.close()
         except Exception:
@@ -2630,6 +2849,11 @@ def _record_feature_batch_stream(
         record(buffer)
 
 
+# Bound CUDA-prefetch teardown. Prefer waiting out in-flight HDFS/open timeouts
+# when possible; abandon rather than hang forever after training stops.
+_DEVICE_PREFETCH_JOIN_TIMEOUT_SEC = 180.0
+
+
 class _DevicePrefetchIterator:
     """Prepare and copy future batches on a dedicated CUDA stream/thread."""
 
@@ -2638,6 +2862,8 @@ class _DevicePrefetchIterator:
         iterator: Iterator[FeatureBatch],
         device: torch.device,
         depth: int,
+        *,
+        join_timeout_sec: float = _DEVICE_PREFETCH_JOIN_TIMEOUT_SEC,
     ) -> None:
         if device.type != "cuda" or depth <= 0:
             raise ValueError("device prefetch requires CUDA and positive depth")
@@ -2647,6 +2873,7 @@ class _DevicePrefetchIterator:
             if device.index is not None
             else torch.device("cuda", torch.cuda.current_device())
         )
+        self._join_timeout_sec = float(join_timeout_sec)
         self.stop_event = threading.Event()
         self.queue: queue.Queue[_DevicePrefetchItem] = queue.Queue(maxsize=depth)
         self.thread = threading.Thread(
@@ -2702,7 +2929,18 @@ class _DevicePrefetchIterator:
                 close()
 
     def _next_item(self) -> _DevicePrefetchItem:
-        item = self.queue.get()
+        while True:
+            try:
+                item = self.queue.get(timeout=0.5)
+            except queue.Empty:
+                if self.stop_event.is_set():
+                    raise StopIteration
+                if not self.thread.is_alive() and self.queue.empty():
+                    raise RuntimeError(
+                        "CUDA prefetch worker exited without a terminal queue item"
+                    )
+                continue
+            break
         if item.error is not None:
             self.close()
             raise item.error
@@ -2733,14 +2971,19 @@ class _DevicePrefetchIterator:
 
     def close(self) -> None:
         self.stop_event.set()
-        if self.thread is not threading.current_thread():
-            # The worker owns the host iterator and may still be inside Parquet
-            # decode/tensorization when training reaches max_steps. Do not let
-            # the interpreter tear down CUDA/Arrow while that work is live:
-            # doing so can abort the process after an otherwise successful
-            # final step. Scanner IO has its own timeouts, so a full join is
-            # the safe lifecycle boundary here.
-            self.thread.join()
+        if self.thread is threading.current_thread():
+            return
+        # Prefer a clean join so CUDA/Arrow teardown does not race the worker.
+        # Cap the wait: an abandoned HDFS JNI thread must not hang process exit
+        # after the step watchdog has already been (or is about to be) stopped.
+        timeout = max(0.01, self._join_timeout_sec)
+        self.thread.join(timeout=timeout)
+        if self.thread.is_alive():
+            logger.warning(
+                "abandoning CUDA prefetch worker after %.1fs join timeout "
+                "(daemon thread may still be blocked in host iterator / HDFS)",
+                timeout,
+            )
 
 
 def _classify_model_parameters(model: nn.Module) -> _ParameterGroups:
@@ -3864,6 +4107,7 @@ def _loss_terms_from_batch(
     batch: FeatureBatch,
     moe_loss_weight: float = 0.0,
     loss_reduction: str = "sum",
+    task_loss_weights: Tensor | tuple[float, ...] | None = None,
     rank_active: bool = True,
     active_rank_count: int | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
@@ -3931,12 +4175,37 @@ def _loss_terms_from_batch(
         task_numerators = (element_loss * weights).sum(dim=0)
         task_counts = weights.sum(dim=0)
 
+    if task_loss_weights is None:
+        task_weight_tensor = torch.ones_like(task_numerators)
+    elif isinstance(task_loss_weights, Tensor):
+        task_weight_tensor = task_loss_weights.to(
+            device=task_numerators.device,
+            dtype=task_numerators.dtype,
+        )
+    else:
+        raw_task_weights = tuple(float(weight) for weight in task_loss_weights)
+        if any(
+            not math.isfinite(weight) or weight < 0.0
+            for weight in raw_task_weights
+        ):
+            raise ValueError(
+                "task_loss_weights must contain finite non-negative values"
+            )
+        task_weight_tensor = task_numerators.new_tensor(raw_task_weights)
+    if (
+        task_weight_tensor.ndim != 1
+        or task_weight_tensor.numel() != element_loss.size(1)
+    ):
+        raise ValueError(
+            "task_loss_weights must contain exactly one weight per logits task"
+        )
+
     distributed = torch_dist.is_available() and torch_dist.is_initialized()
     if loss_reduction == "sum":
         # DDP averages gradients across ranks. Multiplying each local sum by the
         # world size makes the averaged gradient equal the global paper sum.
         world_size = float(torch_dist.get_world_size()) if distributed else 1.0
-        prediction_loss = task_numerators.sum() * world_size
+        prediction_loss = (task_numerators * task_weight_tensor).sum() * world_size
     elif loss_reduction in {"mean_per_task", "mean_per_request_per_task"}:
         if distributed:
             global_counts = task_counts.detach().clone()
@@ -3953,7 +4222,9 @@ def _loss_terms_from_batch(
                 task_counts.clamp_min(1.0).reciprocal(),
                 torch.zeros_like(task_counts),
             )
-        prediction_loss = (task_numerators * task_scale).sum()
+        prediction_loss = (
+            task_numerators * task_scale * task_weight_tensor
+        ).sum()
     else:
         raise ValueError(
             "loss_reduction must be sum, mean_per_task, "
@@ -3977,6 +4248,17 @@ def _loss_terms_from_batch(
 
 def _loss_from_batch(output: dict[str, Tensor], batch: FeatureBatch) -> Tensor:
     return _loss_terms_from_batch(output, batch)[0]
+
+
+def _configured_task_loss_weights(config: AppConfig) -> tuple[float, ...]:
+    ordered = getattr(config, "ordered_task_loss_weights", None)
+    if ordered is not None:
+        return tuple(float(weight) for weight in ordered)
+    configured = getattr(config.training, "task_loss_weights", {})
+    return tuple(
+        float(configured.get(task_name, 1.0))
+        for task_name in config.task_names
+    )
 
 
 def _aggregate_train_result(
@@ -4039,6 +4321,7 @@ def train_mdl(
 
     context = _setup_distributed(config)
     batch_iterator: Iterator[FeatureBatch] | None = None
+    step_watchdog: _StepWatchdog | None = None
     try:
         device = context.device
         if device.type == "cuda":
@@ -4150,6 +4433,12 @@ def train_mdl(
         ]
         lr_decay_steps = _resolve_lr_decay_steps(config, max_steps)
         scaler = _make_grad_scaler(config, device)
+        ordered_task_loss_weights = _configured_task_loss_weights(config)
+        task_loss_weights = torch.tensor(
+            ordered_task_loss_weights,
+            device=device,
+            dtype=torch.float32,
+        )
         non_blocking = _non_blocking_transfer(config, "train", device)
         quick_eval = getattr(config.training, "quick_eval", QuickEvalConfig())
         gradient_accumulation_steps = int(
@@ -4173,6 +4462,25 @@ def train_mdl(
                 f"gradient_accumulation_steps={gradient_accumulation_steps} "
                 f"runtime_effective_global_batch={runtime_effective_global_batch}"
             )
+            task_weight_summary = " ".join(
+                f"{task_name}={weight:g}"
+                for task_name, weight in zip(
+                    config.task_names,
+                    ordered_task_loss_weights,
+                )
+            )
+            print(
+                f"Loss | reduction={config.training.loss_reduction} "
+                f"task_weights={task_weight_summary}"
+            )
+
+        watchdog_sec = getattr(config.training, "step_watchdog_sec", None)
+        if watchdog_sec is not None:
+            step_watchdog = _StepWatchdog(
+                float(watchdog_sec),
+                rank=context.rank,
+            )
+            step_watchdog.start()
 
         steps = 0
         rows = 0
@@ -4379,6 +4687,7 @@ def train_mdl(
                         batch,
                         moe_loss_weight=config.model.sparse_moe_loss_weight,
                         loss_reduction=config.training.loss_reduction,
+                        task_loss_weights=task_loss_weights,
                         rank_active=rank_active,
                         active_rank_count=active_ranks,
                     )
@@ -4515,6 +4824,8 @@ def train_mdl(
                 _sync_device(device)
             optimizer_seconds = perf_counter() - optimizer_started if observing else 0.0
             steps += 1
+            if step_watchdog is not None:
+                step_watchdog.beat()
             rows += window_rows
             if window_loss_numerator is None or window_loss_denominator is None:
                 raise AssertionError("completed accumulation window has no loss")
@@ -4692,12 +5003,20 @@ def train_mdl(
                 sharded_optimizer=sharded_embedding_optimizer,
             )
         return result
+    except RemoteIoStallError as error:
+        abort_rank_for_remote_io_stall(error)
     finally:
-        if batch_iterator is not None:
-            close = getattr(batch_iterator, "close", None)
-            if callable(close):
-                close()
-        _cleanup_distributed(context)
+        # Keep the step watchdog armed through iterator teardown so a hung
+        # device/host prefetch close cannot stall silently after training ends.
+        try:
+            if batch_iterator is not None:
+                close = getattr(batch_iterator, "close", None)
+                if callable(close):
+                    close()
+        finally:
+            if step_watchdog is not None:
+                step_watchdog.stop()
+            _cleanup_distributed(context)
 
 
 def _binary_auc(scores: Tensor, labels: Tensor) -> float | None:

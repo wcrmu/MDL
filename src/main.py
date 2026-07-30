@@ -667,7 +667,18 @@ def _cmd_train(args: argparse.Namespace) -> int:
     if _effective_distributed_mode(args, config) == "ddp" and not _in_distributed_launcher():
         return _launch_ddp_command(args, config)
     config.data.train.require_inputs("train")
-    result = train_mdl(config, max_steps=args.max_steps)
+    try:
+        result = train_mdl(config, max_steps=args.max_steps)
+    except Exception as error:  # noqa: BLE001 - map fatal remote stalls to exit 70
+        from src.dataloader import (
+            RemoteIoStallError,
+            abort_rank_for_remote_io_stall,
+            is_remote_io_stall_error,
+        )
+
+        if isinstance(error, RemoteIoStallError) or is_remote_io_stall_error(error):
+            abort_rank_for_remote_io_stall(error)
+        raise
     if is_main_process():
         print(
             "train_result "

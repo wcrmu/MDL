@@ -668,6 +668,14 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         self.assertEqual(payload["training"]["embedding_weight_dtype"], "bf16")
         self.assertEqual(payload["training"]["loss_reduction"], "mean_per_task")
         self.assertEqual(
+            payload["training"]["task_loss_weights"],
+            {
+                "fst_cart": 0.5,
+                "cateid_filter": 0.01,
+                "upid_pay": 0.01,
+            },
+        )
+        self.assertEqual(
             payload["training"]["quick_eval"],
             {
                 "enabled": True,
@@ -1377,15 +1385,15 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertFalse(config.data.train.reader.validate_prehashed_nonzero)
                 self.assertTrue(config.data.train.reader.trusted_input)
                 self.assertTrue(config.data.test.reader.trusted_input)
-                # Production profiles keep cardinality audit tiny (1) so startup
-                # does not scan hundreds of rows per table before training.
+                # Production profiles disable cardinality audit on the GPU rank
+                # so startup does not open HDFS before the step watchdog is armed.
                 self.assertEqual(
                     config.data.train.reader.effective_cardinality_audit_raw_rows(),
-                    1,
+                    0,
                 )
                 self.assertEqual(
                     config.data.test.reader.effective_cardinality_audit_raw_rows(),
-                    1,
+                    0,
                 )
                 self.assertFalse(config.data.train.label_masks)
                 self.assertFalse(config.data.test.label_masks)
@@ -1455,7 +1463,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 for name, limit in adapter_limits.items():
                     self.assertGreaterEqual(limit, main_sequences[name])
                 self.assertTrue(config.data.train.reader.coalesce_pinned_tensors)
-                self.assertEqual(config.data.train.reader.num_workers, 4)
+                self.assertEqual(config.data.train.reader.num_workers, 2)
                 self.assertEqual(config.data.train.reader.adapter_workers, 4)
                 self.assertEqual(config.data.train.reader.scanner_batch_rows, 128)
                 self.assertEqual(

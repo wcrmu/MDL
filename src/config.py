@@ -165,7 +165,7 @@ LossReductionType = Literal[
 
 # OneTrans-family choices: model.name=onetrans or experimental mdl_onetrans.
 SequenceFusionType = Literal[
-    "timestamp_aware",  # Add sequence-type embeddings and globally sort S tokens by time.
+    "timestamp_aware",  # Add type embeddings and globally sort S by timestamp/time delta.
     "intent_ordered",  # Concatenate S-token groups in config order with optional separators.
 ]
 
@@ -548,7 +548,15 @@ class ReaderConfig(_DeeplyImmutableConfig):
     # through a queue of this depth. Avoids GIL contention with training; 0
     # keeps prepare in-process. Requires pin_memory when CUDA training pins.
     # Combines with device_prefetch_batches as prepare→H2D→train pipeline.
+    # Prefer a spawn child for pack+tensorize: shared-memory FeatureBatches
+    # avoid GIL fights with wide-batch forward (threaded prepare regresses).
     host_prepare_prefetch: int = 0
+    # Parent-side bounds for the host-prepare child. None disables that timer.
+    # Idle measures time since the last successful batch/sentinel/error delivery.
+    # On timeout the parent kills the child process group and aborts the rank
+    # (exit 70) so torchrun can restart the job — it does not respawn the reader.
+    host_prepare_startup_timeout_sec: float | None = 300.0
+    host_prepare_idle_timeout_sec: float | None = 300.0
     # Repeated candidates from one request can share Context and UPS tensors.
     # The adapter remains responsible for declaring context feature membership.
     deduplicate_request_features: bool = False
@@ -589,9 +597,11 @@ class ReaderConfig(_DeeplyImmutableConfig):
     # in a daemon thread so hung opens cannot stall the trainer forever.
     hdfs_op_timeout: float = 30.0
     # ParquetFile construction / footer open is often slower than a single read.
-    hdfs_open_timeout: float = 120.0
+    # Keep this aligned with host_prepare_* / step_watchdog budgets: worst-case
+    # open ≈ (retry_count+1)*open_timeout + backoff sum.
+    hdfs_open_timeout: float = 60.0
     # Transient NameNode/DataNode failures retry with exponential backoff.
-    hdfs_retry_count: int = 5
+    hdfs_retry_count: int = 2
     hdfs_retry_base_sec: float = 0.5
     # Serialize concurrent opens of the same remote URI within a node.
     hdfs_file_lock: bool = True
@@ -604,6 +614,15 @@ class ReaderConfig(_DeeplyImmutableConfig):
     hdfs_pre_buffer: bool = True
     # Timed close for native HDFS streams that may hang after DFSClient damage.
     hdfs_close_timeout: float = 5.0
+    # Max abandoned HDFS sessions retained without native close. Exceeding this
+    # fails fast so a poisoned process is restarted instead of leaking forever.
+    hdfs_quarantine_limit: int = 32
+    # Skip-budget for on_hdfs_failure=skip. None disables that counter.
+    # Prefer skipped_rows for large row groups; both are enforced when set.
+    hdfs_max_skipped_row_groups: int | None = 64
+    hdfs_max_skipped_rows: int | None = 2_000_000
+    # Bound joins on row-group prefetch workers after stop/SENTINEL.
+    hdfs_prefetch_join_timeout: float = 5.0
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> "ReaderConfig":
@@ -656,6 +675,17 @@ class ReaderConfig(_DeeplyImmutableConfig):
             raise ValueError(
                 "reader.host_prepare_prefetch must be a non-negative integer"
             )
+        for timeout_name in (
+            "host_prepare_startup_timeout_sec",
+            "host_prepare_idle_timeout_sec",
+        ):
+            timeout_value = getattr(self, timeout_name)
+            if timeout_value is not None and (
+                type(timeout_value) not in {int, float} or float(timeout_value) <= 0
+            ):
+                raise ValueError(
+                    f"reader.{timeout_name} must be a positive number or null"
+                )
         if self.cardinality_audit_raw_rows is not None and (
             type(self.cardinality_audit_raw_rows) is not int
             or self.cardinality_audit_raw_rows < 0
@@ -718,6 +748,29 @@ class ReaderConfig(_DeeplyImmutableConfig):
             or self.hdfs_close_timeout <= 0
         ):
             raise ValueError("reader.hdfs_close_timeout must be a positive number")
+        if (
+            type(self.hdfs_quarantine_limit) is not int
+            or self.hdfs_quarantine_limit <= 0
+        ):
+            raise ValueError("reader.hdfs_quarantine_limit must be a positive integer")
+        for skip_name in (
+            "hdfs_max_skipped_row_groups",
+            "hdfs_max_skipped_rows",
+        ):
+            skip_value = getattr(self, skip_name)
+            if skip_value is not None and (
+                type(skip_value) is not int or skip_value < 0
+            ):
+                raise ValueError(
+                    f"reader.{skip_name} must be a non-negative integer or null"
+                )
+        if (
+            type(self.hdfs_prefetch_join_timeout) not in {int, float}
+            or self.hdfs_prefetch_join_timeout <= 0
+        ):
+            raise ValueError(
+                "reader.hdfs_prefetch_join_timeout must be a positive number"
+            )
         previous = 0
         saw_catch_all = False
         for index, bucket in enumerate(self.length_buckets):
@@ -2709,7 +2762,7 @@ class QuickEvalConfig:
 
 
 @dataclass(frozen=True)
-class TrainingConfig:
+class TrainingConfig(_DeeplyImmutableConfig):
     """Optimizer, batch, schedule, and checkpoint settings."""
 
     # Physical samples per forward on each rank/GPU. This value is never divided
@@ -2774,9 +2827,16 @@ class TrainingConfig:
     # MDL Eq. (1) uses a literal sum. mean_per_task is an explicit engineering
     # alternative for datasets that need task-balanced normalization.
     loss_reduction: LossReductionType = "sum"
+    # Optional per-task multipliers applied after each task's configured
+    # reduction. Tasks omitted from this mapping retain weight 1.0.
+    task_loss_weights: Mapping[str, float] = field(default_factory=dict)
     # Logging a CUDA scalar synchronizes the device. Large production runs
     # should log periodically rather than draining the GPU pipeline every step.
-    log_every_steps: int = 1
+    log_every_steps: int = 100
+    # Background watchdog: if no optimizer step completes within this many
+    # seconds, terminate the process (silent dataloader/NCCL hangs). Null
+    # disables the watchdog.
+    step_watchdog_sec: float | None = 600.0
     # Periodic pre-update AUC check performed without saving/reloading a checkpoint.
     quick_eval: QuickEvalConfig = field(default_factory=QuickEvalConfig)
     # Default checkpoint path used by train/predict when CLI does not override it.
@@ -2917,6 +2977,20 @@ class TrainingConfig:
                 "training.loss_reduction must be sum, mean_per_task, "
                 "or mean_per_request_per_task"
             )
+        for task_name, weight in self.task_loss_weights.items():
+            if not isinstance(task_name, str) or not task_name:
+                raise ValueError(
+                    "training.task_loss_weights keys must be non-empty task names"
+                )
+            if (
+                type(weight) not in {int, float}
+                or not math.isfinite(float(weight))
+                or float(weight) < 0.0
+            ):
+                raise ValueError(
+                    "training.task_loss_weights values must be finite "
+                    "non-negative numbers"
+                )
         if self.embedding_weight_dtype not in {"fp32", "bf16"}:
             raise ValueError("training.embedding_weight_dtype must be fp32 or bf16")
         if type(self.embedding_collect_stats) is not bool:
@@ -2933,6 +3007,13 @@ class TrainingConfig:
             )
         if type(self.log_every_steps) is not int or self.log_every_steps <= 0:
             raise ValueError("training.log_every_steps must be a positive integer")
+        if self.step_watchdog_sec is not None and (
+            type(self.step_watchdog_sec) not in {int, float}
+            or float(self.step_watchdog_sec) <= 0
+        ):
+            raise ValueError(
+                "training.step_watchdog_sec must be a positive number or null"
+            )
 
 
 @dataclass(frozen=True)
@@ -2975,6 +3056,13 @@ class AppConfig(_DeeplyImmutableConfig):
     @property
     def task_names(self) -> list[str]:
         return list(self.data.train.labels.keys())
+
+    @property
+    def ordered_task_loss_weights(self) -> tuple[float, ...]:
+        return tuple(
+            float(self.training.task_loss_weights.get(task_name, 1.0))
+            for task_name in self.task_names
+        )
 
     @cached_property
     def resolved(self) -> "ResolvedConfig":
@@ -4456,6 +4544,19 @@ def validate_app_config(config: AppConfig) -> None:
     config.model.validate()
     config.runtime.validate()
     config.training.validate()
+    unknown_task_loss_weights = sorted(
+        set(config.training.task_loss_weights) - set(config.task_names)
+    )
+    if unknown_task_loss_weights:
+        raise ValueError(
+            "training.task_loss_weights contains unknown tasks: "
+            + ", ".join(unknown_task_loss_weights)
+        )
+    if not any(weight > 0.0 for weight in config.ordered_task_loss_weights):
+        raise ValueError(
+            "training.task_loss_weights must leave at least one task with "
+            "positive weight"
+        )
     if (
         config.training.loss_reduction == "mean_per_request_per_task"
         and not config.data.train.reader.deduplicate_request_features
@@ -4560,11 +4661,17 @@ def validate_app_config(config: AppConfig) -> None:
         for group in resolved.tokenization.sequence_token_groups:
             for input_name in group.input_refs:
                 sequence = sequence_by_name.get(input_name)
-                if sequence is not None and sequence.timestamp_field is None:
+                if (
+                    sequence is not None
+                    and sequence.timestamp_field is None
+                    and sequence.time_delta_field is None
+                ):
                     raise ValueError(
                         f"timestamp-aware {config.model.name} requires "
-                        f"sequences.{sequence.name}.timestamp_field; "
-                        "use model.sequence_fusion=intent_ordered when timestamps are unavailable"
+                        f"sequences.{sequence.name}.timestamp_field or "
+                        "time_delta_field; use "
+                        "model.sequence_fusion=intent_ordered when neither is "
+                        "available"
                     )
     if config.model.name in {
         "onetrans",

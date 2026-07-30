@@ -142,9 +142,132 @@ _RETRYABLE_NEEDLES = (
 
 _DEFAULT_NODE_CPU_COUNT = 64
 _THREAD_LOCAL = threading.local()
+_ABANDONED_REMOTE_SESSION_LOCK = threading.Lock()
+_ABANDONED_REMOTE_SESSIONS: list[tuple[Any, ...]] = []
+_DEFAULT_HDFS_QUARANTINE_LIMIT = 32
 # Reused by wide-sequence prehashed gathers; creating a pool per batch was measurable.
 _PREHASHED_GATHER_POOL: ThreadPoolExecutor | None = None
 _PREHASHED_GATHER_POOL_WORKERS = 0
+
+
+class RemoteIoStallError(RuntimeError):
+    """Fatal remote-IO stall; the rank should exit so the job can restart.
+
+    Platform launchers should treat ``exit_code`` (default 70) as retryable.
+    Do not respawn the reader inside the same training process: there is no
+    precise row-group resume cursor, so in-process restart would duplicate rows.
+    """
+
+    exit_code: int = 70
+    marker: str = "REMOTE_IO_STALL"
+
+    def __init__(self, message: str, *, exit_code: int | None = None) -> None:
+        prefix = self.marker if self.marker not in message else ""
+        super().__init__(f"{prefix}: {message}" if prefix else message)
+        if exit_code is not None:
+            self.exit_code = int(exit_code)
+
+
+class RemoteIoQuarantineExhaustedError(RemoteIoStallError):
+    """Raised when too many poisoned HDFS sessions are retained without close."""
+
+
+class RemoteIoSkipBudgetExceededError(RemoteIoStallError):
+    """Raised when skipped row-group/row budgets are exhausted under skip policy."""
+
+
+def abort_rank_for_remote_io_stall(error: BaseException) -> None:
+    """Hard-exit the process for a fatal remote-IO stall (never returns)."""
+
+    exit_code = int(getattr(error, "exit_code", RemoteIoStallError.exit_code))
+    message = f"{RemoteIoStallError.marker}: aborting rank after fatal remote IO ({error})"
+    logger.error(message)
+    print(message, flush=True)
+    os._exit(exit_code)
+
+
+def is_remote_io_stall_error(error: BaseException) -> bool:
+    """True when ``error`` (or its cause chain) is a fatal remote-IO stall."""
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, RemoteIoStallError):
+            return True
+        text = str(current)
+        if RemoteIoStallError.marker in text:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+@dataclass
+class RemoteSkipTracker:
+    """Process-local counters for on_hdfs_failure=skip budgets."""
+
+    max_skipped_row_groups: int | None = 64
+    max_skipped_rows: int | None = 2_000_000
+    skipped_row_groups: int = 0
+    skipped_rows: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def record(
+        self,
+        *,
+        row_groups: int = 0,
+        rows: int = 0,
+        label: str,
+    ) -> None:
+        row_groups = max(0, int(row_groups))
+        rows = max(0, int(rows))
+        if row_groups == 0 and rows == 0:
+            return
+        with self._lock:
+            self.skipped_row_groups += row_groups
+            self.skipped_rows += rows
+            logger.warning(
+                "remote skip budget | %s | +rg=%d +rows=%d | "
+                "totals rg=%d/%s rows=%d/%s",
+                label,
+                row_groups,
+                rows,
+                self.skipped_row_groups,
+                (
+                    "inf"
+                    if self.max_skipped_row_groups is None
+                    else self.max_skipped_row_groups
+                ),
+                self.skipped_rows,
+                "inf" if self.max_skipped_rows is None else self.max_skipped_rows,
+            )
+            if (
+                self.max_skipped_row_groups is not None
+                and self.skipped_row_groups > self.max_skipped_row_groups
+            ):
+                raise RemoteIoSkipBudgetExceededError(
+                    f"skipped_row_groups={self.skipped_row_groups} exceeds "
+                    f"reader.hdfs_max_skipped_row_groups="
+                    f"{self.max_skipped_row_groups} while handling {label}"
+                )
+            if (
+                self.max_skipped_rows is not None
+                and self.skipped_rows > self.max_skipped_rows
+            ):
+                raise RemoteIoSkipBudgetExceededError(
+                    f"skipped_rows={self.skipped_rows} exceeds "
+                    f"reader.hdfs_max_skipped_rows={self.max_skipped_rows} "
+                    f"while handling {label}"
+                )
+
+    def snapshot(self) -> dict[str, int | None]:
+        with self._lock:
+            return {
+                "skipped_row_groups": self.skipped_row_groups,
+                "skipped_rows": self.skipped_rows,
+                "max_skipped_row_groups": self.max_skipped_row_groups,
+                "max_skipped_rows": self.max_skipped_rows,
+            }
 
 
 def _prehashed_gather_pool(workers: int) -> ThreadPoolExecutor:
@@ -173,8 +296,47 @@ def _shutdown_prehashed_gather_pool() -> None:
 atexit.register(_shutdown_prehashed_gather_pool)
 
 
+@dataclass
+class _TimedRemoteOperation:
+    """State retained after a timed call outlives its caller."""
+
+    done: threading.Event = field(default_factory=threading.Event)
+    result_box: list[Any] = field(default_factory=list)
+    error_box: list[BaseException] = field(default_factory=list)
+
+
 class RemoteIoTimeoutError(TimeoutError):
-    """Raised when a remote IO call exceeds its configured timeout."""
+    """Raised when a remote IO call exceeds its configured timeout.
+
+    Python cannot cancel the worker thread. ``operation`` therefore remains
+    available so owners of native resources can keep them alive until the
+    abandoned call actually exits.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        operation: _TimedRemoteOperation | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.operation = operation
+        self.cleanup_scheduled = False
+
+
+class _ParquetSessionReopen(Exception):
+    """Internal: abandon a poisoned parquet session and reopen from scratch.
+
+    After ``call_with_timeout`` abandons a hung ``next()``, the daemon thread
+    still owns the Arrow generator. Retrying ``next()`` / ``close()`` on that
+    same iterator causes ``generator already executing`` and can wedge the
+    process-wide HDFS client for tens of minutes. Callers must open a fresh
+    ``ParquetFile`` instead of retrying in place.
+    """
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__(str(error))
+        self.error = error
 
 
 @dataclass(frozen=True)
@@ -191,6 +353,8 @@ class RemoteIoPolicy:
     worker_stagger_sec: float
     pre_buffer: bool = True
     close_timeout: float = 5.0
+    quarantine_limit: int = _DEFAULT_HDFS_QUARANTINE_LIMIT
+    prefetch_join_timeout: float = 5.0
 
     @classmethod
     def disabled(cls) -> "RemoteIoPolicy":
@@ -205,6 +369,8 @@ class RemoteIoPolicy:
             worker_stagger_sec=0.0,
             pre_buffer=False,
             close_timeout=5.0,
+            quarantine_limit=_DEFAULT_HDFS_QUARANTINE_LIMIT,
+            prefetch_join_timeout=5.0,
         )
 
     @classmethod
@@ -222,6 +388,12 @@ class RemoteIoPolicy:
             worker_stagger_sec=float(reader.worker_stagger_sec),
             pre_buffer=bool(getattr(reader, "hdfs_pre_buffer", True)),
             close_timeout=float(getattr(reader, "hdfs_close_timeout", 5.0)),
+            quarantine_limit=int(
+                getattr(reader, "hdfs_quarantine_limit", _DEFAULT_HDFS_QUARANTINE_LIMIT)
+            ),
+            prefetch_join_timeout=float(
+                getattr(reader, "hdfs_prefetch_join_timeout", 5.0)
+            ),
         )
 
     @property
@@ -290,15 +462,251 @@ class PerFileLock:
             self._thread_lock.release()
 
 
+def is_poisoned_iterator_error(error: BaseException) -> bool:
+    """Return True when an Arrow/Python generator was left mid-execution.
+
+    After ``call_with_timeout`` abandons a hung ``next()``, the daemon thread
+    still owns the generator. Further ``next()`` / ``close()`` on that object
+    raises this error or deadlocks — callers must reopen a fresh session.
+    """
+
+    text = f"{type(error).__name__}: {error}".lower()
+    return "generator already executing" in text
+
+
 def is_retryable_remote_error(error: BaseException) -> bool:
     """Return True for transient remote IO failures worth retrying."""
 
+    # Never treat a poisoned generator as "retry the same callable" — the
+    # retry must reopen a new Parquet iterator (see iter_parquet_record_batches).
+    if is_poisoned_iterator_error(error):
+        return False
     if isinstance(error, (RemoteIoTimeoutError, TimeoutError, InterruptedError)):
         return True
     if isinstance(error, (BlockingIOError, ConnectionError, BrokenPipeError, OSError)):
         return True
     text = f"{type(error).__name__}: {error}".lower()
     return any(needle in text for needle in _RETRYABLE_NEEDLES)
+
+
+def _close_batch_iterator(
+    batch_iterator: Any,
+    *,
+    poisoned: bool,
+    label: str,
+) -> None:
+    """Close an Arrow batch iterator unless a timed-out thread still owns it."""
+
+    if batch_iterator is None:
+        return
+    if poisoned:
+        logger.warning(
+            "abandoning batch iterator for %s without close "
+            "(iterator timed out or poisoned)",
+            label,
+        )
+        return
+    close = getattr(batch_iterator, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except BaseException as error:
+        logger.warning("failed to close batch iterator for %s: %s", label, error)
+
+
+def abandoned_remote_session_count() -> int:
+    """Return how many poisoned HDFS sessions are currently quarantined."""
+
+    with _ABANDONED_REMOTE_SESSION_LOCK:
+        return len(_ABANDONED_REMOTE_SESSIONS)
+
+
+def _retain_abandoned_remote_session(
+    *resources: Any,
+    label: str,
+    quarantine_limit: int = _DEFAULT_HDFS_QUARANTINE_LIMIT,
+) -> None:
+    """Keep a poisoned session alive until process exit; never native-close it.
+
+    Entering JNI ``close`` on a handle that still has an abandoned ``pread``
+    (or on a damaged DistributedRaid client) can wedge process-wide. Timeout
+    paths therefore retain references and rely on process restart to reclaim.
+    """
+
+    retained = tuple(resource for resource in resources if resource is not None)
+    if not retained:
+        return
+    limit = max(1, int(quarantine_limit))
+    with _ABANDONED_REMOTE_SESSION_LOCK:
+        if len(_ABANDONED_REMOTE_SESSIONS) >= limit:
+            raise RemoteIoQuarantineExhaustedError(
+                f"HDFS quarantine limit {limit} exceeded while handling {label}; "
+                "restart the process to reclaim abandoned DFSClients"
+            )
+        _ABANDONED_REMOTE_SESSIONS.append(retained)
+        quarantined = len(_ABANDONED_REMOTE_SESSIONS)
+    logger.warning(
+        "quarantining %s until process exit without native close "
+        "(%d/%d abandoned sessions)",
+        label,
+        quarantined,
+        limit,
+    )
+
+
+def _defer_remote_session_cleanup(
+    timeout_error: RemoteIoTimeoutError,
+    *,
+    filesystem: Any,
+    batch_iterator: Any = None,
+    native_file: Any = None,
+    late_result_kind: Literal["ignore", "batch_iterator", "native_file"] = "ignore",
+    retained_resources: tuple[Any, ...] = (),
+    label: str,
+    quarantine_limit: int = _DEFAULT_HDFS_QUARANTINE_LIMIT,
+) -> None:
+    """Quarantine a timed-out HDFS session and never call native close on it.
+
+    Arrow HDFS streams keep a raw ``hdfsFS`` pointer. Destroying the owning
+    HadoopFileSystem (or closing the native handle) while ``pread`` is still
+    running closes the DFSClient under that read and can produce
+    ``DFSClient.checkOpen: Filesystem closed``. Python also cannot cancel the
+    abandoned JNI close. The durable policy is: retain forever, open retries on
+    a fresh client, and fail-fast when the quarantine cap is hit.
+    """
+
+    operation = timeout_error.operation
+    # Retain the list object itself in quarantine. A late-returning handle is
+    # written into late_holder[0] after the caller has already moved on; if only
+    # the pre-timeout (often None) resources were retained, GC would destroy the
+    # late native/iterator while JNI may still be using it.
+    late_holder: list[Any] = [None]
+
+    def _collect_resources() -> tuple[Any, ...]:
+        iterator = batch_iterator
+        native = native_file
+        late_result = late_holder[0]
+        if late_result_kind == "batch_iterator" and iterator is None:
+            iterator = late_result
+        elif late_result_kind == "native_file" and native is None:
+            native = late_result
+        return (
+            filesystem,
+            iterator,
+            native,
+            late_holder,
+            *retained_resources,
+        )
+
+    if operation is None:
+        _retain_abandoned_remote_session(
+            *_collect_resources(),
+            label=label,
+            quarantine_limit=quarantine_limit,
+        )
+        return
+
+    # Retain immediately so a late-returning handle cannot outlive the
+    # caller's stack without a strong reference, and so the quarantine cap
+    # applies before spawning the waiter thread.
+    _retain_abandoned_remote_session(
+        *_collect_resources(),
+        label=label,
+        quarantine_limit=quarantine_limit,
+    )
+
+    def observe_completion() -> None:
+        operation.done.wait()
+        if operation.result_box:
+            late_holder[0] = operation.result_box[0]
+        if operation.error_box:
+            logger.warning(
+                "%s timed operation eventually failed while quarantined "
+                "(resources remain unclosed): %s",
+                label,
+                operation.error_box[0],
+            )
+        else:
+            logger.warning(
+                "%s timed operation finished while quarantined; "
+                "resources remain unclosed until process exit",
+                label,
+            )
+        # late_holder is already in _ABANDONED_REMOTE_SESSIONS; keep a local
+        # strong reference until this observer returns as belt-and-suspenders.
+        _ = _collect_resources()
+
+    logger.warning(
+        "tracking %s until its timed operation exits; retry uses a fresh "
+        "HDFS client and will not native-close the poisoned session",
+        label,
+    )
+    observer = threading.Thread(
+        target=observe_completion,
+        name=f"remote-io-quarantine:{label[:40]}",
+        daemon=True,
+    )
+    observer.start()
+
+
+def _interruptible_sleep(
+    delay_sec: float,
+    stop_event: threading.Event | None,
+) -> bool:
+    """Sleep up to ``delay_sec``; return True if ``stop_event`` was set."""
+
+    delay = max(0.0, float(delay_sec))
+    if delay <= 0.0:
+        return bool(stop_event is not None and stop_event.is_set())
+    if stop_event is None:
+        time.sleep(delay)
+        return False
+    return bool(stop_event.wait(delay))
+
+
+def _join_prefetch_thread(
+    thread: threading.Thread | None,
+    *,
+    timeout_sec: float,
+    label: str,
+) -> None:
+    """Join a prefetch worker with a hard timeout; abandon if still alive."""
+
+    if thread is None:
+        return
+    timeout = max(0.01, float(timeout_sec))
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        logger.warning(
+            "abandoning %s after %.1fs join timeout (worker may still be "
+            "blocked in HDFS JNI)",
+            label,
+            timeout,
+        )
+
+
+def maybe_skip_or_raise(
+    error: BaseException,
+    policy: RemoteIoPolicy,
+    *,
+    description: str,
+    skip_tracker: RemoteSkipTracker | None = None,
+    skipped_row_groups: int = 0,
+    skipped_rows: int = 0,
+) -> bool:
+    """Log and return True when the policy says to skip; otherwise re-raise."""
+
+    if policy.skip_on_failure:
+        logger.warning("skipping %s after failure: %s", description, error)
+        if skip_tracker is not None:
+            skip_tracker.record(
+                row_groups=skipped_row_groups,
+                rows=skipped_rows,
+                label=description,
+            )
+        return True
+    raise error
 
 
 def call_with_timeout(
@@ -312,17 +720,15 @@ def call_with_timeout(
     if timeout_sec <= 0:
         return fn()
 
-    result_box: list[T] = []
-    error_box: list[BaseException] = []
-    done = threading.Event()
+    operation = _TimedRemoteOperation()
 
     def runner() -> None:
         try:
-            result_box.append(fn())
+            operation.result_box.append(fn())
         except BaseException as error:  # noqa: BLE001 - surface to caller
-            error_box.append(error)
+            operation.error_box.append(error)
         finally:
-            done.set()
+            operation.done.set()
 
     thread = threading.Thread(
         target=runner,
@@ -330,11 +736,14 @@ def call_with_timeout(
         daemon=True,
     )
     thread.start()
-    if not done.wait(timeout_sec):
-        raise RemoteIoTimeoutError(f"{description} timed out after {timeout_sec:.1f}s")
-    if error_box:
-        raise error_box[0]
-    return result_box[0]
+    if not operation.done.wait(timeout_sec):
+        raise RemoteIoTimeoutError(
+            f"{description} timed out after {timeout_sec:.1f}s",
+            operation=operation,
+        )
+    if operation.error_box:
+        raise operation.error_box[0]
+    return operation.result_box[0]
 
 
 def retry_with_backoff(
@@ -407,20 +816,6 @@ def run_remote_op(
         base_sec=policy.retry_base_sec,
         description=description,
     )
-
-
-def maybe_skip_or_raise(
-    error: BaseException,
-    policy: RemoteIoPolicy,
-    *,
-    description: str,
-) -> bool:
-    """Log and return True when the policy says to skip; otherwise re-raise."""
-
-    if policy.skip_on_failure:
-        logger.warning("skipping %s after failure: %s", description, error)
-        return True
-    raise error
 
 
 def run_under_file_lock(
@@ -533,27 +928,124 @@ def thread_local_hdfs_filesystem(
     return filesystem
 
 
+def invalidate_thread_local_hdfs_filesystem(
+    filesystem_key: str,
+    filesystem: Any,
+) -> bool:
+    """Evict exactly ``filesystem`` from the current worker's HDFS cache.
+
+    Identity checking prevents cleanup for an old session from evicting a newer
+    replacement client created under the same URI key.
+    """
+
+    cache: dict[str, Any] | None = getattr(_THREAD_LOCAL, "filesystems", None)
+    if cache is None or cache.get(filesystem_key) is not filesystem:
+        return False
+    del cache[filesystem_key]
+    return True
+
+
 def close_hdfs_native_file(
     native_file: Any,
     *,
     timeout_sec: float = 5.0,
     description: str = "close hdfs native file",
-) -> None:
-    """Close a native input stream with a short timeout; abandon on hang."""
+    filesystem: Any = None,
+    filesystem_key: str | None = None,
+) -> bool:
+    """Close a native stream without ever reusing a client during hung close.
+
+    Returns ``True`` when close completed (successfully or with a synchronous
+    error) and ``False`` when close timed out. A timed close continues on its
+    daemon thread while a cleanup waiter retains the owning filesystem.
+    """
 
     if native_file is None:
-        return
+        return True
     close = getattr(native_file, "close", None)
     if not callable(close):
-        return
+        return True
     try:
         call_with_timeout(close, timeout_sec, description=description)
-    except RemoteIoTimeoutError:
+    except RemoteIoTimeoutError as error:
+        if filesystem_key is not None and filesystem is not None:
+            invalidate_thread_local_hdfs_filesystem(filesystem_key, filesystem)
+            _defer_remote_session_cleanup(
+                error,
+                filesystem=filesystem,
+                label=description,
+                quarantine_limit=_DEFAULT_HDFS_QUARANTINE_LIMIT,
+            )
         logger.warning(
-            "%s timed out after %.1fs; abandoning handle", description, timeout_sec
+            "%s timed out after %.1fs; quarantining client without further "
+            "native close",
+            description,
+            timeout_sec,
         )
+        return False
     except BaseException as error:
+        if filesystem_key is not None and filesystem is not None:
+            invalidate_thread_local_hdfs_filesystem(filesystem_key, filesystem)
         logger.warning("%s failed: %s", description, error)
+    return True
+
+
+def _close_remote_parquet_session(
+    *,
+    batch_iterator: Any,
+    parquet_file: Any,
+    native_file: Any,
+    filesystem: Any,
+    filesystem_key: str,
+    policy: RemoteIoPolicy,
+    label: str,
+) -> None:
+    """Close iterator then native handle without racing either operation."""
+
+    iterator_close = getattr(batch_iterator, "close", None)
+    if callable(iterator_close):
+        try:
+            call_with_timeout(
+                iterator_close,
+                policy.close_timeout,
+                description=f"{label} (iterator close)",
+            )
+        except RemoteIoTimeoutError as error:
+            invalidate_thread_local_hdfs_filesystem(filesystem_key, filesystem)
+            _defer_remote_session_cleanup(
+                error,
+                filesystem=filesystem,
+                native_file=native_file,
+                retained_resources=(parquet_file, batch_iterator),
+                label=f"{label} (iterator close)",
+                quarantine_limit=policy.quarantine_limit,
+            )
+            error.cleanup_scheduled = True
+            return
+        except BaseException as error:
+            logger.warning("failed to close batch iterator for %s: %s", label, error)
+            invalidate_thread_local_hdfs_filesystem(
+                filesystem_key,
+                filesystem,
+            )
+            if is_poisoned_iterator_error(error):
+                _retain_abandoned_remote_session(
+                    filesystem,
+                    parquet_file,
+                    batch_iterator,
+                    native_file,
+                    label=f"{label} (iterator close)",
+                    quarantine_limit=policy.quarantine_limit,
+                )
+                return
+
+    close_hdfs_native_file(
+        native_file,
+        timeout_sec=policy.close_timeout,
+        description=f"{label} (native close)",
+        filesystem=filesystem,
+        filesystem_key=filesystem_key,
+    )
 
 
 def open_hdfs_input_with_protection(
@@ -564,7 +1056,13 @@ def open_hdfs_input_with_protection(
     policy: RemoteIoPolicy,
     description: str | None = None,
 ) -> Any:
-    """Open ``fs_path`` under flock + timeout + retry; return native file."""
+    """Open one native HDFS handle under flock + timeout.
+
+    Resource-producing calls are deliberately single-attempt. If they time
+    out, their daemon thread can still return a live handle later; retrying on
+    the same DFSClient would race that operation. Session owners perform retry
+    with a fresh filesystem instead.
+    """
 
     label = description or f"open_input_file {lock_key}"
 
@@ -572,11 +1070,10 @@ def open_hdfs_input_with_protection(
         return filesystem.open_input_file(fs_path)
 
     with PerFileLock(lock_key, enabled=policy.file_lock):
-        return run_remote_op(
+        return call_with_timeout(
             open_fn,
-            policy,
+            policy.open_timeout if policy.enabled else policy.op_timeout,
             description=label,
-            timeout_sec=policy.open_timeout if policy.enabled else policy.op_timeout,
         )
 
 
@@ -587,6 +1084,7 @@ def open_parquet_via_native(
     lock_key: str,
     policy: RemoteIoPolicy,
     pq_module: Any,
+    filesystem_key: str | None = None,
     description: str | None = None,
 ) -> tuple[Any, Any | None]:
     """Open a ``ParquetFile``, using native_file + pre_buffer on remote FS.
@@ -599,13 +1097,30 @@ def open_parquet_via_native(
     if not policy.enabled:
         return pq_module.ParquetFile(fs_path, filesystem=filesystem), None
 
-    native_file = open_hdfs_input_with_protection(
-        filesystem,
-        fs_path,
-        lock_key=lock_key,
-        policy=policy,
-        description=f"{label} (native open)",
-    )
+    try:
+        native_file = open_hdfs_input_with_protection(
+            filesystem,
+            fs_path,
+            lock_key=lock_key,
+            policy=policy,
+            description=f"{label} (native open)",
+        )
+    except RemoteIoTimeoutError as error:
+        if filesystem_key is not None:
+            invalidate_thread_local_hdfs_filesystem(filesystem_key, filesystem)
+        _defer_remote_session_cleanup(
+            error,
+            filesystem=filesystem,
+            late_result_kind="native_file",
+            label=f"{label} (native open)",
+            quarantine_limit=policy.quarantine_limit,
+        )
+        error.cleanup_scheduled = True
+        raise
+    except BaseException as error:
+        if filesystem_key is not None and is_retryable_remote_error(error):
+            invalidate_thread_local_hdfs_filesystem(filesystem_key, filesystem)
+        raise
 
     def build() -> Any:
         return pq_module.ParquetFile(
@@ -614,17 +1129,33 @@ def open_parquet_via_native(
         )
 
     try:
-        parquet_file = run_remote_op(
+        parquet_file = call_with_timeout(
             build,
-            policy,
+            policy.open_timeout,
             description=f"{label} (ParquetFile)",
-            timeout_sec=policy.open_timeout,
         )
-    except BaseException:
+    except RemoteIoTimeoutError as error:
+        if filesystem_key is not None:
+            invalidate_thread_local_hdfs_filesystem(filesystem_key, filesystem)
+        _defer_remote_session_cleanup(
+            error,
+            filesystem=filesystem,
+            native_file=native_file,
+            retained_resources=(build,),
+            label=f"{label} (ParquetFile)",
+            quarantine_limit=policy.quarantine_limit,
+        )
+        error.cleanup_scheduled = True
+        raise
+    except BaseException as error:
+        if filesystem_key is not None and is_retryable_remote_error(error):
+            invalidate_thread_local_hdfs_filesystem(filesystem_key, filesystem)
         close_hdfs_native_file(
             native_file,
             timeout_sec=policy.close_timeout,
             description=f"{label} (close after open failure)",
+            filesystem=filesystem,
+            filesystem_key=filesystem_key,
         )
         raise
     return parquet_file, native_file
@@ -653,6 +1184,7 @@ def parquet_native_session(
         lock_key=lock_key,
         policy=policy,
         pq_module=pq_module,
+        filesystem_key=filesystem_key,
         description=description,
     )
     try:
@@ -662,7 +1194,295 @@ def parquet_native_session(
             native_file,
             timeout_sec=policy.close_timeout,
             description=f"{description or lock_key} (native close)",
+            filesystem=filesystem,
+            filesystem_key=filesystem_key,
         )
+
+
+def _run_remote_parquet_operation(
+    *,
+    filesystem_key: str,
+    prototype: Any,
+    fs_path: str,
+    lock_key: str,
+    policy: RemoteIoPolicy,
+    pq_module: Any,
+    description: str,
+    operation: Callable[[Any], T],
+) -> T:
+    """Run a metadata operation with whole-session retries on fresh clients."""
+
+    max_sessions = 1 + max(0, int(policy.retry_count))
+    last_error: BaseException | None = None
+    for session_idx in range(max_sessions):
+        if session_idx > 0 and last_error is not None:
+            delay = float(policy.retry_base_sec) * (2 ** (session_idx - 1))
+            logger.warning(
+                "%s failed (%s); reopen session %d/%d in %.2fs",
+                description,
+                last_error,
+                session_idx + 1,
+                max_sessions,
+                delay,
+            )
+            time.sleep(delay)
+
+        filesystem = thread_local_hdfs_filesystem(
+            filesystem_key,
+            prototype=prototype,
+        )
+        native_file: Any = None
+        try:
+            parquet_file, native_file = open_parquet_via_native(
+                filesystem=filesystem,
+                fs_path=fs_path,
+                lock_key=lock_key,
+                policy=policy,
+                pq_module=pq_module,
+                filesystem_key=filesystem_key,
+                description=description,
+            )
+            return operation(parquet_file)
+        except BaseException as error:
+            if not is_retryable_remote_error(error):
+                raise
+            invalidate_thread_local_hdfs_filesystem(
+                filesystem_key,
+                filesystem,
+            )
+            last_error = error
+        finally:
+            close_hdfs_native_file(
+                native_file,
+                timeout_sec=policy.close_timeout,
+                description=f"{description} (native close)",
+                filesystem=filesystem,
+                filesystem_key=filesystem_key,
+            )
+
+    assert last_error is not None
+    raise last_error
+
+
+def _iter_parquet_record_batches_local(
+    *,
+    fs_path: str,
+    filesystem: Any,
+    lock_key: str,
+    pq_module: Any,
+    stop_event: threading.Event | None,
+    kwargs: dict[str, Any],
+) -> Iterator[Any]:
+    """Plain local ``ParquetFile.iter_batches`` path (no remote timeouts)."""
+
+    with PerFileLock(lock_key, enabled=False):
+        parquet_file = pq_module.ParquetFile(fs_path, filesystem=filesystem)
+    batch_iterator = iter(parquet_file.iter_batches(**kwargs))
+    try:
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return
+            try:
+                yield next(batch_iterator)
+            except StopIteration:
+                return
+    finally:
+        _close_batch_iterator(batch_iterator, poisoned=False, label=lock_key)
+
+
+def _iter_parquet_record_batches_remote_session(
+    *,
+    fs_path: str,
+    filesystem: Any,
+    filesystem_key: str,
+    lock_key: str,
+    policy: RemoteIoPolicy,
+    pq_module: Any,
+    stop_event: threading.Event | None,
+    label: str,
+    kwargs: dict[str, Any],
+    skip_tracker: RemoteSkipTracker | None = None,
+    estimated_rows: int | None = None,
+) -> Iterator[Any]:
+    """One remote open→stream attempt. Raises ``_ParquetSessionReopen`` to retry."""
+
+    fs: Any = None
+    parquet_file: Any = None
+    native_file: Any | None = None
+    batch_iterator: Any = None
+    yielded_any = False
+    yielded_rows = 0
+    timeout_error: RemoteIoTimeoutError | None = None
+    timeout_late_result_kind: Literal["ignore", "batch_iterator"] = "ignore"
+    untrackable_poison = False
+    invalidate_filesystem = False
+
+    def _skip_rows_for_abandon() -> int:
+        if estimated_rows is None:
+            return 0
+        return max(0, int(estimated_rows) - int(yielded_rows))
+
+    try:
+        fs = thread_local_hdfs_filesystem(
+            filesystem_key,
+            prototype=filesystem,
+        )
+        parquet_file, native_file = open_parquet_via_native(
+            filesystem=fs,
+            fs_path=fs_path,
+            lock_key=lock_key,
+            policy=policy,
+            pq_module=pq_module,
+            filesystem_key=filesystem_key,
+            description=label,
+        )
+        try:
+            batch_iterator = call_with_timeout(
+                lambda: iter(parquet_file.iter_batches(**kwargs)),
+                policy.open_timeout,
+                description=f"{label} (start)",
+            )
+        except RemoteIoTimeoutError as error:
+            timeout_error = error
+            timeout_late_result_kind = "batch_iterator"
+            invalidate_filesystem = True
+            raise _ParquetSessionReopen(error) from error
+
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return
+
+            def next_batch(iterator: Any = batch_iterator) -> Any:
+                return next(iterator)
+
+            try:
+                batch = call_with_timeout(
+                    next_batch,
+                    policy.op_timeout,
+                    description=f"{label} (batch)",
+                )
+            except StopIteration:
+                return
+            except RemoteIoTimeoutError as error:
+                timeout_error = error
+                invalidate_filesystem = True
+                if yielded_any:
+                    # Already emitted batches — reopening would duplicate rows.
+                    logger.warning(
+                        "%s timed out after yielding batches; "
+                        "abandoning remainder of this row group",
+                        label,
+                    )
+                    if maybe_skip_or_raise(
+                        error,
+                        policy,
+                        description=f"{label} (batch)",
+                        skip_tracker=skip_tracker,
+                        skipped_row_groups=1,
+                        skipped_rows=_skip_rows_for_abandon(),
+                    ):
+                        return
+                    raise
+                raise _ParquetSessionReopen(error) from error
+            except BaseException as error:
+                if is_poisoned_iterator_error(error):
+                    untrackable_poison = True
+                    invalidate_filesystem = True
+                    if yielded_any:
+                        if maybe_skip_or_raise(
+                            error,
+                            policy,
+                            description=f"{label} (batch)",
+                            skip_tracker=skip_tracker,
+                            skipped_row_groups=1,
+                            skipped_rows=_skip_rows_for_abandon(),
+                        ):
+                            return
+                        raise
+                    raise _ParquetSessionReopen(error) from error
+                if is_retryable_remote_error(error):
+                    invalidate_filesystem = True
+                    if not yielded_any:
+                        raise _ParquetSessionReopen(error) from error
+                if maybe_skip_or_raise(
+                    error,
+                    policy,
+                    description=f"{label} (batch)",
+                    skip_tracker=skip_tracker,
+                    skipped_row_groups=1,
+                    skipped_rows=_skip_rows_for_abandon() if yielded_any else (
+                        int(estimated_rows) if estimated_rows is not None else 0
+                    ),
+                ):
+                    return
+                raise
+
+            yielded_any = True
+            try:
+                yielded_rows += int(getattr(batch, "num_rows", 0) or 0)
+            except Exception:
+                pass
+            yield batch
+    except _ParquetSessionReopen:
+        invalidate_filesystem = True
+        raise
+    except BaseException as error:
+        # Failures before the batch loop are open/start errors. Prefer session
+        # reopen for transient faults; honor skip only after retries exhaust
+        # in the outer iter_parquet_record_batches loop (or immediately when
+        # the error is not retryable).
+        if batch_iterator is None and not yielded_any:
+            if isinstance(error, RemoteIoTimeoutError):
+                invalidate_filesystem = True
+                if not error.cleanup_scheduled:
+                    timeout_error = error
+            if is_retryable_remote_error(error):
+                invalidate_filesystem = True
+                raise _ParquetSessionReopen(error) from error
+            if maybe_skip_or_raise(
+                error,
+                policy,
+                description=f"{label} (open)",
+                skip_tracker=skip_tracker,
+                skipped_row_groups=1,
+                skipped_rows=int(estimated_rows) if estimated_rows is not None else 0,
+            ):
+                return
+        raise
+    finally:
+        if invalidate_filesystem and fs is not None:
+            invalidate_thread_local_hdfs_filesystem(filesystem_key, fs)
+        if timeout_error is not None and not timeout_error.cleanup_scheduled:
+            _defer_remote_session_cleanup(
+                timeout_error,
+                filesystem=fs,
+                batch_iterator=batch_iterator,
+                native_file=native_file,
+                late_result_kind=timeout_late_result_kind,
+                retained_resources=(parquet_file,),
+                label=label,
+                quarantine_limit=policy.quarantine_limit,
+            )
+            timeout_error.cleanup_scheduled = True
+        elif untrackable_poison:
+            _retain_abandoned_remote_session(
+                fs,
+                parquet_file,
+                batch_iterator,
+                native_file,
+                label=label,
+                quarantine_limit=policy.quarantine_limit,
+            )
+        else:
+            _close_remote_parquet_session(
+                batch_iterator=batch_iterator,
+                parquet_file=parquet_file,
+                native_file=native_file,
+                filesystem=fs,
+                filesystem_key=filesystem_key,
+                policy=policy,
+                label=label,
+            )
 
 
 def iter_parquet_record_batches(
@@ -675,6 +1495,8 @@ def iter_parquet_record_batches(
     filesystem_key: str | None = None,
     stop_event: threading.Event | None = None,
     description: str | None = None,
+    skip_tracker: RemoteSkipTracker | None = None,
+    estimated_rows: int | None = None,
     **iter_kwargs: Any,
 ) -> Iterator[Any]:
     """Open and stream ``iter_batches`` under one remote IO session.
@@ -682,6 +1504,12 @@ def iter_parquet_record_batches(
     Remote path uses thread-local FS + native_file + pre_buffer. Local path
     keeps a plain ``ParquetFile`` open. ``on_hdfs_failure: skip`` applies to
     body reads only.
+
+    Critical resilience rule: never retry ``next()`` / ``close()`` on an Arrow
+    batch generator after a timeout. Abandoned timeout threads still own the
+    generator; in-place retries cause ``generator already executing`` and can
+    wedge HDFS for a long time. Instead reopen a fresh session (before any
+    batches were yielded) or abandon the remainder of the row group.
     """
 
     label = description or f"read parquet {lock_key}"
@@ -689,91 +1517,70 @@ def iter_parquet_record_batches(
     if policy.enabled:
         kwargs["use_threads"] = False
 
+    if not policy.enabled:
+        yield from _iter_parquet_record_batches_local(
+            fs_path=fs_path,
+            filesystem=filesystem,
+            lock_key=lock_key,
+            pq_module=pq_module,
+            stop_event=stop_event,
+            kwargs=kwargs,
+        )
+        return
+
     resolved_key = filesystem_key
     if resolved_key is None and filesystem is not None:
-        # Best-effort: callers should pass filesystem_key for TLS cloning.
-        resolved_key = "hdfs://" if policy.enabled else "file://"
+        resolved_key = "hdfs://"
+    resolved_key = resolved_key or "hdfs://"
 
-    try:
-        if policy.enabled:
-            fs = thread_local_hdfs_filesystem(
-                resolved_key or "hdfs://",
-                prototype=filesystem,
+    max_sessions = 1 + max(0, int(policy.retry_count))
+    last_error: BaseException | None = None
+    for session_idx in range(max_sessions):
+        if stop_event is not None and stop_event.is_set():
+            return
+        if session_idx > 0 and last_error is not None:
+            delay = float(policy.retry_base_sec) * (2 ** (session_idx - 1))
+            logger.warning(
+                "%s failed (%s); reopen session %d/%d in %.2fs",
+                label,
+                last_error,
+                session_idx + 1,
+                max_sessions,
+                delay,
             )
-            parquet_file, native_file = open_parquet_via_native(
-                filesystem=fs,
+            if _interruptible_sleep(delay, stop_event):
+                return
+        try:
+            yield from _iter_parquet_record_batches_remote_session(
                 fs_path=fs_path,
+                filesystem=filesystem,
+                filesystem_key=resolved_key,
                 lock_key=lock_key,
                 policy=policy,
                 pq_module=pq_module,
-                description=label,
+                stop_event=stop_event,
+                label=label,
+                kwargs=kwargs,
+                skip_tracker=skip_tracker,
+                estimated_rows=estimated_rows,
             )
-        else:
-            native_file = None
-            with PerFileLock(lock_key, enabled=False):
-                parquet_file = pq_module.ParquetFile(fs_path, filesystem=filesystem)
-    except BaseException as error:
-        if maybe_skip_or_raise(error, policy, description=f"{label} (open)"):
             return
-        raise
+        except _ParquetSessionReopen as reopen:
+            last_error = reopen.error
+            continue
 
-    batch_iterator: Any = None
-    try:
-        try:
-            batch_iterator = run_remote_op(
-                lambda: iter(parquet_file.iter_batches(**kwargs)),
-                policy,
-                description=f"{label} (start)",
-                timeout_sec=policy.open_timeout
-                if policy.enabled
-                else policy.op_timeout,
-            )
-        except BaseException as error:
-            if maybe_skip_or_raise(error, policy, description=f"{label} (start)"):
-                return
-            raise
+    assert last_error is not None
+    if maybe_skip_or_raise(
+        last_error,
+        policy,
+        description=f"{label} (batch)",
+        skip_tracker=skip_tracker,
+        skipped_row_groups=1,
+        skipped_rows=int(estimated_rows) if estimated_rows is not None else 0,
+    ):
+        return
+    raise last_error
 
-        while True:
-            if stop_event is not None and stop_event.is_set():
-                return
-
-            def next_batch(iterator: Any = batch_iterator) -> Any:
-                return next(iterator)
-
-            try:
-                yield run_remote_op(
-                    next_batch,
-                    policy,
-                    description=f"{label} (batch)",
-                    timeout_sec=policy.op_timeout,
-                )
-            except StopIteration:
-                return
-            except BaseException as error:
-                if maybe_skip_or_raise(
-                    error,
-                    policy,
-                    description=f"{label} (batch)",
-                ):
-                    return
-                raise
-    finally:
-        if batch_iterator is not None:
-            close = getattr(batch_iterator, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except BaseException as error:
-                    logger.warning(
-                        "failed to close batch iterator for %s: %s",
-                        label,
-                        error,
-                    )
-        close_hdfs_native_file(
-            native_file,
-            timeout_sec=policy.close_timeout,
-            description=f"{label} (native close)",
-        )
 
 
 # Changing the planner algorithm changes which distributed rank sees each row
@@ -1200,27 +2007,17 @@ def parquet_schema(
     if not io_policy.enabled:
         return pq.read_schema(ref.fs_path, filesystem=ref.filesystem)
 
-    filesystem = thread_local_hdfs_filesystem(
-        ref.filesystem_key,
-        prototype=ref.filesystem,
-    )
     schema_policy = replace(io_policy, pre_buffer=False)
-    parquet_file, native_file = open_parquet_via_native(
-        filesystem=filesystem,
+    return _run_remote_parquet_operation(
+        filesystem_key=ref.filesystem_key,
+        prototype=ref.filesystem,
         fs_path=ref.fs_path,
         lock_key=ref.canonical_uri,
         policy=schema_policy,
         pq_module=pq,
         description=f"read schema {ref.canonical_uri}",
+        operation=lambda parquet_file: parquet_file.schema_arrow,
     )
-    try:
-        return parquet_file.schema_arrow
-    finally:
-        close_hdfs_native_file(
-            native_file,
-            timeout_sec=io_policy.close_timeout,
-            description=f"close schema handle {ref.canonical_uri}",
-        )
 
 
 def validate_matching_schemas(
@@ -1443,6 +2240,7 @@ class _RowGroupWorkItem:
     weight: int  # compressed_bytes or num_rows, depending on the plan
     rank: int
     scan_order: int  # global order before LPT; restores deterministic yield order
+    num_rows: int = 0
 
 
 @dataclass(frozen=True)
@@ -1488,75 +2286,60 @@ def _load_file_metadata_cache(
     io_policy = policy or RemoteIoPolicy.disabled()
     _pa, _pc, _ds, pq = _require_pyarrow()
 
-    def load() -> _FileMetadataCache:
-        filesystem = thread_local_hdfs_filesystem(
-            ref.filesystem_key,
-            prototype=ref.filesystem,
-        )
-        meta_policy = (
-            replace(io_policy, pre_buffer=False) if io_policy.enabled else io_policy
-        )
-        if io_policy.enabled:
-            parquet_file, native_file = open_parquet_via_native(
-                filesystem=filesystem,
-                fs_path=ref.fs_path,
-                lock_key=ref.canonical_uri,
-                policy=meta_policy,
-                pq_module=pq,
-                description=f"load parquet metadata {ref.canonical_uri}",
-            )
-        else:
-            parquet_file = pq.ParquetFile(ref.fs_path, filesystem=ref.filesystem)
-            native_file = None
-        try:
-            schema = parquet_file.schema_arrow
-            column_names = (
-                scan_columns if scan_columns is not None else list(schema.names)
-            )
-            column_indices = {
-                column_name: schema.get_field_index(column_name)
-                for column_name in column_names
-            }
-            row_groups: list[_RowGroupMetadata] = []
-            for local_row_group_index in range(parquet_file.metadata.num_row_groups):
-                row_group = parquet_file.metadata.row_group(local_row_group_index)
-                compressed_bytes = 0
-                missing_bytes = False
-                for column_name in column_names:
-                    column_index = column_indices[column_name]
-                    if column_index < 0:
-                        missing_bytes = True
-                        break
-                    column_meta = row_group.column(column_index)
-                    if (
-                        column_meta.total_compressed_size is None
-                        or column_meta.total_compressed_size < 0
-                    ):
-                        missing_bytes = True
-                        break
-                    compressed_bytes += int(column_meta.total_compressed_size)
-                row_groups.append(
-                    _RowGroupMetadata(
-                        input_ref=ref,
-                        local_row_group_index=local_row_group_index,
-                        num_rows=row_group.num_rows,
-                        compressed_bytes=None if missing_bytes else compressed_bytes,
-                    )
+    def build_cache(parquet_file: Any) -> _FileMetadataCache:
+        schema = parquet_file.schema_arrow
+        column_names = scan_columns if scan_columns is not None else list(schema.names)
+        column_indices = {
+            column_name: schema.get_field_index(column_name)
+            for column_name in column_names
+        }
+        row_groups: list[_RowGroupMetadata] = []
+        for local_row_group_index in range(parquet_file.metadata.num_row_groups):
+            row_group = parquet_file.metadata.row_group(local_row_group_index)
+            compressed_bytes = 0
+            missing_bytes = False
+            for column_name in column_names:
+                column_index = column_indices[column_name]
+                if column_index < 0:
+                    missing_bytes = True
+                    break
+                column_meta = row_group.column(column_index)
+                if (
+                    column_meta.total_compressed_size is None
+                    or column_meta.total_compressed_size < 0
+                ):
+                    missing_bytes = True
+                    break
+                compressed_bytes += int(column_meta.total_compressed_size)
+            row_groups.append(
+                _RowGroupMetadata(
+                    input_ref=ref,
+                    local_row_group_index=local_row_group_index,
+                    num_rows=row_group.num_rows,
+                    compressed_bytes=None if missing_bytes else compressed_bytes,
                 )
-            return _FileMetadataCache(schema=schema, row_groups=tuple(row_groups))
-        finally:
-            close_hdfs_native_file(
-                native_file,
-                timeout_sec=io_policy.close_timeout,
-                description=f"close metadata handle {ref.canonical_uri}",
             )
+        return _FileMetadataCache(schema=schema, row_groups=tuple(row_groups))
 
     # Footer planning must stay strict: skipping here would desync LPT shards.
-    # open_parquet_via_native already locks; for local keep a simple call.
     if io_policy.enabled:
-        return load()
+        return _run_remote_parquet_operation(
+            filesystem_key=ref.filesystem_key,
+            prototype=ref.filesystem,
+            fs_path=ref.fs_path,
+            lock_key=ref.canonical_uri,
+            policy=replace(io_policy, pre_buffer=False),
+            pq_module=pq,
+            description=f"load parquet metadata {ref.canonical_uri}",
+            operation=build_cache,
+        )
+
+    def load_local() -> _FileMetadataCache:
+        parquet_file = pq.ParquetFile(ref.fs_path, filesystem=ref.filesystem)
+        return build_cache(parquet_file)
+
     return run_under_file_lock(
-        load,
+        load_local,
         lock_key=ref.canonical_uri,
         policy=io_policy,
         description=f"load parquet metadata {ref.canonical_uri}",
@@ -1668,6 +2451,7 @@ def _build_lpt_shard_plan(
             weight=weight,
             rank=rank,
             scan_order=order,
+            num_rows=int(item.num_rows),
         )
         for order, item, weight, rank in assignments
     )
@@ -1797,6 +2581,12 @@ class ParquetScanner:
         self._io_policy = RemoteIoPolicy.from_reader(
             split.reader,
             remote=_refs_are_remote(self.all_paths),
+        )
+        self._skip_tracker = RemoteSkipTracker(
+            max_skipped_row_groups=getattr(
+                split.reader, "hdfs_max_skipped_row_groups", 64
+            ),
+            max_skipped_rows=getattr(split.reader, "hdfs_max_skipped_rows", 2_000_000),
         )
         if self._io_policy.enabled:
             apply_worker_stagger(shard_rank, split.reader.worker_stagger_sec)
@@ -2000,6 +2790,8 @@ class ParquetScanner:
                     f"row group {work_item.local_row_group_index} of "
                     f"{ref.canonical_uri}"
                 ),
+                skip_tracker=self._skip_tracker,
+                estimated_rows=int(work_item.num_rows),
                 batch_size=batch_size,
                 row_groups=[work_item.local_row_group_index],
                 columns=scan_columns,
@@ -2031,6 +2823,8 @@ class ParquetScanner:
                     f"prefetch row group {work_item.local_row_group_index} of "
                     f"{ref.canonical_uri}"
                 ),
+                skip_tracker=self._skip_tracker,
+                estimated_rows=int(work_item.num_rows),
                 batch_size=batch_size,
                 row_groups=[work_item.local_row_group_index],
                 columns=scan_columns,
@@ -2179,7 +2973,15 @@ class ParquetScanner:
                         slot.byte_budget.release(item.nbytes)
 
                 if slot.thread is not None:
-                    slot.thread.join()
+                    _join_prefetch_thread(
+                        slot.thread,
+                        timeout_sec=self._io_policy.prefetch_join_timeout,
+                        label=(
+                            f"parquet-prefetch worker for "
+                            f"{_work_item.input_ref.canonical_uri}:"
+                            f"{_work_item.local_row_group_index}"
+                        ),
+                    )
                 slot.thread = None
                 slot.error = None
                 _drain_prefetch_slot(slot)
@@ -2193,10 +2995,18 @@ class ParquetScanner:
                 slot.byte_budget.wake_all()
             with assignment_condition:
                 assignment_condition.notify_all()
-            assignment_thread.join()
+            _join_prefetch_thread(
+                assignment_thread,
+                timeout_sec=self._io_policy.prefetch_join_timeout,
+                label="parquet-prefetch-assign",
+            )
             for slot in slots:
                 if slot.thread is not None:
-                    slot.thread.join()
+                    _join_prefetch_thread(
+                        slot.thread,
+                        timeout_sec=self._io_policy.prefetch_join_timeout,
+                        label=f"parquet-prefetch slot-{slot.index}",
+                    )
                 _drain_prefetch_slot(slot)
                 slot.thread = None
                 slot.error = None
@@ -2236,6 +3046,7 @@ class ParquetScanner:
                 pq_module=pq,
                 stop_event=stop_event,
                 description=f"file scan {ref.canonical_uri}",
+                skip_tracker=self._skip_tracker,
                 batch_size=batch_size,
                 columns=scan_columns,
                 use_threads=not self._io_policy.enabled,
@@ -2261,6 +3072,7 @@ class ParquetScanner:
                 pq_module=pq,
                 stop_event=stop_event,
                 description=f"prefetch file {ref.canonical_uri}",
+                skip_tracker=self._skip_tracker,
                 batch_size=batch_size,
                 columns=scan_columns,
                 # Prefetch workers: HDFS keeps Arrow inner threads off (JNI).
@@ -2385,13 +3197,21 @@ class ParquetScanner:
 
                 slot = slot_for_item[work_index]
                 while True:
-                    if stop_event.is_set():
+                    if stop_event.is_set() and slot.queue.empty():
                         return
                     if slot.error is not None:
                         raise slot.error
                     try:
                         item = slot.queue.get(timeout=0.1)
                     except queue.Empty:
+                        if (
+                            slot.thread is not None
+                            and not slot.thread.is_alive()
+                            and slot.queue.empty()
+                        ):
+                            if slot.error is not None:
+                                raise slot.error
+                            break
                         continue
                     if item is _SENTINEL:
                         if slot.error is not None:
@@ -2404,7 +3224,11 @@ class ParquetScanner:
                     finally:
                         slot.byte_budget.release(item.nbytes)
                 if slot.thread is not None:
-                    slot.thread.join(timeout=0.01)
+                    _join_prefetch_thread(
+                        slot.thread,
+                        timeout_sec=self._io_policy.prefetch_join_timeout,
+                        label=f"parquet-file-prefetch worker for {_ref.canonical_uri}",
+                    )
                 slot.thread = None
                 slot.error = None
                 free_slots.put(slot.index)
@@ -2413,11 +3237,25 @@ class ParquetScanner:
                 del slot_for_item[work_index]
         finally:
             stop_event.set()
-            assignment_thread.join(timeout=1.0)
             for slot in slots:
-                if slot.thread is not None and slot.thread.is_alive():
-                    slot.thread.join(timeout=0.5)
+                slot.byte_budget.wake_all()
+            with assignment_condition:
+                assignment_condition.notify_all()
+            _join_prefetch_thread(
+                assignment_thread,
+                timeout_sec=self._io_policy.prefetch_join_timeout,
+                label="parquet-file-prefetch-assign",
+            )
+            for slot in slots:
+                if slot.thread is not None:
+                    _join_prefetch_thread(
+                        slot.thread,
+                        timeout_sec=self._io_policy.prefetch_join_timeout,
+                        label=f"parquet-file-prefetch slot-{slot.index}",
+                    )
                 _drain_prefetch_slot(slot)
+                slot.thread = None
+                slot.error = None
             slot_for_item.clear()
 
     def _iter_file_record_batches(self, stop_event: threading.Event) -> Iterator[Any]:

@@ -45,8 +45,8 @@ MASTER_PORTS = {
 # 24GB mock E2E: production MixFormer batches under-fill the GPU after embedding
 # caps. Scale request batches (and length-bucket sizes) for util measurement only.
 MIXFORMER_E2E_BATCH_SCALE = {
-    "mixformer": 1.5,  # ~84% util @ ~9 GiB
-    "mdl_mixformer": 3.0,  # ~85% util @ ~14 GiB
+    "mixformer": 3.5,  # ~92% util @ ~16 GiB on 2x4090 mock E2E
+    "mdl_mixformer": 5.5,  # ~90% util @ ~21 GiB with selective ckpt
 }
 
 
@@ -190,6 +190,10 @@ def build_overlay(
     # Keep the flash SLO for models that actually emit Flash kernels.
     if model_name in {"mixformer", "mdl_mixformer"}:
         runtime["attention_backend"] = "sdpa"
+    # MDL-MixFormer at full ckpt tops out ~87% on 24GB mock cards; selective
+    # frees activation memory so batch scale 5.5 can reach ~90% util.
+    if model_name == "mdl_mixformer":
+        runtime["activation_checkpoint"] = "selective"
     payload["runtime"] = runtime
 
     # Mock random-init + paper lr_dense=0.01 is numerically unstable for the

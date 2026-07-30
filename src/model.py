@@ -4476,50 +4476,75 @@ class OneTransTokenizer(nn.Module):
                 )
         return max_length, first
 
-    def _sequence_group_timestamps(
+    def _sequence_group_temporal_sort_keys(
         self,
         group: TokenGroupConfig,
         features: dict[str, Any],
         expected_mask: Tensor,
     ) -> Tensor:
-        timestamps: Tensor | None = None
+        sort_keys: Tensor | None = None
+        temporal_kind: str | None = None
         for name in group.inputs:
             sequence = self.sequence_by_name.get(name)
             if sequence is None:
                 continue
-            if sequence.timestamp_field is None:
-                raise ValueError(f"sequence {name!r} has no timestamp_field")
+            if sequence.timestamp_field is not None:
+                field_name = sequence.timestamp_field
+                current_kind = "timestamp"
+            elif sequence.time_delta_field is not None:
+                field_name = sequence.time_delta_field
+                current_kind = "time_delta"
+            else:
+                raise ValueError(
+                    f"sequence {name!r} has neither timestamp_field nor "
+                    "time_delta_field"
+                )
+            if temporal_kind is None:
+                temporal_kind = current_kind
+            elif temporal_kind != current_kind:
+                raise ValueError(
+                    f"sequence token group {group.name!r} mixes absolute "
+                    "timestamps and relative time deltas"
+                )
             value = features[name]
-            raw = value["fields"][sequence.timestamp_field].float()
+            raw = value["fields"][field_name].float()
             if raw.dim() == 2:
                 raw = raw.unsqueeze(-1)
             if raw.size(-1) != 1:
-                raise ValueError(f"sequence {name!r} timestamp field must be scalar")
-            aligned, timestamp_mask = self.encoder_bank._align_sequence_inputs(
+                raise ValueError(
+                    f"sequence {name!r} temporal field must be scalar"
+                )
+            aligned, temporal_mask = self.encoder_bank._align_sequence_inputs(
                 sequence,
                 raw,
                 value["lengths"].long(),
                 target_length=expected_mask.size(1),
             )
             current = aligned.squeeze(-1)
-            if timestamp_mask.shape != expected_mask.shape:
+            if temporal_mask.shape != expected_mask.shape:
                 raise ValueError(
-                    f"sequence {name!r} timestamp shape does not match token shape"
+                    f"sequence {name!r} temporal shape does not match token shape"
                 )
-            if timestamps is None:
-                timestamps = current
+            # Ascending absolute timestamps are oldest-to-newest. A time delta
+            # is an age relative to the common request time, so negate its
+            # monotonic value to retain the same canonical direction.
+            if current_kind == "time_delta":
+                current = -current
+            if sort_keys is None:
+                sort_keys = current
             elif not torch.equal(
-                timestamps.masked_select(expected_mask),
+                sort_keys.masked_select(expected_mask),
                 current.masked_select(expected_mask),
             ):
                 raise ValueError(
-                    f"sequence token group {group.name!r} contains inconsistent timestamps"
+                    f"sequence token group {group.name!r} contains inconsistent "
+                    "temporal values"
                 )
-        if timestamps is None:
+        if sort_keys is None:
             raise ValueError(
-                f"sequence token group {group.name!r} has no timestamp source"
+                f"sequence token group {group.name!r} has no temporal source"
             )
-        return timestamps
+        return sort_keys
 
     def _sequence_group_tokens(
         self,
@@ -4578,12 +4603,12 @@ class OneTransTokenizer(nn.Module):
             self.config,
         )
         tokens = tokens * mask.unsqueeze(-1).to(tokens.dtype)
-        timestamps = (
-            self._sequence_group_timestamps(group, features, mask)
+        temporal_sort_keys = (
+            self._sequence_group_temporal_sort_keys(group, features, mask)
             if self.sequence_fusion == "timestamp_aware"
             else None
         )
-        return tokens, mask, timestamps
+        return tokens, mask, temporal_sort_keys
 
     def _ns_tokens_groupwise(self, encoded: dict[str, Tensor]) -> Tensor:
         tokens = []
@@ -4624,11 +4649,11 @@ class OneTransTokenizer(nn.Module):
     ) -> OneTransRequestCache:
         sequence_tokens: list[Tensor] = []
         sequence_masks: list[Tensor] = []
-        sequence_timestamps: list[Tensor] = []
+        sequence_temporal_sort_keys: list[Tensor] = []
         for index, (group, projection) in enumerate(
             zip(self.sequence_groups, self.sequence_projectors)
         ):
-            tokens, mask, timestamps = self._sequence_group_tokens(
+            tokens, mask, temporal_sort_keys = self._sequence_group_tokens(
                 group,
                 projection,
                 features,
@@ -4647,9 +4672,11 @@ class OneTransTokenizer(nn.Module):
             sequence_tokens.append(tokens)
             sequence_masks.append(mask)
             if self.sequence_fusion == "timestamp_aware":
-                if timestamps is None:
-                    raise RuntimeError("timestamp-aware fusion requires timestamps")
-                sequence_timestamps.append(timestamps)
+                if temporal_sort_keys is None:
+                    raise RuntimeError(
+                        "timestamp-aware fusion requires temporal sort keys"
+                    )
+                sequence_temporal_sort_keys.append(temporal_sort_keys)
             elif self.use_sep_tokens and index < len(self.sep_tokens):
                 sep = (
                     self.sep_tokens[index]
@@ -4666,8 +4693,8 @@ class OneTransTokenizer(nn.Module):
         tokens = torch.cat(sequence_tokens, dim=1)
         mask = torch.cat(sequence_masks, dim=1)
         if self.sequence_fusion == "timestamp_aware":
-            timestamps = torch.cat(sequence_timestamps, dim=1)
-            sort_values = timestamps.masked_fill(~mask, -torch.inf)
+            temporal_sort_keys = torch.cat(sequence_temporal_sort_keys, dim=1)
+            sort_values = temporal_sort_keys.masked_fill(~mask, -torch.inf)
             order = torch.argsort(sort_values, dim=1, stable=True)
             tokens = tokens.gather(
                 1, order.unsqueeze(-1).expand(-1, -1, tokens.size(-1))
@@ -4820,7 +4847,7 @@ class MixFormerFeatureHeadProjector(nn.Module):
 class MixFormerTokenizer(OneTransTokenizer):
     """Raw behavior tokenizer plus strict non-sequential embedding split.
 
-    Existing sequence alignment, truncation, intent fusion, request
+    Existing sequence alignment, truncation, temporal fusion, request
     deduplication, and grouped embedding lookup are reused from the project's
     OneTrans data path.  Only the representation width changes: every action
     is linearly aligned to ``N * D`` as required by MixFormer cross attention.
@@ -4854,6 +4881,10 @@ class MixFormerTokenizer(OneTransTokenizer):
             for group in self.sequence_groups
         )
         if self.sequence_fusion == "timestamp_aware":
+            # The paper includes action type in every s_t. Adding its learned
+            # full-width vector after the bias-free field projection is
+            # algebraically equivalent to concatenating a type embedding before
+            # the corresponding block of one linear alignment matrix.
             self.sequence_type_embeddings = _init_embedding(
                 nn.Embedding(len(self.sequence_groups), self.sequence_dim),
                 config.model.init_std,

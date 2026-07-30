@@ -37,16 +37,16 @@ data:
     reader:
       engine: pyarrow_dataset
       columns_pruning: true
-      num_workers: 4
+      num_workers: 2
       adapter_workers: 4
-      prefetch_batches: 4
-      max_prefetch_bytes: 8589934592
+      prefetch_batches: 2
+      max_prefetch_bytes: 2147483648
       scanner_batch_rows: 128
       pin_memory: true
       shard_unit: row_group
       eager_schema_validation: sample
       schema_validation_samples: 1
-      cardinality_audit_raw_rows: 1
+      cardinality_audit_raw_rows: 0
       coalesce_pinned_tensors: true
       device_prefetch_batches: 1
       deduplicate_request_features: true
@@ -57,8 +57,8 @@ data:
       shuffle_buffer_rows: 512
       shuffle_seed: 2025
       hdfs_op_timeout: 30
-      hdfs_open_timeout: 120
-      hdfs_retry_count: 5
+      hdfs_open_timeout: 60
+      hdfs_retry_count: 2
       hdfs_retry_base_sec: 0.5
       hdfs_file_lock: true
       on_hdfs_failure: skip
@@ -655,16 +655,16 @@ data:
     reader:
       engine: pyarrow_dataset
       columns_pruning: true
-      num_workers: 4
+      num_workers: 2
       adapter_workers: 4
-      prefetch_batches: 4
-      max_prefetch_bytes: 8589934592
+      prefetch_batches: 2
+      max_prefetch_bytes: 2147483648
       scanner_batch_rows: 128
       pin_memory: true
       shard_unit: row_group
       eager_schema_validation: sample
       schema_validation_samples: 1
-      cardinality_audit_raw_rows: 1
+      cardinality_audit_raw_rows: 0
       coalesce_pinned_tensors: true
       device_prefetch_batches: 1
       deduplicate_request_features: true
@@ -673,8 +673,8 @@ data:
       validate_prehashed_nonzero: false
       trusted_input: true
       hdfs_op_timeout: 30
-      hdfs_open_timeout: 120
-      hdfs_retry_count: 5
+      hdfs_open_timeout: 60
+      hdfs_retry_count: 2
       hdfs_retry_base_sec: 0.5
       hdfs_file_lock: true
       on_hdfs_failure: skip
@@ -5328,6 +5328,7 @@ model:
   experimental_model_acknowledged: true
   mdl_token_state: coupled
 training:
+  step_watchdog_sec: 600.0
   batch_size: 1408
   gradient_accumulation_steps: 1
   embedding_distribution: sharded
@@ -5365,6 +5366,10 @@ training:
   dense_clip_norm: 1.0
   sparse_clip_norm: 1.0
   loss_reduction: mean_per_task
+  task_loss_weights:
+    fst_cart: 0.5
+    cateid_filter: 0.01
+    upid_pay: 0.01
   log_every_steps: 100
   quick_eval:
     enabled: true

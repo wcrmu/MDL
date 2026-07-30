@@ -21,6 +21,77 @@ from src.features import load_vocab_maps, plan_vocab_fit
 
 
 class ModelConfigOverlayTest(unittest.TestCase):
+    def test_training_loss_logs_every_100_steps_by_default_and_in_production(
+        self,
+    ) -> None:
+        self.assertEqual(TrainingConfig().log_every_steps, 100)
+        root = Path(__file__).resolve().parents[1]
+        for model_name in (
+            "rankmixer",
+            "mdl_rankmixer",
+            "onetrans",
+            "mdl_onetrans",
+            "mixformer",
+            "mdl_mixformer",
+        ):
+            for suffix in ("", "_fine"):
+                config_name = f"{model_name}{suffix}.yaml"
+                with self.subTest(config=config_name):
+                    config = load_app_config(root / "configs" / config_name)
+                    self.assertEqual(config.training.log_every_steps, 100)
+
+    def test_production_task_loss_weights_are_point_5_point_01_point_01(
+        self,
+    ) -> None:
+        expected = {
+            "fst_cart": 0.5,
+            "cateid_filter": 0.01,
+            "upid_pay": 0.01,
+        }
+        root = Path(__file__).resolve().parents[1]
+        for model_name in (
+            "rankmixer",
+            "mdl_rankmixer",
+            "onetrans",
+            "mdl_onetrans",
+            "mixformer",
+            "mdl_mixformer",
+        ):
+            for suffix in ("", "_fine"):
+                config_name = f"{model_name}{suffix}.yaml"
+                with self.subTest(config=config_name):
+                    config = load_app_config(root / "configs" / config_name)
+                    self.assertEqual(
+                        dict(config.training.task_loss_weights),
+                        expected,
+                    )
+                    self.assertEqual(
+                        dict(
+                            zip(
+                                config.task_names,
+                                config.ordered_task_loss_weights,
+                            )
+                        ),
+                        expected,
+                    )
+
+    def test_task_loss_weights_reject_unknown_task_names(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "onetrans.yaml")
+        invalid = replace(
+            config,
+            training=replace(
+                config.training,
+                task_loss_weights={"unknown_task": 1.0},
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "task_loss_weights contains unknown tasks: unknown_task",
+        ):
+            invalid.validate()
+
     def test_early_adapter_truncation_must_cover_sequence_consumers(self) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(root / "configs" / "mdl_rankmixer.yaml")

@@ -31,12 +31,22 @@ model:
   # dense-parameter budget close to MixFormer-small and is feasible on 2xH100.
   hidden_dim: 1024
   task_head_hidden_dim: 1024
+  # The nine physical histories share a request-relative time delta derived
+  # from the same impr_time. Globally interleave actions by that monotonic
+  # clock and encode their stream as action type; the paper has no SEP events.
+  sequence_fusion: timestamp_aware
+  use_sep_tokens: false
   mixformer_user_head_count: null
   use_pyramid: false
   final_s_tokens: null
 
 training:
+  step_watchdog_sec: 600.0
   batch_size: 128
   lr_dense: 0.01
   dense_optimizer: rmsprop
-
+  task_loss_weights:
+    fst_cart: 0.5
+    cateid_filter: 0.01
+    upid_pay: 0.01
+  log_every_steps: 100

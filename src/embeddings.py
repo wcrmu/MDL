@@ -20,8 +20,38 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 
+_DEFAULT_GROUPED_EMB_MAX_OUTPUT_BYTES = 1024**3
+
+
 def _env_flag_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _grouped_emb_max_output_bytes(override: int | None = None) -> int:
+    """Resolve the per-autograd-node packed output cap.
+
+    ``MDL_GROUPED_EMB_MAX_OUTPUT_MIB`` offers a launcher-level escape hatch for
+    unusually tight or roomy accelerators. The default keeps each grouped
+    lookup's base output (and therefore its backward base gradient) at roughly
+    1 GiB or less.
+    """
+
+    if override is not None:
+        value = int(override)
+    else:
+        raw_mib = os.environ.get("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", "").strip()
+        if not raw_mib:
+            value = _DEFAULT_GROUPED_EMB_MAX_OUTPUT_BYTES
+        else:
+            try:
+                value = int(raw_mib) * 1024**2
+            except ValueError as exc:
+                raise ValueError(
+                    "MDL_GROUPED_EMB_MAX_OUTPUT_MIB must be a positive integer"
+                ) from exc
+    if value <= 0:
+        raise ValueError("grouped embedding max output bytes must be positive")
+    return value
 
 
 def _grouped_emb_pack_values_enabled(mixed_dims: bool) -> bool:
@@ -1272,25 +1302,158 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
         return (None, None, *local_weight_grads)
 
 
+def _global_max_request_numels(
+    request_list: list[tuple[ShardedEmbedding, Tensor]],
+    group_indices: list[int],
+) -> tuple[int, ...]:
+    """Return per-request max sizes with one identical planning collective/rank."""
+
+    first_module, first_indices = request_list[group_indices[0]]
+    local_numels = torch.tensor(
+        [request_list[index][1].numel() for index in group_indices],
+        dtype=torch.long,
+        device=first_indices.device,
+    )
+    collective_numels = _collective_tensor(local_numels, first_module.process_group)
+    if first_module.world_size > 1:
+        torch_dist.all_reduce(
+            collective_numels,
+            op=torch_dist.ReduceOp.MAX,
+            group=first_module.process_group,
+        )
+    return tuple(int(value) for value in collective_numels.to(device="cpu").tolist())
+
+
+def _partition_group_by_output_bytes(
+    group_indices: list[int],
+    global_max_numels: tuple[int, ...],
+    *,
+    bytes_per_row: int,
+    max_output_bytes: int,
+) -> list[list[int]]:
+    """Build rank-identical request chunks bounded by packed base-output bytes.
+
+    Request tensors stay atomic so the public output remains a direct view of a
+    grouped autograd output. A single request larger than the cap necessarily
+    remains larger than the cap; callers must chunk that source tensor itself.
+    """
+
+    if len(group_indices) != len(global_max_numels):
+        raise ValueError("group indices and global request sizes must align")
+    if bytes_per_row <= 0 or max_output_bytes <= 0:
+        raise ValueError("grouped embedding byte limits must be positive")
+
+    chunks: list[list[int]] = []
+    current: list[int] = []
+    current_bytes = 0
+    for request_index, request_numel in zip(group_indices, global_max_numels):
+        request_bytes = request_numel * bytes_per_row
+        if current and current_bytes + request_bytes > max_output_bytes:
+            chunks.append(current)
+            current = []
+            current_bytes = 0
+        current.append(request_index)
+        current_bytes += request_bytes
+        if current_bytes >= max_output_bytes:
+            chunks.append(current)
+            current = []
+            current_bytes = 0
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _execute_grouped_sharded_embedding_lookup(
+    request_list: list[tuple[ShardedEmbedding, Tensor]],
+    group_indices: list[int],
+    outputs: list[Tensor | None],
+) -> None:
+    """Execute one homogeneous, memory-bounded grouped autograd node."""
+
+    if len(group_indices) == 1:
+        request_index = group_indices[0]
+        module, indices = request_list[request_index]
+        outputs[request_index] = module(indices)
+        return
+
+    unique_modules: list[ShardedEmbedding] = []
+    module_index_by_id: dict[int, int] = {}
+    request_table_indices: list[int] = []
+    flat_indices: list[Tensor] = []
+    request_numels: list[int] = []
+    request_shapes: list[torch.Size] = []
+    request_dims: list[int] = []
+    for request_index in group_indices:
+        module, indices = request_list[request_index]
+        module_id = id(module)
+        table_index = module_index_by_id.get(module_id)
+        if table_index is None:
+            table_index = len(unique_modules)
+            module_index_by_id[module_id] = table_index
+            unique_modules.append(module)
+        request_table_indices.append(table_index)
+        flat_indices.append(indices.reshape(-1))
+        request_numels.append(indices.numel())
+        request_shapes.append(indices.shape)
+        request_dims.append(module.embedding_dim)
+    table_offsets: list[int] = []
+    next_offset = 0
+    for module in unique_modules:
+        table_offsets.append(next_offset)
+        next_offset += module.num_embeddings
+    metadata = _GroupedLookupMetadata(
+        modules=tuple(unique_modules),
+        request_table_indices=tuple(request_table_indices),
+        request_numels=tuple(request_numels),
+        table_offsets=tuple(table_offsets),
+        local_dedup=unique_modules[0].local_dedup,
+        process_group=unique_modules[0].process_group,
+        collect_stats=unique_modules[0].collect_stats,
+        validate_indices=unique_modules[0].validate_indices,
+    )
+    packed_indices = torch.cat(flat_indices)
+    packed_output = _GroupedShardedEmbeddingLookup.apply(
+        packed_indices,
+        metadata,
+        *(module.weight for module in unique_modules),
+    )
+    offset = 0
+    for request_index, request_numel, request_shape, request_dim in zip(
+        group_indices, request_numels, request_shapes, request_dims
+    ):
+        part = packed_output.narrow(0, offset, request_numel).narrow(
+            -1, 0, request_dim
+        )
+        outputs[request_index] = part.reshape(*request_shape, request_dim)
+        offset += request_numel
+
+
 def grouped_sharded_embedding_lookup(
     requests: Iterable[tuple[ShardedEmbedding, Tensor]],
+    *,
+    max_output_bytes: int | None = None,
 ) -> list[Tensor]:
-    """Lookup compatible tables in grouped owner-based collectives.
+    """Lookup compatible tables in memory-bounded grouped collectives.
 
-    Requests are partitioned by device, dtype, process group, and dedup policy.
-    Different embedding widths share one value collective: rows are packed to
-    exact per-table widths on the wire (no max-dim pad traffic), then locally
-    unpacked and sliced. A singleton retains the simpler per-table
-    implementation; all other requests in a partition share one count exchange,
-    request route, and response route.
+    Distributed requests are grouped by device, dtype, process group, dedup
+    policy, and embedding width. Homogeneous-width groups avoid local max-width
+    padding, then split at request boundaries so one grouped autograd output is
+    normally at most 1 GiB. ``MDL_GROUPED_EMB_MAX_OUTPUT_MIB`` or the explicit
+    argument can tune that cap.
+
+    Chunk planning uses the per-request maximum size across ranks. Every rank
+    therefore issues the same collective sequence even when its deduplicated
+    request batch has a different number of rows.
     """
 
     request_list = list(requests)
     if not request_list:
         return []
+    resolved_max_output_bytes = _grouped_emb_max_output_bytes(max_output_bytes)
     # Single-GPU training owns every row locally. Keep native embedding autograd
     # and skip the collective unique/argsort/.item() tax that still runs when
-    # world_size==1 in the grouped route.
+    # world_size==1 in the grouped route. Native calls already avoid a fused
+    # packed base output, so the distributed cap does not apply to this path.
     if all(module.world_size == 1 for module, _indices in request_list):
         outputs = [
             _single_rank_embedding(
@@ -1325,15 +1488,15 @@ def grouped_sharded_embedding_lookup(
         return outputs
 
     outputs: list[Tensor | None] = [None] * len(request_list)
+    # ``routing_groups`` preserve the old fused compatibility partitions and
+    # need only one small MAX reduction for chunk planning. ``groups`` add
+    # embedding_dim so local outputs never pad 8/16/24/32-wide rows to width 48.
+    routing_groups: dict[tuple[Any, ...], list[int]] = {}
     groups: dict[tuple[Any, ...], list[int]] = {}
     for request_index, (module, indices) in enumerate(request_list):
         if indices.dtype != torch.long:
             raise TypeError("sharded embedding indices must be torch.long")
-        # Intentionally omit embedding_dim: mixed widths share one value
-        # collective (exact-width 1D pack on the wire). That cuts RankMixer
-        # from ~20 all_to_all_single ops/step to ~4 and raises multi-GPU util
-        # on SYS/PCIe fabrics where collective latency dominates bandwidth.
-        key = (
+        routing_key = (
             indices.device,
             module.weight.device,
             module.weight.dtype,
@@ -1343,64 +1506,35 @@ def grouped_sharded_embedding_lookup(
             module.validate_indices,
             id(module.process_group),
         )
-        groups.setdefault(key, []).append(request_index)
+        routing_groups.setdefault(routing_key, []).append(request_index)
+        groups.setdefault((*routing_key, module.embedding_dim), []).append(
+            request_index
+        )
+
+    global_max_numels_by_request: dict[int, int] = {}
+    for routing_group_indices in routing_groups.values():
+        global_max_numels = _global_max_request_numels(
+            request_list, routing_group_indices
+        )
+        global_max_numels_by_request.update(
+            zip(routing_group_indices, global_max_numels)
+        )
 
     for group_indices in groups.values():
-        if len(group_indices) == 1:
-            request_index = group_indices[0]
-            module, indices = request_list[request_index]
-            outputs[request_index] = module(indices)
-            continue
-        unique_modules: list[ShardedEmbedding] = []
-        module_index_by_id: dict[int, int] = {}
-        request_table_indices: list[int] = []
-        flat_indices: list[Tensor] = []
-        request_numels: list[int] = []
-        request_shapes: list[torch.Size] = []
-        request_dims: list[int] = []
-        for request_index in group_indices:
-            module, indices = request_list[request_index]
-            module_id = id(module)
-            table_index = module_index_by_id.get(module_id)
-            if table_index is None:
-                table_index = len(unique_modules)
-                module_index_by_id[module_id] = table_index
-                unique_modules.append(module)
-            request_table_indices.append(table_index)
-            flat_indices.append(indices.reshape(-1))
-            request_numels.append(indices.numel())
-            request_shapes.append(indices.shape)
-            request_dims.append(module.embedding_dim)
-        table_offsets: list[int] = []
-        next_offset = 0
-        for module in unique_modules:
-            table_offsets.append(next_offset)
-            next_offset += module.num_embeddings
-        metadata = _GroupedLookupMetadata(
-            modules=tuple(unique_modules),
-            request_table_indices=tuple(request_table_indices),
-            request_numels=tuple(request_numels),
-            table_offsets=tuple(table_offsets),
-            local_dedup=unique_modules[0].local_dedup,
-            process_group=unique_modules[0].process_group,
-            collect_stats=unique_modules[0].collect_stats,
-            validate_indices=unique_modules[0].validate_indices,
+        module = request_list[group_indices[0]][0]
+        global_max_numels = tuple(
+            global_max_numels_by_request[index] for index in group_indices
         )
-        packed_indices = torch.cat(flat_indices)
-        packed_output = _GroupedShardedEmbeddingLookup.apply(
-            packed_indices,
-            metadata,
-            *(module.weight for module in unique_modules),
+        chunks = _partition_group_by_output_bytes(
+            group_indices,
+            global_max_numels,
+            bytes_per_row=module.embedding_dim * module.weight.element_size(),
+            max_output_bytes=resolved_max_output_bytes,
         )
-        offset = 0
-        for request_index, request_numel, request_shape, request_dim in zip(
-            group_indices, request_numels, request_shapes, request_dims
-        ):
-            part = packed_output.narrow(0, offset, request_numel).narrow(
-                -1, 0, request_dim
+        for chunk_indices in chunks:
+            _execute_grouped_sharded_embedding_lookup(
+                request_list, chunk_indices, outputs
             )
-            outputs[request_index] = part.reshape(*request_shape, request_dim)
-            offset += request_numel
 
     if any(output is None for output in outputs):
         raise RuntimeError("grouped embedding lookup did not produce every output")

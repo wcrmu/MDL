@@ -4063,6 +4063,11 @@ def build_config(
                 if rankmixer_family and sequence_encoder == "stca"
                 else "mean_per_task"
             ),
+            "task_loss_weights": {
+                "fst_cart": 0.5,
+                "cateid_filter": 0.01,
+                "upid_pay": 0.01,
+            },
             # Avoid a CUDA scalar readback on every production step.
             "log_every_steps": 100,
             "quick_eval": {
