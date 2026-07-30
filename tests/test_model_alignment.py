@@ -2708,6 +2708,62 @@ class OneTransCacheAlignmentTest(unittest.TestCase):
                 old_cache,
             )
 
+    def test_cache_for_candidate_rows_keeps_request_sized_layers(self) -> None:
+        backbone = self._backbone(use_pyramid=True).train()
+        backbone.config.runtime.activation_checkpoint = "full"
+        s_tokens = torch.randn(2, 5, 8)
+        ns_tokens = torch.randn(2, 2, 8)
+        cache = backbone.precompute_request_cache(
+            {"s_tokens": s_tokens, "ns_tokens": ns_tokens}
+        )
+        kept = backbone.cache_for_candidate_rows(
+            {"s_tokens": s_tokens, "ns_tokens": ns_tokens, "row_indices": torch.tensor([0, 0, 1, 1])},
+            cache,
+        )
+        self.assertIs(kept, cache)
+        self.assertEqual(kept.layers[0].s_input.size(0), 2)
+
+    def test_forward_cached_ns_gathers_multi_request_rows(self) -> None:
+        config = SimpleNamespace(
+            model=SimpleNamespace(token_dim=8, num_heads=2, hidden_dim=16),
+            runtime=SimpleNamespace(attention_backend="auto"),
+        )
+        torch.manual_seed(47)
+        block = OneTransBlock(config, ns_token_count=3).train()
+        s_input = torch.randn(2, 5, 8, requires_grad=True)
+        ns_tokens = torch.randn(4, 3, 8, requires_grad=True)
+        s_mask = torch.tensor(
+            [[False, True, True, True, True], [True, True, True, True, False]]
+        )
+        row_indices = torch.tensor([0, 0, 1, 1])
+        empty = s_input.new_empty(2, block.attention.num_heads, 0, block.attention.head_dim)
+
+        lazy = block.forward_cached_ns_tensors(
+            ns_tokens,
+            s_input,
+            empty,
+            empty,
+            s_mask,
+            row_indices,
+        )
+        eager_s = s_input.index_select(0, row_indices)
+        eager_mask = s_mask.index_select(0, row_indices)
+        eager_empty = empty.new_empty(
+            4, block.attention.num_heads, 0, block.attention.head_dim
+        )
+        eager = block.forward_cached_ns_tensors(
+            ns_tokens,
+            eager_s,
+            eager_empty,
+            eager_empty,
+            eager_mask,
+            None,
+        )
+        torch.testing.assert_close(lazy, eager, rtol=1e-5, atol=1e-6)
+        lazy.square().mean().backward()
+        self.assertTrue(torch.isfinite(s_input.grad).all())
+        self.assertTrue(torch.isfinite(ns_tokens.grad).all())
+
 
 class OneTransPositionEmbeddingAlignmentTest(unittest.TestCase):
     def test_prepare_adds_logical_positions_to_unified_s_and_ns_tokens(self) -> None:

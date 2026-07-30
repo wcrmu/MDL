@@ -246,6 +246,35 @@ def _index_onetrans_request_cache(
     )
 
 
+def _align_onetrans_cache_batch(
+    value: Tensor,
+    candidate_batch: int,
+    row_indices: Tensor | None,
+) -> Tensor:
+    """Map request-level cache rows onto the candidate batch.
+
+    Prefer ``index_select`` via ``row_indices`` so multi-request caches stay
+    request-sized until the layer that needs them. Fall back to broadcast when
+    the cache holds a single shared request.
+    """
+
+    if value.size(0) == candidate_batch:
+        return value
+    if row_indices is not None:
+        indices = row_indices.to(device=value.device, dtype=torch.long)
+        if indices.numel() != candidate_batch:
+            raise ValueError(
+                "OneTrans request_row_indices must match the candidate batch"
+            )
+        return value.index_select(0, indices)
+    if value.size(0) == 1:
+        return value.expand((candidate_batch,) + value.shape[1:])
+    raise ValueError(
+        "OneTrans layer cache batch must match candidates, be 1, or provide "
+        "request_row_indices"
+    )
+
+
 @dataclass(frozen=True)
 class OneTransBackboneState:
     tokens: Tensor
@@ -254,6 +283,7 @@ class OneTransBackboneState:
     ns_count: int
     initial_s_count: int
     encoded_features: dict[str, Tensor]
+    request_row_indices: Tensor | None = None
 
 
 def _encoding_for(config: AppConfig, feature_name: str) -> ResolvedEncoding:
@@ -5806,7 +5836,21 @@ class OneTransBlock(nn.Module):
         s_key: Tensor,
         s_value: Tensor,
         s_mask: Tensor,
+        row_indices: Tensor | None = None,
     ) -> Tensor:
+        candidate_batch = ns_tokens.size(0)
+        if s_input.size(0) != candidate_batch:
+            s_input = _align_onetrans_cache_batch(
+                s_input, candidate_batch, row_indices
+            )
+            s_mask = _align_onetrans_cache_batch(s_mask, candidate_batch, row_indices)
+            if s_key.size(0) != candidate_batch:
+                s_key = _align_onetrans_cache_batch(
+                    s_key, candidate_batch, row_indices
+                )
+                s_value = _align_onetrans_cache_batch(
+                    s_value, candidate_batch, row_indices
+                )
         if s_key.size(2) == 0 and s_value.size(2) == 0:
             normalized_s = self.norm_attention(s_input)
             s_key, s_value = self.attention.project_s_kv(normalized_s)
@@ -5816,13 +5860,15 @@ class OneTransBlock(nn.Module):
         query = self.attention.project_ns_query(normalized)
         ns_key, ns_value = self.attention.project_ns_kv(normalized)
         if s_key.size(0) != ns_tokens.size(0):
-            if s_key.size(0) != 1:
-                raise ValueError(
-                    "OneTrans layer cache batch must be 1 or match candidate batch"
-                )
-            s_key = s_key.expand(ns_tokens.size(0), -1, -1, -1)
-            s_value = s_value.expand(ns_tokens.size(0), -1, -1, -1)
-            s_mask = s_mask.expand(ns_tokens.size(0), -1)
+            s_key = _align_onetrans_cache_batch(
+                s_key, ns_tokens.size(0), row_indices
+            )
+            s_value = _align_onetrans_cache_batch(
+                s_value, ns_tokens.size(0), row_indices
+            )
+            s_mask = _align_onetrans_cache_batch(
+                s_mask, ns_tokens.size(0), row_indices
+            )
         key = torch.cat([s_key, ns_key], dim=2)
         value = torch.cat([s_value, ns_value], dim=2)
         ns_count = ns_tokens.size(1)
@@ -5839,13 +5885,19 @@ class OneTransBlock(nn.Module):
         hidden = ns_tokens + attended
         return hidden + self.ffn(self.norm_ffn(hidden), query_s_count=0)
 
-    def forward_cached_ns(self, ns_tokens: Tensor, cache: OneTransLayerCache) -> Tensor:
+    def forward_cached_ns(
+        self,
+        ns_tokens: Tensor,
+        cache: OneTransLayerCache,
+        row_indices: Tensor | None = None,
+    ) -> Tensor:
         return self.forward_cached_ns_tensors(
             ns_tokens,
             cache.s_input,
             cache.s_key,
             cache.s_value,
             cache.s_key_valid_mask,
+            row_indices,
         )
 
     def forward(
@@ -6117,15 +6169,16 @@ class OneTransBackbone(nn.Module):
         features: dict[str, Any],
         cache: OneTransRequestCache | None,
     ) -> OneTransRequestCache | None:
-        if cache is None:
-            return None
-        row_indices_fn = getattr(self.tokenizer, "request_row_indices", None)
-        if row_indices_fn is None:
-            return cache
-        row_indices = row_indices_fn(features)
-        if row_indices is None or cache.s_tokens.size(0) == row_indices.numel():
-            return cache
-        return _index_onetrans_request_cache(cache, row_indices)
+        """Keep layer caches request-sized; candidates gather lazily in ``step``.
+
+        Eager ``index_select`` across every layer's ``s_input`` used to multiply
+        peak HBM by candidates/request before the first block ran. Tokenizer
+        still expands the live S stream for NS concat; layer caches stay compact
+        until each checkpointed NS forward needs them.
+        """
+
+        del features
+        return cache
 
     def update_request_cache(
         self,
@@ -6213,6 +6266,14 @@ class OneTransBackbone(nn.Module):
             tokenized.feature_tokens,
             valid_mask,
         )
+        row_indices_fn = getattr(self.tokenizer, "request_row_indices", None)
+        request_row_indices = (
+            None if row_indices_fn is None else row_indices_fn(features)
+        )
+        if request_row_indices is not None:
+            request_row_indices = request_row_indices.to(
+                device=tokens.device, dtype=torch.long
+            )
         return OneTransBackboneState(
             tokens=tokens,
             valid_mask=valid_mask,
@@ -6220,6 +6281,7 @@ class OneTransBackbone(nn.Module):
             ns_count=tokenized.ns_token_count,
             initial_s_count=tokenized.s_token_count,
             encoded_features=tokenized.encoded_features,
+            request_row_indices=request_row_indices,
         )
 
     def step(
@@ -6233,13 +6295,14 @@ class OneTransBackbone(nn.Module):
             state.initial_s_count, state.s_count, layer_index
         )
         if layer_cache is not None:
-            if layer_cache.s_key.size(2) not in {0, state.s_count}:
+            if layer_cache.s_key.size(2) not in {0, layer_cache.s_input.size(1)}:
                 raise ValueError(
                     "OneTrans layer cache S-token count does not match backbone state"
                 )
             if layer_cache.s_output.size(1) != query_s_count:
                 raise ValueError("OneTrans layer cache pyramid output count is invalid")
             ns_tokens = state.tokens[:, state.s_count :, :]
+            row_indices = state.request_row_indices
             if (
                 _activation_checkpoint_enabled(
                     self.config.runtime.activation_checkpoint
@@ -6253,20 +6316,23 @@ class OneTransBackbone(nn.Module):
                     layer_cache.s_key,
                     layer_cache.s_value,
                     layer_cache.s_key_valid_mask,
+                    row_indices,
                     use_reentrant=False,
                     preserve_rng_state=False,
                 )
             else:
-                ns_output = block.forward_cached_ns(ns_tokens, layer_cache)
+                ns_output = block.forward_cached_ns(
+                    ns_tokens, layer_cache, row_indices
+                )
             s_output = layer_cache.s_output
             s_output_mask = layer_cache.s_output_valid_mask
             if s_output.size(0) != ns_output.size(0):
-                if s_output.size(0) != 1:
-                    raise ValueError(
-                        "OneTrans S-output cache batch must be 1 or match candidates"
-                    )
-                s_output = s_output.expand(ns_output.size(0), -1, -1)
-                s_output_mask = s_output_mask.expand(ns_output.size(0), -1)
+                s_output = _align_onetrans_cache_batch(
+                    s_output, ns_output.size(0), row_indices
+                )
+                s_output_mask = _align_onetrans_cache_batch(
+                    s_output_mask, ns_output.size(0), row_indices
+                )
             tokens = torch.cat([s_output, ns_output], dim=1)
             valid_mask = torch.cat(
                 [s_output_mask, state.valid_mask[:, state.s_count :]],
@@ -6295,6 +6361,7 @@ class OneTransBackbone(nn.Module):
             ns_count=state.ns_count,
             initial_s_count=state.initial_s_count,
             encoded_features=state.encoded_features,
+            request_row_indices=state.request_row_indices,
         )
 
     def forward(
