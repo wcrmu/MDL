@@ -251,9 +251,10 @@ class EvaluationMetricTest(unittest.TestCase):
         self.assertIn("prob_mean=0.970000", task_line)
         self.assertIn("logit_mean=3.500000", task_line)
         self.assertIn("logloss=0.900000", task_line)
+        self.assertNotIn("copc=", task_line)
         warning_line = next(line for line in lines if line.startswith("Quick eval warning"))
         self.assertIn("prob_mean=", warning_line)
-        self.assertIn("copc=", warning_line)
+        self.assertNotIn("copc=", warning_line)
         self.assertIn("auc=", warning_line)
 
 

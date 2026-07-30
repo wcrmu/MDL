@@ -1261,10 +1261,19 @@ class SequenceConfig(_DeeplyImmutableConfig):
     # When set, steps whose anchor value is null are removed from every field
     # together. Non-anchor nulls stay as padding ID 0 / 0.0.
     null_anchor_field: str | None = None
+    # Internal transport cap for unified-event models. The public max_length is
+    # still the per-stream contract; when MixFormer selects one global recent
+    # window, a single stream must be able to carry the whole global capacity.
+    _transport_max_length: int | None = field(default=None, repr=False)
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "SequenceConfig":
         # Sequences now use field-level list columns only. Reject old layout keys early.
+        if "_transport_max_length" in payload:
+            raise ValueError(
+                "sequence._transport_max_length is derived from "
+                "model.global_sequence_max_length and cannot be configured directly"
+            )
         removed = sorted(set(payload) & {"layout", "source"})
         if removed:
             raise ValueError(
@@ -1312,6 +1321,19 @@ class SequenceConfig(_DeeplyImmutableConfig):
             time_delta_field=payload.get("time_delta_field"),
             null_anchor_field=payload.get("null_anchor_field"),
         )
+
+    @property
+    def tensor_max_length(self) -> int | None:
+        """Physical cap used by data transport/tensorization.
+
+        Normally this is the sequence's own max_length. A globally truncated
+        MixFormer event stream replaces it with the shared global capacity so
+        an active stream can borrow capacity left unused by other streams.
+        """
+
+        if self._transport_max_length is not None:
+            return self._transport_max_length
+        return self.max_length
 
     def resolved_longer_candidate_global_tokens(self) -> int:
         if self.longer_candidate_global_tokens is not None:
@@ -1365,6 +1387,13 @@ class SequenceConfig(_DeeplyImmutableConfig):
             )
         if self.max_length is not None and self.max_length <= 0:
             raise ValueError(f"sequence {self.name!r} max_length must be positive")
+        if (
+            self._transport_max_length is not None
+            and self._transport_max_length <= 0
+        ):
+            raise ValueError(
+                f"sequence {self.name!r} internal transport max length must be positive"
+            )
         if self.truncation not in {"head", "tail"}:
             raise ValueError(f"sequence {self.name!r} truncation must be head or tail")
         if self.sequence_order not in {"oldest_to_newest", "newest_to_oldest"}:
@@ -2420,8 +2449,20 @@ class ModelConfig:
     use_pyramid: bool = True
     pyramid_round_to: int = 32
     # OneTrans NS tokenizer mode and optional token count override.
-    ns_tokenizer: Literal["auto_split", "groupwise"] = "auto_split"
+    # dcnv2 replaces the auto_split MLP with a Deep & Cross Network v2 encoder
+    # over the same packed scalar/bag feature vector, then projects to NS tokens.
+    ns_tokenizer: Literal["auto_split", "groupwise", "dcnv2"] = "auto_split"
     num_ns_tokens: int | None = None
+    # DCNv2 NS encoder knobs (ignored unless ns_tokenizer=dcnv2).
+    # Input concat is first projected to ns_dcn_projection_dim (default: hidden_dim).
+    ns_dcn_cross_layers: int = 3
+    ns_dcn_deep_layers: int = 2
+    ns_dcn_projection_dim: int | None = None
+    # None keeps a full-rank cross kernel on the projected width; set a positive
+    # rank to use W ≈ U V^T when the projected width is large.
+    ns_dcn_low_rank: int | None = None
+    # Optional deep-tower width; defaults to ns_dcn_projection_dim.
+    ns_dcn_deep_dim: int | None = None
     # Capacity of the learned absolute embedding added to the unified [S; NS]
     # sequence. None infers the exact configured maximum when every behavior
     # sequence declares max_length.
@@ -2430,6 +2471,9 @@ class ModelConfig:
     use_sep_tokens: bool = True
     final_s_tokens: int | None = None
     sequence_fusion: SequenceFusionType = "intent_ordered"
+    # Merge heterogeneous behavior streams first, then retain one global
+    # newest-event window of this size. None preserves per-stream truncation.
+    global_sequence_max_length: int | None = None
     # MixFormer uses feature-token count as N and token_dim as the per-head D.
     # null is the original MixFormer. Setting a strict interior split enables
     # the paper's optional UI-MixFormer one-way user-to-item HeadMixing mask.
@@ -2570,10 +2614,43 @@ class ModelConfig:
                 )
         if self.pyramid_round_to <= 0:
             raise ValueError("model.pyramid_round_to must be positive")
-        if self.ns_tokenizer not in {"auto_split", "groupwise"}:
-            raise ValueError("model.ns_tokenizer must be auto_split or groupwise")
+        if self.ns_tokenizer not in {"auto_split", "groupwise", "dcnv2"}:
+            raise ValueError(
+                "model.ns_tokenizer must be auto_split, groupwise, or dcnv2"
+            )
         if self.num_ns_tokens is not None and self.num_ns_tokens <= 0:
             raise ValueError("model.num_ns_tokens must be positive")
+        if type(self.ns_dcn_cross_layers) is not int or self.ns_dcn_cross_layers <= 0:
+            raise ValueError("model.ns_dcn_cross_layers must be a positive integer")
+        if type(self.ns_dcn_deep_layers) is not int or self.ns_dcn_deep_layers < 0:
+            raise ValueError("model.ns_dcn_deep_layers must be a non-negative integer")
+        if (
+            self.ns_dcn_projection_dim is not None
+            and (
+                type(self.ns_dcn_projection_dim) is not int
+                or self.ns_dcn_projection_dim <= 0
+            )
+        ):
+            raise ValueError(
+                "model.ns_dcn_projection_dim must be a positive integer or null"
+            )
+        if (
+            self.ns_dcn_low_rank is not None
+            and (type(self.ns_dcn_low_rank) is not int or self.ns_dcn_low_rank <= 0)
+        ):
+            raise ValueError("model.ns_dcn_low_rank must be a positive integer or null")
+        if (
+            self.ns_dcn_deep_dim is not None
+            and (type(self.ns_dcn_deep_dim) is not int or self.ns_dcn_deep_dim <= 0)
+        ):
+            raise ValueError("model.ns_dcn_deep_dim must be a positive integer or null")
+        if self.ns_tokenizer != "dcnv2":
+            # Keep unused knobs from silently implying a DCN path is active.
+            pass
+        elif self.name not in {"onetrans", "mdl_onetrans"}:
+            raise ValueError(
+                "model.ns_tokenizer=dcnv2 is only valid for onetrans or mdl_onetrans"
+            )
         if (
             self.max_position_embeddings is not None
             and self.max_position_embeddings <= 0
@@ -2585,6 +2662,26 @@ class ModelConfig:
             raise ValueError(
                 "model.sequence_fusion must be timestamp_aware or intent_ordered"
             )
+        if (
+            self.global_sequence_max_length is not None
+            and (
+                type(self.global_sequence_max_length) is not int
+                or self.global_sequence_max_length <= 0
+            )
+        ):
+            raise ValueError(
+                "model.global_sequence_max_length must be a positive integer or null"
+            )
+        if self.global_sequence_max_length is not None:
+            if self.name not in {"mixformer", "mdl_mixformer"}:
+                raise ValueError(
+                    "model.global_sequence_max_length requires mixformer or mdl_mixformer"
+                )
+            if self.sequence_fusion != "timestamp_aware":
+                raise ValueError(
+                    "model.global_sequence_max_length requires "
+                    "model.sequence_fusion=timestamp_aware"
+                )
         if (
             self.mixformer_user_head_count is not None
             and (
@@ -3041,14 +3138,32 @@ class AppConfig(_DeeplyImmutableConfig):
         sequences = tuple(
             SequenceConfig.from_mapping(item) for item in payload.get("sequences", [])
         )
+        model = ModelConfig.from_mapping(payload["model"])
+        tokenization = TokenizationConfig.from_mapping(payload.get("tokenization"))
+        if model.global_sequence_max_length is not None:
+            global_sequence_names = {
+                input_name
+                for group in tokenization.resolved_sequence_tokens(features, sequences)
+                for input_name in group.inputs
+                if any(sequence.name == input_name for sequence in sequences)
+            }
+            sequences = tuple(
+                replace(
+                    sequence,
+                    _transport_max_length=model.global_sequence_max_length,
+                )
+                if sequence.name in global_sequence_names
+                else sequence
+                for sequence in sequences
+            )
         return cls(
             data=DataConfig.from_mapping(payload["data"]),
             features=features,
             sequences=sequences,
             vocab_strategy=VocabStrategy.from_mapping(payload.get("vocab_strategy")),
-            model=ModelConfig.from_mapping(payload["model"]),
+            model=model,
             scenarios=ScenarioConfig.from_mapping(payload.get("scenarios")),
-            tokenization=TokenizationConfig.from_mapping(payload.get("tokenization")),
+            tokenization=tokenization,
             runtime=RuntimeConfig.from_mapping(payload.get("runtime")),
             training=TrainingConfig.from_mapping(payload.get("training")),
         )
@@ -4472,20 +4587,22 @@ def resolve_onetrans_max_position_embeddings(
 
     resolved = config.resolved if resolved is None else resolved
     sequence_by_name = {sequence.name: sequence for sequence in config.sequences}
-    inferred_s_tokens = 0
+    global_limit = config.model.global_sequence_max_length
+    inferred_s_tokens = 0 if global_limit is None else int(global_limit)
     has_dynamic_length = False
-    for group in resolved.tokenization.sequence_token_groups:
-        group_lengths: list[int] = []
-        for input_name in group.input_refs:
-            sequence = sequence_by_name.get(input_name)
-            if sequence is None:
-                continue
-            if sequence.max_length is None:
-                has_dynamic_length = True
-                continue
-            group_lengths.append(sequence.max_length)
-        if group_lengths:
-            inferred_s_tokens += max(group_lengths)
+    if global_limit is None:
+        for group in resolved.tokenization.sequence_token_groups:
+            group_lengths: list[int] = []
+            for input_name in group.input_refs:
+                sequence = sequence_by_name.get(input_name)
+                if sequence is None:
+                    continue
+                if sequence.max_length is None:
+                    has_dynamic_length = True
+                    continue
+                group_lengths.append(sequence.max_length)
+            if group_lengths:
+                inferred_s_tokens += max(group_lengths)
 
     if config.model.sequence_fusion == "intent_ordered" and config.model.use_sep_tokens:
         inferred_s_tokens += max(
@@ -4493,7 +4610,7 @@ def resolve_onetrans_max_position_embeddings(
             0,
         )
 
-    if config.model.ns_tokenizer == "auto_split":
+    if config.model.ns_tokenizer in {"auto_split", "dcnv2"}:
         ns_tokens = config.model.num_ns_tokens or max(
             len(resolved.scalar_feature_names),
             1,
@@ -4596,6 +4713,39 @@ def validate_app_config(config: AppConfig) -> None:
     _validate_mdl_extra_embeddings(config, resolved)
     _validate_mdl_domain_priors(config, resolved)
     sequence_by_name = {sequence.name: sequence for sequence in config.sequences}
+    if config.model.global_sequence_max_length is not None:
+        global_sequence_names = {
+            input_name
+            for group in resolved.tokenization.sequence_token_groups
+            for input_name in group.input_refs
+            if input_name in sequence_by_name
+        }
+        mismatched_transport = [
+            name
+            for name in sorted(global_sequence_names)
+            if sequence_by_name[name].tensor_max_length
+            != config.model.global_sequence_max_length
+        ]
+        if mismatched_transport:
+            raise ValueError(
+                "model.global_sequence_max_length requires matching derived "
+                "sequence transport caps; rebuild the AppConfig from its mapping "
+                "after changing the model option. Mismatched sequences: "
+                + ", ".join(mismatched_transport)
+            )
+    else:
+        stale_transport = [
+            sequence.name
+            for sequence in config.sequences
+            if sequence._transport_max_length is not None
+        ]
+        if stale_transport:
+            raise ValueError(
+                "sequence transport caps remain derived after "
+                "model.global_sequence_max_length was cleared; rebuild the "
+                "AppConfig from its mapping. Stale sequences: "
+                + ", ".join(sorted(stale_transport))
+            )
     for split_name, split in (("train", config.data.train), ("test", config.data.test)):
         if (
             split is None
@@ -4608,6 +4758,40 @@ def validate_app_config(config: AppConfig) -> None:
             raise ValueError(
                 f"data.{split_name}.adapter.options.sequence_max_lengths must be an object"
             )
+        raw_global_limit = split.adapter.options.get("global_sequence_max_length")
+        if raw_global_limit is not None and (
+            type(raw_global_limit) is not int or raw_global_limit <= 0
+        ):
+            raise ValueError(
+                f"data.{split_name}.adapter.options.global_sequence_max_length "
+                "must be a positive integer or null"
+            )
+        if raw_global_limit != config.model.global_sequence_max_length:
+            raise ValueError(
+                f"data.{split_name}.adapter.options.global_sequence_max_length must "
+                "match model.global_sequence_max_length: "
+                f"{raw_global_limit!r} != "
+                f"{config.model.global_sequence_max_length!r}"
+            )
+        if raw_global_limit is not None:
+            global_sequence_names = {
+                input_name
+                for group in resolved.tokenization.sequence_token_groups
+                for input_name in group.input_refs
+                if input_name in sequence_by_name
+            }
+            for name in sorted(global_sequence_names):
+                sequence = sequence_by_name[name]
+                if (
+                    sequence.sequence_order != "newest_to_oldest"
+                    or sequence.truncation != "head"
+                ):
+                    raise ValueError(
+                        "adapter global_sequence_max_length requires every "
+                        "globally merged sequence to use "
+                        "sequence_order=newest_to_oldest and truncation=head; "
+                        f"sequences.{name} does not"
+                    )
         for raw_name, raw_limit in sequence_limits.items():
             name = str(raw_name)
             sequence = sequence_by_name.get(name)
@@ -4977,11 +5161,12 @@ def validate_app_config(config: AppConfig) -> None:
                 f"model.name={config.model.name!r} requires at least one sequence token"
             )
         if (
-            config.model.ns_tokenizer == "auto_split"
+            config.model.ns_tokenizer in {"auto_split", "dcnv2"}
             and not resolved.scalar_feature_names
         ):
             raise ValueError(
-                f"model.name={config.model.name!r} with model.ns_tokenizer=auto_split "
+                f"model.name={config.model.name!r} with "
+                f"model.ns_tokenizer={config.model.ns_tokenizer} "
                 "requires at least one scalar feature with embedding_scope feature or shared"
             )
         if (

@@ -14,6 +14,8 @@ from src.dataloader import FeatureBatch
 from src.embeddings import grouped_sharded_embedding_lookup
 from src.config import SequenceConfig, SequenceFieldConfig, TokenGroupConfig, load_app_config
 from src.model import (
+    CrossNetV2Layer,
+    DCNv2NSEncoder,
     FeatureEncoderBank,
     MDLDomainBlock,
     MDLRankMixerBlock,
@@ -1613,6 +1615,60 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
         )
         self.assertEqual(first_linear.in_features, raw_sequence_dim)
 
+    def test_dcnv2_ns_tokenizer_emits_ns_tokens_and_gradients(self) -> None:
+        config = replace(
+            self._base_config(),
+            model=replace(
+                self._base_config().model,
+                ns_tokenizer="dcnv2",
+                num_ns_tokens=4,
+                ns_dcn_cross_layers=2,
+                ns_dcn_deep_layers=1,
+                ns_dcn_projection_dim=32,
+                ns_dcn_deep_dim=32,
+                ns_dcn_low_rank=8,
+                token_dim=32,
+                hidden_dim=64,
+            ),
+        )
+        scalar_names = [
+            feature.name
+            for feature in config.features
+            if feature.embedding_scope in {"feature", "shared"}
+        ]
+        raw_sequence_dim = sum(
+            config.resolved.categorical_embedding_dims.get(
+                field.qualified_name(config.sequences[0].name),
+                field.dimension,
+            )
+            for field in config.sequences[0].fields
+        )
+        encoder = self.Encoder(
+            {name: config.resolved.encoded_input_dims[name] for name in scalar_names},
+            {config.sequences[0].name: raw_sequence_dim},
+        )
+        tokenizer = OneTransTokenizer(config, encoder)
+        self.assertIsNone(tokenizer.auto_ns_projection)
+        self.assertIsInstance(tokenizer.dcn_ns_encoder, DCNv2NSEncoder)
+        assert tokenizer.dcn_ns_encoder is not None
+        self.assertEqual(len(tokenizer.dcn_ns_encoder.cross_layers), 2)
+        self.assertIsInstance(tokenizer.dcn_ns_encoder.cross_layers[0], CrossNetV2Layer)
+
+        batch = 3
+        encoded = {
+            name: torch.randn(batch, config.resolved.encoded_input_dims[name])
+            for name in scalar_names
+        }
+        ns_tokens = tokenizer._ns_tokens_auto_split(encoded)
+        self.assertEqual(tuple(ns_tokens.shape), (batch, 4, 32))
+        ns_tokens.sum().backward()
+        self.assertTrue(
+            any(
+                parameter.grad is not None and parameter.grad.abs().sum() > 0
+                for parameter in tokenizer.dcn_ns_encoder.parameters()
+            )
+        )
+
     def _fusion_tokenizer(
         self,
         fusion: str,
@@ -1718,6 +1774,138 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
             cache.s_tokens[0, :, 0],
             torch.tensor([1.0, 2.0, 3.0, 4.0]),
         )
+
+    def test_timestamp_aware_global_window_keeps_newest_events(self) -> None:
+        tokenizer = self._fusion_tokenizer("timestamp_aware")
+        tokenizer.config = replace(
+            tokenizer.config,
+            model=replace(
+                tokenizer.config.model,
+                global_sequence_max_length=2,
+            ),
+        )
+
+        cache = tokenizer.precompute_request_cache(self._fusion_features())
+
+        torch.testing.assert_close(
+            cache.s_tokens[0, :, 0],
+            torch.tensor([3.0, 4.0]),
+        )
+
+    def test_global_window_projects_only_valid_selected_events(self) -> None:
+        class RecordingIdentity(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.projected_rows: list[int] = []
+
+            def forward(self, values: Tensor) -> Tensor:
+                self.projected_rows.append(values.size(0))
+                return values
+
+        tokenizer = self._fusion_tokenizer("timestamp_aware")
+        tokenizer.config = replace(
+            tokenizer.config,
+            model=replace(
+                tokenizer.config.model,
+                global_sequence_max_length=2,
+            ),
+        )
+        projectors = [RecordingIdentity(), RecordingIdentity()]
+        tokenizer.sequence_projectors = nn.ModuleList(projectors)
+        features = self._fusion_features()
+        features["a"]["event_inputs"] = torch.tensor(
+            [
+                [[1.0, 0.0, 0.0, 0.0], [3.0, 0.0, 0.0, 0.0]],
+                [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+            ]
+        )
+        features["a"]["mask"] = torch.tensor(
+            [[True, True], [False, False]]
+        )
+        features["a"]["fields"]["timestamp"] = torch.tensor(
+            [[1.0, 3.0], [1.0, 3.0]]
+        )
+        features["a"]["lengths"] = torch.tensor([2, 0])
+        features["b"]["event_inputs"] = torch.tensor(
+            [
+                [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+                [[2.0, 0.0, 0.0, 0.0], [4.0, 0.0, 0.0, 0.0]],
+            ]
+        )
+        features["b"]["mask"] = torch.tensor(
+            [[False, False], [True, True]]
+        )
+        features["b"]["fields"]["timestamp"] = torch.tensor(
+            [[2.0, 4.0], [2.0, 4.0]]
+        )
+        features["b"]["lengths"] = torch.tensor([0, 2])
+
+        cache = tokenizer.precompute_request_cache(features)
+
+        torch.testing.assert_close(
+            cache.s_tokens[:, :, 0],
+            torch.tensor([[1.0, 3.0], [2.0, 4.0]]),
+        )
+        self.assertEqual(
+            [projector.projected_rows for projector in projectors],
+            [[2], [2]],
+        )
+
+    def test_global_window_keeps_empty_stream_projector_in_backward(self) -> None:
+        tokenizer = self._fusion_tokenizer("timestamp_aware")
+        tokenizer.config = replace(
+            tokenizer.config,
+            model=replace(
+                tokenizer.config.model,
+                global_sequence_max_length=2,
+            ),
+        )
+        projectors = [
+            nn.Linear(4, 4, bias=False),
+            nn.Linear(4, 4, bias=False),
+        ]
+        tokenizer.sequence_projectors = nn.ModuleList(projectors)
+        features = self._fusion_features()
+        features["b"]["mask"] = torch.zeros(1, 2, dtype=torch.bool)
+        features["b"]["lengths"] = torch.zeros(1, dtype=torch.long)
+
+        cache = tokenizer.precompute_request_cache(features)
+        cache.s_tokens.sum().backward()
+
+        self.assertIsNotNone(projectors[0].weight.grad)
+        self.assertIsNotNone(projectors[1].weight.grad)
+        assert projectors[1].weight.grad is not None
+        torch.testing.assert_close(
+            projectors[1].weight.grad,
+            torch.zeros_like(projectors[1].weight.grad),
+        )
+
+    def test_global_window_all_empty_batch_keeps_parameters_in_backward(self) -> None:
+        tokenizer = self._fusion_tokenizer("timestamp_aware")
+        tokenizer.config = replace(
+            tokenizer.config,
+            model=replace(
+                tokenizer.config.model,
+                global_sequence_max_length=2,
+            ),
+        )
+        projectors = [
+            nn.Linear(4, 4, bias=False),
+            nn.Linear(4, 4, bias=False),
+        ]
+        tokenizer.sequence_projectors = nn.ModuleList(projectors)
+        features = self._fusion_features()
+        for value in features.values():
+            value["mask"] = torch.zeros(1, 2, dtype=torch.bool)
+            value["lengths"] = torch.zeros(1, dtype=torch.long)
+
+        cache = tokenizer.precompute_request_cache(features)
+        cache.s_tokens.sum().backward()
+
+        for projector in projectors:
+            self.assertIsNotNone(projector.weight.grad)
+        assert tokenizer.sequence_type_embeddings is not None
+        self.assertIsNotNone(tokenizer.sequence_type_embeddings.weight.grad)
 
     def test_time_delta_aware_fusion_interleaves_oldest_to_newest(self) -> None:
         tokenizer = self._fusion_tokenizer(

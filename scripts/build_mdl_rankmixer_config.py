@@ -2652,7 +2652,10 @@ def _reader_config(*, training: bool) -> dict[str, Any]:
         "pin_memory": True,
         "coalesce_pinned_tensors": True,
         "device_prefetch_batches": 1,
-        "shard_unit": "row_group",
+        # Production hour partitions contain hundreds of files.  File sharding
+        # starts streaming immediately; row-group LPT must open every footer on
+        # every rank before the first batch and can exceed the startup watchdog.
+        "shard_unit": "file",
         "validate_prehashed_nonzero": False,
         "trusted_input": True,
     }

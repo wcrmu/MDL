@@ -705,6 +705,63 @@ class RemoteIoHelperTest(unittest.TestCase):
 
 
 class PrefetchScalingTest(unittest.TestCase):
+    def test_prefetch_workers_reuse_thread_local_hdfs_clients(self) -> None:
+        from src.dataloader import (
+            ParquetScanner,
+            _QueuedRecordBatch,
+            _SENTINEL,
+        )
+
+        scanner = ParquetScanner.__new__(ParquetScanner)
+        scanner.shard_world_size = 4
+        scanner.split = type(
+            "Split",
+            (),
+            {
+                "reader": ReaderConfig(
+                    num_workers=2,
+                    prefetch_batches=2,
+                    max_prefetch_bytes=1024,
+                )
+            },
+        )()
+        scanner._io_policy = RemoteIoPolicy.from_reader(
+            scanner.split.reader,
+            remote=True,
+        )
+        first_workers_ready = threading.Barrier(2)
+        clients_by_item: dict[int, int] = {}
+
+        def fake_worker(item, slot, stop_event) -> None:
+            filesystem = thread_local_hdfs_filesystem(
+                "hdfs://persistent-prefetch-test"
+            )
+            clients_by_item[item] = id(filesystem)
+            if item < 2:
+                first_workers_ready.wait(timeout=2.0)
+            self.assertTrue(slot.byte_budget.acquire(1, stop_event))
+            slot.queue.put(_QueuedRecordBatch(item, 1), timeout=2.0)
+            slot.queue.put(_SENTINEL, timeout=2.0)
+
+        with patch(
+            "src.dataloader._filesystem_from_uri",
+            side_effect=lambda _key: object(),
+        ) as filesystem_factory, patch.object(
+            scanner,
+            "_row_group_worker",
+            side_effect=fake_worker,
+        ):
+            observed = list(
+                scanner._iter_row_group_record_batches_prefetch(
+                    list(range(6)),
+                    threading.Event(),
+                )
+            )
+
+        self.assertEqual(observed, list(range(6)))
+        self.assertEqual(filesystem_factory.call_count, 2)
+        self.assertEqual(len(set(clients_by_item.values())), 2)
+
     def test_scaled_workers_for_gpu_counts(self) -> None:
         for world_size in (2, 4, 8):
             workers = scaled_hdfs_prefetch_workers(
@@ -793,7 +850,7 @@ class PrefetchScalingTest(unittest.TestCase):
         ):
             config = load_app_config(root / "configs" / name)
             reader = config.data.train.reader
-            self.assertEqual(reader.shard_unit, "row_group")
+            self.assertEqual(reader.shard_unit, "file")
             self.assertEqual(reader.on_hdfs_failure, "skip")
             self.assertEqual(reader.worker_stagger_sec, 1.0)
             self.assertEqual(reader.hdfs_retry_count, 2)
@@ -814,7 +871,7 @@ class PrefetchScalingTest(unittest.TestCase):
             self.assertEqual(reader.host_prepare_idle_timeout_sec, 300.0)
             self.assertEqual(config.training.step_watchdog_sec, 600.0)
             if config.data.test is not None:
-                self.assertEqual(config.data.test.reader.shard_unit, "row_group")
+                self.assertEqual(config.data.test.reader.shard_unit, "file")
                 self.assertEqual(config.data.test.reader.on_hdfs_failure, "skip")
                 self.assertTrue(config.data.test.reader.hdfs_pre_buffer)
 

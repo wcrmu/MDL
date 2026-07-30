@@ -1366,7 +1366,10 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     config.training.checkpoint_path,
                     f"artifacts/checkpoints/{model_name}_2xh100_phase2_shared_dim",
                 )
-                self.assertFalse(config.training.embedding_collect_stats)
+                self.assertEqual(
+                    config.training.embedding_collect_stats,
+                    model_name == "mdl_rankmixer",
+                )
                 self.assertFalse(config.training.embedding_validate_indices)
                 self.assertFalse(config.scenarios.auto_discover)
                 self.assertIsNone(config.scenarios.discovery_cache_path)
@@ -1440,7 +1443,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     )
                 self.assertTrue(config.training.quick_eval.enabled)
                 self.assertEqual(config.training.quick_eval.split, "train")
-                self.assertEqual(config.data.train.reader.shard_unit, "row_group")
+                self.assertEqual(config.data.train.reader.shard_unit, "file")
                 self.assertEqual(config.data.train.reader.shuffle_buffer_rows, 512)
                 self.assertEqual(config.data.train.reader.shuffle_seed, 2025)
                 self.assertFalse(config.data.train.prediction_keys)

@@ -845,6 +845,84 @@ class SourceRegistryTest(unittest.TestCase):
 
 
 class AxisSeparatedAdaptTest(unittest.TestCase):
+    def test_global_recent_window_matches_python_and_arrow_axis_paths(self) -> None:
+        from src.dataloader import adapt_mdl_rankmixer_parquet
+
+        table = pa.table(
+            {
+                "context_indices": [[0]],
+                "target_indices": [[0]],
+                "ctx": [[[11]]],
+                "item": [[[21]]],
+                "impr_x_goods": [[-1, -2, -3]],
+                "impr_x_time": [[4900, 4800, 4700]],
+                "impr_x_indices": [[[0], [0], [0]]],
+                "buy_x_goods": [[-9]],
+                "buy_x_time": [[1000]],
+                "buy_x_indices": [[[0]]],
+                "search_id": [["r0"]],
+                "impr_time": [[5000]],
+                "label": [[1]],
+            }
+        )
+        required = (
+            "ctx",
+            "item",
+            "impr_x_goods",
+            "impr_x_dt",
+            "buy_x_goods",
+            "buy_x_dt",
+            "search_id",
+            "label",
+        )
+        options = {
+            "context_features": ["ctx"],
+            "item_features": ["item"],
+            "ups_types": ["impr", "buy"],
+            "request_columns": ["search_id", "impr_time"],
+            "integer_request_columns": ["impr_time"],
+            "labels": {"a": "label"},
+            "request_time_column": "impr_time",
+            "time_delta_outputs": {
+                "impr": "impr_x_dt",
+                "buy": "buy_x_dt",
+            },
+            "sequence_max_lengths": {"impr": 1, "buy": 1},
+            "global_sequence_max_length": 2,
+        }
+
+        bundles = []
+        for mode in ("axis_separated", "arrow_axis"):
+            context = SimpleNamespace(
+                required_columns=required,
+                options=options,
+                trusted_input=False,
+                _runtime_cache={
+                    mode: True,
+                    "axis_request_id_column": "search_id",
+                },
+            )
+            adapted = adapt_mdl_rankmixer_parquet(table, context=context)
+            bundle = (
+                adapted
+                if mode == "axis_separated"
+                else adapted._cache["bundle"]
+            )
+            bundles.append(bundle)
+            self.assertEqual(
+                bundle.sequence_features["impr_x_goods"][0].tolist(),
+                [-1, -2],
+            )
+            self.assertEqual(
+                bundle.sequence_features["buy_x_goods"][0].tolist(),
+                [],
+            )
+
+        np.testing.assert_array_equal(
+            bundles[0].sequence_features["impr_x_dt"][0],
+            bundles[1].sequence_features["impr_x_dt"][0],
+        )
+
     def test_direct_path_tensorizes_derived_request_columns(self) -> None:
         """Derived request cols are not context_features but live on request axis."""
 

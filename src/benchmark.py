@@ -223,6 +223,77 @@ def _mean(values: list[float]) -> float:
     return float(sum(values) / len(values)) if values else 0.0
 
 
+def _analytical_dense_flops_per_step(
+    config: AppConfig,
+    *,
+    candidates_per_step: float,
+    input_tokens_per_step: float,
+) -> float:
+    """Lower-bound dense FLOPs when profiler undercounts Flash/custom kernels.
+
+    Sparse embedding all-to-all and Adagrad are intentionally excluded: they
+    dominate wall time but are not dense Tensor-Core FLOPs. Counting only the
+    backbone keeps MFU comparable across families while repairing the common
+    ``event.flops == 0`` gap on FlashAttention paths.
+    """
+
+    model = getattr(config, "model", None)
+    resolved = getattr(config, "resolved", None)
+    tokenization = getattr(resolved, "tokenization", None)
+    if model is None or tokenization is None:
+        # Unit tests and downstream callers may intentionally provide only the
+        # runtime fields consumed by the legacy report path.
+        return 0.0
+    d = float(model.token_dim)
+    h = float(model.hidden_dim)
+    layers = float(model.num_layers)
+    candidates = max(float(candidates_per_step), 1.0)
+    feature_tokens = float(tokenization.feature_token_count)
+    checkpoint = str(config.runtime.activation_checkpoint)
+    # fwd+bwd ≈ 3×fwd; activation checkpoint adds roughly one extra forward.
+    train_mult = 4.0 if checkpoint in {"full", "selective"} else 3.0
+    name = str(model.name)
+    avg_seq = max(float(input_tokens_per_step) / candidates, 1.0)
+
+    if name in {"rankmixer", "mdl_rankmixer"}:
+        # Per-token FFN: two GEMMs (d→h, h→d) ⇒ 4 C N d h per layer.
+        forward = layers * 4.0 * candidates * feature_tokens * d * h
+        if name == "mdl_rankmixer":
+            # Domain-aware QKV FFNs + attention roughly double dense work.
+            forward *= 2.0
+        return train_mult * forward
+
+    if name in {"onetrans", "mdl_onetrans"}:
+        ns_tokens = float(model.num_ns_tokens or 32)
+        max_pos = float(model.max_position_embeddings or avg_seq)
+        sequence_tokens = min(avg_seq, max_pos)
+        unified = sequence_tokens + ns_tokens
+        # QKVO + attention + FFN on the unified stream (candidate-expanded).
+        forward = layers * (
+            8.0 * candidates * unified * d * d
+            + 4.0 * candidates * unified * unified * d
+            + 4.0 * candidates * unified * d * h
+        )
+        return train_mult * forward
+
+    if name in {"mixformer", "mdl_mixformer"}:
+        # token_dim is per-head D; feature_token_count is head count N.
+        head_dim = d
+        configured_max = getattr(model, "global_sequence_max_length", None)
+        max_seq = float(configured_max) if configured_max else 2048.0
+        seq_len = min(avg_seq, max_seq)
+        # Sequence FFN runs on request-level histories (≤C). Use C as a
+        # conservative stand-in for unique requests to avoid undercount.
+        forward = layers * (
+            12.0 * candidates * feature_tokens * head_dim * h
+            + 6.0 * candidates * seq_len * (feature_tokens * head_dim) * h
+            + 4.0 * candidates * feature_tokens * seq_len * head_dim
+        )
+        return train_mult * forward
+
+    return 0.0
+
+
 def _process_peak_rss_bytes() -> int:
     # Linux reports KiB, while macOS reports bytes.
     value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
@@ -605,14 +676,39 @@ def _build_report(
         for summary in summaries
         if summary.profiler.estimated_flops_per_step is not None
     ]
-    flops_per_step = max(profiled_flops) if profiled_flops else None
+    profiler_flops = max(profiled_flops) if profiled_flops else None
+    rows_per_step_rank = samples / float(measured_steps * max(context.world_size, 1))
+    tokens_per_step_rank = input_tokens / float(
+        measured_steps * max(context.world_size, 1)
+    )
+    analytical_flops = _analytical_dense_flops_per_step(
+        config,
+        candidates_per_step=rows_per_step_rank,
+        input_tokens_per_step=tokens_per_step_rank,
+    )
+    flops_per_step = profiler_flops
     mfu = None
     mfu_method = None
+    if analytical_flops > 0.0 and (
+        flops_per_step is None or analytical_flops > float(flops_per_step)
+    ):
+        flops_per_step = analytical_flops
+        mfu_method = (
+            "analytical_dense_flops / configured_peak_tflops"
+            if profiler_flops is None
+            else "max(torch_profiler_estimated_flops, analytical_dense_flops) / "
+            "configured_peak_tflops"
+        )
+    elif flops_per_step is not None:
+        mfu_method = "torch_profiler_estimated_flops / configured_peak_tflops"
     if flops_per_step is not None and options.peak_tflops is not None:
         mean_step = _mean(step_seconds)
         if mean_step > 0.0:
-            mfu = flops_per_step / (mean_step * options.peak_tflops * 1.0e12)
-            mfu_method = "torch_profiler_estimated_flops / configured_peak_tflops"
+            mfu = float(flops_per_step) / (
+                mean_step * options.peak_tflops * 1.0e12
+            )
+            if mfu_method is None:
+                mfu_method = "configured_peak_tflops"
 
     profiler_errors = tuple(
         sorted(

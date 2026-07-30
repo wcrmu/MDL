@@ -24,6 +24,7 @@ tokenization:
 
 model:
   name: mdl_mixformer
+  ns_tokenizer: auto_split
   token_dim: 384
   num_layers: 4
   num_heads: 12

@@ -648,6 +648,112 @@ def _projection_mlp(
     )
 
 
+class CrossNetV2Layer(nn.Module):
+    """One DCNv2 cross layer: x ← x0 ⊙ (W x + b) + x."""
+
+    def __init__(self, dim: int, low_rank: int | None = None) -> None:
+        super().__init__()
+        if dim <= 0:
+            raise ValueError("CrossNetV2Layer dim must be positive")
+        self.dim = dim
+        self.low_rank = low_rank
+        if low_rank is None:
+            self.weight = nn.Parameter(torch.empty(dim, dim))
+            self.u = None
+            self.v = None
+            nn.init.xavier_uniform_(self.weight)
+        else:
+            if low_rank <= 0 or low_rank > dim:
+                raise ValueError(
+                    f"CrossNetV2Layer low_rank must be in [1, {dim}], got {low_rank}"
+                )
+            self.weight = None
+            self.u = nn.Parameter(torch.empty(dim, low_rank))
+            self.v = nn.Parameter(torch.empty(dim, low_rank))
+            nn.init.xavier_uniform_(self.u)
+            nn.init.xavier_uniform_(self.v)
+        self.bias = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x0: Tensor, x: Tensor) -> Tensor:
+        if self.weight is not None:
+            cross = F.linear(x, self.weight, self.bias)
+        else:
+            assert self.u is not None and self.v is not None
+            cross = F.linear(F.linear(x, self.v.transpose(0, 1)), self.u, self.bias)
+        return x0 * cross + x
+
+
+class DCNv2NSEncoder(nn.Module):
+    """Pack scalar/bag features with DCNv2, then project to NS token logits.
+
+    Architecture (Wang et al., DCNv2):
+      x0 --input_proj--> z0
+      cross = CrossNet^L(z0)
+      deep  = MLP(z0)           # optional
+      out   = Linear(concat(cross, deep)) → [B, num_ns_tokens * token_dim]
+    """
+
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        output_dim: int,
+        projection_dim: int,
+        cross_layers: int,
+        deep_layers: int,
+        deep_dim: int,
+        activation: str,
+        low_rank: int | None = None,
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0 or output_dim <= 0:
+            raise ValueError("DCNv2NSEncoder input/output dims must be positive")
+        if projection_dim <= 0:
+            raise ValueError("DCNv2NSEncoder projection_dim must be positive")
+        if cross_layers <= 0:
+            raise ValueError("DCNv2NSEncoder cross_layers must be positive")
+        if deep_layers < 0:
+            raise ValueError("DCNv2NSEncoder deep_layers must be non-negative")
+        self.input_proj = (
+            nn.Identity()
+            if input_dim == projection_dim
+            else nn.Linear(input_dim, projection_dim)
+        )
+        self.cross_layers = nn.ModuleList(
+            CrossNetV2Layer(projection_dim, low_rank=low_rank)
+            for _ in range(cross_layers)
+        )
+        deep: list[nn.Module] = []
+        if deep_layers > 0:
+            if deep_dim <= 0:
+                raise ValueError("DCNv2NSEncoder deep_dim must be positive")
+            in_dim = projection_dim
+            for _ in range(deep_layers):
+                deep.append(nn.Linear(in_dim, deep_dim))
+                deep.append(_activation_module(activation))
+                in_dim = deep_dim
+            self.deep = nn.Sequential(*deep)
+            self.deep_out_dim = deep_dim
+        else:
+            self.deep = None
+            self.deep_out_dim = 0
+        head_in = projection_dim + self.deep_out_dim
+        self.output_proj = nn.Linear(head_in, output_dim)
+
+    def forward(self, values: Tensor) -> Tensor:
+        if values.dim() != 2:
+            raise ValueError("DCNv2NSEncoder expects [batch, input_dim] features")
+        x0 = self.input_proj(values)
+        x = x0
+        for layer in self.cross_layers:
+            x = layer(x0, x)
+        if self.deep is None:
+            combined = x
+        else:
+            combined = torch.cat([x, self.deep(x0)], dim=-1)
+        return self.output_proj(combined)
+
+
 class TaskHead(nn.Module):
     def __init__(
         self, input_dim: int, hidden_dim: int, dropout: float, activation: str
@@ -4331,7 +4437,9 @@ class OneTransTokenizer(nn.Module):
         )
 
         self.scalar_feature_names = list(config.resolved.scalar_feature_names)
-        if self.ns_tokenizer == "auto_split":
+        self.auto_ns_projection: nn.Module | None = None
+        self.dcn_ns_encoder: DCNv2NSEncoder | None = None
+        if self.ns_tokenizer in {"auto_split", "dcnv2"}:
             self.num_ns_tokens = config.model.num_ns_tokens or max(
                 len(self.scalar_feature_names), 1
             )
@@ -4341,18 +4449,35 @@ class OneTransTokenizer(nn.Module):
             )
             if input_dim <= 0:
                 raise ValueError(
-                    "auto_split OneTrans tokenizer requires at least one scalar feature"
+                    f"{self.ns_tokenizer} OneTrans tokenizer requires at least one "
+                    "scalar feature"
                 )
-            self.auto_ns_projection = _projection_mlp(
-                input_dim,
-                self.num_ns_tokens * self.token_dim,
-                config.model.hidden_dim,
-                config.model.ffn_activation,
-            )
+            output_dim = self.num_ns_tokens * self.token_dim
+            if self.ns_tokenizer == "auto_split":
+                self.auto_ns_projection = _projection_mlp(
+                    input_dim,
+                    output_dim,
+                    config.model.hidden_dim,
+                    config.model.ffn_activation,
+                )
+            else:
+                projection_dim = (
+                    config.model.ns_dcn_projection_dim or config.model.hidden_dim
+                )
+                deep_dim = config.model.ns_dcn_deep_dim or projection_dim
+                self.dcn_ns_encoder = DCNv2NSEncoder(
+                    input_dim=input_dim,
+                    output_dim=output_dim,
+                    projection_dim=projection_dim,
+                    cross_layers=config.model.ns_dcn_cross_layers,
+                    deep_layers=config.model.ns_dcn_deep_layers,
+                    deep_dim=deep_dim,
+                    activation=config.model.ffn_activation,
+                    low_rank=config.model.ns_dcn_low_rank,
+                )
             self.ns_projectors = nn.ModuleList()
         else:
             self.num_ns_tokens = len(self.ns_groups)
-            self.auto_ns_projection = None
             self.ns_projectors = nn.ModuleList(
                 _projection_mlp(
                     self._group_input_dim(group),
@@ -4364,7 +4489,7 @@ class OneTransTokenizer(nn.Module):
             )
         self.ns_input_names = (
             set(self.scalar_feature_names)
-            if self.ns_tokenizer == "auto_split"
+            if self.ns_tokenizer in {"auto_split", "dcnv2"}
             else {name for group in self.ns_groups for name in group.inputs}
         )
         self.sequence_input_names = {
@@ -4455,7 +4580,12 @@ class OneTransTokenizer(nn.Module):
                 if not isinstance(value, dict):
                     raise ValueError(f"sequence {name!r} must be a payload dict")
                 sequence_lengths.append(value["lengths"].long())
-                configured_length = self.sequence_by_name[name].max_length
+                sequence_config = self.sequence_by_name[name]
+                configured_length = getattr(
+                    sequence_config,
+                    "tensor_max_length",
+                    sequence_config.max_length,
+                )
                 payload_length = self._payload_max_length(value)
                 if configured_length is not None:
                     payload_length = min(payload_length, configured_length)
@@ -4546,10 +4676,9 @@ class OneTransTokenizer(nn.Module):
             )
         return sort_keys
 
-    def _sequence_group_tokens(
+    def _sequence_group_inputs(
         self,
         group: TokenGroupConfig,
-        projection: nn.Module,
         features: dict[str, Any],
         preencoded_inputs: dict[str, Tensor] | None = None,
     ) -> tuple[Tensor, Tensor, Tensor | None]:
@@ -4597,18 +4726,167 @@ class OneTransTokenizer(nn.Module):
             parts.append(scalar.unsqueeze(1).expand(-1, max_length, -1))
         if mask is None:
             raise ValueError(f"sequence token group {group.name!r} produced no mask")
-        tokens = _project_sequence_in_chunks(
-            projection,
-            torch.cat(parts, dim=-1),
-            self.config,
-        )
-        tokens = tokens * mask.unsqueeze(-1).to(tokens.dtype)
         temporal_sort_keys = (
             self._sequence_group_temporal_sort_keys(group, features, mask)
             if self.sequence_fusion == "timestamp_aware"
             else None
         )
+        return torch.cat(parts, dim=-1), mask, temporal_sort_keys
+
+    def _sequence_group_tokens(
+        self,
+        group: TokenGroupConfig,
+        projection: nn.Module,
+        features: dict[str, Any],
+        preencoded_inputs: dict[str, Tensor] | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
+        inputs, mask, temporal_sort_keys = self._sequence_group_inputs(
+            group,
+            features,
+            preencoded_inputs,
+        )
+        tokens = _project_sequence_in_chunks(
+            projection,
+            inputs,
+            self.config,
+        )
+        tokens = tokens * mask.unsqueeze(-1).to(tokens.dtype)
         return tokens, mask, temporal_sort_keys
+
+    def _global_timestamp_sequence_token_part(
+        self,
+        features: dict[str, Any],
+        preencoded_inputs: dict[str, Tensor] | None,
+        global_limit: int,
+    ) -> OneTransRequestCache:
+        """Project only valid events in the globally selected time window.
+
+        Per-stream dense widths are batch maxima. Once streams can borrow a
+        shared global capacity, their maxima may sum to many times that shared
+        capacity even though each request has at most ``global_limit`` events.
+        Sorting cheap temporal grids first and projecting selected events in
+        compact form keeps the expensive output at exactly ``[B, T, D]``.
+        """
+
+        if self.sequence_type_embeddings is None:
+            raise RuntimeError("timestamp-aware fusion has no type embeddings")
+
+        group_inputs: list[Tensor] = []
+        group_masks: list[Tensor] = []
+        temporal_keys: list[Tensor] = []
+        source_offsets: list[int] = []
+        source_width = 0
+        batch_size: int | None = None
+        for group in self.sequence_groups:
+            inputs, mask, current_keys = self._sequence_group_inputs(
+                group,
+                features,
+                preencoded_inputs,
+            )
+            if current_keys is None:
+                raise RuntimeError(
+                    "global timestamp fusion requires temporal sort keys"
+                )
+            if batch_size is None:
+                batch_size = inputs.size(0)
+            elif inputs.size(0) != batch_size:
+                raise ValueError(
+                    "all global timestamp sequence groups must share a batch size"
+                )
+            source_offsets.append(source_width)
+            source_width += inputs.size(1)
+            group_inputs.append(inputs)
+            group_masks.append(mask)
+            temporal_keys.append(current_keys)
+
+        if batch_size is None:
+            raise RuntimeError("global timestamp fusion has no sequence groups")
+        source_mask = torch.cat(group_masks, dim=1)
+        source_keys = torch.cat(temporal_keys, dim=1)
+        sort_values = source_keys.masked_fill(~source_mask, -torch.inf)
+        order = torch.argsort(sort_values, dim=1, stable=True)
+        output_width = min(source_width, global_limit)
+        if order.size(1) > output_width:
+            order = order[:, -output_width:]
+        output_mask = source_mask.gather(1, order)
+
+        flat_indices: list[Tensor] = []
+        projected_values: list[Tensor] = []
+        empty_group_anchors: list[Tensor] = []
+        for group_index, (inputs, projection, source_start) in enumerate(
+            zip(group_inputs, self.sequence_projectors, source_offsets)
+        ):
+            source_stop = source_start + inputs.size(1)
+            belongs = (
+                (order >= source_start)
+                & (order < source_stop)
+                & output_mask
+            )
+            batch_indices, output_positions = torch.where(belongs)
+            if batch_indices.numel() == 0:
+                if projection.training:
+                    # DDP normally runs with find_unused_parameters=False.
+                    # Keep an empty stream's independent projector in the
+                    # autograd graph without introducing a pseudo event.
+                    dummy_inputs = inputs.new_zeros(1, inputs.size(-1))
+                    dummy_projection = _project_sequence_in_chunks(
+                        projection,
+                        dummy_inputs,
+                        self.config,
+                    )
+                    empty_group_anchors.append(dummy_projection.sum() * 0.0)
+                continue
+            local_positions = order[batch_indices, output_positions] - source_start
+            selected_inputs = inputs[batch_indices, local_positions]
+            projected = _project_sequence_in_chunks(
+                projection,
+                selected_inputs,
+                self.config,
+            )
+            type_indicator = self.sequence_type_embeddings.weight[group_index].to(
+                dtype=projected.dtype
+            )
+            projected_values.append(projected + type_indicator)
+            flat_indices.append(batch_indices * output_width + output_positions)
+
+        if projected_values:
+            selected_values = torch.cat(projected_values, dim=0)
+            selected_indices = torch.cat(flat_indices, dim=0)
+            flat_tokens = selected_values.new_zeros(
+                batch_size * output_width,
+                selected_values.size(-1),
+            )
+            flat_tokens = flat_tokens.index_copy(
+                0,
+                selected_indices,
+                selected_values,
+            )
+        else:
+            flat_tokens = self.sequence_type_embeddings.weight.new_zeros(
+                batch_size * output_width,
+                self.sequence_type_embeddings.embedding_dim,
+            )
+        if not projected_values and self.sequence_type_embeddings.training:
+            empty_group_anchors.append(
+                self.sequence_type_embeddings.weight.sum() * 0.0
+            )
+        if empty_group_anchors:
+            graph_anchor = torch.stack(
+                [
+                    anchor.to(device=flat_tokens.device, dtype=flat_tokens.dtype)
+                    for anchor in empty_group_anchors
+                ]
+            ).sum()
+            flat_tokens = flat_tokens + graph_anchor
+        tokens = flat_tokens.view(
+            batch_size,
+            output_width,
+            flat_tokens.size(-1),
+        )
+        return OneTransRequestCache(
+            s_tokens=tokens,
+            s_valid_mask=output_mask,
+        )
 
     def _ns_tokens_groupwise(self, encoded: dict[str, Tensor]) -> Tensor:
         tokens = []
@@ -4618,10 +4896,16 @@ class OneTransTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)
 
     def _ns_tokens_auto_split(self, encoded: dict[str, Tensor]) -> Tensor:
-        if self.auto_ns_projection is None:
-            raise RuntimeError("auto NS projection is not initialized")
         parts = [encoded[name] for name in self.scalar_feature_names]
-        values = self.auto_ns_projection(torch.cat(parts, dim=1))
+        packed = torch.cat(parts, dim=1)
+        if self.ns_tokenizer == "dcnv2":
+            if self.dcn_ns_encoder is None:
+                raise RuntimeError("DCNv2 NS encoder is not initialized")
+            values = self.dcn_ns_encoder(packed)
+        else:
+            if self.auto_ns_projection is None:
+                raise RuntimeError("auto NS projection is not initialized")
+            values = self.auto_ns_projection(packed)
         return values.view(values.size(0), self.num_ns_tokens, self.token_dim)
 
     def _compact_valid_tokens(
@@ -4642,11 +4926,46 @@ class OneTransTokenizer(nn.Module):
         first_valid = int(torch.nonzero(valid_columns, as_tuple=False)[0].item())
         return tokens[:, first_valid:, :], mask[:, first_valid:]
 
+    def _finalize_sequence_token_part(
+        self,
+        tokens: Tensor,
+        mask: Tensor,
+    ) -> OneTransRequestCache:
+        if self.require_compact_sequence_batches:
+            if mask.size(1):
+                compact = mask[:, 0].any()
+                message = (
+                    "runtime.require_compact_sequence_batches requires sequence "
+                    "payloads padded only to the longest row in the batch"
+                )
+                if mask.device.type == "cuda" and hasattr(torch, "_assert_async"):
+                    torch._assert_async(compact, message)
+                elif not bool(compact.item()):
+                    raise ValueError(message)
+        elif self.trim_all_invalid_sequence_prefix:
+            tokens, mask = self._trim_all_invalid_prefix(tokens, mask)
+        return OneTransRequestCache(s_tokens=tokens, s_valid_mask=mask)
+
     def _sequence_token_part(
         self,
         features: dict[str, Any],
         preencoded_inputs: dict[str, Tensor] | None = None,
     ) -> OneTransRequestCache:
+        global_limit = self.config.model.global_sequence_max_length
+        if global_limit is not None:
+            if self.sequence_fusion != "timestamp_aware":
+                raise RuntimeError(
+                    "global sequence selection requires timestamp-aware fusion"
+                )
+            cache = self._global_timestamp_sequence_token_part(
+                features,
+                preencoded_inputs,
+                global_limit,
+            )
+            return self._finalize_sequence_token_part(
+                cache.s_tokens,
+                cache.s_valid_mask,
+            )
         sequence_tokens: list[Tensor] = []
         sequence_masks: list[Tensor] = []
         sequence_temporal_sort_keys: list[Tensor] = []
@@ -4702,20 +5021,7 @@ class OneTransTokenizer(nn.Module):
             mask = mask.gather(1, order)
         else:
             tokens, mask = self._compact_valid_tokens(tokens, mask)
-        if self.require_compact_sequence_batches:
-            if mask.size(1):
-                compact = mask[:, 0].any()
-                message = (
-                    "runtime.require_compact_sequence_batches requires sequence "
-                    "payloads padded only to the longest row in the batch"
-                )
-                if mask.device.type == "cuda" and hasattr(torch, "_assert_async"):
-                    torch._assert_async(compact, message)
-                elif not bool(compact.item()):
-                    raise ValueError(message)
-        elif self.trim_all_invalid_sequence_prefix:
-            tokens, mask = self._trim_all_invalid_prefix(tokens, mask)
-        return OneTransRequestCache(s_tokens=tokens, s_valid_mask=mask)
+        return self._finalize_sequence_token_part(tokens, mask)
 
     def precompute_request_cache(
         self,
@@ -4766,7 +5072,7 @@ class OneTransTokenizer(nn.Module):
         s_mask = cache.s_valid_mask
         ns_tokens = (
             self._ns_tokens_auto_split(encoded)
-            if self.ns_tokenizer == "auto_split"
+            if self.ns_tokenizer in {"auto_split", "dcnv2"}
             else self._ns_tokens_groupwise(encoded)
         )
         if s_tokens.size(0) != ns_tokens.size(0):

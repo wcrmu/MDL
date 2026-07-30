@@ -18,6 +18,7 @@ from src.dataloader import (
     _normalize_optional_outer_list,
     _normalized_list_array,
     _scalarize,
+    _select_global_recent_sequence_positions,
     _select_sequence,
     _sequence_membership_positions,
     _time_deltas,
@@ -72,6 +73,24 @@ REQUIRED = [
 
 
 class MDLRankMixerParquetAdapterTest(unittest.TestCase):
+    def test_global_recent_selection_excludes_events_without_timestamps(self) -> None:
+        selected = _select_global_recent_sequence_positions(
+            {
+                "impr": [0, 1],
+                "buy": [0],
+            },
+            {
+                "impr": [4900, None],
+                "buy": [4800],
+            },
+            ups_types=["impr", "buy"],
+            max_length=3,
+            raw_row=0,
+            validate_contract=True,
+        )
+
+        self.assertEqual(selected, {"impr": [0], "buy": [0]})
+
     def test_nested_numeric_arrow_fast_path_preserves_nulls_and_empty_lists(self) -> None:
         array = pa.array(
             [[[1, 2], None, []], None, [[3]]],
@@ -535,6 +554,54 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
 
         self.assertEqual(actual["impr_x_goods_id_hn"], [[-1, -2]])
         self.assertEqual(actual["impr_x_time_delta_ms"], [[100.0, 1000.0]])
+
+    def test_req_global_recent_window_allows_stream_capacity_borrowing(self) -> None:
+        table = pa.table(
+            {
+                "ctx_scalar_hn": [[101]],
+                "ctx_bag_hn": [[1, 2]],
+                "item_scalar_hn": [[[201]]],
+                "sku_a_hn": [[[11]]],
+                "sku_b_hn": [[[21]]],
+                "impr_x_goods_id_hn": [[-1, -2, -3]],
+                "impr_x_time": [[4900, 4800, 4700]],
+                "buy_x_goods_id_hn": [[-9]],
+                "buy_x_time": [[1000]],
+                "scene_id": [7],
+                "search_id": ["r0"],
+                "impr_time": [5000],
+                "label_a": [[0]],
+                "label_b": [[1]],
+                "label_c": [[0]],
+            }
+        )
+        required = [
+            *REQUIRED,
+            "buy_x_goods_id_hn",
+            "buy_x_time_delta_ms",
+        ]
+        context = _context(required)
+        context.options.update(
+            {
+                "ups_types": ["impr", "buy"],
+                "time_delta_outputs": {
+                    "impr": "impr_x_time_delta_ms",
+                    "buy": "buy_x_time_delta_ms",
+                },
+                # The old policy would keep one event from each stream. The
+                # global policy keeps both newest events, even though both are
+                # impressions.
+                "sequence_max_lengths": {"impr": 1, "buy": 1},
+                "global_sequence_max_length": 2,
+            }
+        )
+
+        actual = adapt(table, context=context).to_pydict()
+
+        self.assertEqual(actual["impr_x_goods_id_hn"], [[-1, -2]])
+        self.assertEqual(actual["impr_x_time_delta_ms"], [[100.0, 200.0]])
+        self.assertEqual(actual["buy_x_goods_id_hn"], [[]])
+        self.assertEqual(actual["buy_x_time_delta_ms"], [[]])
 
     def test_req_accepts_optional_single_request_axis_on_context(self) -> None:
         table = pa.table(

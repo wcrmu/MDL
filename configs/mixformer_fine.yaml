@@ -7,6 +7,9 @@ runtime:
 
 data:
   train:
+    adapter:
+      options:
+        global_sequence_max_length: 2048
     reader:
       length_buckets:
         - {max_length: 2048, batch_size: 128}
@@ -14,6 +17,10 @@ data:
         - {max_length: 6144, batch_size: 48}
         - {max_length: 8192, batch_size: 32}
         - {max_length: null, batch_size: 64}
+  test:
+    adapter:
+      options:
+        global_sequence_max_length: 2048
 
 tokenization:
   feature_tokenizer: rankmixer
@@ -22,12 +29,14 @@ tokenization:
 
 model:
   name: mixformer
+  ns_tokenizer: auto_split
   token_dim: 384
   num_layers: 4
   num_heads: 12
   hidden_dim: 1024
   task_head_hidden_dim: 1024
   sequence_fusion: timestamp_aware
+  global_sequence_max_length: 2048
   use_sep_tokens: false
   mixformer_user_head_count: null
   use_pyramid: false

@@ -72,6 +72,7 @@ from .features import load_vocab_maps
 from .embeddings import (
     ShardedEmbedding,
     consume_sharded_embedding_stats,
+    set_embedding_stats_host_sync,
     sharded_embedding_modules,
 )
 from .model import build_model
@@ -1209,8 +1210,11 @@ def _table_sequence_lengths(config: AppConfig, sequence: Any, table: object) -> 
     values = torch.from_numpy(
         lengths.to_numpy(zero_copy_only=False).copy()
     ).to(dtype=torch.long)
-    if sequence.max_length is not None:
-        values.clamp_(max=sequence.max_length)
+    tensor_max_length = getattr(
+        sequence, "tensor_max_length", sequence.max_length
+    )
+    if tensor_max_length is not None:
+        values.clamp_(max=tensor_max_length)
     return values
 
 
@@ -4460,7 +4464,8 @@ def train_mdl(
                 f"configured_batch_per_rank={configured_batch_per_rank} "
                 f"runtime_world_size={context.world_size} "
                 f"gradient_accumulation_steps={gradient_accumulation_steps} "
-                f"runtime_effective_global_batch={runtime_effective_global_batch}"
+                f"runtime_effective_global_batch={runtime_effective_global_batch} "
+                f"reader_shard_unit={config.data.train.reader.shard_unit}"
             )
             task_weight_summary = " ".join(
                 f"{task_name}={weight:g}"
@@ -4571,6 +4576,17 @@ def train_mdl(
                 window_h2d_seconds = 0.0
                 window_forward_seconds = 0.0
                 window_backward_seconds = 0.0
+            # Sample embedding A2A host stats only on log / observer windows so
+            # embedding_collect_stats does not D2H every step.
+            sample_embedding_stats = observing or (
+                log_steps
+                and (steps + 1) % config.training.log_every_steps == 0
+            )
+            set_embedding_stats_host_sync(
+                sample_embedding_stats
+                if getattr(config.training, "embedding_collect_stats", False)
+                else False
+            )
             dataloader_started = perf_counter()
             trace_batch: FeatureBatch | None = None
             collect_batch_stats = observing or (
@@ -4882,16 +4898,8 @@ def train_mdl(
                     if window_task_monitors is not None
                     else []
                 )
-                task_loss_parts = [
-                    f"{task_name}={_format_optional_float(stats['loss'])}"
-                    for task_name, stats in zip(config.task_names, task_stats)
-                ]
-                task_loss_suffix = (
-                    (" | " + " ".join(task_loss_parts)) if task_loss_parts else ""
-                )
                 print(
-                    f"Train step | step={steps} | logloss={last_loss:.6f}"
-                    f"{task_loss_suffix} "
+                    f"Train step | step={steps} | logloss={last_loss:.6f} "
                     f"active_ranks={window_active_ranks}/{context.world_size} "
                     f"micro_batches={gradient_accumulation_steps} "
                     f"local_rows={window_rows} "
@@ -5529,15 +5537,14 @@ def _print_training_quick_eval(
     )
     for task_name, metrics in result.metrics.items():
         auc = metrics["auc"]
-        copc = metrics.get("copc")
         auc_value = None if auc is None else float(auc)
-        copc_value = None if copc is None else float(copc)
         prob_mean = metrics.get("prob_mean")
         prob_mean_value = None if prob_mean is None else float(prob_mean)
+        # COPC is still computed into metrics for debugging, but not printed:
+        # rare tasks + small quick-eval windows make it too noisy to trust.
         print(
             f"Quick eval task | step={step} task={task_name} "
             f"auc={_format_optional_float(auc_value, 8)} "
-            f"copc={_format_optional_float(copc_value, 8)} "
             f"logloss={_format_optional_float(metrics.get('loss'))} "
             f"prob_mean={_format_optional_float(prob_mean_value)} "
             f"logit_mean={_format_optional_float(metrics.get('logit_mean'))} "
@@ -5547,7 +5554,6 @@ def _print_training_quick_eval(
         )
         warning_parts = _task_monitor_warning_parts(
             prob_mean=prob_mean_value,
-            copc=copc_value,
             auc=auc_value,
         )
         if warning_parts:

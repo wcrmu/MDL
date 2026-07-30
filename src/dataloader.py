@@ -26,6 +26,7 @@ import fnmatch
 from hashlib import sha256
 from itertools import chain, islice
 import glob
+import heapq
 import importlib
 import json
 import logging
@@ -115,7 +116,7 @@ _PROCESS_ADAPTER_SPLIT_NAME = ""
 # Remote filesystem IO (HDFS/viewfs)
 #
 # Eason-equivalent model inside one DDP rank:
-# - each prefetch worker uses a thread-local HadoopFileSystem (own DFSClient)
+# - each long-lived prefetch worker uses a thread-local HadoopFileSystem
 # - open via open_input_file with timeout / retry / defensive flock
 # - ParquetFile(native_file, pre_buffer=True) + iter_batches(use_threads=False)
 # - timed native_file.close() so a corrupted stream cannot hang forever
@@ -2487,7 +2488,7 @@ def _build_lpt_shard_plan(
 
 @dataclass
 class _PrefetchSlot:
-    """One bounded queue plus its row-group reader thread."""
+    """One bounded output queue plus its persistent reader thread."""
 
     index: int
     queue: queue.Queue[Any]
@@ -2846,6 +2847,128 @@ class ParquetScanner:
         finally:
             _put_queue_item(slot.queue, _SENTINEL, stop_event)
 
+    def _iter_record_batches_with_persistent_prefetch(
+        self,
+        work_items: Sequence[Any],
+        stop_event: threading.Event,
+        *,
+        active_workers: int,
+        worker: Callable[[Any, _PrefetchSlot, threading.Event], None],
+        thread_name_prefix: str,
+    ) -> Iterator[Any]:
+        """Stream ordered work through a fixed set of long-lived daemon workers.
+
+        HDFS clients are cached in thread-local storage.  Creating a fresh
+        thread for every row group/file destroys that cache when the thread
+        exits; with Hadoop implementations that share an underlying client,
+        one wrapper's destruction can close a DFSClient still used by another
+        prefetch worker.  Persistent workers bound client lifetime to the whole
+        scan while preserving the existing bounded, deterministic output order.
+        """
+
+        if not work_items or active_workers <= 0:
+            return
+
+        capacities = self._prefetch_queue_capacities(active_workers)
+        byte_capacity = max(1, self.split.reader.max_prefetch_bytes // active_workers)
+        slots = [
+            _PrefetchSlot(
+                index=index,
+                queue=queue.Queue(maxsize=capacity),
+                byte_budget=_ByteBudget(byte_capacity),
+            )
+            for index, capacity in enumerate(capacities)
+        ]
+        task_queues = [queue.Queue(maxsize=1) for _ in slots]
+        slot_for_item: dict[int, _PrefetchSlot] = {}
+
+        def worker_loop(slot: _PrefetchSlot) -> None:
+            task_queue = task_queues[slot.index]
+            while not stop_event.is_set():
+                try:
+                    work_item = task_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                try:
+                    worker(work_item, slot, stop_event)
+                except BaseException as error:  # defensive: workers normally capture
+                    slot.error = error
+                    _put_queue_item(slot.queue, _SENTINEL, stop_event)
+
+        for slot in slots:
+            slot.thread = threading.Thread(
+                target=worker_loop,
+                args=(slot,),
+                name=f"{thread_name_prefix}-slot-{slot.index}",
+                daemon=True,
+            )
+            slot.thread.start()
+
+        next_assign_index = 0
+
+        def assign(slot: _PrefetchSlot) -> None:
+            nonlocal next_assign_index
+            if next_assign_index >= len(work_items) or stop_event.is_set():
+                return
+            work_index = next_assign_index
+            next_assign_index += 1
+            slot.error = None
+            slot_for_item[work_index] = slot
+            task_queues[slot.index].put(work_items[work_index])
+
+        for slot in slots:
+            assign(slot)
+
+        try:
+            for work_index in range(len(work_items)):
+                if stop_event.is_set():
+                    return
+                slot = slot_for_item.pop(work_index)
+                while True:
+                    if stop_event.is_set() and slot.queue.empty():
+                        return
+                    try:
+                        item = slot.queue.get(timeout=0.1)
+                    except queue.Empty:
+                        if (
+                            slot.thread is not None
+                            and not slot.thread.is_alive()
+                            and slot.queue.empty()
+                        ):
+                            if slot.error is not None:
+                                raise slot.error
+                            raise RuntimeError(
+                                f"{thread_name_prefix} worker exited without sentinel"
+                            )
+                        continue
+                    if item is _SENTINEL:
+                        if slot.error is not None:
+                            raise slot.error
+                        break
+                    if not isinstance(item, _QueuedRecordBatch):
+                        raise RuntimeError("invalid parquet prefetch queue item")
+                    try:
+                        yield item.value
+                    finally:
+                        slot.byte_budget.release(item.nbytes)
+
+                _drain_prefetch_slot(slot)
+                assign(slot)
+        finally:
+            stop_event.set()
+            for slot in slots:
+                slot.byte_budget.wake_all()
+            for slot in slots:
+                _join_prefetch_thread(
+                    slot.thread,
+                    timeout_sec=self._io_policy.prefetch_join_timeout,
+                    label=f"{thread_name_prefix} slot-{slot.index}",
+                )
+                _drain_prefetch_slot(slot)
+                slot.thread = None
+                slot.error = None
+            slot_for_item.clear()
+
     def _iter_row_group_record_batches_prefetch(
         self,
         work_items: list[_RowGroupWorkItem],
@@ -2864,153 +2987,13 @@ class ParquetScanner:
         if active_workers <= 0:
             yield from self._iter_row_group_record_batches_sync(work_items, stop_event)
             return
-
-        capacities = self._prefetch_queue_capacities(active_workers)
-        byte_capacity = max(1, self.split.reader.max_prefetch_bytes // active_workers)
-        slots = [
-            _PrefetchSlot(
-                index=index,
-                queue=queue.Queue(maxsize=capacity),
-                byte_budget=_ByteBudget(byte_capacity),
-            )
-            for index, capacity in enumerate(capacities)
-        ]
-        slot_for_item: dict[int, _PrefetchSlot] = {}
-        free_slots: queue.Queue[int] = queue.Queue()
-        for index in range(active_workers):
-            free_slots.put(index)
-        assignment_condition = threading.Condition()
-        next_assign_index = 0
-        assignment_error: BaseException | None = None
-
-        def assign_available_slots() -> None:
-            nonlocal next_assign_index
-            while next_assign_index < len(work_items) and not free_slots.empty():
-                if stop_event.is_set():
-                    return
-                try:
-                    slot_index = free_slots.get_nowait()
-                except queue.Empty:
-                    return
-                work_item = work_items[next_assign_index]
-                slot = slots[slot_index]
-
-                def run_worker(
-                    item: _RowGroupWorkItem = work_item,
-                    target_slot: _PrefetchSlot = slot,
-                ) -> None:
-                    self._row_group_worker(item, target_slot, stop_event)
-
-                slot.thread = threading.Thread(
-                    target=run_worker,
-                    name=f"parquet-prefetch-{next_assign_index}",
-                    daemon=True,
-                )
-                slot.thread.start()
-                slot_for_item[next_assign_index] = slot
-                next_assign_index += 1
-
-        def assignment_loop() -> None:
-            nonlocal assignment_error
-            try:
-                while next_assign_index < len(work_items) and not stop_event.is_set():
-                    with assignment_condition:
-                        assign_available_slots()
-                        if next_assign_index >= len(work_items) or stop_event.is_set():
-                            break
-                        assignment_condition.wait(timeout=0.01)
-            except BaseException as error:
-                assignment_error = error
-                stop_event.set()
-
-        assignment_thread = threading.Thread(
-            target=assignment_loop, name="parquet-prefetch-assign", daemon=True
+        yield from self._iter_record_batches_with_persistent_prefetch(
+            work_items,
+            stop_event,
+            active_workers=active_workers,
+            worker=self._row_group_worker,
+            thread_name_prefix="parquet-prefetch",
         )
-        assignment_thread.start()
-
-        try:
-            for work_index, _work_item in enumerate(work_items):
-                if stop_event.is_set():
-                    return
-                if assignment_error is not None:
-                    raise assignment_error
-                while work_index not in slot_for_item:
-                    if stop_event.is_set():
-                        return
-                    if assignment_error is not None:
-                        raise assignment_error
-                    with assignment_condition:
-                        assign_available_slots()
-                        assignment_condition.notify_all()
-                    if work_index not in slot_for_item:
-                        time.sleep(0.001)
-
-                slot = slot_for_item[work_index]
-                while True:
-                    if stop_event.is_set() and slot.queue.empty():
-                        return
-                    try:
-                        item = slot.queue.get(timeout=0.1)
-                    except queue.Empty:
-                        if (
-                            slot.thread is not None
-                            and not slot.thread.is_alive()
-                            and slot.queue.empty()
-                        ):
-                            if slot.error is not None:
-                                raise slot.error
-                            break
-                        continue
-                    if item is _SENTINEL:
-                        if slot.error is not None:
-                            raise slot.error
-                        break
-                    if not isinstance(item, _QueuedRecordBatch):
-                        raise RuntimeError("invalid parquet prefetch queue item")
-                    try:
-                        yield item.value
-                    finally:
-                        slot.byte_budget.release(item.nbytes)
-
-                if slot.thread is not None:
-                    _join_prefetch_thread(
-                        slot.thread,
-                        timeout_sec=self._io_policy.prefetch_join_timeout,
-                        label=(
-                            f"parquet-prefetch worker for "
-                            f"{_work_item.input_ref.canonical_uri}:"
-                            f"{_work_item.local_row_group_index}"
-                        ),
-                    )
-                slot.thread = None
-                slot.error = None
-                _drain_prefetch_slot(slot)
-                free_slots.put(slot.index)
-                with assignment_condition:
-                    assign_available_slots()
-                    assignment_condition.notify_all()
-        finally:
-            stop_event.set()
-            for slot in slots:
-                slot.byte_budget.wake_all()
-            with assignment_condition:
-                assignment_condition.notify_all()
-            _join_prefetch_thread(
-                assignment_thread,
-                timeout_sec=self._io_policy.prefetch_join_timeout,
-                label="parquet-prefetch-assign",
-            )
-            for slot in slots:
-                if slot.thread is not None:
-                    _join_prefetch_thread(
-                        slot.thread,
-                        timeout_sec=self._io_policy.prefetch_join_timeout,
-                        label=f"parquet-prefetch slot-{slot.index}",
-                    )
-                _drain_prefetch_slot(slot)
-                slot.thread = None
-                slot.error = None
-            slot_for_item.clear()
 
     def _iter_row_group_record_batches(
         self, stop_event: threading.Event
@@ -3112,151 +3095,13 @@ class ParquetScanner:
         if active_workers <= 0:
             yield from self._iter_file_record_batches_sync(paths, stop_event)
             return
-
-        capacities = self._prefetch_queue_capacities(active_workers)
-        byte_capacity = max(1, self.split.reader.max_prefetch_bytes // active_workers)
-        slots = [
-            _PrefetchSlot(
-                index=index,
-                queue=queue.Queue(maxsize=capacity),
-                byte_budget=_ByteBudget(byte_capacity),
-            )
-            for index, capacity in enumerate(capacities)
-        ]
-        slot_for_item: dict[int, _PrefetchSlot] = {}
-        free_slots: queue.Queue[int] = queue.Queue()
-        for index in range(active_workers):
-            free_slots.put(index)
-        assignment_condition = threading.Condition()
-        next_assign_index = 0
-        assignment_error: BaseException | None = None
-
-        def assign_available_slots() -> None:
-            nonlocal next_assign_index
-            while next_assign_index < len(paths) and not free_slots.empty():
-                if stop_event.is_set():
-                    return
-                try:
-                    slot_index = free_slots.get_nowait()
-                except queue.Empty:
-                    return
-                ref = paths[next_assign_index]
-                slot = slots[slot_index]
-
-                def run_worker(
-                    item: ParquetInputRef = ref,
-                    target_slot: _PrefetchSlot = slot,
-                ) -> None:
-                    self._file_worker(item, target_slot, stop_event)
-
-                slot.thread = threading.Thread(
-                    target=run_worker,
-                    name=f"parquet-file-prefetch-{next_assign_index}",
-                    daemon=True,
-                )
-                slot.thread.start()
-                slot_for_item[next_assign_index] = slot
-                next_assign_index += 1
-
-        def assignment_loop() -> None:
-            nonlocal assignment_error
-            try:
-                while next_assign_index < len(paths) and not stop_event.is_set():
-                    with assignment_condition:
-                        assign_available_slots()
-                        if next_assign_index >= len(paths) or stop_event.is_set():
-                            break
-                        assignment_condition.wait(timeout=0.01)
-            except BaseException as error:
-                assignment_error = error
-                stop_event.set()
-
-        assignment_thread = threading.Thread(
-            target=assignment_loop,
-            name="parquet-file-prefetch-assign",
-            daemon=True,
+        yield from self._iter_record_batches_with_persistent_prefetch(
+            paths,
+            stop_event,
+            active_workers=active_workers,
+            worker=self._file_worker,
+            thread_name_prefix="parquet-file-prefetch",
         )
-        assignment_thread.start()
-
-        try:
-            for work_index, _ref in enumerate(paths):
-                if stop_event.is_set():
-                    return
-                if assignment_error is not None:
-                    raise assignment_error
-                while work_index not in slot_for_item:
-                    if stop_event.is_set():
-                        return
-                    if assignment_error is not None:
-                        raise assignment_error
-                    with assignment_condition:
-                        assign_available_slots()
-                        assignment_condition.notify_all()
-                    if work_index not in slot_for_item:
-                        time.sleep(0.001)
-
-                slot = slot_for_item[work_index]
-                while True:
-                    if stop_event.is_set() and slot.queue.empty():
-                        return
-                    if slot.error is not None:
-                        raise slot.error
-                    try:
-                        item = slot.queue.get(timeout=0.1)
-                    except queue.Empty:
-                        if (
-                            slot.thread is not None
-                            and not slot.thread.is_alive()
-                            and slot.queue.empty()
-                        ):
-                            if slot.error is not None:
-                                raise slot.error
-                            break
-                        continue
-                    if item is _SENTINEL:
-                        if slot.error is not None:
-                            raise slot.error
-                        break
-                    if not isinstance(item, _QueuedRecordBatch):
-                        raise RuntimeError("invalid parquet prefetch queue item")
-                    try:
-                        yield item.value
-                    finally:
-                        slot.byte_budget.release(item.nbytes)
-                if slot.thread is not None:
-                    _join_prefetch_thread(
-                        slot.thread,
-                        timeout_sec=self._io_policy.prefetch_join_timeout,
-                        label=f"parquet-file-prefetch worker for {_ref.canonical_uri}",
-                    )
-                slot.thread = None
-                slot.error = None
-                free_slots.put(slot.index)
-                with assignment_condition:
-                    assignment_condition.notify_all()
-                del slot_for_item[work_index]
-        finally:
-            stop_event.set()
-            for slot in slots:
-                slot.byte_budget.wake_all()
-            with assignment_condition:
-                assignment_condition.notify_all()
-            _join_prefetch_thread(
-                assignment_thread,
-                timeout_sec=self._io_policy.prefetch_join_timeout,
-                label="parquet-file-prefetch-assign",
-            )
-            for slot in slots:
-                if slot.thread is not None:
-                    _join_prefetch_thread(
-                        slot.thread,
-                        timeout_sec=self._io_policy.prefetch_join_timeout,
-                        label=f"parquet-file-prefetch slot-{slot.index}",
-                    )
-                _drain_prefetch_slot(slot)
-                slot.thread = None
-                slot.error = None
-            slot_for_item.clear()
 
     def _iter_file_record_batches(self, stop_event: threading.Event) -> Iterator[Any]:
         """Scan rank-local files via ``ParquetFile`` (never Dataset scanner).
@@ -4610,6 +4455,120 @@ def _select_sequence(
     return normalized
 
 
+def _select_global_recent_sequence_positions(
+    positions_by_type: Mapping[str, Sequence[int]],
+    event_times_by_type: Mapping[str, Sequence[Any]],
+    *,
+    ups_types: Sequence[str],
+    max_length: int,
+    raw_row: int,
+    validate_contract: bool,
+) -> dict[str, list[int]]:
+    """Select one newest-event window across heterogeneous UPS streams.
+
+    Each input stream remains in its original newest-to-oldest physical order
+    after selection. Ties are deterministic: configured UPS order, then the
+    original position within that stream.
+    """
+
+    normalized_times_by_type: dict[str, list[int | None]] = {}
+    for ups in ups_types:
+        positions = positions_by_type.get(ups, ())
+        event_times = event_times_by_type.get(ups, ())
+        if len(positions) != len(event_times):
+            raise RuntimeError(
+                f"global sequence selection received {len(positions)} positions "
+                f"but {len(event_times)} timestamps for {ups!r} at raw row {raw_row}"
+            )
+        normalized_times: list[int | None] = []
+        previous_timestamp: int | None = None
+        saw_null = False
+        for local_order, raw_time in enumerate(event_times):
+            if raw_time is None:
+                normalized_times.append(None)
+                saw_null = True
+                continue
+            if isinstance(raw_time, np.integer):
+                raw_time = int(raw_time)
+            if validate_contract and (
+                isinstance(raw_time, bool) or not isinstance(raw_time, int)
+            ):
+                raise ValueError(
+                    f"sequence {ups!r} has invalid event time {raw_time!r} "
+                    f"at raw row {raw_row}, position {local_order}"
+                )
+            try:
+                timestamp = int(raw_time)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(
+                    f"sequence {ups!r} has invalid event time {raw_time!r} "
+                    f"at raw row {raw_row}, position {local_order}"
+                ) from error
+            if validate_contract and (
+                saw_null
+                or (
+                    previous_timestamp is not None
+                    and timestamp > previous_timestamp
+                )
+            ):
+                raise ValueError(
+                    f"sequence {ups!r} event times must be newest-to-oldest "
+                    f"before global selection at raw row {raw_row}, position "
+                    f"{local_order}"
+                )
+            normalized_times.append(timestamp)
+            previous_timestamp = timestamp
+        normalized_times_by_type[ups] = normalized_times
+
+    # Every UPS is already newest-to-oldest, so this is a k-way merge rather
+    # than a sort of up to len(ups_types) * max_length Python tuples.
+    heap: list[tuple[int, int, int, str, int]] = []
+
+    def _push(ups: str, stream_order: int, local_order: int) -> None:
+        times = normalized_times_by_type[ups]
+        if local_order >= len(times):
+            return
+        timestamp = times[local_order]
+        if timestamp is None:
+            # An event without a timestamp cannot participate in a global
+            # chronological window. Nulls are required to be a suffix under
+            # validation, so there can be no later comparable event to push.
+            return
+        heapq.heappush(
+            heap,
+            (
+                -timestamp,
+                stream_order,
+                local_order,
+                ups,
+                int(positions_by_type[ups][local_order]),
+            ),
+        )
+
+    for stream_order, ups in enumerate(ups_types):
+        _push(ups, stream_order, 0)
+
+    selected_by_type: dict[str, list[tuple[int, int]]] = {
+        ups: [] for ups in ups_types
+    }
+    selected_count = 0
+    while heap and selected_count < max_length:
+        (
+            _newest_rank,
+            stream_order,
+            local_order,
+            ups,
+            position,
+        ) = heapq.heappop(heap)
+        selected_by_type[ups].append((local_order, position))
+        selected_count += 1
+        _push(ups, stream_order, local_order + 1)
+    return {
+        ups: [position for _local_order, position in sorted(selected_by_type[ups])]
+        for ups in ups_types
+    }
+
+
 def _flatten_singleton_ups_array(
     pa: Any,
     pc: Any,
@@ -5063,6 +5022,7 @@ class _MdlRankMixerAdapterPlan:
     time_delta_outputs: Mapping[str, str]
     time_delta_transform: str
     sequence_max_lengths: Mapping[str, int]
+    global_sequence_max_length: int | None
     compact_request_lists: bool
     request_time_column: str
     aligned_groups: tuple[tuple[str, ...], ...]
@@ -5140,6 +5100,14 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     time_delta_outputs = _mapping(options, "time_delta_outputs")
     time_delta_transform = str(options.get("time_delta_transform", "raw_ms"))
     sequence_max_lengths = _positive_int_mapping(options, "sequence_max_lengths")
+    global_sequence_max_length = options.get("global_sequence_max_length")
+    if global_sequence_max_length is not None and (
+        type(global_sequence_max_length) is not int
+        or global_sequence_max_length <= 0
+    ):
+        raise ValueError(
+            "adapter option 'global_sequence_max_length' must be a positive integer or null"
+        )
     compact_request_lists = options.get("compact_request_lists", False)
     if type(compact_request_lists) is not bool:
         raise ValueError("adapter option 'compact_request_lists' must be a boolean")
@@ -5189,6 +5157,14 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
             )
     if set(time_delta_outputs) - set(ups_types):
         raise ValueError("time_delta_outputs contains an unknown UPS type")
+    if global_sequence_max_length is not None:
+        missing_global_times = sorted(set(ups_types) - set(time_delta_outputs))
+        if missing_global_times:
+            raise ValueError(
+                "adapter global_sequence_max_length requires a time_delta_outputs "
+                "entry for every UPS type; missing: "
+                + ", ".join(missing_global_times)
+            )
     unknown_sequence_limits = sorted(set(sequence_max_lengths) - set(ups_types))
     if unknown_sequence_limits:
         raise ValueError(
@@ -5374,6 +5350,7 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         time_delta_outputs=time_delta_outputs,
         time_delta_transform=time_delta_transform,
         sequence_max_lengths=sequence_max_lengths,
+        global_sequence_max_length=global_sequence_max_length,
         compact_request_lists=compact_request_lists,
         request_time_column=request_time_column,
         aligned_groups=aligned_groups,
@@ -5493,6 +5470,18 @@ def build_arrow_axis_source(
             ups_index_rows[ups] = [None] * table.num_rows
         else:
             ups_index_rows[ups] = _control_pylist(index_name)
+    ups_time_rows: dict[str, list[Any]] = {}
+    if plan.global_sequence_max_length is not None:
+        for ups in plan.ups_types:
+            time_name = f"{ups}_x_time"
+            if time_name not in physical_columns:
+                raise ValueError(
+                    f"adapter global sequence selection requires column {time_name!r}"
+                )
+            time_column = table[physical_columns[time_name]]
+            if hasattr(time_column, "combine_chunks"):
+                time_column = time_column.combine_chunks()
+            ups_time_rows[ups] = _arrow_array_to_pylist(pa, time_column)
 
     request_id_to_slot: dict[Any, int] = {}
     request_ids: list[Any] = []
@@ -5549,6 +5538,7 @@ def build_arrow_axis_source(
 
         known_requests = set(positions)
         membership_positions: dict[str, dict[int, list[int]]] = {}
+        membership_lengths: dict[str, int] = {}
         for ups in plan.ups_types:
             index_column = f"{ups}_x_indices"
             memberships_raw = ups_index_rows[ups][raw_row]
@@ -5561,6 +5551,7 @@ def build_arrow_axis_source(
                     row_index=raw_row,
                     validate_contract=validate_structure,
                 )
+            membership_lengths[ups] = len(memberships)
             membership_positions[ups] = _sequence_membership_positions(
                 memberships,
                 known_requests=known_requests,
@@ -5603,12 +5594,48 @@ def build_arrow_axis_source(
                 request_ids.append(request_id)
                 request_raw_rows.append(raw_row)
                 request_local_positions.append(int(request_position))
+                selected_by_type: dict[str, list[int]]
+                if plan.global_sequence_max_length is not None:
+                    candidates_by_type = {
+                        ups: list(
+                            membership_positions[ups].get(request_index, ())[
+                                : plan.global_sequence_max_length
+                            ]
+                        )
+                        for ups in plan.ups_types
+                    }
+                    candidate_times = {
+                        ups: _select_sequence(
+                            ups_time_rows[ups][raw_row],
+                            candidates_by_type[ups],
+                            expected_length=membership_lengths[ups],
+                            column=f"{ups}_x_time",
+                            raw_row=raw_row,
+                            validate_structure=validate_structure,
+                            validate_payload=validate_structure,
+                        )
+                        for ups in plan.ups_types
+                    }
+                    selected_by_type = _select_global_recent_sequence_positions(
+                        candidates_by_type,
+                        candidate_times,
+                        ups_types=plan.ups_types,
+                        max_length=plan.global_sequence_max_length,
+                        raw_row=raw_row,
+                        validate_contract=validate_structure,
+                    )
+                else:
+                    selected_by_type = {}
+                    for ups in plan.ups_types:
+                        selected = list(
+                            membership_positions[ups].get(request_index, ())
+                        )
+                        max_length = plan.sequence_max_lengths.get(ups)
+                        if max_length is not None:
+                            selected = selected[: int(max_length)]
+                        selected_by_type[ups] = selected
                 for ups in plan.ups_types:
-                    selected = list(membership_positions[ups].get(request_index, ()))
-                    max_length = plan.sequence_max_lengths.get(ups)
-                    if max_length is not None:
-                        selected = selected[: int(max_length)]
-                    ups_positions_by_slot[ups].append(selected)
+                    ups_positions_by_slot[ups].append(selected_by_type[ups])
             row_request_slots[request_index] = slot
 
         request_ordinals: defaultdict[int, int] = defaultdict(int)
@@ -5718,6 +5745,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
     time_delta_outputs = plan.time_delta_outputs
     time_delta_transform = plan.time_delta_transform
     sequence_max_lengths = plan.sequence_max_lengths
+    global_sequence_max_length = plan.global_sequence_max_length
     compact_request_lists = plan.compact_request_lists
     request_time_column = plan.request_time_column
     aligned_groups = plan.aligned_groups
@@ -6171,16 +6199,75 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                 agg=is_agg,
                 validate_contract=validate_row_contract,
             )
+            globally_selected_positions: dict[str, list[int]] | None = None
+            global_expected_lengths: dict[str, int] = {}
+            if global_sequence_max_length is not None:
+                candidate_positions_by_type: dict[str, list[int]] = {}
+                candidate_times_by_type: dict[str, Sequence[Any]] = {}
+                for ups in ups_types:
+                    raw_time_column = f"{ups}_x_time"
+                    if validate_row_contract and raw_time_column not in row:
+                        raise ValueError(
+                            f"missing UPS time column {raw_time_column!r}"
+                        )
+                    time_values = row.get(raw_time_column)
+                    if is_agg:
+                        expected = membership_lengths[ups]
+                        positions_for_global = list(
+                            membership_positions[ups][request_index][
+                                :global_sequence_max_length
+                            ]
+                        )
+                    else:
+                        raw_times = _as_list(
+                            time_values,
+                            column=raw_time_column,
+                            row_index=raw_row,
+                            validate_contract=validate_structure,
+                        )
+                        expected = len(raw_times)
+                        positions_for_global = list(
+                            range(min(expected, global_sequence_max_length))
+                        )
+                    global_expected_lengths[ups] = expected
+                    candidate_positions_by_type[ups] = positions_for_global
+                    candidate_times_by_type[ups] = _select_sequence(
+                        time_values,
+                        positions_for_global,
+                        expected_length=expected,
+                        column=raw_time_column,
+                        raw_row=raw_row,
+                        validated_flat=(
+                            raw_time_column in validated_flat_sequence_columns
+                        ),
+                        validate_structure=validate_structure,
+                        validate_payload=validate_payload,
+                    )
+                globally_selected_positions = (
+                    _select_global_recent_sequence_positions(
+                        candidate_positions_by_type,
+                        candidate_times_by_type,
+                        ups_types=ups_types,
+                        max_length=global_sequence_max_length,
+                        raw_row=raw_row,
+                        validate_contract=validate_payload,
+                    )
+                )
             # Trusted + flattened UPS rows are NumPy views. Build one index
             # array per UPS and fancy-index every aligned column, instead of
             # ~100× ``_select_sequence`` call/listcomp overhead per request.
             use_numpy_seq = not validate_structure and not validate_payload and is_agg
             for ups in ups_types:
-                selected_positions = (
-                    membership_positions[ups][request_index] if is_agg else None
-                )
-                expected_length = membership_lengths.get(ups)
-                max_length = sequence_max_lengths.get(ups)
+                if globally_selected_positions is not None:
+                    selected_positions = globally_selected_positions[ups]
+                    expected_length = global_expected_lengths[ups]
+                    max_length = None
+                else:
+                    selected_positions = (
+                        membership_positions[ups][request_index] if is_agg else None
+                    )
+                    expected_length = membership_lengths.get(ups)
+                    max_length = sequence_max_lengths.get(ups)
                 pos_index: Any = None
                 if use_numpy_seq and selected_positions is not None:
                     if max_length is not None:
@@ -7827,6 +7914,12 @@ def _sequence_step_is_present(value: Any) -> bool:
     return True
 
 
+def _sequence_tensor_max_length(sequence: Any) -> int | None:
+    """Resolve the physical cap, including unified-event transport overrides."""
+
+    return getattr(sequence, "tensor_max_length", sequence.max_length)
+
+
 def _compress_row_fields_by_anchor(
     raw_items_by_field: dict[str, list[Any]],
     *,
@@ -7851,11 +7944,12 @@ def _compress_row_fields_by_anchor(
 
 def _sequence_bounds(length: int, sequence: SequenceConfig) -> tuple[int, int]:
     """Return the configured physical head/tail window before order canonicalization."""
-    if sequence.max_length is None or length <= sequence.max_length:
+    max_length = _sequence_tensor_max_length(sequence)
+    if max_length is None or length <= max_length:
         return 0, length
     if sequence.truncation == "tail":
-        return length - sequence.max_length, length
-    return 0, sequence.max_length
+        return length - max_length, length
+    return 0, max_length
 
 
 def _direct_sequence_supported(config: AppConfig, sequence: SequenceConfig) -> bool:
@@ -8341,8 +8435,9 @@ def _tensorize_direct_sequence(
 
     raw_lengths = reference_offsets[1:] - reference_offsets[:-1]
     lengths = raw_lengths
-    if sequence.max_length is not None:
-        lengths = torch.clamp(raw_lengths, max=sequence.max_length)
+    tensor_max_length = _sequence_tensor_max_length(sequence)
+    if tensor_max_length is not None:
+        lengths = torch.clamp(raw_lengths, max=tensor_max_length)
     if sequence.truncation == "tail":
         starts = reference_offsets[1:] - lengths
     else:
@@ -11119,7 +11214,7 @@ def build_sequence_selection_plan(
         kept, pre_len, compact_len = row_sequence_selection_after_truncate_then_compact(
             list_length=list_length,
             anchor_is_null=anchor_flags,
-            max_length=sequence.max_length,
+            max_length=_sequence_tensor_max_length(sequence),
             truncation=sequence.truncation,
         )
         selections.append(kept)
@@ -11249,7 +11344,7 @@ def build_axis_sequence_selection_plan(
     range_ends_arr = np.empty(n_plan_requests, dtype=np.int64)
     pre_lengths_arr = np.empty(n_plan_requests, dtype=np.int64)
     compacted_lengths_arr = np.empty(n_plan_requests, dtype=np.int64)
-    max_length = sequence.max_length
+    max_length = _sequence_tensor_max_length(sequence)
     truncation = sequence.truncation
 
     source_ids_arr = np.empty(n_plan_requests, dtype=np.int64)
@@ -11452,8 +11547,9 @@ def table_pre_compaction_sequence_lengths(
         if lengths.null_count:
             lengths = pc.fill_null(lengths, 0)
         values = lengths.to_numpy(zero_copy_only=False).astype(np.int64, copy=True)
-        if sequence.max_length is not None:
-            np.minimum(values, int(sequence.max_length), out=values)
+        tensor_max_length = _sequence_tensor_max_length(sequence)
+        if tensor_max_length is not None:
+            np.minimum(values, int(tensor_max_length), out=values)
         result[sequence.name] = values
     return result
 
@@ -12115,8 +12211,9 @@ def request_group_blocks_from_axis_bundle(
                 length = seq_column.row_length(stable_group_order)
             else:
                 length = len(seq_column[stable_group_order])
-            if sequence.max_length is not None:
-                length = min(length, int(sequence.max_length))
+            tensor_max_length = _sequence_tensor_max_length(sequence)
+            if tensor_max_length is not None:
+                length = min(length, int(tensor_max_length))
             pre_compaction[sequence.name] = int(length)
         blocks.append(
             RequestGroupBlock(
@@ -13175,8 +13272,9 @@ def request_group_blocks_from_arrow_source(
                 continue
             ups = ups_by_sequence[sequence.name]
             length = int(len(plan.ups_token_positions[ups][stable_group_order]))
-            if sequence.max_length is not None:
-                length = min(length, int(sequence.max_length))
+            tensor_max_length = _sequence_tensor_max_length(sequence)
+            if tensor_max_length is not None:
+                length = min(length, int(tensor_max_length))
             pre_compaction[sequence.name] = length
         blocks.append(
             RequestGroupBlock(
@@ -13266,7 +13364,7 @@ def _sequence_selection_plan_from_request_values(
         ) = row_sequence_selection_after_truncate_then_compact(
             list_length=list_length,
             anchor_is_null=anchor_is_null,
-            max_length=sequence.max_length,
+            max_length=_sequence_tensor_max_length(sequence),
             truncation=sequence.truncation,
         )
         expected_pre_length = block.pre_compaction_sequence_lengths.get(sequence.name)

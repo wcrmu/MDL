@@ -7,12 +7,14 @@ variable-size ``all_to_all_single`` collectives.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
 import os
+import threading
 from time import perf_counter
-from typing import Any, Iterable, Literal
+from typing import Any, Iterator, Iterable, Literal
 
 import torch
 import torch.distributed as torch_dist
@@ -21,10 +23,40 @@ from torch import Tensor, nn
 
 
 _DEFAULT_GROUPED_EMB_MAX_OUTPUT_BYTES = 1024**3
+_STATS_HOST_SYNC = threading.local()
 
 
 def _env_flag_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def embedding_stats_host_sync_enabled() -> bool:
+    """Whether embedding communication stats may issue device→host syncs.
+
+    Defaults to True so unit tests and ad-hoc lookups keep working. Training
+    gates this to log windows so ``embedding_collect_stats: true`` does not
+    serialize every step.
+    """
+
+    return bool(getattr(_STATS_HOST_SYNC, "enabled", True))
+
+
+def set_embedding_stats_host_sync(enabled: bool) -> None:
+    """Enable or disable host syncs for embedding communication stats."""
+
+    _STATS_HOST_SYNC.enabled = bool(enabled)
+
+
+@contextmanager
+def embedding_stats_host_sync(enabled: bool) -> Iterator[None]:
+    """Temporarily override embedding stats host-sync collection."""
+
+    previous = getattr(_STATS_HOST_SYNC, "enabled", True)
+    _STATS_HOST_SYNC.enabled = bool(enabled)
+    try:
+        yield
+    finally:
+        _STATS_HOST_SYNC.enabled = previous
 
 
 def _grouped_emb_max_output_bytes(override: int | None = None) -> int:
@@ -59,6 +91,8 @@ def _grouped_emb_pack_values_enabled(mixed_dims: bool) -> bool:
 
     Keeps one fused collective while dropping max-dim pad bytes on the wire.
     Set ``MDL_GROUPED_EMB_PADDED_A2A=1`` to force the old padded path.
+    Pack/unpack uses a small Triton kernel when CUDA is available; set
+    ``MDL_GROUPED_EMB_TORCH_PACK=1`` to force the ``masked_select`` path.
     """
 
     if not mixed_dims:
@@ -724,7 +758,7 @@ class ShardedEmbedding(nn.Module):
                 table_name=self.table_name,
                 validate_indices=self.validate_indices,
             )
-            if self.collect_stats:
+            if self.collect_stats and embedding_stats_host_sync_enabled():
                 # Avoid device->host syncs on the single-rank hot path; padding
                 # exclusions are not required for local-only stats.
                 raw_ids = int(indices.numel())
@@ -751,7 +785,9 @@ class ShardedEmbedding(nn.Module):
             self.shard_spec,
             self.local_dedup,
             self.process_group,
-            self._stats_sink if self.collect_stats else None,
+            self._stats_sink
+            if self.collect_stats and embedding_stats_host_sync_enabled()
+            else None,
             self.table_name,
             self.validate_indices,
         )
@@ -850,31 +886,151 @@ def _embedding_dims_for_keys(
     return dim_table.index_select(0, table_indices)
 
 
+def _segment_element_totals(
+    dims: Tensor, row_splits: tuple[int, ...]
+) -> Tensor:
+    """On-device per-split packed element counts for ``dims`` / ``row_splits``."""
+
+    device = dims.device
+    dtype = torch.long
+    if not row_splits:
+        return torch.empty(0, dtype=dtype, device=device)
+    if dims.numel() == 0:
+        return torch.zeros(len(row_splits), dtype=dtype, device=device)
+    split_tensor = torch.tensor(row_splits, dtype=dtype, device=device)
+    ends = torch.cumsum(split_tensor, dim=0)
+    starts = ends - split_tensor
+    prefix = torch.zeros(1, dtype=dtype, device=device)
+    prefix = torch.cat((prefix, torch.cumsum(dims.long(), dim=0)))
+    return prefix.index_select(0, ends) - prefix.index_select(0, starts)
+
+
 def _element_split_sizes(
     dims: Tensor, row_splits: tuple[int, ...]
 ) -> tuple[int, ...]:
     """Sum per-row embedding widths inside each row-split segment."""
 
-    if not row_splits:
+    totals = _segment_element_totals(dims, row_splits)
+    if totals.numel() == 0:
         return ()
-    if dims.numel() == 0:
-        return tuple(0 for _ in row_splits)
-    split_tensor = torch.tensor(
-        row_splits, dtype=torch.long, device=dims.device
-    )
-    ends = torch.cumsum(split_tensor, dim=0)
-    starts = ends - split_tensor
-    prefix = torch.zeros(1, dtype=torch.long, device=dims.device)
-    prefix = torch.cat((prefix, torch.cumsum(dims.long(), dim=0)))
-    totals = prefix.index_select(0, ends) - prefix.index_select(0, starts)
-    return tuple(int(value) for value in totals.tolist())
+    return tuple(int(value) for value in totals.to(device="cpu").tolist())
 
 
-def _pack_rows_by_dim(values: Tensor, dims: Tensor) -> Tensor:
+def _element_split_sizes_pair(
+    dims_a: Tensor,
+    row_splits_a: tuple[int, ...],
+    dims_b: Tensor,
+    row_splits_b: tuple[int, ...],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Compute two element-split vectors with one device→host sync.
+
+    Packed value A2A needs both the forward send and recv element splits.
+    Doing them as separate ``.tolist()`` calls doubled the host syncs on the
+    mixed-dim hot path.
+    """
+
+    totals_a = _segment_element_totals(dims_a, row_splits_a)
+    totals_b = _segment_element_totals(dims_b, row_splits_b)
+    if totals_a.numel() == 0 and totals_b.numel() == 0:
+        return (), ()
+    packed = torch.cat((totals_a, totals_b)).to(device="cpu")
+    n_a = totals_a.numel()
+    split_a = tuple(int(value) for value in packed[:n_a].tolist())
+    split_b = tuple(int(value) for value in packed[n_a:].tolist())
+    return split_a, split_b
+
+
+_PACK_UNPACK_KERNELS: Any = None
+
+
+def _pack_unpack_kernels() -> tuple[Any, Any] | None:
+    """Lazily compile Triton pack/unpack; ``None`` means use the torch path."""
+
+    global _PACK_UNPACK_KERNELS
+    if _PACK_UNPACK_KERNELS is not None:
+        return None if _PACK_UNPACK_KERNELS == () else _PACK_UNPACK_KERNELS
+    if _env_flag_enabled("MDL_GROUPED_EMB_TORCH_PACK"):
+        _PACK_UNPACK_KERNELS = ()
+        return None
+    try:
+        import triton
+        import triton.language as tl
+    except Exception:
+        _PACK_UNPACK_KERNELS = ()
+        return None
+
+    # Nested @triton.jit kernels resolve annotations against module globals.
+    globals()["tl"] = tl
+
+    @triton.jit
+    def _pack_rows_kernel(
+        values_ptr,
+        dims_ptr,
+        offsets_ptr,
+        out_ptr,
+        n_rows,
+        stride_values,
+        BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        if pid >= n_rows:
+            return
+        dim = tl.load(dims_ptr + pid)
+        offset = tl.load(offsets_ptr + pid)
+        cols = tl.arange(0, BLOCK)
+        mask = cols < dim
+        vals = tl.load(values_ptr + pid * stride_values + cols, mask=mask, other=0)
+        tl.store(out_ptr + offset + cols, vals, mask=mask)
+
+    @triton.jit
+    def _unpack_rows_kernel(
+        flat_ptr,
+        dims_ptr,
+        offsets_ptr,
+        out_ptr,
+        n_rows,
+        stride_out,
+        BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        if pid >= n_rows:
+            return
+        dim = tl.load(dims_ptr + pid)
+        offset = tl.load(offsets_ptr + pid)
+        cols = tl.arange(0, BLOCK)
+        mask = cols < dim
+        vals = tl.load(flat_ptr + offset + cols, mask=mask, other=0)
+        tl.store(out_ptr + pid * stride_out + cols, vals, mask=mask)
+
+    _PACK_UNPACK_KERNELS = (_pack_rows_kernel, _unpack_rows_kernel)
+    return _PACK_UNPACK_KERNELS
+
+
+def _row_dim_offsets(dims: Tensor) -> Tensor:
+    """Exclusive prefix sums of per-row widths (no host sync)."""
+
+    n = dims.numel()
+    offsets = torch.empty(n, dtype=torch.long, device=dims.device)
+    if n == 0:
+        return offsets
+    offsets[0] = 0
+    if n > 1:
+        torch.cumsum(dims[:-1].long(), dim=0, out=offsets[1:])
+    return offsets
+
+
+def _pack_rows_by_dim(
+    values: Tensor,
+    dims: Tensor,
+    *,
+    total_elements: int | None = None,
+) -> Tensor:
     """Pack ``[N, max_dim]`` rows into a 1D payload of exact widths.
 
-    Avoid device->host syncs on the mixed-dim hot path; ``masked_select`` keeps
-    the pack fully on-device until the collective needs host split sizes.
+    Prefer a small Triton kernel (one program/row) when ``total_elements`` is
+    already known from the fused element-split host sync. Fall back to
+    ``masked_select`` on CPU, when Triton is unavailable, or when
+    ``MDL_GROUPED_EMB_TORCH_PACK=1``.
     """
 
     if values.ndim != 2:
@@ -883,9 +1039,34 @@ def _pack_rows_by_dim(values: Tensor, dims: Tensor) -> Tensor:
         raise ValueError("dims length must match the number of value rows")
     if values.size(0) == 0:
         return values.new_empty(0)
-    max_dim = values.size(1)
-    columns = torch.arange(max_dim, device=values.device).unsqueeze(0)
-    return values.masked_select(columns < dims.unsqueeze(1))
+    max_dim = int(values.size(1))
+    use_triton = (
+        total_elements is not None
+        and values.is_cuda
+        and dims.device == values.device
+        and _pack_unpack_kernels() is not None
+    )
+    if not use_triton:
+        columns = torch.arange(max_dim, device=values.device).unsqueeze(0)
+        return values.masked_select(columns < dims.unsqueeze(1))
+
+    pack_kernel, _unpack_kernel = _pack_unpack_kernels()
+    import triton
+
+    assert total_elements is not None and pack_kernel is not None
+    offsets = _row_dim_offsets(dims)
+    output = values.new_empty(int(total_elements))
+    block = triton.next_power_of_2(max(max_dim, 1))
+    pack_kernel[(dims.numel(),)](
+        values,
+        dims,
+        offsets,
+        output,
+        dims.numel(),
+        values.stride(0),
+        BLOCK=block,
+    )
+    return output
 
 
 def _unpack_rows_by_dim(
@@ -901,8 +1082,30 @@ def _unpack_rows_by_dim(
     output = flat.new_zeros((rows, max_dim))
     if rows == 0:
         return output
-    columns = torch.arange(max_dim, device=flat.device).unsqueeze(0)
-    output.masked_scatter_(columns < dims.unsqueeze(1), flat)
+    kernels = (
+        _pack_unpack_kernels()
+        if flat.is_cuda and dims.device == flat.device and max_dim > 0
+        else None
+    )
+    if kernels is None:
+        columns = torch.arange(max_dim, device=flat.device).unsqueeze(0)
+        output.masked_scatter_(columns < dims.unsqueeze(1), flat)
+        return output
+
+    _pack_kernel, unpack_kernel = kernels
+    import triton
+
+    offsets = _row_dim_offsets(dims)
+    block = triton.next_power_of_2(max(max_dim, 1))
+    unpack_kernel[(rows,)](
+        flat,
+        dims,
+        offsets,
+        output,
+        rows,
+        output.stride(0),
+        BLOCK=block,
+    )
     return output
 
 
@@ -1065,11 +1268,19 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
                     sorted_keys, metadata.table_offsets, table_embedding_dims
                 )
                 # One host sync for both element-split vectors (NCCL needs ints).
-                value_send_splits = _element_split_sizes(received_dims, recv_splits)
-                value_recv_splits = _element_split_sizes(sorted_dims, send_splits)
+                value_send_splits, value_recv_splits = _element_split_sizes_pair(
+                    received_dims,
+                    recv_splits,
+                    sorted_dims,
+                    send_splits,
+                )
                 returned_values = _unpack_rows_by_dim(
                     _all_to_all_variable(
-                        _pack_rows_by_dim(received_values, received_dims),
+                        _pack_rows_by_dim(
+                            received_values,
+                            received_dims,
+                            total_elements=sum(value_send_splits),
+                        ),
                         value_send_splits,
                         value_recv_splits,
                         metadata.process_group,
@@ -1126,7 +1337,7 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             saved.extend((sorted_dims, received_dims))
         ctx.save_for_backward(*saved)
 
-        if metadata.collect_stats:
+        if metadata.collect_stats and embedding_stats_host_sync_enabled():
             table_count = len(modules)
             requester_table_indices = _table_indices_for_keys(
                 requester_keys, metadata.table_offsets
@@ -1213,7 +1424,11 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
                 # gradient route is the transpose: input=send_elem / output=recv_elem.
                 received_grad = _unpack_rows_by_dim(
                     _all_to_all_variable(
-                        _pack_rows_by_dim(sorted_grad, sorted_dims),
+                        _pack_rows_by_dim(
+                            sorted_grad,
+                            sorted_dims,
+                            total_elements=sum(ctx.value_recv_splits),
+                        ),
                         ctx.value_recv_splits,
                         ctx.value_send_splits,
                         metadata.process_group,
@@ -1276,7 +1491,7 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
                 is_coalesced=True,
             )
 
-        if metadata.collect_stats:
+        if metadata.collect_stats and embedding_stats_host_sync_enabled():
             table_count = len(metadata.modules)
             sent_table_indices = _table_indices_for_keys(
                 sorted_keys, metadata.table_offsets
@@ -1435,11 +1650,14 @@ def grouped_sharded_embedding_lookup(
 ) -> list[Tensor]:
     """Lookup compatible tables in memory-bounded grouped collectives.
 
-    Distributed requests are grouped by device, dtype, process group, dedup
-    policy, and embedding width. Homogeneous-width groups avoid local max-width
-    padding, then split at request boundaries so one grouped autograd output is
-    normally at most 1 GiB. ``MDL_GROUPED_EMB_MAX_OUTPUT_MIB`` or the explicit
-    argument can tune that cap.
+    Distributed requests are grouped by device, dtype, process group, and dedup
+    policy. Embedding width is intentionally omitted so mixed dims share one
+    value collective; the wire path packs exact per-table widths by default
+    (``MDL_GROUPED_EMB_PACKED_A2A``, disable with ``0`` or force pad with
+    ``MDL_GROUPED_EMB_PADDED_A2A=1``). Local autograd outputs still use the
+    group max width, so request chunks are capped by
+    ``MDL_GROUPED_EMB_MAX_OUTPUT_MIB`` (default 1 GiB) using
+    ``max(dim) * element_size`` per row.
 
     Chunk planning uses the per-request maximum size across ranks. Every rank
     therefore issues the same collective sequence even when its deduplicated
@@ -1466,7 +1684,10 @@ def grouped_sharded_embedding_lookup(
             )
             for module, indices in request_list
         ]
-        if any(module.collect_stats for module, _indices in request_list):
+        if (
+            embedding_stats_host_sync_enabled()
+            and any(module.collect_stats for module, _indices in request_list)
+        ):
             for module, indices in request_list:
                 if not module.collect_stats:
                     continue
@@ -1488,15 +1709,15 @@ def grouped_sharded_embedding_lookup(
         return outputs
 
     outputs: list[Tensor | None] = [None] * len(request_list)
-    # ``routing_groups`` preserve the old fused compatibility partitions and
-    # need only one small MAX reduction for chunk planning. ``groups`` add
-    # embedding_dim so local outputs never pad 8/16/24/32-wide rows to width 48.
-    routing_groups: dict[tuple[Any, ...], list[int]] = {}
+    # Intentionally omit embedding_dim: mixed widths share one value collective
+    # (exact-width 1D pack on the wire). That cuts RankMixer from ~5 dim groups
+    # (~20 all_to_all ops) down to one fused group (~4 ops), with 1 GiB chunks
+    # bounding the local max-width autograd output.
     groups: dict[tuple[Any, ...], list[int]] = {}
     for request_index, (module, indices) in enumerate(request_list):
         if indices.dtype != torch.long:
             raise TypeError("sharded embedding indices must be torch.long")
-        routing_key = (
+        key = (
             indices.device,
             module.weight.device,
             module.weight.dtype,
@@ -1506,29 +1727,18 @@ def grouped_sharded_embedding_lookup(
             module.validate_indices,
             id(module.process_group),
         )
-        routing_groups.setdefault(routing_key, []).append(request_index)
-        groups.setdefault((*routing_key, module.embedding_dim), []).append(
-            request_index
-        )
-
-    global_max_numels_by_request: dict[int, int] = {}
-    for routing_group_indices in routing_groups.values():
-        global_max_numels = _global_max_request_numels(
-            request_list, routing_group_indices
-        )
-        global_max_numels_by_request.update(
-            zip(routing_group_indices, global_max_numels)
-        )
+        groups.setdefault(key, []).append(request_index)
 
     for group_indices in groups.values():
-        module = request_list[group_indices[0]][0]
-        global_max_numels = tuple(
-            global_max_numels_by_request[index] for index in group_indices
+        first_module = request_list[group_indices[0]][0]
+        global_max_numels = _global_max_request_numels(request_list, group_indices)
+        max_dim = max(
+            request_list[index][0].embedding_dim for index in group_indices
         )
         chunks = _partition_group_by_output_bytes(
             group_indices,
             global_max_numels,
-            bytes_per_row=module.embedding_dim * module.weight.element_size(),
+            bytes_per_row=max_dim * first_module.weight.element_size(),
             max_output_bytes=resolved_max_output_bytes,
         )
         for chunk_indices in chunks:

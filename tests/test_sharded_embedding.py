@@ -13,7 +13,11 @@ from torch import nn
 from src.embeddings import (
     EmbeddingTableSpec,
     ShardedEmbedding,
+    _element_split_sizes,
+    _element_split_sizes_pair,
+    _pack_rows_by_dim,
     _partition_group_by_output_bytes,
+    _unpack_rows_by_dim,
     embedding_local_bytes,
     grouped_sharded_embedding_lookup,
     plan_embedding_shards,
@@ -543,6 +547,49 @@ class GroupedEmbeddingChunkPlanningTest(unittest.TestCase):
             ),
             [[0], [1]],
         )
+
+
+class PackedEmbeddingValueCodecTest(unittest.TestCase):
+    def test_pack_unpack_roundtrip_torch_path(self) -> None:
+        values = torch.tensor(
+            [
+                [1.0, 2.0, 3.0, 4.0],
+                [5.0, 6.0, 7.0, 8.0],
+                [9.0, 10.0, 11.0, 12.0],
+            ]
+        )
+        dims = torch.tensor([2, 4, 1], dtype=torch.long)
+        packed = _pack_rows_by_dim(values, dims)
+        self.assertEqual(packed.tolist(), [1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 9.0])
+        restored = _unpack_rows_by_dim(packed, dims, max_dim=4)
+        expected = torch.tensor(
+            [
+                [1.0, 2.0, 0.0, 0.0],
+                [5.0, 6.0, 7.0, 8.0],
+                [9.0, 0.0, 0.0, 0.0],
+            ]
+        )
+        torch.testing.assert_close(restored, expected)
+
+    def test_pack_with_known_total_matches_masked_select(self) -> None:
+        values = torch.arange(24, dtype=torch.float32).view(6, 4)
+        dims = torch.tensor([1, 3, 2, 4, 1, 2], dtype=torch.long)
+        reference = _pack_rows_by_dim(values, dims)
+        packed = _pack_rows_by_dim(
+            values, dims, total_elements=int(dims.sum().item())
+        )
+        torch.testing.assert_close(packed, reference)
+
+    def test_element_split_sizes_pair_matches_individual(self) -> None:
+        dims_a = torch.tensor([2, 4, 1, 3], dtype=torch.long)
+        dims_b = torch.tensor([1, 1, 5, 2, 2], dtype=torch.long)
+        splits_a = (2, 2)
+        splits_b = (3, 2)
+        paired_a, paired_b = _element_split_sizes_pair(
+            dims_a, splits_a, dims_b, splits_b
+        )
+        self.assertEqual(paired_a, _element_split_sizes(dims_a, splits_a))
+        self.assertEqual(paired_b, _element_split_sizes(dims_b, splits_b))
 
 
 class ShardingPlannerTest(unittest.TestCase):

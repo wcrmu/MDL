@@ -43,7 +43,7 @@ data:
       max_prefetch_bytes: 2147483648
       scanner_batch_rows: 128
       pin_memory: true
-      shard_unit: row_group
+      shard_unit: file
       eager_schema_validation: sample
       schema_validation_samples: 1
       cardinality_audit_raw_rows: 0
@@ -786,7 +786,7 @@ data:
       max_prefetch_bytes: 2147483648
       scanner_batch_rows: 128
       pin_memory: true
-      shard_unit: row_group
+      shard_unit: file
       eager_schema_validation: sample
       schema_validation_samples: 1
       cardinality_audit_raw_rows: 0
@@ -5574,7 +5574,7 @@ vocab_strategy:
 model:
   name: mdl_onetrans
   embedding_dim: 32
-  token_dim: 256
+  token_dim: 512
   num_layers: 6
   num_heads: 4
   hidden_dim: 1024
@@ -5584,8 +5584,13 @@ model:
   task_head_dropout: 0.0
   task_head_activation: gelu
   sequence_fusion: intent_ordered
-  ns_tokenizer: auto_split
+  ns_tokenizer: dcnv2
   num_ns_tokens: 32
+  ns_dcn_cross_layers: 3
+  ns_dcn_deep_layers: 2
+  ns_dcn_projection_dim: 1024
+  ns_dcn_low_rank: null
+  ns_dcn_deep_dim: 1024
   max_position_embeddings: 2088
   use_sep_tokens: true
   use_pyramid: true

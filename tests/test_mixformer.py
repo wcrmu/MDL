@@ -374,6 +374,28 @@ class MixFormerIntegrationTest(unittest.TestCase):
                     config.model.sequence_fusion,
                     "timestamp_aware",
                 )
+                paper_mixformer = not config_name.startswith("mdl_")
+                expected_global_limit = 2048 if paper_mixformer else None
+                self.assertEqual(
+                    config.model.global_sequence_max_length,
+                    expected_global_limit,
+                )
+                for name in active_sequence_names:
+                    expected_transport = (
+                        2048
+                        if paper_mixformer
+                        else sequence_by_name[name].max_length
+                    )
+                    self.assertEqual(
+                        sequence_by_name[name].tensor_max_length,
+                        expected_transport,
+                    )
+                for split in (config.data.train, config.data.test):
+                    assert split is not None and split.adapter is not None
+                    self.assertEqual(
+                        split.adapter.options.get("global_sequence_max_length"),
+                        expected_global_limit,
+                    )
                 self.assertFalse(config.model.use_sep_tokens)
                 self.assertTrue(
                     all(
