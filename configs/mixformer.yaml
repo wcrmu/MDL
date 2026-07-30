@@ -7,7 +7,7 @@ runtime:
   activation_checkpoint: full
   # Tighter than OneTrans: MixFormer sequence FFN is N*D wide and cross-attn
   # score tensors scale with L; also enables length/request attention chunking.
-  sequence_projection_chunk_tokens: 2048
+  sequence_projection_chunk_tokens: 1024
 
 data:
   train:
@@ -18,18 +18,18 @@ data:
         # active stream can borrow unused capacity from sparse/empty streams.
         global_sequence_max_length: 2048
     reader:
-      # Parent OneTrans keeps one device-side batch; at MixFormer batch≥1024
-      # that doubles peak HBM. Host queue alone is enough to hide prepare.
+      # Parent may keep a device-side batch; at MixFormer wide batches that
+      # doubles peak HBM. Host queue alone is enough to hide prepare.
       device_prefetch_batches: 0
       host_prepare_prefetch: 2
       length_buckets:
-        # Paper MixFormer uses batch≈1500; keep ≥1024 on the short bucket and
-        # scale longer buckets more aggressively than RankMixer/OneTrans for HBM.
-        - {max_length: 2048, batch_size: 1024}
-        - {max_length: 4096, batch_size: 512}
-        - {max_length: 6144, batch_size: 320}
-        - {max_length: 8192, batch_size: 192}
-        - {max_length: null, batch_size: 256}
+        # Keep short-bucket throughput near paper while leaving HBM headroom for
+        # high-padding batches under full activation checkpoint.
+        - {max_length: 2048, batch_size: 768}
+        - {max_length: 4096, batch_size: 384}
+        - {max_length: 6144, batch_size: 256}
+        - {max_length: 8192, batch_size: 160}
+        - {max_length: null, batch_size: 192}
   test:
     adapter:
       options:
@@ -64,7 +64,7 @@ model:
 
 training:
   step_watchdog_sec: 600.0
-  batch_size: 1024
+  batch_size: 768
   lr_dense: 0.01
   dense_optimizer: rmsprop
   task_loss_weights:

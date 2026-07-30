@@ -44,12 +44,12 @@ MASTER_PORTS = {
 }
 # 24GB mock E2E: production MixFormer batches under-fill the GPU after embedding
 # caps. Scale request batches (and length-bucket sizes) for util measurement only.
-# Production MixFormer defaults are now ≥1024 (paper ≈1500). Mock 24GB E2E
-# still needs a down-scale so capped-emb runs fit; keep absolute sizes near the
-# previous ~450–530 candidate regime that filled the 4090s.
+# Production MixFormer defaults are 768 (paper ≈1500). Mock 24GB E2E still needs
+# a down-scale so capped-emb runs fit; keep absolute sizes near the previous
+# ~450–530 candidate regime that filled the 4090s.
 MIXFORMER_E2E_BATCH_SCALE = {
-    "mixformer": 0.45,  # 1024 → ~460
-    "mdl_mixformer": 0.55,  # 1024 → ~560
+    "mixformer": 0.60,  # 768 → ~460
+    "mdl_mixformer": 0.73,  # 768 → ~560
 }
 
 

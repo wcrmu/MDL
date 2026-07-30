@@ -14,9 +14,9 @@ runtime:
   activation_checkpoint: full
   attention_backend: flash
   varlen_packing: compact
-  sequence_projection_chunk_tokens: 81920
+  sequence_projection_chunk_tokens: 16384
   sequence_encoder_chunk_rows: 0
-  sequence_encoder_chunk_tokens: 163840
+  sequence_encoder_chunk_tokens: 32768
   onetrans_batched_ns: true
   distributed: ddp
   nproc_per_node: 2
