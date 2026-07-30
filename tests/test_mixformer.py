@@ -176,6 +176,72 @@ class MixFormerPaperAlignmentTest(unittest.TestCase):
 
         torch.testing.assert_close(grouped, expanded, rtol=1e-5, atol=1e-6)
 
+    def test_chunked_cross_attention_matches_eager(self) -> None:
+        torch.manual_seed(13)
+        eager = MixFormerCrossAttention(
+            num_heads=2,
+            dim=4,
+            hidden_dim=6,
+            sequence_chunk_tokens=0,
+        )
+        chunked = MixFormerCrossAttention(
+            num_heads=2,
+            dim=4,
+            hidden_dim=6,
+            # Force both length-chunked online softmax and request chunking.
+            sequence_chunk_tokens=2,
+        )
+        chunked.load_state_dict(eager.state_dict())
+        query = torch.randn(5, 2, 4, requires_grad=True)
+        history = torch.randn(3, 7, 8, requires_grad=True)
+        valid_mask = torch.tensor(
+            [
+                [True, True, True, False, True, False, False],
+                [True, False, False, False, False, False, False],
+                [False, False, False, False, False, False, False],
+            ]
+        )
+        row_indices = torch.tensor([0, 0, 1, 2, 2])
+
+        eager_query = query.detach().clone().requires_grad_(True)
+        eager_history = history.detach().clone().requires_grad_(True)
+        chunked_query = query.detach().clone().requires_grad_(True)
+        chunked_history = history.detach().clone().requires_grad_(True)
+
+        eager_out = eager(eager_query, eager_history, valid_mask, row_indices)
+        chunked_out = chunked(
+            chunked_query,
+            chunked_history,
+            valid_mask,
+            row_indices,
+        )
+        torch.testing.assert_close(chunked_out, eager_out, rtol=1e-5, atol=1e-5)
+
+        eager_out.square().mean().backward()
+        chunked_out.square().mean().backward()
+        torch.testing.assert_close(
+            chunked_query.grad,
+            eager_query.grad,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(
+            chunked_history.grad,
+            eager_history.grad,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        for eager_parameter, chunked_parameter in zip(
+            eager.parameters(),
+            chunked.parameters(),
+        ):
+            torch.testing.assert_close(
+                chunked_parameter.grad,
+                eager_parameter.grad,
+                rtol=1e-5,
+                atol=1e-5,
+            )
+
 
 class MDLMixFormerInnovationTest(unittest.TestCase):
     def test_scenario_router_starts_as_exact_mixformer_identity(self) -> None:

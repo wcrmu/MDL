@@ -692,11 +692,33 @@ def _setup_distributed(config: AppConfig) -> DistributedContext:
 
 def _cleanup_distributed(context: DistributedContext) -> None:
     global _CONTROL_PROCESS_GROUP
-    if context.initialized_here and torch_dist.is_initialized():
+    if not (context.initialized_here and torch_dist.is_initialized()):
+        return
+
+    def _destroy() -> None:
+        global _CONTROL_PROCESS_GROUP
         if _CONTROL_PROCESS_GROUP is not None:
             torch_dist.destroy_process_group(_CONTROL_PROCESS_GROUP)
             _CONTROL_PROCESS_GROUP = None
         torch_dist.destroy_process_group()
+
+    # A peer stuck in host-prepare teardown can make NCCL destroy block forever
+    # after we already printed the local SIGKILL warning.
+    worker = threading.Thread(
+        target=_destroy,
+        name="mdl-destroy-process-group",
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=30.0)
+    if worker.is_alive():
+        logger.warning(
+            "destroy_process_group timed out after 30s; abandoning distributed cleanup"
+        )
+        print(
+            "destroy_process_group timed out after 30s; abandoning to avoid hang",
+            flush=True,
+        )
 
 
 def _resolve_distributed_auto_scenarios(
@@ -2374,6 +2396,7 @@ def _host_prepare_process_main(
             os.setpgrp()
         except OSError:
             pass
+    _install_host_prepare_shutdown_handlers()
 
     os.environ["MDL_HOST_PREPARE_PROCESS"] = "1"
     use_share = ipc_mode == "share"
@@ -2435,36 +2458,112 @@ def _host_prepare_process_main(
                 elif child_pin:
                     batch = pin_feature_batch(batch, coalesce_tensors=False)
                 if use_share:
-                    queue.put(_share_feature_batch_for_ipc(batch))
+                    _queue_put_interruptible(
+                        queue, _share_feature_batch_for_ipc(batch)
+                    )
                 else:
-                    queue.put(_spill_feature_batch_for_ipc(batch, share_dir))
-            queue.put(None)
+                    _queue_put_interruptible(
+                        queue, _spill_feature_batch_for_ipc(batch, share_dir)
+                    )
+            _queue_put_interruptible(queue, None)
+        except (BrokenPipeError, EOFError, OSError):
+            # Parent closed the IPC queue during teardown; exit quietly.
+            return
         finally:
             close = getattr(table_iter, "close", None)
             if callable(close):
                 close()
     except BaseException as error:  # noqa: BLE001 - propagate to parent
         if isinstance(error, RemoteIoStallError):
-            queue.put(error)
+            try:
+                _queue_put_interruptible(queue, error)
+            except Exception:
+                pass
             return
         # Pickling a bare exception across spawn drops the child traceback.
         # Embed it in the message so train logs show the real int(None)/etc site.
         import traceback
 
-        queue.put(
-            RuntimeError(
-                f"{type(error).__name__}: {error}\n{traceback.format_exc()}"
+        try:
+            _queue_put_interruptible(
+                queue,
+                RuntimeError(
+                    f"{type(error).__name__}: {error}\n{traceback.format_exc()}"
+                ),
             )
-        )
+        except Exception:
+            # Parent may already have closed the queue during teardown.
+            pass
+
+
+def _install_host_prepare_shutdown_handlers() -> None:
+    """Make SIGTERM exit the host-prepare child promptly.
+
+    Default Python signal handling only runs between bytecode instructions. A
+    child blocked inside ``Queue.put`` / CUDA pin can outlive the parent's
+    SIGTERM grace window and force a noisy SIGKILL. ``os._exit`` skips orderly
+    interpreter teardown; the parent already abandoned the IPC queue.
+    """
+
+    import signal
+
+    def _exit_immediately(signum: int, _frame: object | None) -> None:
+        os._exit(128 + int(signum))
+
+    signal.signal(signal.SIGTERM, _exit_immediately)
+    signal.signal(signal.SIGINT, _exit_immediately)
+
+
+def _queue_put_interruptible(
+    ipc_queue: Any, item: object, *, timeout: float = 0.5
+) -> None:
+    """``Queue.put`` that returns to Python often enough for SIGTERM handlers."""
+
+    while True:
+        try:
+            ipc_queue.put(item, timeout=max(0.05, float(timeout)))
+            return
+        except queue.Full:
+            continue
+
+
+def _wait_process_exit(process: Any, timeout_sec: float) -> bool:
+    """Wait until ``process`` exits; return False on timeout (never hang)."""
+
+    deadline = perf_counter() + max(0.0, float(timeout_sec))
+    while True:
+        try:
+            alive = bool(process.is_alive())
+        except Exception:
+            return True
+        if not alive:
+            try:
+                process.join(timeout=0.05)
+            except Exception:
+                pass
+            return True
+        remaining = deadline - perf_counter()
+        if remaining <= 0.0:
+            return False
+        try:
+            process.join(timeout=min(0.2, remaining))
+        except Exception:
+            return False
 
 
 def _terminate_process_group(
     process: Any,
     *,
-    grace_sec: float = 5.0,
+    grace_sec: float = 2.0,
+    kill_grace_sec: float = 0.5,
     label: str = "host-prepare",
 ) -> None:
-    """SIGTERM the child's process group, then SIGKILL if it refuses to exit."""
+    """SIGTERM the child's process group, then SIGKILL if it refuses to exit.
+
+    Never blocks longer than ``grace_sec + kill_grace_sec``. A child stuck in
+    uninterruptible HDFS/JNI (D-state) can ignore even SIGKILL until the kernel
+    wakes it; abandon after the kill grace so training teardown cannot hang.
+    """
 
     import signal
 
@@ -2500,15 +2599,7 @@ def _terminate_process_group(
         except Exception as error:
             logger.warning("%s terminate() failed: %s", label, error)
 
-    try:
-        process.join(timeout=max(0.1, float(grace_sec)))
-    except Exception:
-        pass
-    try:
-        still_alive = bool(process.is_alive())
-    except Exception:
-        still_alive = False
-    if not still_alive:
+    if _wait_process_exit(process, grace_sec):
         return
 
     logger.warning(
@@ -2516,6 +2607,11 @@ def _terminate_process_group(
         label,
         grace_sec,
     )
+    print(
+        f"{label} still alive after {grace_sec:.1f}s SIGTERM; sending SIGKILL",
+        flush=True,
+    )
+    killed_group = False
     if pid is not None and hasattr(os, "killpg"):
         try:
             os.killpg(int(pid), signal.SIGKILL)
@@ -2527,10 +2623,19 @@ def _terminate_process_group(
             process.kill()
         except Exception as error:
             logger.warning("%s kill() failed: %s", label, error)
-    try:
-        process.join(timeout=max(0.1, float(grace_sec)))
-    except Exception:
-        pass
+    if _wait_process_exit(process, kill_grace_sec):
+        return
+    # D-state / unreapable child: do not block training or destroy_process_group.
+    logger.warning(
+        "%s pid=%s still alive after SIGKILL (%.1fs); abandoning process",
+        label,
+        pid,
+        kill_grace_sec,
+    )
+    print(
+        f"{label} pid={pid} still alive after SIGKILL; abandoning to avoid hang",
+        flush=True,
+    )
 
 
 def _close_process_queue(ipc_queue: Any) -> None:
@@ -2704,7 +2809,24 @@ class _ProcessHostPrepareIterator:
         # before teardown so a subsequent native/IPC cleanup failure cannot
         # leave SIGKILL as the only visible line.
         print(str(error), flush=True)
-        self.close()
+        # Watchdog abort must not spend seconds on graceful SIGTERM: close the
+        # IPC, SIGKILL immediately, then hard-exit the rank.
+        self._closed = True
+        try:
+            _close_process_queue(self._queue)
+        except Exception:
+            pass
+        import signal
+
+        process = self._process
+        pid = getattr(process, "pid", None)
+        try:
+            if pid is not None and hasattr(os, "killpg"):
+                os.killpg(int(pid), signal.SIGKILL)
+            elif process is not None:
+                process.kill()
+        except Exception:
+            pass
         abort_rank_for_remote_io_stall(error)
 
     def __next__(self) -> FeatureBatch:
@@ -2716,13 +2838,22 @@ class _ProcessHostPrepareIterator:
             except queue.Empty:
                 if self._closed:
                     raise StopIteration
-                if not self._process.is_alive() and self._queue.empty():
+                try:
+                    alive = bool(self._process.is_alive())
+                except Exception:
+                    alive = False
+                if not alive and self._queue.empty():
                     self.close()
                     raise RuntimeError(
                         "host prepare process exited without a terminal queue item"
                     )
                 self._raise_if_child_stalled()
                 continue
+            except (OSError, ValueError, EOFError) as error:
+                self.close()
+                raise RuntimeError(
+                    "host prepare IPC queue closed while waiting for a batch"
+                ) from error
             break
         self._mark_progress()
         if item is self._SENTINEL:
@@ -2757,8 +2888,15 @@ class _ProcessHostPrepareIterator:
         if self._closed:
             return
         self._closed = True
-        _terminate_process_group(self._process, grace_sec=5.0, label="host-prepare")
+        # Unblock a child stuck in Queue.put (full prefetch) before SIGTERM so
+        # the grace window is spent on real teardown, not a deadlocked feeder.
         _close_process_queue(self._queue)
+        _terminate_process_group(
+            self._process,
+            grace_sec=2.0,
+            kill_grace_sec=0.5,
+            label="host-prepare",
+        )
 
     def __del__(self) -> None:
         try:

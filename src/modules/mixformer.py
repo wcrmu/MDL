@@ -416,6 +416,155 @@ class MixFormerCrossAttention(nn.Module):
     def _project_context(self, context: Tensor) -> Tensor:
         return torch.einsum("bni,noi->bno", context, self.value_weight)
 
+    def _attention_length_chunk(self, length: int) -> int:
+        """Bound score storage when sequence FFN chunking is enabled.
+
+        ``sequence_chunk_tokens`` is primarily a flattened FFN budget. When it
+        is set we also split the attention length axis so peak score tensors
+        stay proportional to the chunk instead of full ``L``. Production-sized
+        budgets keep a 256-token floor to avoid tiny GEMMs; smaller budgets
+        (tests / extreme HBM caps) honor the raw limit.
+        """
+
+        if self.sequence_chunk_tokens <= 0 or length <= 0:
+            return length
+        budget = max(1, self.sequence_chunk_tokens // max(self.num_heads, 1))
+        if self.sequence_chunk_tokens >= 256:
+            budget = max(budget, 256)
+        return min(length, budget)
+
+    def _context_from_aligned_scores(
+        self,
+        score_query: Tensor,
+        history: Tensor,
+        valid_mask: Tensor,
+    ) -> Tensor:
+        scores = (
+            torch.einsum("bnd,blnd->bnl", score_query, history) * self.scale
+        )
+        weights = self._masked_softmax(scores, valid_mask)
+        return torch.einsum("bnl,blnd->bnd", weights, history)
+
+    def _context_from_grouped_scores(
+        self,
+        grouped_query: Tensor,
+        history: Tensor,
+        valid_mask: Tensor,
+    ) -> Tensor:
+        scores = (
+            torch.einsum("rmnd,rlnd->rmnl", grouped_query, history) * self.scale
+        )
+        weights = self._masked_softmax(scores, valid_mask)
+        return torch.einsum("rmnl,rlnd->rmnd", weights, history)
+
+    def _context_aligned_chunked(
+        self,
+        score_query: Tensor,
+        history: Tensor,
+        valid_mask: Tensor,
+        length_chunk: int,
+    ) -> Tensor:
+        """Online-softmax attention along the sequence length axis."""
+
+        batch, num_heads, dim = score_query.shape
+        length = history.size(1)
+        neg = torch.finfo(torch.float32).min
+        running_max = score_query.new_full(
+            (batch, num_heads),
+            neg,
+            dtype=torch.float32,
+        )
+        running_sum = score_query.new_zeros(
+            (batch, num_heads),
+            dtype=torch.float32,
+        )
+        context = score_query.new_zeros(
+            (batch, num_heads, dim),
+            dtype=torch.float32,
+        )
+        for start in range(0, length, length_chunk):
+            end = min(length, start + length_chunk)
+            hist = history[:, start:end]
+            mask = valid_mask[:, start:end]
+            scores = (
+                torch.einsum("bnd,blnd->bnl", score_query, hist) * self.scale
+            ).float()
+            scores = scores.masked_fill(~mask.unsqueeze(1), neg)
+            block_max = scores.amax(dim=-1)
+            block_max = torch.where(
+                torch.isfinite(block_max),
+                block_max,
+                running_max,
+            )
+            new_max = torch.maximum(running_max, block_max)
+            prior_scale = torch.exp(running_max - new_max)
+            weights = torch.exp(scores - new_max.unsqueeze(-1))
+            weights = weights * mask.unsqueeze(1).to(dtype=weights.dtype)
+            context = context * prior_scale.unsqueeze(-1) + torch.einsum(
+                "bnl,blnd->bnd",
+                weights,
+                hist.float(),
+            )
+            running_sum = running_sum * prior_scale + weights.sum(dim=-1)
+            running_max = new_max
+        context = context / running_sum.unsqueeze(-1).clamp_min(
+            torch.finfo(torch.float32).tiny
+        )
+        return context.to(dtype=score_query.dtype)
+
+    def _context_grouped_chunked(
+        self,
+        grouped_query: Tensor,
+        history: Tensor,
+        valid_mask: Tensor,
+        length_chunk: int,
+    ) -> Tensor:
+        request_count, max_targets, num_heads, dim = grouped_query.shape
+        length = history.size(1)
+        neg = torch.finfo(torch.float32).min
+        running_max = grouped_query.new_full(
+            (request_count, max_targets, num_heads),
+            neg,
+            dtype=torch.float32,
+        )
+        running_sum = grouped_query.new_zeros(
+            (request_count, max_targets, num_heads),
+            dtype=torch.float32,
+        )
+        context = grouped_query.new_zeros(
+            (request_count, max_targets, num_heads, dim),
+            dtype=torch.float32,
+        )
+        for start in range(0, length, length_chunk):
+            end = min(length, start + length_chunk)
+            hist = history[:, start:end]
+            mask = valid_mask[:, start:end]
+            scores = (
+                torch.einsum("rmnd,rlnd->rmnl", grouped_query, hist) * self.scale
+            ).float()
+            scores = scores.masked_fill(~mask[:, None, None, :], neg)
+            block_max = scores.amax(dim=-1)
+            block_max = torch.where(
+                torch.isfinite(block_max),
+                block_max,
+                running_max,
+            )
+            new_max = torch.maximum(running_max, block_max)
+            prior_scale = torch.exp(running_max - new_max)
+            weights = torch.exp(scores - new_max.unsqueeze(-1))
+            weights = weights * mask[:, None, None, :].to(dtype=weights.dtype)
+            context = context * prior_scale.unsqueeze(-1) + torch.einsum(
+                "rmnl,rlnd->rmnd",
+                weights,
+                hist.float(),
+            )
+            running_sum = running_sum * prior_scale + weights.sum(dim=-1)
+            running_max = new_max
+        context = context / running_sum.unsqueeze(-1).clamp_min(
+            torch.finfo(torch.float32).tiny
+        )
+        return context.to(dtype=grouped_query.dtype)
+
     def _forward_aligned(
         self,
         score_query: Tensor,
@@ -425,11 +574,20 @@ class MixFormerCrossAttention(nn.Module):
         if history.size(0) == 1 and score_query.size(0) != 1:
             history = history.expand(score_query.size(0), -1, -1, -1)
             valid_mask = valid_mask.expand(score_query.size(0), -1)
-        scores = (
-            torch.einsum("bnd,blnd->bnl", score_query, history) * self.scale
-        )
-        weights = self._masked_softmax(scores, valid_mask)
-        context = torch.einsum("bnl,blnd->bnd", weights, history)
+        length_chunk = self._attention_length_chunk(history.size(1))
+        if length_chunk < history.size(1):
+            context = self._context_aligned_chunked(
+                score_query,
+                history,
+                valid_mask,
+                length_chunk,
+            )
+        else:
+            context = self._context_from_aligned_scores(
+                score_query,
+                history,
+                valid_mask,
+            )
         return self._project_context(context)
 
     def _forward_grouped(
@@ -457,16 +615,57 @@ class MixFormerCrossAttention(nn.Module):
                 self.dim,
             )
         )
-        scores = (
-            torch.einsum("rmnd,rlnd->rmnl", grouped_query, history)
-            * self.scale
-        )
-        weights = self._masked_softmax(scores, valid_mask)
-        grouped_context = torch.einsum(
-            "rmnl,rlnd->rmnd",
-            weights,
-            history,
-        )
+        length_chunk = self._attention_length_chunk(history.size(1))
+        # Bound padded request×target score storage by walking request rows when
+        # the FFN token budget implies the full score tensor would dominate HBM.
+        request_chunk = layout.request_count
+        if self.sequence_chunk_tokens > 0 and history.size(1) > 0:
+            tokens_per_request = history.size(1) * max(layout.max_targets, 1)
+            request_chunk = max(
+                1,
+                min(
+                    layout.request_count,
+                    max(1, self.sequence_chunk_tokens // max(tokens_per_request, 1)),
+                ),
+            )
+        if request_chunk < layout.request_count:
+            grouped_context = grouped_query.new_empty(
+                layout.request_count,
+                layout.max_targets,
+                self.num_heads,
+                self.dim,
+            )
+            for start in range(0, layout.request_count, request_chunk):
+                end = min(layout.request_count, start + request_chunk)
+                query_slice = grouped_query[start:end]
+                hist_slice = history[start:end]
+                mask_slice = valid_mask[start:end]
+                if length_chunk < history.size(1):
+                    grouped_context[start:end] = self._context_grouped_chunked(
+                        query_slice,
+                        hist_slice,
+                        mask_slice,
+                        length_chunk,
+                    )
+                else:
+                    grouped_context[start:end] = self._context_from_grouped_scores(
+                        query_slice,
+                        hist_slice,
+                        mask_slice,
+                    )
+        elif length_chunk < history.size(1):
+            grouped_context = self._context_grouped_chunked(
+                grouped_query,
+                history,
+                valid_mask,
+                length_chunk,
+            )
+        else:
+            grouped_context = self._context_from_grouped_scores(
+                grouped_query,
+                history,
+                valid_mask,
+            )
         sorted_context = grouped_context.reshape(
             layout.request_count * layout.max_targets,
             self.num_heads,

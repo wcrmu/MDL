@@ -28,12 +28,30 @@ class HostPrepareWatchdogTest(unittest.TestCase):
 
     def test_terminate_process_group_escalates_to_kill(self) -> None:
         process = MagicMock()
+        # terminate check → SIGTERM wait → SIGKILL wait sees exit
         process.is_alive.side_effect = [True, True, False]
         process.pid = 4242
-        with patch("src.train.os.killpg") as killpg:
-            _terminate_process_group(process, grace_sec=0.01, label="test")
+        with patch("src.train.os.killpg") as killpg, patch(
+            "src.train.perf_counter", side_effect=[0.0, 10.0, 10.0]
+        ):
+            _terminate_process_group(
+                process, grace_sec=0.01, kill_grace_sec=0.01, label="test"
+            )
         self.assertEqual(killpg.call_count, 2)
-        process.join.assert_called()
+
+    def test_terminate_process_group_abandons_after_sigkill_timeout(self) -> None:
+        process = MagicMock()
+        process.is_alive.return_value = True
+        process.pid = 4242
+        with patch("src.train.os.killpg"), patch(
+            "src.train.perf_counter", side_effect=[0.0, 10.0, 10.0, 20.0]
+        ), patch("builtins.print") as printed:
+            _terminate_process_group(
+                process, grace_sec=0.01, kill_grace_sec=0.01, label="test"
+            )
+        self.assertTrue(
+            any("abandoning" in str(call) for call in printed.call_args_list)
+        )
 
     def test_startup_timeout_aborts_rank_without_respawn(self) -> None:
         iterator = _ProcessHostPrepareIterator.__new__(_ProcessHostPrepareIterator)
@@ -49,6 +67,7 @@ class HostPrepareWatchdogTest(unittest.TestCase):
         iterator._queue.get.side_effect = queue.Empty
         iterator._process = MagicMock()
         iterator._process.is_alive.return_value = True
+        iterator._process.pid = 4242
 
         aborted: list[BaseException] = []
 
@@ -59,19 +78,19 @@ class HostPrepareWatchdogTest(unittest.TestCase):
         with patch("src.train.perf_counter", side_effect=[0.0, 1.0]), patch(
             "src.train.abort_rank_for_remote_io_stall",
             side_effect=_abort,
-        ), patch("builtins.print") as print_message, patch.object(
-            iterator, "close"
-        ) as close:
+        ), patch("builtins.print") as print_message, patch(
+            "src.train._close_process_queue"
+        ) as close_queue, patch("src.train.os.killpg") as killpg:
             with self.assertRaises(SystemExit) as raised:
                 next(iterator)
         self.assertEqual(raised.exception.code, 70)
         self.assertEqual(len(aborted), 1)
         self.assertIsInstance(aborted[0], RemoteIoStallError)
         self.assertIn("startup exceeded", str(aborted[0]))
-        print_message.assert_called_once_with(str(aborted[0]), flush=True)
-        close.assert_called_once()
-        # Avoid __del__ -> real close() racing later tests that patch os.killpg.
-        iterator._closed = True
+        print_message.assert_any_call(str(aborted[0]), flush=True)
+        close_queue.assert_called_once()
+        killpg.assert_called()
+        self.assertTrue(iterator._closed)
 
     def test_close_discards_queue_without_unbounded_join(self) -> None:
         iterator = _ProcessHostPrepareIterator.__new__(_ProcessHostPrepareIterator)
@@ -87,6 +106,29 @@ class HostPrepareWatchdogTest(unittest.TestCase):
         iterator._queue._reader.close.assert_called_once_with()
         iterator._queue._writer.close.assert_called_once_with()
         iterator._queue.join_thread.assert_not_called()
+
+    def test_close_unblocks_queue_before_terminate(self) -> None:
+        iterator = _ProcessHostPrepareIterator.__new__(_ProcessHostPrepareIterator)
+        iterator._closed = False
+        iterator._process = MagicMock()
+        iterator._process.is_alive.return_value = True
+        iterator._process.pid = 4242
+        iterator._queue = MagicMock()
+        order: list[str] = []
+
+        def _close_queue(_queue: object) -> None:
+            order.append("queue")
+
+        def _terminate(_process: object, **_kwargs: object) -> None:
+            order.append("terminate")
+
+        with patch("src.train._close_process_queue", side_effect=_close_queue), patch(
+            "src.train._terminate_process_group", side_effect=_terminate
+        ):
+            iterator.close()
+
+        self.assertEqual(order, ["queue", "terminate"])
+        self.assertTrue(iterator._closed)
 
 
 if __name__ == "__main__":
