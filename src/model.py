@@ -4761,8 +4761,8 @@ class OneTransTokenizer(nn.Module):
     ) -> OneTransRequestCache:
         """Project only valid events in the globally selected time window.
 
-        Per-stream dense widths are batch maxima. Once streams can borrow a
-        shared global capacity, their maxima may sum to many times that shared
+        Per-stream dense widths are batch maximums. Once streams can borrow a
+        shared global capacity, those maximums may sum to many times that shared
         capacity even though each request has at most ``global_limit`` events.
         Sorting cheap temporal grids first and projecting selected events in
         compact form keeps the expensive output at exactly ``[B, T, D]``.

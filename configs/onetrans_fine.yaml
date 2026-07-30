@@ -4152,7 +4152,7 @@ vocab_strategy:
 model:
   name: onetrans
   embedding_dim: 32
-  token_dim: 512
+  token_dim: 256
   num_layers: 6
   num_heads: 4
   hidden_dim: 1024
