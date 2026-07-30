@@ -10,7 +10,7 @@ runtime:
   compile_mode: default
   require_compact_sequence_batches: false
   allow_tf32: true
-  activation_checkpoint: none
+  activation_checkpoint: full
   attention_backend: flash
   distributed: ddp
   nproc_per_node: 2

@@ -1346,10 +1346,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertEqual(config.runtime.compile, compile_enabled)
                 self.assertEqual(config.runtime.nproc_per_node, nproc)
                 memory_optimized = model_name.startswith("mdl_")
-                self.assertEqual(
-                    config.runtime.activation_checkpoint,
-                    "full" if memory_optimized else "none",
-                )
+                self.assertEqual(config.runtime.activation_checkpoint, "full")
                 self.assertFalse(config.runtime.cuda_graph_backbone)
                 self.assertEqual(
                     config.runtime.varlen_packing,
