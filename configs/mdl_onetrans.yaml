@@ -14,9 +14,9 @@ runtime:
   activation_checkpoint: full
   attention_backend: flash
   varlen_packing: compact
-  sequence_projection_chunk_tokens: 16384
+  sequence_projection_chunk_tokens: 8192
   sequence_encoder_chunk_rows: 0
-  sequence_encoder_chunk_tokens: 32768
+  sequence_encoder_chunk_tokens: 16384
   onetrans_batched_ns: true
   distributed: ddp
   nproc_per_node: 2
@@ -69,18 +69,18 @@ data:
       hdfs_close_timeout: 5
       length_bucket_metric: sum
       length_buckets:
-      # 1024 still OOMed on fat batches during checkpoint recompute; keep ~25%
-      # HBM headroom under compact varlen + full activation checkpoint.
+      # Step 1300 still OOMed on H100-80G at 768 with ~12GiB allocator
+      # fragmentation; cut another notch and steepen long buckets.
       - max_length: 2048
-        batch_size: 768
+        batch_size: 512
       - max_length: 4096
-        batch_size: 384
-      - max_length: 6144
         batch_size: 256
-      - max_length: 8192
+      - max_length: 6144
         batch_size: 160
+      - max_length: 8192
+        batch_size: 96
       - max_length: null
-        batch_size: 192
+        batch_size: 128
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
       input_columns:
@@ -5613,7 +5613,7 @@ model:
   mdl_token_state: coupled
 training:
   step_watchdog_sec: 600.0
-  batch_size: 768
+  batch_size: 512
   gradient_accumulation_steps: 1
   embedding_distribution: sharded
   dense_distribution: ddp

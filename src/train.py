@@ -21,6 +21,13 @@ import threading
 from time import perf_counter, time, time_ns
 from typing import Any, Callable, Iterator, MutableMapping
 
+# Torchrun workers import this module before main()'s allocator bootstrap.
+# Set both env names before ``import torch`` so expandable segments are active
+# for the first CUDA caching-allocator init (cuts near-capacity fragmentation).
+_ALLOC_CONF = "expandable_segments:True,max_split_size_mb:256"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", _ALLOC_CONF)
+os.environ.setdefault("PYTORCH_ALLOC_CONF", _ALLOC_CONF)
+
 import numpy as np
 import torch
 import torch.distributed as torch_dist

@@ -3,7 +3,7 @@ extends: onetrans_fine.yaml
 
 runtime:
   activation_checkpoint: full
-  sequence_projection_chunk_tokens: 1024
+  sequence_projection_chunk_tokens: 512
 
 data:
   train:
@@ -14,13 +14,12 @@ data:
       device_prefetch_batches: 0
       host_prepare_prefetch: 2
       length_buckets:
-        # Keep short-bucket throughput near paper while leaving HBM headroom for
-        # high-padding batches under full activation checkpoint.
-        - {max_length: 2048, batch_size: 768}
-        - {max_length: 4096, batch_size: 384}
-        - {max_length: 6144, batch_size: 256}
-        - {max_length: 8192, batch_size: 160}
-        - {max_length: null, batch_size: 192}
+        # Match OneTrans H100-80G budget after mid-run OOM at 768.
+        - {max_length: 2048, batch_size: 512}
+        - {max_length: 4096, batch_size: 256}
+        - {max_length: 6144, batch_size: 160}
+        - {max_length: 8192, batch_size: 96}
+        - {max_length: null, batch_size: 128}
   test:
     adapter:
       options:
@@ -48,7 +47,7 @@ model:
 
 training:
   step_watchdog_sec: 600.0
-  batch_size: 768
+  batch_size: 512
   lr_dense: 0.01
   dense_optimizer: rmsprop
   task_loss_weights:
