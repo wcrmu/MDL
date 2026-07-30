@@ -15,6 +15,7 @@ class NcclP2PEnvTest(unittest.TestCase):
             _configure_nccl_runtime_env(env)
         self.assertNotIn("NCCL_IGNORE_DISABLED_P2P", env)
         self.assertNotIn("NCCL_P2P_DISABLE", env)
+        self.assertEqual(env.get("TORCH_NCCL_ASYNC_ERROR_HANDLING"), "1")
 
     def test_p2p_broken_enables_fallback(self) -> None:
         env: dict[str, str] = {}
@@ -22,6 +23,7 @@ class NcclP2PEnvTest(unittest.TestCase):
             _configure_nccl_runtime_env(env)
         self.assertEqual(env.get("NCCL_IGNORE_DISABLED_P2P"), "1")
         self.assertEqual(env.get("NCCL_P2P_DISABLE"), "1")
+        self.assertEqual(env.get("TORCH_NCCL_ASYNC_ERROR_HANDLING"), "1")
 
     def test_explicit_override_wins(self) -> None:
         env = {"NCCL_IGNORE_DISABLED_P2P": "0"}
@@ -29,6 +31,14 @@ class NcclP2PEnvTest(unittest.TestCase):
             _configure_nccl_runtime_env(env)
         self.assertEqual(env.get("NCCL_IGNORE_DISABLED_P2P"), "0")
         self.assertNotIn("NCCL_P2P_DISABLE", env)
+        # Async handling is still defaulted even when P2P override short-circuits.
+        self.assertEqual(env.get("TORCH_NCCL_ASYNC_ERROR_HANDLING"), "1")
+
+    def test_async_error_handling_explicit_override_wins(self) -> None:
+        env = {"TORCH_NCCL_ASYNC_ERROR_HANDLING": "0"}
+        with mock.patch("src.train._local_cuda_p2p_accessible", return_value=True):
+            _configure_nccl_runtime_env(env)
+        self.assertEqual(env.get("TORCH_NCCL_ASYNC_ERROR_HANDLING"), "0")
 
     def test_inconclusive_probe_defaults_ignore(self) -> None:
         env: dict[str, str] = {}

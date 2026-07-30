@@ -108,12 +108,20 @@ class _StepWatchdog:
     Silent hangs (blocked HDFS JNI / NCCL waits) leave GPU memory allocated and
     print no traceback. A daemon watchdog converts that into a hard exit so the
     job can be restarted.
+
+    Call :meth:`beat` at phase boundaries (``dataloader`` / ``forward`` / …)
+    so a stall dump names where the main thread last made progress instead of
+    only saying "no optimizer step".
     """
 
     def __init__(self, timeout_sec: float, *, rank: int = 0) -> None:
         self._timeout_sec = float(timeout_sec)
         self._rank = int(rank)
         self._last_progress = perf_counter()
+        self._phase = "init"
+        self._detail = ""
+        self._allocated_bytes: int | None = None
+        self._reserved_bytes: int | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -123,7 +131,7 @@ class _StepWatchdog:
         )
 
     def start(self) -> None:
-        self.beat()
+        self.beat("init")
         self._thread.start()
         if self._rank == 0:
             logger.info(
@@ -131,31 +139,129 @@ class _StepWatchdog:
                 self._timeout_sec,
             )
 
-    def beat(self) -> None:
+    def beat(
+        self,
+        phase: str | None = None,
+        detail: str = "",
+        *,
+        allocated_bytes: int | None = None,
+        reserved_bytes: int | None = None,
+    ) -> None:
         with self._lock:
             self._last_progress = perf_counter()
+            if phase is not None:
+                self._phase = str(phase)
+            if detail:
+                self._detail = str(detail)
+            if allocated_bytes is not None:
+                self._allocated_bytes = int(allocated_bytes)
+            if reserved_bytes is not None:
+                self._reserved_bytes = int(reserved_bytes)
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _snapshot(self) -> tuple[float, str, str, int | None, int | None]:
+        with self._lock:
+            return (
+                perf_counter() - self._last_progress,
+                self._phase,
+                self._detail,
+                self._allocated_bytes,
+                self._reserved_bytes,
+            )
 
     def _run(self) -> None:
         # Poll often enough to notice stalls promptly without waking every second.
         interval = min(30.0, max(5.0, self._timeout_sec / 60.0))
         while not self._stop.wait(interval):
-            with self._lock:
-                stalled = perf_counter() - self._last_progress
+            stalled, phase, detail, allocated, reserved = self._snapshot()
             if stalled < self._timeout_sec:
                 continue
-            message = (
-                f"Train step watchdog: no optimizer step for {stalled:.0f}s "
-                f"(limit={self._timeout_sec:.0f}s) on rank={self._rank}; "
-                "exiting to escape a likely dataloader/NCCL hang"
+            parts = [
+                f"Train step watchdog: no progress for {stalled:.0f}s "
+                f"(limit={self._timeout_sec:.0f}s) on rank={self._rank}",
+                f"last_phase={phase}",
+            ]
+            if detail:
+                parts.append(f"detail={detail}")
+            if allocated is not None:
+                parts.append(f"cuda_allocated_mib={allocated / (1024 ** 2):.1f}")
+            if reserved is not None:
+                parts.append(f"cuda_reserved_mib={reserved / (1024 ** 2):.1f}")
+            parts.append(
+                "exiting to escape a likely dataloader/NCCL hang "
+                "(peer ranks should fail faster with "
+                "TORCH_NCCL_ASYNC_ERROR_HANDLING=1)"
             )
+            message = "; ".join(parts)
             logger.error(message)
             print(message, flush=True)
             # Hard exit: exceptions in this thread cannot unwind the hung main
             # thread blocked in JNI/NCCL.
             os._exit(70)
+
+
+def _step_watchdog_beat(
+    watchdog: _StepWatchdog | None,
+    phase: str,
+    *,
+    detail: str = "",
+    device: torch.device | None = None,
+) -> None:
+    """Record phase progress for the step watchdog (no-op when disarmed)."""
+
+    if watchdog is None:
+        return
+    allocated: int | None = None
+    reserved: int | None = None
+    if device is not None and device.type == "cuda" and torch.cuda.is_available():
+        try:
+            allocated = int(torch.cuda.memory_allocated(device))
+            reserved = int(torch.cuda.memory_reserved(device))
+        except Exception:  # noqa: BLE001 - diagnostics must not break training
+            allocated = None
+            reserved = None
+    watchdog.beat(
+        phase,
+        detail,
+        allocated_bytes=allocated,
+        reserved_bytes=reserved,
+    )
+
+
+def _abort_rank_for_cuda_oom(
+    error: BaseException,
+    *,
+    rank: int,
+    steps: int,
+    detail: str = "",
+) -> None:
+    """Hard-exit after CUDA OOM so torchrun restarts; peers rely on NCCL async."""
+
+    parts = [
+        f"CUDA_OOM: aborting rank={rank} after step={steps}",
+        str(error).split("\n", 1)[0],
+    ]
+    if detail:
+        parts.append(detail)
+    if torch.cuda.is_available():
+        try:
+            allocated = torch.cuda.memory_allocated() / (1024 ** 2)
+            reserved = torch.cuda.memory_reserved() / (1024 ** 2)
+            parts.append(
+                f"cuda_allocated_mib={allocated:.1f} cuda_reserved_mib={reserved:.1f}"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    parts.append(
+        "peers should surface NCCL errors via TORCH_NCCL_ASYNC_ERROR_HANDLING; "
+        "resume from checkpoint after restart"
+    )
+    message = "; ".join(parts)
+    logger.error(message)
+    print(message, flush=True)
+    os._exit(70)
 
 
 def _varlen_attention_reasons(config: AppConfig) -> tuple[str, ...]:
@@ -571,7 +677,9 @@ def _configure_nccl_runtime_env(
 ) -> None:
     """Use CUDA P2P when healthy; otherwise tell NCCL to fall back safely.
 
-    - P2P OK → leave NCCL defaults so NVLink/P2P stays enabled.
+    - Always default ``TORCH_NCCL_ASYNC_ERROR_HANDLING=1`` so a dead peer
+      fails collectives quickly instead of waiting for the step watchdog.
+    - P2P OK → leave NCCL P2P defaults so NVLink/P2P stays enabled.
     - P2P broken → ``NCCL_IGNORE_DISABLED_P2P=1`` + ``NCCL_P2P_DISABLE=1``
       so NCCL skips doomed P2P and uses SHM/NET.
     - Inconclusive (e.g. each torchrun rank only sees one GPU) → only
@@ -584,6 +692,9 @@ def _configure_nccl_runtime_env(
     """
 
     env: MutableMapping[str, str] = os.environ if environ is None else environ
+    # Fail collectives when a peer dies/errors instead of blocking until the
+    # 600s step watchdog. Explicit exports always win over this default.
+    env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     if "NCCL_IGNORE_DISABLED_P2P" in env:
         return
     accessible = _local_cuda_p2p_accessible()
@@ -4600,6 +4711,7 @@ def train_mdl(
     context = _setup_distributed(config)
     batch_iterator: Iterator[FeatureBatch] | None = None
     step_watchdog: _StepWatchdog | None = None
+    steps = 0
     try:
         device = context.device
         if device.type == "cuda":
@@ -4868,6 +4980,12 @@ def train_mdl(
                 and context.rank == 0
                 and (steps + 1) % config.training.log_every_steps == 0
             )
+            _step_watchdog_beat(
+                step_watchdog,
+                "dataloader",
+                detail=f"steps={steps}",
+                device=device,
+            )
             if pending_train_batches:
                 local_batch = pending_train_batches.popleft()
                 local_batch_on_device = False
@@ -4892,6 +5010,12 @@ def train_mdl(
             rank_active = local_batch is not None
             # Kick the Gloo/NCCL active-rank reduction immediately so pinned H2D
             # can overlap it. Wait only after the host→device copy is queued.
+            _step_watchdog_beat(
+                step_watchdog,
+                "active_rank_sync",
+                detail=f"steps={steps} rank_active={int(rank_active)}",
+                device=device,
+            )
             active_rank_handle = _start_active_rank_count(context, rank_active)
             h2d_started = perf_counter() if observing else 0.0
             if rank_active:
@@ -4941,6 +5065,13 @@ def train_mdl(
             if tracing:
                 _sync_device(device)
             h2d_seconds = perf_counter() - h2d_started if observing else 0.0
+            local_rows = int(batch.scenario_id.size(0)) if batch is not None else 0
+            _step_watchdog_beat(
+                step_watchdog,
+                "h2d",
+                detail=f"steps={steps} local_rows={local_rows}",
+                device=device,
+            )
 
             if accumulation_index == 0:
                 lr_multiplier = _lr_schedule_multiplier(
@@ -4962,6 +5093,12 @@ def train_mdl(
                 context.enabled and ddp_config.static_graph and steps == 0
             )
             forward_started = perf_counter() if observing else 0.0
+            _step_watchdog_beat(
+                step_watchdog,
+                "forward",
+                detail=f"steps={steps} local_rows={local_rows}",
+                device=device,
+            )
             with _gradient_sync_context(
                 model,
                 synchronize=(
@@ -4990,6 +5127,12 @@ def train_mdl(
                     perf_counter() - forward_started if observing else 0.0
                 )
                 backward_started = perf_counter() if observing else 0.0
+                _step_watchdog_beat(
+                    step_watchdog,
+                    "backward",
+                    detail=f"steps={steps} local_rows={local_rows}",
+                    device=device,
+                )
                 if scaler.is_enabled():
                     scaler.scale(backward_loss).backward()
                 else:
@@ -5064,6 +5207,12 @@ def train_mdl(
             ddp_auditor.observe()
             window_active_ranks = _active_rank_count(context, window_rank_active)
             sparse_sync_started = perf_counter() if observing else 0.0
+            _step_watchdog_beat(
+                step_watchdog,
+                "sparse_sync",
+                detail=f"steps={steps} local_rows={local_rows}",
+                device=device,
+            )
             sparse_sync_stats = sparse_synchronizer.synchronize(
                 rank_active=window_rank_active
             )
@@ -5087,6 +5236,12 @@ def train_mdl(
                 _sync_device(device)
             sparse_sync_seconds = perf_counter() - sparse_sync_started if observing else 0.0
             optimizer_started = perf_counter() if observing else 0.0
+            _step_watchdog_beat(
+                step_watchdog,
+                "optimizer",
+                detail=f"steps={steps} local_rows={local_rows}",
+                device=device,
+            )
             if scaler.is_enabled():
                 for optimizer in optimizers:
                     scaler.unscale_(optimizer)
@@ -5114,8 +5269,15 @@ def train_mdl(
                 _sync_device(device)
             optimizer_seconds = perf_counter() - optimizer_started if observing else 0.0
             steps += 1
-            if step_watchdog is not None:
-                step_watchdog.beat()
+            _step_watchdog_beat(
+                step_watchdog,
+                "step_done",
+                detail=(
+                    f"steps={steps} local_rows={window_rows} "
+                    f"active_ranks={window_active_ranks}"
+                ),
+                device=device,
+            )
             rows += window_rows
             if window_loss_numerator is None or window_loss_denominator is None:
                 raise AssertionError("completed accumulation window has no loss")
@@ -5296,6 +5458,13 @@ def train_mdl(
                 sharded_optimizer=sharded_embedding_optimizer,
             )
         return result
+    except torch.cuda.OutOfMemoryError as error:
+        _abort_rank_for_cuda_oom(
+            error,
+            rank=context.rank,
+            steps=steps,
+            detail=f"device={device}",
+        )
     except RemoteIoStallError as error:
         abort_rank_for_remote_io_stall(error)
     finally:

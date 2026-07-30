@@ -624,6 +624,9 @@ def _launch_ddp_command(args: argparse.Namespace, config) -> int:
     # segment instead of failing with free-but-fragmented HBM near capacity.
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", _ALLOC_CONF)
     env.setdefault("PYTORCH_ALLOC_CONF", _ALLOC_CONF)
+    # Fail NCCL collectives quickly when a peer dies instead of waiting for the
+    # step watchdog with no traceback.
+    env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     # Probe local CUDA P2P: keep NVLink/P2P when healthy, otherwise fall back
     # via NCCL_IGNORE_DISABLED_P2P / NCCL_P2P_DISABLE (see train.py).
     _configure_nccl_runtime_env(env)
