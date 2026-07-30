@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from importlib import import_module
+import gc
 import inspect
 import logging
 import math
@@ -17,7 +18,7 @@ import queue
 import sqlite3
 import tempfile
 import threading
-from time import perf_counter, time_ns
+from time import perf_counter, time, time_ns
 from typing import Any, Callable, Iterator, MutableMapping
 
 import numpy as np
@@ -50,6 +51,7 @@ from .dataloader import (
     build_packed_request_plan,
     build_request_deduplication_from_pack,
     discover_scenario_values,
+    io_progress_pulses,
     is_remote_io_stall_error,
     iter_adapted_axis_bundles,
     iter_flat_tables,
@@ -57,6 +59,7 @@ from .dataloader import (
     materialize_packed_blocks,
     move_feature_batch,
     pin_feature_batch,
+    privatize_shared_feature_batch,
     prepare_packed_arrow_axis_batch,
     prepare_packed_axis_batch,
     publish_direct_pipeline_stats,
@@ -66,6 +69,7 @@ from .dataloader import (
     reset_direct_pipeline_stats,
     resolve_auto_scenarios,
     run_feature_cardinality_audit,
+    set_io_progress_hook,
     table_to_feature_batch,
 )
 from .features import load_vocab_maps
@@ -1581,6 +1585,7 @@ def _iter_batch_tables_direct(
                     registry.release(source_id, count)
     finally:
         publish_direct_pipeline_stats(registry.snapshot_stats())
+        registry.clear()
 
 
 def _iter_batch_tables(
@@ -2379,6 +2384,7 @@ def _host_prepare_process_main(
     include_group_id: bool,
     ipc_mode: str,
     pin_memory: bool,
+    progress_mtime: Any | None = None,
 ) -> None:
     """Child entry: pack+tensorize and push FeatureBatches to the train process.
 
@@ -2386,6 +2392,15 @@ def _host_prepare_process_main(
     - ``share``: keep CUDA visible so we can pin in-child, then ``share_memory_``
       so the parent receives already-pinned handles (large ``/dev/shm``).
     """
+
+    def _beat(note: str = "") -> None:
+        del note  # reserved for optional debug logging
+        if progress_mtime is None:
+            return
+        try:
+            progress_mtime.value = time()
+        except Exception:
+            pass
 
     # Own a process group so the parent can SIGTERM/SIGKILL the whole tree
     # (including adapter ProcessPool workers) on idle/startup stall.
@@ -2397,7 +2412,44 @@ def _host_prepare_process_main(
         except OSError:
             pass
     _install_host_prepare_shutdown_handlers()
+    set_io_progress_hook(_beat)
+    _beat("child-start")
 
+    try:
+        _host_prepare_process_body(
+            queue,
+            config,
+            split_name,
+            vocab_maps,
+            require_labels=require_labels,
+            shard_rank=shard_rank,
+            shard_world_size=shard_world_size,
+            coalesce_tensors=coalesce_tensors,
+            include_group_id=include_group_id,
+            ipc_mode=ipc_mode,
+            pin_memory=pin_memory,
+            progress_beat=_beat,
+        )
+    finally:
+        set_io_progress_hook(None)
+
+
+def _host_prepare_process_body(
+    queue: Any,
+    config: AppConfig,
+    split_name: str,
+    vocab_maps: dict[str, dict[str, int]],
+    *,
+    require_labels: bool,
+    shard_rank: int,
+    shard_world_size: int,
+    coalesce_tensors: bool,
+    include_group_id: bool,
+    ipc_mode: str,
+    pin_memory: bool,
+    progress_beat: Callable[[str], None],
+) -> None:
+    _beat = progress_beat
     os.environ["MDL_HOST_PREPARE_PROCESS"] = "1"
     use_share = ipc_mode == "share"
     shm_free = _dev_shm_free_bytes()
@@ -2434,6 +2486,7 @@ def _host_prepare_process_main(
         child_pin = bool(
             pin_memory and use_share and shm_ok_for_pin_share and torch.cuda.is_available()
         )
+        _beat("before-table-iter")
         table_iter = _iter_batch_tables(
             config,
             split_name,
@@ -2441,22 +2494,26 @@ def _host_prepare_process_main(
             shard_world_size=shard_world_size,
             require_labels=require_labels,
         )
+        _beat("after-table-iter-open")
         try:
+            produced = 0
             for table in table_iter:
-                batch = _prepare_feature_batch(
-                    config,
-                    split,
-                    table,
-                    vocab_maps,
-                    require_labels,
-                    False,
-                    False,
-                    include_group_id,
-                )
-                if coalesce_tensors:
-                    batch = _coalesce_feature_batch(batch, pin_memory=child_pin)
-                elif child_pin:
-                    batch = pin_feature_batch(batch, coalesce_tensors=False)
+                _beat("table")
+                with io_progress_pulses(15.0):
+                    batch = _prepare_feature_batch(
+                        config,
+                        split,
+                        table,
+                        vocab_maps,
+                        require_labels,
+                        False,
+                        False,
+                        include_group_id,
+                    )
+                    if coalesce_tensors:
+                        batch = _coalesce_feature_batch(batch, pin_memory=child_pin)
+                    elif child_pin:
+                        batch = pin_feature_batch(batch, coalesce_tensors=False)
                 if use_share:
                     _queue_put_interruptible(
                         queue, _share_feature_batch_for_ipc(batch)
@@ -2465,6 +2522,18 @@ def _host_prepare_process_main(
                     _queue_put_interruptible(
                         queue, _spill_feature_batch_for_ipc(batch, share_dir)
                     )
+                _beat("batch-queued")
+                # Free the child's handle promptly so shared IPC files / Arrow
+                # arenas are not pinned by the previous loop iteration.
+                del batch
+                produced += 1
+                if produced % 32 == 0:
+                    try:
+                        import pyarrow as pa
+
+                        pa.default_memory_pool().release_unused()
+                    except Exception:
+                        pass
             _queue_put_interruptible(queue, None)
         except (BrokenPipeError, EOFError, OSError):
             # Parent closed the IPC queue during teardown; exit quietly.
@@ -2679,9 +2748,11 @@ class _ProcessHostPrepareIterator:
 
     Override with ``MDL_HOST_PREPARE_IPC=share|memfd|auto``.
 
-    Parent enforces startup/idle timeouts against the child. A hung JNI read
-    inside the child will not wait for the global step watchdog: the parent
-    kills the process group and aborts the rank with ``REMOTE_IO_STALL``.
+    Parent enforces startup/idle timeouts against the child. Timers measure
+    silence since the last child heartbeat (HDFS list/footer/adapt) or
+    delivered batch. A hung JNI read that stops Python heartbeats will not
+    wait for the global step watchdog: the parent kills the process group and
+    aborts the rank with ``REMOTE_IO_STALL``.
     """
 
     _SENTINEL = None
@@ -2721,6 +2792,12 @@ class _ProcessHostPrepareIterator:
         self._started_at = perf_counter()
         self._last_progress_at = self._started_at
         self._received_item = False
+        # Wall-clock heartbeat shared with the child. Updated during HDFS
+        # discover / footer / adapt work so slow-but-alive startup is not
+        # mistaken for a JNI hang (which would stop heartbeats too once the
+        # child can no longer run Python).
+        self._ctx = mp.get_context("spawn")
+        self._progress_mtime = self._ctx.Value("d", time())
         _configure_host_prepare_tensor_sharing()
         if self._ipc_mode == "share":
             try:
@@ -2740,7 +2817,6 @@ class _ProcessHostPrepareIterator:
                 self._startup_timeout_sec,
                 self._idle_timeout_sec,
             )
-        self._ctx = mp.get_context("spawn")
         self._queue: Any = self._ctx.Queue(maxsize=int(queue_size))
         self._process = self._ctx.Process(
             target=_host_prepare_process_main,
@@ -2756,6 +2832,7 @@ class _ProcessHostPrepareIterator:
                 "include_group_id": include_group_id,
                 "ipc_mode": self._ipc_mode,
                 "pin_memory": self._pin_memory,
+                "progress_mtime": self._progress_mtime,
             },
             name=f"mdl-host-prepare-{split_name}",
             daemon=False,
@@ -2778,28 +2855,44 @@ class _ProcessHostPrepareIterator:
         self._received_item = True
         self._last_progress_at = perf_counter()
 
+    def _silence_sec(self, now: float) -> float:
+        """Seconds since the freshest child heartbeat or delivered batch."""
+
+        silence = now - self._last_progress_at
+        progress_mtime = getattr(self, "_progress_mtime", None)
+        if progress_mtime is None:
+            return silence
+        try:
+            beat_age = time() - float(progress_mtime.value)
+        except Exception:
+            return silence
+        if beat_age < 0:
+            beat_age = 0.0
+        return min(silence, beat_age)
+
     def _raise_if_child_stalled(self) -> None:
         now = perf_counter()
+        silence = self._silence_sec(now)
         if (
             not self._received_item
             and self._startup_timeout_sec is not None
-            and (now - self._started_at) >= float(self._startup_timeout_sec)
+            and silence >= float(self._startup_timeout_sec)
         ):
             self._abort_stalled_child(
                 RemoteIoStallError(
                     f"host-prepare startup exceeded "
-                    f"{float(self._startup_timeout_sec):.0f}s without a batch"
+                    f"{float(self._startup_timeout_sec):.0f}s without progress"
                 )
             )
         if (
             self._received_item
             and self._idle_timeout_sec is not None
-            and (now - self._last_progress_at) >= float(self._idle_timeout_sec)
+            and silence >= float(self._idle_timeout_sec)
         ):
             self._abort_stalled_child(
                 RemoteIoStallError(
                     f"host-prepare idle exceeded "
-                    f"{float(self._idle_timeout_sec):.0f}s since last batch"
+                    f"{float(self._idle_timeout_sec):.0f}s without progress"
                 )
             )
 
@@ -2868,14 +2961,12 @@ class _ProcessHostPrepareIterator:
                 abort_rank_for_remote_io_stall(item)
             raise RuntimeError("host prepare process failed") from item
         if isinstance(item, FeatureBatch):
-            # Shared-memory path: child already pinned when CUDA was available.
-            if self._pin_memory and item._packed_buffers:
-                if all(buffer.is_pinned() for buffer in item._packed_buffers):
-                    return item
-                return pin_feature_batch(item, coalesce_tensors=False)
+            # share_memory_ IPC: always clone off shared storages in the parent.
+            # Returning already-pinned shared buffers used to keep /dev/shm files
+            # alive across steps and ratchet parent RSS.
             if self._pin_memory:
                 return pin_feature_batch(item, coalesce_tensors=False)
-            return item
+            return privatize_shared_feature_batch(item)
         if not isinstance(item, dict):
             self.close()
             raise TypeError(
@@ -5109,6 +5200,11 @@ def train_mdl(
                             f"Train task warning | step={steps} task={task_name} "
                             + " ".join(warning_parts)
                         )
+                # Drop the host-side log snapshot so pinned/shared batches from
+                # next_with_host do not linger until the next log window.
+                last_trace_batch = None
+                window_task_monitors = None
+                gc.collect()
             if (
                 run_quick_eval
                 and quick_eval.enabled
@@ -5143,6 +5239,11 @@ def train_mdl(
                     max_batches=quick_eval_batch_limit,
                 )
                 pending_train_batches.extend(staged_batches)
+                # Drop the caller's strong refs immediately. Leaving
+                # ``staged_batches`` bound until the next eval keeps every
+                # FeatureBatch (often pinned / share_memory_) alive for the
+                # whole every_steps window and ratchets RSS on each eval.
+                del staged_batches
                 # Evaluation forwards also touch sharded-embedding diagnostics;
                 # keep them out of the following training step's trace/log.
                 consume_sharded_embedding_stats(base_model)
@@ -5152,6 +5253,7 @@ def train_mdl(
                         quick_eval,
                         quick_eval_result,
                     )
+                del quick_eval_result
         audit_report = ddp_auditor.report(context)
         if log_steps and context.rank == 0 and audit_report is not None:
             print(f"DDP graph audit | {audit_report}")
@@ -5684,13 +5786,17 @@ def _run_training_quick_eval(
                 "negatives": negatives,
             }
         _sync_device(context.device)
+        # Do not retain the last device replay batch across the return path.
+        replay_batch = None
+        retained = tuple(staged_batches)
+        staged_batches.clear()
         return (
             QuickEvalResult(
                 rows=rows,
                 metrics=metrics,
                 elapsed_seconds=perf_counter() - started,
             ),
-            tuple(staged_batches),
+            retained,
         )
     finally:
         if owns_batch_iterator and batch_iterator is not None:

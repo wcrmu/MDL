@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import queue
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
 from src.config import LengthBucketConfig, ReaderConfig
-from src.dataloader import RemoteIoStallError
+from src.dataloader import (
+    FeatureBatch,
+    RemoteIoStallError,
+    note_io_progress,
+    set_io_progress_hook,
+)
 from src.train import (
     _ProcessHostPrepareIterator,
     _terminate_process_group,
@@ -15,6 +21,9 @@ from src.train import (
 
 
 class HostPrepareWatchdogTest(unittest.TestCase):
+    def tearDown(self) -> None:
+        set_io_progress_hook(None)
+
     def test_reader_accepts_host_prepare_timeouts(self) -> None:
         reader = ReaderConfig(
             length_buckets=(LengthBucketConfig(max_length=None, batch_size=8),),
@@ -63,6 +72,7 @@ class HostPrepareWatchdogTest(unittest.TestCase):
         iterator._started_at = 0.0
         iterator._last_progress_at = 0.0
         iterator._received_item = False
+        iterator._progress_mtime = None
         iterator._queue = MagicMock()
         iterator._queue.get.side_effect = queue.Empty
         iterator._process = MagicMock()
@@ -91,6 +101,53 @@ class HostPrepareWatchdogTest(unittest.TestCase):
         close_queue.assert_called_once()
         killpg.assert_called()
         self.assertTrue(iterator._closed)
+
+    def test_startup_heartbeat_keeps_watchdog_alive(self) -> None:
+        iterator = _ProcessHostPrepareIterator.__new__(_ProcessHostPrepareIterator)
+        iterator._pin_memory = False
+        iterator._ipc_mode = "memfd"
+        iterator._closed = False
+        iterator._startup_timeout_sec = 0.2
+        iterator._idle_timeout_sec = None
+        iterator._started_at = 0.0
+        iterator._last_progress_at = 0.0
+        iterator._received_item = False
+        progress = MagicMock()
+        progress.value = 1_000.0
+        iterator._progress_mtime = progress
+        iterator._queue = MagicMock()
+        iterator._process = MagicMock()
+        iterator._process.is_alive.return_value = True
+        batch = MagicMock(spec=FeatureBatch)
+        iterator._queue.get.side_effect = [queue.Empty, batch]
+
+        # Wall clock stays near the fresh heartbeat while perf time is long past
+        # the startup timeout measured from process start.
+        with patch("src.train.perf_counter", side_effect=[10.0, 10.0]), patch(
+            "src.train.time", side_effect=[1_000.05, 1_000.05]
+        ), patch(
+            "src.train.privatize_shared_feature_batch",
+            side_effect=lambda item: item,
+        ):
+            got = next(iterator)
+        self.assertIs(got, batch)
+        self.assertTrue(iterator._received_item)
+
+    def test_note_io_progress_invokes_hook(self) -> None:
+        seen: list[int] = []
+        set_io_progress_hook(lambda: seen.append(1))
+        note_io_progress()
+        self.assertEqual(seen, [1])
+
+    def test_io_progress_pulses_during_long_work(self) -> None:
+        from src.dataloader import io_progress_pulses
+
+        seen: list[int] = []
+        set_io_progress_hook(lambda: seen.append(1))
+        with io_progress_pulses(0.05):
+            time.sleep(0.18)
+        # start pulse + at least one interval pulse + final pulse
+        self.assertGreaterEqual(len(seen), 3)
 
     def test_close_discards_queue_without_unbounded_join(self) -> None:
         iterator = _ProcessHostPrepareIterator.__new__(_ProcessHostPrepareIterator)

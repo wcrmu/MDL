@@ -149,6 +149,68 @@ _DEFAULT_HDFS_QUARANTINE_LIMIT = 32
 # Reused by wide-sequence prehashed gathers; creating a pool per batch was measurable.
 _PREHASHED_GATHER_POOL: ThreadPoolExecutor | None = None
 _PREHASHED_GATHER_POOL_WORKERS = 0
+# Optional host-prepare progress hook. The spawn child installs a shared
+# ``mp.Value`` writer so the parent watchdog can see HDFS list/footer/adapt
+# progress before the first FeatureBatch is delivered.
+_IO_PROGRESS_HOOK: Callable[[], None] | None = None
+_IO_PROGRESS_HOOK_LOCK = threading.Lock()
+
+
+def set_io_progress_hook(hook: Callable[[], None] | None) -> None:
+    """Install or clear the process-wide remote-IO progress heartbeat callback."""
+
+    global _IO_PROGRESS_HOOK
+    with _IO_PROGRESS_HOOK_LOCK:
+        _IO_PROGRESS_HOOK = hook
+
+
+def note_io_progress() -> None:
+    """Pulse the host-prepare watchdog when remote IO makes forward progress."""
+
+    with _IO_PROGRESS_HOOK_LOCK:
+        hook = _IO_PROGRESS_HOOK
+    if hook is None:
+        return
+    try:
+        hook()
+    except Exception:
+        pass
+
+
+@contextmanager
+def io_progress_pulses(interval_sec: float = 15.0) -> Iterator[None]:
+    """Keep the host-prepare idle watchdog alive during long CPU prepare work.
+
+    Used around adapt/tensorize that can exceed ``host_prepare_idle_timeout_sec``
+    without touching HDFS. A hung JNI call that holds the GIL will also stall
+    this helper (no false liveness); the step watchdog remains the backstop.
+    """
+
+    interval = float(interval_sec)
+    with _IO_PROGRESS_HOOK_LOCK:
+        hook_present = _IO_PROGRESS_HOOK is not None
+    if interval <= 0 or not hook_present:
+        yield
+        return
+    stop = threading.Event()
+
+    def _pulse() -> None:
+        while not stop.wait(interval):
+            note_io_progress()
+
+    thread = threading.Thread(
+        target=_pulse,
+        name="mdl-io-progress-pulse",
+        daemon=True,
+    )
+    note_io_progress()
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=max(0.1, min(interval, 1.0)))
+        note_io_progress()
 
 
 class RemoteIoStallError(RuntimeError):
@@ -788,7 +850,15 @@ def apply_worker_stagger(rank: int, stagger_sec: float) -> None:
         delay,
         rank,
     )
-    time.sleep(delay)
+    # Chunk the sleep and heartbeat so a large rank stagger does not look like
+    # a host-prepare JNI hang to the parent startup watchdog.
+    deadline = time.monotonic() + delay
+    while True:
+        note_io_progress()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(remaining, 5.0))
 
 
 def run_remote_op(
@@ -1284,9 +1354,11 @@ def _iter_parquet_record_batches_local(
             if stop_event is not None and stop_event.is_set():
                 return
             try:
-                yield next(batch_iterator)
+                batch = next(batch_iterator)
             except StopIteration:
                 return
+            note_io_progress()
+            yield batch
     finally:
         _close_batch_iterator(batch_iterator, poisoned=False, label=lock_key)
 
@@ -1423,6 +1495,7 @@ def _iter_parquet_record_batches_remote_session(
                 yielded_rows += int(getattr(batch, "num_rows", 0) or 0)
             except Exception:
                 pass
+            note_io_progress()
             yield batch
     except _ParquetSessionReopen:
         invalidate_filesystem = True
@@ -1864,10 +1937,27 @@ def _remote_ref(remote: _RemoteInput, fs_path: str) -> ParquetInputRef:
     )
 
 
-def _discover_remote_directory(remote: _RemoteInput) -> list[ParquetInputRef]:
+def _discover_remote_directory(
+    remote: _RemoteInput,
+    *,
+    list_timeout_sec: float | None = None,
+) -> list[ParquetInputRef]:
     pafs = _require_pyarrow_fs()
     selector = pafs.FileSelector(remote.fs_path, recursive=True)
-    infos = remote.filesystem.get_file_info(selector)
+
+    def list_infos() -> list[Any]:
+        return list(remote.filesystem.get_file_info(selector))
+
+    timeout = None if list_timeout_sec is None else float(list_timeout_sec)
+    infos = (
+        list_infos()
+        if timeout is None or timeout <= 0
+        else call_with_timeout(
+            list_infos,
+            timeout,
+            description=f"list hdfs directory {remote.canonical_uri}",
+        )
+    )
     return [
         _remote_ref(remote, info.path)
         for info in infos
@@ -1875,17 +1965,35 @@ def _discover_remote_directory(remote: _RemoteInput) -> list[ParquetInputRef]:
     ]
 
 
-def _discover_remote_glob(remote: _RemoteInput, item: str) -> list[ParquetInputRef]:
+def _discover_remote_glob(
+    remote: _RemoteInput,
+    item: str,
+    *,
+    list_timeout_sec: float | None = None,
+) -> list[ParquetInputRef]:
     pafs = _require_pyarrow_fs()
     base_dir = _remote_glob_base_dir(remote.fs_path)
-    base_info = remote.filesystem.get_file_info(base_dir)
-    if base_info.type != pafs.FileType.Directory:
-        raise FileNotFoundError(f"no parquet files matched input {item!r}")
+    timeout = None if list_timeout_sec is None else float(list_timeout_sec)
 
-    selector = pafs.FileSelector(base_dir, recursive=True)
+    def list_base_and_matches() -> tuple[Any, list[Any]]:
+        base_info = remote.filesystem.get_file_info(base_dir)
+        if base_info.type != pafs.FileType.Directory:
+            raise FileNotFoundError(f"no parquet files matched input {item!r}")
+        selector = pafs.FileSelector(base_dir, recursive=True)
+        return base_info, list(remote.filesystem.get_file_info(selector))
+
+    if timeout is None or timeout <= 0:
+        _base_info, infos = list_base_and_matches()
+    else:
+        _base_info, infos = call_with_timeout(
+            list_base_and_matches,
+            timeout,
+            description=f"list hdfs glob {item}",
+        )
+
     refs: list[ParquetInputRef] = []
     matched_any = False
-    for info in remote.filesystem.get_file_info(selector):
+    for info in infos:
         if not _match_remote_glob(_normalize_remote_path(info.path), remote.fs_path):
             continue
         matched_any = True
@@ -1897,18 +2005,40 @@ def _discover_remote_glob(remote: _RemoteInput, item: str) -> list[ParquetInputR
 
 
 def _discover_remote_input(
-    item: str, filesystems: dict[str, Any]
+    item: str,
+    filesystems: dict[str, Any],
+    *,
+    list_timeout_sec: float | None = None,
 ) -> list[ParquetInputRef]:
     pafs = _require_pyarrow_fs()
     remote = _remote_input_from_uri(item, filesystems)
     if _has_glob_meta(remote.fs_path):
-        return _discover_remote_glob(remote, item)
+        return _discover_remote_glob(
+            remote,
+            item,
+            list_timeout_sec=list_timeout_sec,
+        )
 
-    info = remote.filesystem.get_file_info(remote.fs_path)
+    def stat_path() -> Any:
+        return remote.filesystem.get_file_info(remote.fs_path)
+
+    timeout = None if list_timeout_sec is None else float(list_timeout_sec)
+    info = (
+        stat_path()
+        if timeout is None or timeout <= 0
+        else call_with_timeout(
+            stat_path,
+            timeout,
+            description=f"stat hdfs path {item}",
+        )
+    )
     if info.type == pafs.FileType.File:
         return [_remote_ref(remote, info.path)]
     if info.type == pafs.FileType.Directory:
-        return _discover_remote_directory(remote)
+        return _discover_remote_directory(
+            remote,
+            list_timeout_sec=list_timeout_sec,
+        )
     raise FileNotFoundError(f"no parquet files matched input {item!r}")
 
 
@@ -1917,12 +2047,18 @@ def _unique_sorted_refs(refs: Iterable[ParquetInputRef]) -> list[ParquetInputRef
     return sorted(unique.values(), key=lambda ref: ref.canonical_uri)
 
 
-def discover_parquet_inputs(inputs: Iterable[str | Path]) -> list[ParquetInputRef]:
+def discover_parquet_inputs(
+    inputs: Iterable[str | Path],
+    *,
+    remote_list_timeout_sec: float | None = None,
+) -> list[ParquetInputRef]:
     """Resolve parquet files from local paths or HDFS/viewfs URLs.
 
     Local inputs keep the existing file, directory, and Python glob behavior.
     HDFS/viewfs inputs use PyArrow filesystem discovery and support common
     POSIX-style glob segments, including ``**`` as a full path segment.
+    ``remote_list_timeout_sec`` bounds recursive listing / stat calls so a hung
+    NameNode RPC cannot stall host-prepare startup indefinitely.
     """
     refs: list[ParquetInputRef] = []
     remote_filesystems: dict[str, Any] = {}
@@ -1936,11 +2072,19 @@ def discover_parquet_inputs(inputs: Iterable[str | Path]) -> list[ParquetInputRe
                 "supported URI schemes are file, hdfs, and viewfs"
             )
         if scheme in _REMOTE_URI_SCHEMES:
-            refs.extend(_discover_remote_input(item, remote_filesystems))
+            refs.extend(
+                _discover_remote_input(
+                    item,
+                    remote_filesystems,
+                    list_timeout_sec=remote_list_timeout_sec,
+                )
+            )
+            note_io_progress()
             continue
         if local_filesystem is None:
             local_filesystem = _require_pyarrow_fs().LocalFileSystem()
         refs.extend(_discover_local_input(item, local_filesystem))
+        note_io_progress()
 
     unique_refs = _unique_sorted_refs(refs)
     if not unique_refs:
@@ -2029,9 +2173,10 @@ def validate_matching_schemas(
     refs = [_coerce_parquet_input_ref(path) for path in paths]
     if not refs:
         raise ValueError("paths must not be empty")
-    fingerprints = {
-        ref: schema_fingerprint(parquet_schema(ref, policy=policy)) for ref in refs
-    }
+    fingerprints: dict[ParquetInputRef, str] = {}
+    for ref in refs:
+        fingerprints[ref] = schema_fingerprint(parquet_schema(ref, policy=policy))
+        note_io_progress()
     expected = next(iter(fingerprints.values()))
     mismatched = [
         ref.canonical_uri
@@ -2369,6 +2514,7 @@ def _load_metadata_cache(
                 scan_columns,
                 io_policy,
             )
+            note_io_progress()
         return metadata_by_path
 
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -2380,6 +2526,7 @@ def _load_metadata_cache(
         }
         for future in as_completed(futures):
             metadata_by_path[futures[future]] = future.result()
+            note_io_progress()
     return metadata_by_path
 
 
@@ -2578,7 +2725,17 @@ class ParquetScanner:
                 f"unsupported reader.shard_unit {requested_shard_unit!r} "
                 "for distributed scanning"
             )
-        self.all_paths = discover_parquet_inputs(split.inputs)
+        self.all_paths = discover_parquet_inputs(
+            split.inputs,
+            remote_list_timeout_sec=(
+                float(split.reader.hdfs_open_timeout)
+                if any(
+                    str(item).startswith(("hdfs://", "viewfs://"))
+                    for item in split.inputs
+                )
+                else None
+            ),
+        )
         self._io_policy = RemoteIoPolicy.from_reader(
             split.reader,
             remote=_refs_are_remote(self.all_paths),
@@ -10766,13 +10923,21 @@ def pin_feature_batch(
     *,
     coalesce_tensors: bool = False,
 ) -> FeatureBatch:
-    """Pin CPU tensors so CUDA transfers can use the non-blocking path."""
+    """Pin CPU tensors so CUDA transfers can use the non-blocking path.
+
+    Host-prepare ``share`` IPC may hand back storages that are both pinned and
+    ``share_memory_()``-backed. Those must still be cloned into private pinned
+    pages; otherwise ``/dev/shm`` IPC files stay alive for the FeatureBatch
+    lifetime and parent RSS ratchets up across steps.
+    """
+
     if batch._packed_buffers:
         # Already coalesced (host-prepare child): copy the few base buffers into
-        # fresh pinned storage and remap views. Cloning off shared-memory first
-        # releases /dev/shm quickly under tiny container shm caps.
+        # fresh private pinned storage and remap views.
         pinned_buffers = tuple(
-            buffer.detach().clone().pin_memory() if not buffer.is_pinned() else buffer
+            buffer.detach().clone().pin_memory()
+            if (not buffer.is_pinned() or buffer.is_shared())
+            else buffer
             for buffer in batch._packed_buffers
         )
         pinned_by_dtype = {buffer.dtype: buffer for buffer in pinned_buffers}
@@ -10801,14 +10966,89 @@ def pin_feature_batch(
         )
     if coalesce_tensors:
         return _coalesce_feature_batch(batch, pin_memory=True)
+
+    def pin_leaf(tensor: Tensor) -> Tensor:
+        if tensor.is_shared() or not tensor.is_pinned():
+            return tensor.detach().clone().pin_memory()
+        return tensor
+
     return FeatureBatch(
         features={
-            key: _map_feature_value(value, lambda tensor: tensor.pin_memory())
+            key: _map_feature_value(value, pin_leaf)
             for key, value in batch.features.items()
         },
-        labels=None if batch.labels is None else batch.labels.pin_memory(),
-        label_mask=None if batch.label_mask is None else batch.label_mask.pin_memory(),
-        scenario_id=batch.scenario_id.pin_memory(),
+        labels=None if batch.labels is None else pin_leaf(batch.labels),
+        label_mask=None if batch.label_mask is None else pin_leaf(batch.label_mask),
+        scenario_id=pin_leaf(batch.scenario_id),
+        group_id=batch.group_id,
+        prediction_keys=batch.prediction_keys,
+    )
+
+
+def privatize_shared_feature_batch(batch: FeatureBatch) -> FeatureBatch:
+    """Clone torch IPC shared storages into process-private CPU memory.
+
+    Used when host-prepare delivers ``share_memory_`` batches without pinning.
+    """
+
+    def clone_if_shared(tensor: Tensor) -> Tensor:
+        return tensor.detach().clone() if tensor.is_shared() else tensor
+
+    if batch._packed_buffers:
+        if not any(buffer.is_shared() for buffer in batch._packed_buffers):
+            return batch
+        private_buffers = tuple(
+            clone_if_shared(buffer) for buffer in batch._packed_buffers
+        )
+        private_by_dtype = {buffer.dtype: buffer for buffer in private_buffers}
+
+        def private_view(tensor: Tensor) -> Tensor:
+            base = private_by_dtype[tensor.dtype]
+            return base.as_strided(
+                tensor.size(),
+                tensor.stride(),
+                tensor.storage_offset(),
+            )
+
+        return FeatureBatch(
+            features={
+                key: _map_feature_value(value, private_view)
+                for key, value in batch.features.items()
+            },
+            labels=None if batch.labels is None else private_view(batch.labels),
+            label_mask=(
+                None if batch.label_mask is None else private_view(batch.label_mask)
+            ),
+            scenario_id=private_view(batch.scenario_id),
+            group_id=batch.group_id,
+            prediction_keys=batch.prediction_keys,
+            _packed_buffers=private_buffers,
+        )
+
+    def tree_shared(value: Any) -> bool:
+        if isinstance(value, Tensor):
+            return bool(value.is_shared())
+        if isinstance(value, dict):
+            return any(tree_shared(child) for child in value.values())
+        return False
+
+    if not (
+        any(tree_shared(value) for value in batch.features.values())
+        or (batch.labels is not None and batch.labels.is_shared())
+        or (batch.label_mask is not None and batch.label_mask.is_shared())
+        or batch.scenario_id.is_shared()
+    ):
+        return batch
+    return FeatureBatch(
+        features={
+            key: _map_feature_value(value, clone_if_shared)
+            for key, value in batch.features.items()
+        },
+        labels=None if batch.labels is None else clone_if_shared(batch.labels),
+        label_mask=(
+            None if batch.label_mask is None else clone_if_shared(batch.label_mask)
+        ),
+        scenario_id=clone_if_shared(batch.scenario_id),
         group_id=batch.group_id,
         prediction_keys=batch.prediction_keys,
     )
@@ -12121,6 +12361,12 @@ class SourceRegistry:
         del self._refcount[source_id]
         del self._sources[source_id]
         self.release_events += 1
+
+    def clear(self) -> None:
+        """Drop every retained payload (interrupted shuffle/bucket teardown)."""
+
+        self._sources.clear()
+        self._refcount.clear()
 
     def retained_source_ids(self) -> tuple[int, ...]:
         return tuple(self._sources.keys())

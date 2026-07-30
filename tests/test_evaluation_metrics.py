@@ -111,6 +111,60 @@ class EvaluationMetricTest(unittest.TestCase):
         )
         self.assertGreater(float(result.metrics["click"]["logit_std"]), 0.0)
 
+    def test_staged_quick_eval_batches_release_after_caller_drops_refs(self) -> None:
+        """Train-split quick eval must not pin FeatureBatches until the next eval.
+
+        The training loop extends ``pending_train_batches`` then must ``del`` the
+        returned tuple; otherwise every staged batch stays alive for the whole
+        ``every_steps`` window and RSS ratchets on each eval.
+        """
+
+        import gc
+        import weakref
+        from collections import deque
+
+        model = _ModeTrackingEvaluationModel().train()
+        config = SimpleNamespace(
+            runtime=SimpleNamespace(precision="fp32"),
+            data=SimpleNamespace(train=object(), test=object()),
+            task_names=["click"],
+        )
+        context = DistributedContext(
+            enabled=False,
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            device=torch.device("cpu"),
+        )
+        batches = [
+            _quick_eval_batch([-2.0, 2.0], [0.0, 1.0]),
+            _quick_eval_batch([-1.0, 1.0], [0.0, 1.0]),
+        ]
+        refs = [weakref.ref(batch) for batch in batches]
+
+        _result, staged_batches = _run_training_quick_eval(
+            config,
+            model,
+            {},
+            context,
+            QuickEvalConfig(
+                enabled=True,
+                max_batches=2,
+                split="train",
+                auc_bins=128,
+            ),
+            fallback_batch=None,
+            training_batch_iterator=iter(batches),
+        )
+        pending: deque = deque()
+        pending.extend(staged_batches)
+        del staged_batches
+        del batches
+        while pending:
+            pending.popleft()
+        gc.collect()
+        self.assertTrue(all(ref() is None for ref in refs))
+
     def test_binary_auc_handles_ordering_and_ties_exactly(self) -> None:
         labels = torch.tensor([0.0, 0.0, 1.0, 1.0])
 

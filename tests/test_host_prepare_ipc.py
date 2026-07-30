@@ -7,7 +7,7 @@ from unittest import mock
 
 import torch
 
-from src.dataloader import FeatureBatch
+from src.dataloader import FeatureBatch, pin_feature_batch, privatize_shared_feature_batch
 from src.train import (
     _HOST_PREPARE_SHARE_SHM_BYTES,
     _host_prepare_ipc_mode,
@@ -44,6 +44,42 @@ class HostPrepareIpcModeTest(unittest.TestCase):
         shared = _share_feature_batch_for_ipc(batch)
         self.assertTrue(shared._packed_buffers[0].is_shared())
         self.assertTrue(shared.scenario_id.is_shared())
+
+    def test_pin_feature_batch_clones_shared_buffers(self) -> None:
+        # Production order: pin then share_memory_. After share, torch reports
+        # the storage as shared (and typically no longer pinned). Parent must
+        # clone into private pinned pages so /dev/shm IPC files can unlink.
+        base = torch.arange(8, dtype=torch.int64).pin_memory().share_memory_()
+        batch = FeatureBatch(
+            features={"x": base.view(2, 4)},
+            labels=None,
+            label_mask=None,
+            scenario_id=base[:2],
+            group_id=["a", "b"],
+            _packed_buffers=(base,),
+        )
+        self.assertTrue(batch._packed_buffers[0].is_shared())
+        privatized = pin_feature_batch(batch, coalesce_tensors=False)
+        self.assertTrue(privatized._packed_buffers[0].is_pinned())
+        self.assertFalse(privatized._packed_buffers[0].is_shared())
+        torch.testing.assert_close(
+            privatized.features["x"],
+            batch.features["x"],
+        )
+
+    def test_privatize_shared_feature_batch_drops_share_memory(self) -> None:
+        base = torch.arange(8, dtype=torch.int64).share_memory_()
+        batch = FeatureBatch(
+            features={"x": base.view(2, 4)},
+            labels=None,
+            label_mask=None,
+            scenario_id=base[:2],
+            group_id=["a", "b"],
+            _packed_buffers=(base,),
+        )
+        private = privatize_shared_feature_batch(batch)
+        self.assertFalse(private._packed_buffers[0].is_shared())
+        torch.testing.assert_close(private.features["x"], batch.features["x"])
 
 
 if __name__ == "__main__":

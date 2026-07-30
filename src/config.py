@@ -552,7 +552,9 @@ class ReaderConfig(_DeeplyImmutableConfig):
     # avoid GIL fights with wide-batch forward (threaded prepare regresses).
     host_prepare_prefetch: int = 0
     # Parent-side bounds for the host-prepare child. None disables that timer.
-    # Idle measures time since the last successful batch/sentinel/error delivery.
+    # Timers measure silence since the last child heartbeat OR delivered batch.
+    # Heartbeats cover long HDFS list/footer/adapt work before the first batch;
+    # without them a healthy but slow startup looks identical to a JNI hang.
     # On timeout the parent kills the child process group and aborts the rank
     # (exit 70) so torchrun can restart the job — it does not respawn the reader.
     host_prepare_startup_timeout_sec: float | None = 300.0

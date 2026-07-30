@@ -210,6 +210,7 @@ class _VarlenPacking:
     cumulative_lengths: Tensor
     batch_size: int
     padded_length: int
+    total_valid: int
 
     @classmethod
     def from_mask(cls, mask: Tensor) -> "_VarlenPacking":
@@ -218,6 +219,7 @@ class _VarlenPacking:
         mask = mask.to(dtype=torch.bool)
         flat_mask = mask.reshape(-1)
         lengths = mask.sum(dim=1, dtype=torch.int32)
+        total_valid = int(lengths.sum().item())
         source_positions = torch.arange(
             flat_mask.numel(),
             dtype=torch.long,
@@ -225,7 +227,6 @@ class _VarlenPacking:
         )
         valid_prefix = flat_mask.long().cumsum(0)
         if flat_mask.numel():
-            total_valid = valid_prefix[-1]
             source_to_packed = torch.where(
                 flat_mask,
                 valid_prefix - 1,
@@ -251,6 +252,7 @@ class _VarlenPacking:
             ),
             batch_size=mask.size(0),
             padded_length=mask.size(1),
+            total_valid=total_valid,
         )
 
     def pack(self, values: Tensor, *, compact: bool = False) -> Tensor:
@@ -258,10 +260,18 @@ class _VarlenPacking:
             raise ValueError(
                 "packed values must match the packing mask batch and length"
             )
+        flat = values.flatten(0, 1)
         if compact:
-            return values.flatten(0, 1)[self.flat_mask]
+            # Boolean ``flat[mask]`` materializes a full-sized CUDA gather temp and
+            # regularly OOMs under activation-checkpoint recompute. ``index_select``
+            # only allocates the compact valid-token output.
+            if self.total_valid == 0:
+                return flat[:0]
+            return flat.index_select(
+                0, self.packed_source_indices[: self.total_valid]
+            )
         packed = _PermutationGather.apply(
-            values.flatten(0, 1),
+            flat,
             self.packed_source_indices,
             self.source_to_packed_indices,
         )
@@ -281,14 +291,17 @@ class _VarlenPacking:
             )
         expected_capacity = self.batch_size * self.padded_length
         if compact:
-            expected_valid = self.lengths.sum()
-            if packed.device.type != "cuda" and packed.size(0) != int(expected_valid.item()):
+            expected_valid = self.total_valid
+            if packed.device.type != "cuda" and packed.size(0) != expected_valid:
                 raise ValueError("compact varlen output must match the valid token count")
             flat_reference = reference.flatten(0, 1)
-            output = torch.zeros_like(flat_reference).index_put(
-                (self.flat_mask,),
-                packed,
-            )
+            output = torch.zeros_like(flat_reference)
+            if expected_valid:
+                output.index_copy_(
+                    0,
+                    self.packed_source_indices[:expected_valid],
+                    packed,
+                )
             return output.view_as(reference)
         if packed.size(0) != expected_capacity:
             raise ValueError(

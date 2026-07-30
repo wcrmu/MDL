@@ -48,10 +48,12 @@ data:
       schema_validation_samples: 1
       cardinality_audit_raw_rows: 0
       coalesce_pinned_tensors: true
-      device_prefetch_batches: 1
+      # Extra on-device batch roughly doubles peak HBM under full activation
+      # checkpoint + compact varlen recompute; host queue alone hides prepare.
+      device_prefetch_batches: 0
       deduplicate_request_features: true
       agg_direct_mode: direct
-      host_prepare_prefetch: 3
+      host_prepare_prefetch: 2
       validate_prehashed_nonzero: false
       trusted_input: true
       shuffle_buffer_rows: 512
@@ -67,16 +69,18 @@ data:
       hdfs_close_timeout: 5
       length_bucket_metric: sum
       length_buckets:
+      # Steeper than the old 1408 short bucket: padding_ratio≈0.74 at batch 1024
+      # OOMed during checkpoint recompute of attend_causal_suffix pack.
       - max_length: 2048
-        batch_size: 1408
+        batch_size: 1024
       - max_length: 4096
-        batch_size: 880
+        batch_size: 512
       - max_length: 6144
-        batch_size: 576
+        batch_size: 320
       - max_length: 8192
-        batch_size: 432
+        batch_size: 192
       - max_length: null
-        batch_size: 704
+        batch_size: 256
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
       input_columns:
@@ -5334,7 +5338,7 @@ model:
   mdl_token_state: coupled
 training:
   step_watchdog_sec: 600.0
-  batch_size: 1408
+  batch_size: 1024
   gradient_accumulation_steps: 1
   embedding_distribution: sharded
   dense_distribution: ddp
