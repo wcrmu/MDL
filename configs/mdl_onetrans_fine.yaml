@@ -69,18 +69,18 @@ data:
       hdfs_close_timeout: 5
       length_bucket_metric: sum
       length_buckets:
-      # Steeper than the old 1408 short bucket: padding_ratio≈0.74 at batch 1024
-      # OOMed during checkpoint recompute of attend_causal_suffix pack.
+      # 1024 still OOMed on fat batches during checkpoint recompute; keep ~25%
+      # HBM headroom under compact varlen + full activation checkpoint.
       - max_length: 2048
-        batch_size: 1024
+        batch_size: 768
       - max_length: 4096
-        batch_size: 512
+        batch_size: 384
       - max_length: 6144
-        batch_size: 320
-      - max_length: 8192
-        batch_size: 192
-      - max_length: null
         batch_size: 256
+      - max_length: 8192
+        batch_size: 160
+      - max_length: null
+        batch_size: 192
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
       input_columns:
@@ -5338,7 +5338,7 @@ model:
   mdl_token_state: coupled
 training:
   step_watchdog_sec: 600.0
-  batch_size: 1024
+  batch_size: 768
   gradient_accumulation_steps: 1
   embedding_distribution: sharded
   dense_distribution: ddp
