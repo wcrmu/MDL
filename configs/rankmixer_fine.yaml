@@ -10,8 +10,8 @@ runtime:
   compile_mode: default
   require_compact_sequence_batches: false
   allow_tf32: true
-  activation_checkpoint: full
-  cuda_graph_backbone: false
+  activation_checkpoint: none
+  cuda_graph_backbone: true
   attention_backend: flash
   distributed: ddp
   nproc_per_node: 2

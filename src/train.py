@@ -741,10 +741,20 @@ def _configure_nccl_runtime_env(
         )
 
 
-def _local_batch_scale_for_world_size(world_size: int) -> float:
+def _is_rankmixer_family(config: AppConfig) -> bool:
+    return str(getattr(config.model, "name", "")) in {"rankmixer", "mdl_rankmixer"}
+
+
+def _local_batch_scale_for_world_size(
+    world_size: int,
+    *,
+    rankmixer_family: bool = False,
+) -> float:
     """Scale per-rank batch so large world sizes keep HBM headroom for NCCL.
 
     Override with ``MDL_LOCAL_BATCH_SCALE`` (e.g. ``0.75`` / ``1.0``).
+    RankMixer is emb-bound with a shallow dense stack: milder 8-GPU derate
+    keeps per-step work large enough to hide A2A.
     """
 
     forced = os.environ.get("MDL_LOCAL_BATCH_SCALE", "").strip()
@@ -756,9 +766,9 @@ def _local_batch_scale_for_world_size(world_size: int) -> float:
     if world_size <= 6:
         return 1.0
     if world_size <= 8:
-        # Empirically 8×1024 OOMed in backward; ~0.75 restores headroom while
-        # keeping global batch near the old 6-GPU operating point.
-        return 0.75
+        # OneTrans 8×1024 OOMed in backward → 0.75. RankMixer needs more
+        # dense/emb work per step for util; 0.9 is the util/HBM compromise.
+        return 0.9 if rankmixer_family else 0.75
     return max(0.5, 6.0 / float(world_size))
 
 
@@ -783,14 +793,19 @@ def _apply_world_size_training_profile(
     """Derate local batch / prefetch and widen DDP buckets for 6–8 GPU jobs.
 
     Aggressive multi-GPU defaults (override via env):
-    - ``MDL_LOCAL_BATCH_SCALE``: per-rank batch multiplier (default 1.0 ≤6, 0.75 @8)
-    - ``MDL_GROUPED_EMB_MAX_OUTPUT_MIB``: emb A2A autograd chunk cap (default 512 @≥6)
-    - ``NCCL_MAX_NCHANNELS``: already setdefault in NCCL env for ≥8
+    - ``MDL_LOCAL_BATCH_SCALE``: per-rank batch multiplier
+      (default 1.0 ≤6; 0.75 @8, or 0.9 for RankMixer family)
+    - ``MDL_GROUPED_EMB_MAX_OUTPUT_MIB``: emb A2A chunk cap
+      (RankMixer keeps larger caps — emb-bound util)
+    - ``NCCL_MAX_NCHANNELS``: already setdefault in NCCL env for ≥6
     """
 
     if world_size <= 1:
         return config
-    scale = _local_batch_scale_for_world_size(world_size)
+    rankmixer_family = _is_rankmixer_family(config)
+    scale = _local_batch_scale_for_world_size(
+        world_size, rankmixer_family=rankmixer_family
+    )
     training = config.training
     data = config.data
     if abs(scale - 1.0) >= 1.0e-9:
@@ -811,24 +826,35 @@ def _apply_world_size_training_profile(
             )
         data = replace(data, train=train_split, test=test_split)
 
-    # Cap emb A2A staging so collective scratch doesn't eat activation headroom.
+    # Cap emb A2A staging. RankMixer is emb-heavy / dense-light: keep larger
+    # chunks so 6–8 GPU jobs are not sliced into extra collective bubbles.
     # Explicit launcher exports always win.
     if world_size >= 6:
-        emb_cap = "384" if world_size >= 8 else "512"
+        if rankmixer_family:
+            emb_cap = "768" if world_size >= 8 else "1024"
+        else:
+            emb_cap = "384" if world_size >= 8 else "512"
         os.environ.setdefault("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", emb_cap)
 
-    # 8-GPU: drop the extra on-device prefetch batch (~1× activation footprint).
-    # 6-GPU: keep device prefetch; deepen host-prepare queue for util.
+    # 8-GPU OneTrans: drop device prefetch (~1× activation) for HBM headroom.
+    # RankMixer keeps device prefetch — util is dominated by emb/H2D bubbles,
+    # not activation footprint of the 2-layer backbone.
     train = data.train
     if train is not None:
         reader = train.reader
         reader_changed = False
-        if world_size >= 8 and reader.device_prefetch_batches > 0:
+        if (
+            world_size >= 8
+            and reader.device_prefetch_batches > 0
+            and not rankmixer_family
+        ):
             reader = replace(reader, device_prefetch_batches=0)
             reader_changed = True
         # Deepen host-prepare so pack/tensorize stays ahead of compute when
         # more ranks contend on HDFS/shard tails (6/8 GPU util regressions).
-        target_host = 4 if world_size >= 6 else reader.host_prepare_prefetch
+        target_host = 5 if rankmixer_family and world_size >= 6 else (
+            4 if world_size >= 6 else reader.host_prepare_prefetch
+        )
         if (
             reader.host_prepare_prefetch > 0
             and reader.host_prepare_prefetch < target_host
@@ -841,8 +867,14 @@ def _apply_world_size_training_profile(
 
     ddp = training.ddp
     # Wider reducer buckets → fewer allreduces → better compute/comm overlap
-    # on 6–8 GPU (YAML often still has 50).
-    target_bucket = 125.0 if world_size >= 8 else 100.0
+    # on 6–8 GPU (YAML often still has 50). RankMixer benefits from even
+    # wider buckets (shallow dense finishes before small allreduces overlap).
+    if world_size >= 8:
+        target_bucket = 150.0 if rankmixer_family else 125.0
+    elif world_size >= 6:
+        target_bucket = 125.0 if rankmixer_family else 100.0
+    else:
+        target_bucket = ddp.bucket_cap_mb
     if world_size >= 6 and ddp.bucket_cap_mb < target_bucket:
         training = replace(
             training,

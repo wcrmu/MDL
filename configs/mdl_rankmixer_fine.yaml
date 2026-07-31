@@ -6,7 +6,8 @@ runtime:
   compile_mode: default
   require_compact_sequence_batches: false
   allow_tf32: true
-  activation_checkpoint: full
+  activation_checkpoint: none
+  cuda_graph_backbone: true
   attention_backend: flash
   varlen_packing: compact
   sequence_projection_chunk_tokens: 131072
@@ -5545,7 +5546,7 @@ training:
   lr_decay_steps: null
   lr_min_ratio: 0.0
   dense_optimizer: rmsprop
-  fused_dense_optimizer: false
+  fused_dense_optimizer: true
   dense_optimizer_foreach_bucket_mb: 128
   rmsprop_alpha: 0.99999
   rmsprop_momentum: 0.0

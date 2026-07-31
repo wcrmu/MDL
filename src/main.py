@@ -631,9 +631,8 @@ def _launch_ddp_command(args: argparse.Namespace, config) -> int:
     env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     if nproc_per_node >= 6:
         env.setdefault("NCCL_MAX_NCHANNELS", "4")
-        # Bound emb A2A autograd staging before child ranks import embeddings.
-        emb_cap = "384" if nproc_per_node >= 8 else "512"
-        env.setdefault("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", emb_cap)
+    # Emb A2A chunk caps are model-aware (RankMixer vs OneTrans) and applied
+    # in train._apply_world_size_training_profile after config load.
     # Probe local CUDA P2P: keep NVLink/P2P when healthy, otherwise fall back
     # via NCCL_IGNORE_DISABLED_P2P / NCCL_P2P_DISABLE (see train.py).
     _configure_nccl_runtime_env(env)

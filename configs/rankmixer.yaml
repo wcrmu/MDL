@@ -10,8 +10,10 @@ runtime:
   compile_mode: default
   require_compact_sequence_batches: false
   allow_tf32: true
-  activation_checkpoint: full
-  cuda_graph_backbone: false
+  # full remat starves the shallow 2-layer dense stack on 6/8 GPU; none +
+  # cuda graphs match the known-good util profile (emb A2A can then overlap).
+  activation_checkpoint: none
+  cuda_graph_backbone: true
   attention_backend: flash
   distributed: ddp
   nproc_per_node: 2
