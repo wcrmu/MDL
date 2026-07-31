@@ -696,6 +696,19 @@ def _configure_nccl_runtime_env(
     # Fail collectives when a peer dies/errors instead of blocking until the
     # 600s step watchdog. Explicit exports always win over this default.
     env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    # Cap NCCL scratch / channel memory so 6–8 GPU jobs keep HBM headroom for
+    # activation peaks (8-GPU OneTrans OOMed in backward under default buffers).
+    env.setdefault("NCCL_BUFFSIZE", str(2 * 1024 * 1024))
+    env.setdefault("NCCL_CUMEM_ENABLE", "0")
+    # Read WORLD_SIZE from the target mapping (launcher may pass a child env
+    # before torchrun rewrites the parent process environ).
+    try:
+        world_size = int(env.get("WORLD_SIZE", "1") or "1")
+    except ValueError:
+        world_size = 1
+    # Fewer channels → less per-rank NCCL HBM; slight collective BW trade.
+    if world_size >= 6:
+        env.setdefault("NCCL_MAX_NCHANNELS", "4")
     if "NCCL_IGNORE_DISABLED_P2P" in env:
         return
     accessible = _local_cuda_p2p_accessible()
@@ -725,6 +738,150 @@ def _configure_nccl_runtime_env(
             "CUDA P2P probe inconclusive; defaulting NCCL_IGNORE_DISABLED_P2P=%s",
             env.get("NCCL_IGNORE_DISABLED_P2P"),
         )
+
+
+def _local_batch_scale_for_world_size(world_size: int) -> float:
+    """Scale per-rank batch so large world sizes keep HBM headroom for NCCL.
+
+    Override with ``MDL_LOCAL_BATCH_SCALE`` (e.g. ``0.75`` / ``1.0``).
+    """
+
+    forced = os.environ.get("MDL_LOCAL_BATCH_SCALE", "").strip()
+    if forced:
+        scale = float(forced)
+        if scale <= 0.0:
+            raise ValueError("MDL_LOCAL_BATCH_SCALE must be positive")
+        return scale
+    if world_size <= 6:
+        return 1.0
+    if world_size <= 8:
+        # Empirically 8×1024 OOMed in backward; ~0.75 restores headroom while
+        # keeping global batch near the old 6-GPU operating point.
+        return 0.75
+    return max(0.5, 6.0 / float(world_size))
+
+
+def _scale_int_batch(value: int, scale: float) -> int:
+    return max(8, int(round(int(value) * float(scale))))
+
+
+def _scale_reader_batches(reader: ReaderConfig, scale: float) -> ReaderConfig:
+    if abs(scale - 1.0) < 1.0e-9 or not reader.length_buckets:
+        return reader
+    buckets = tuple(
+        replace(bucket, batch_size=_scale_int_batch(bucket.batch_size, scale))
+        for bucket in reader.length_buckets
+    )
+    return replace(reader, length_buckets=buckets)
+
+
+def _apply_world_size_training_profile(
+    config: AppConfig,
+    world_size: int,
+) -> AppConfig:
+    """Derate local batch / prefetch and widen DDP buckets for 6–8 GPU jobs.
+
+    Aggressive multi-GPU defaults (override via env):
+    - ``MDL_LOCAL_BATCH_SCALE``: per-rank batch multiplier (default 1.0 ≤6, 0.75 @8)
+    - ``MDL_GROUPED_EMB_MAX_OUTPUT_MIB``: emb A2A autograd chunk cap (default 512 @≥6)
+    - ``NCCL_MAX_NCHANNELS``: already setdefault in NCCL env for ≥8
+    """
+
+    if world_size <= 1:
+        return config
+    scale = _local_batch_scale_for_world_size(world_size)
+    training = config.training
+    data = config.data
+    if abs(scale - 1.0) >= 1.0e-9:
+        old_bs = int(training.batch_size)
+        new_bs = _scale_int_batch(old_bs, scale)
+        training = replace(training, batch_size=new_bs)
+        train_split = data.train
+        test_split = data.test
+        if train_split is not None:
+            train_split = replace(
+                train_split,
+                reader=_scale_reader_batches(train_split.reader, scale),
+            )
+        if test_split is not None:
+            test_split = replace(
+                test_split,
+                reader=_scale_reader_batches(test_split.reader, scale),
+            )
+        data = replace(data, train=train_split, test=test_split)
+
+    # Cap emb A2A staging so collective scratch doesn't eat activation headroom.
+    # Explicit launcher exports always win.
+    if world_size >= 6:
+        emb_cap = "384" if world_size >= 8 else "512"
+        os.environ.setdefault("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", emb_cap)
+
+    # 8-GPU: drop the extra on-device prefetch batch (~1× activation footprint).
+    # 6-GPU: keep device prefetch; deepen host-prepare queue for util.
+    train = data.train
+    if train is not None:
+        reader = train.reader
+        reader_changed = False
+        if world_size >= 8 and reader.device_prefetch_batches > 0:
+            reader = replace(reader, device_prefetch_batches=0)
+            reader_changed = True
+        # Deepen host-prepare so pack/tensorize stays ahead of compute when
+        # more ranks contend on HDFS/shard tails (6/8 GPU util regressions).
+        target_host = 4 if world_size >= 6 else reader.host_prepare_prefetch
+        if (
+            reader.host_prepare_prefetch > 0
+            and reader.host_prepare_prefetch < target_host
+        ):
+            reader = replace(reader, host_prepare_prefetch=target_host)
+            reader_changed = True
+        if reader_changed:
+            train = replace(train, reader=reader)
+            data = replace(data, train=train)
+
+    ddp = training.ddp
+    # Wider reducer buckets → fewer allreduces → better compute/comm overlap
+    # on 6–8 GPU (YAML often still has 50).
+    target_bucket = 125.0 if world_size >= 8 else 100.0
+    if world_size >= 6 and ddp.bucket_cap_mb < target_bucket:
+        training = replace(
+            training,
+            ddp=replace(ddp, bucket_cap_mb=target_bucket),
+        )
+
+    if training is config.training and data is config.data:
+        # Still emit the emb-cap side effect even when config is unchanged.
+        if is_main_process() and world_size >= 6:
+            print(
+                "Multi-GPU profile | "
+                f"world_size={world_size} local_batch_scale={scale:.3f} "
+                f"batch_per_rank={config.training.batch_size} "
+                f"device_prefetch="
+                f"{0 if config.data.train is None else config.data.train.reader.device_prefetch_batches} "
+                f"host_prepare="
+                f"{0 if config.data.train is None else config.data.train.reader.host_prepare_prefetch} "
+                f"ddp_bucket_cap_mb={config.training.ddp.bucket_cap_mb:g} "
+                f"emb_max_output_mib="
+                f"{os.environ.get('MDL_GROUPED_EMB_MAX_OUTPUT_MIB', '')}",
+                flush=True,
+            )
+        return config
+    updated = replace(config, training=training, data=data)
+    if is_main_process():
+        train_reader = updated.data.train.reader if updated.data.train else None
+        print(
+            "Multi-GPU profile | "
+            f"world_size={world_size} local_batch_scale={scale:.3f} "
+            f"batch_per_rank={updated.training.batch_size} "
+            f"device_prefetch="
+            f"{0 if train_reader is None else train_reader.device_prefetch_batches} "
+            f"host_prepare="
+            f"{0 if train_reader is None else train_reader.host_prepare_prefetch} "
+            f"ddp_bucket_cap_mb={updated.training.ddp.bucket_cap_mb:g} "
+            f"emb_max_output_mib="
+            f"{os.environ.get('MDL_GROUPED_EMB_MAX_OUTPUT_MIB', '')}",
+            flush=True,
+        )
+    return updated
 
 
 def _resolve_process_group_backend(device: torch.device) -> str:
@@ -765,7 +922,11 @@ def _setup_distributed(config: AppConfig) -> DistributedContext:
 
     if enabled and not torch_dist.is_initialized():
         if device.type == "cuda":
+            # WORLD_SIZE is already set by torchrun here; apply NCCL HBM caps
+            # before ProcessGroupNCCL allocates channel/scratch buffers.
             _configure_nccl_runtime_env()
+            if world_size >= 8:
+                os.environ.setdefault("NCCL_MAX_NCHANNELS", "4")
         backend = _resolve_process_group_backend(device)
         torch_dist.init_process_group(
             backend=backend,
@@ -4763,6 +4924,8 @@ def train_mdl(
         return _coerce_train_result(adapter(config=config, max_steps=max_steps))
 
     context = _setup_distributed(config)
+    # World-size-aware batch/prefetch/NCCL headroom before model+reader start.
+    config = _apply_world_size_training_profile(config, context.world_size)
     batch_iterator: Iterator[FeatureBatch] | None = None
     step_watchdog: _StepWatchdog | None = None
     steps = 0

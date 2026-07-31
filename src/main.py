@@ -620,6 +620,8 @@ def _launch_ddp_command(args: argparse.Namespace, config) -> int:
     ]
     env = os.environ.copy()
     env["MDL_DDP_LAUNCHED"] = "1"
+    # Hint world size for NCCL HBM caps before torchrun rewrites WORLD_SIZE.
+    env.setdefault("WORLD_SIZE", str(nproc_per_node))
     # Expandable segments let adjacent variable-length batches reuse one CUDA
     # segment instead of failing with free-but-fragmented HBM near capacity.
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", _ALLOC_CONF)
@@ -627,6 +629,11 @@ def _launch_ddp_command(args: argparse.Namespace, config) -> int:
     # Fail NCCL collectives quickly when a peer dies instead of waiting for the
     # step watchdog with no traceback.
     env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    if nproc_per_node >= 6:
+        env.setdefault("NCCL_MAX_NCHANNELS", "4")
+        # Bound emb A2A autograd staging before child ranks import embeddings.
+        emb_cap = "384" if nproc_per_node >= 8 else "512"
+        env.setdefault("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", emb_cap)
     # Probe local CUDA P2P: keep NVLink/P2P when healthy, otherwise fall back
     # via NCCL_IGNORE_DISABLED_P2P / NCCL_P2P_DISABLE (see train.py).
     _configure_nccl_runtime_env(env)
