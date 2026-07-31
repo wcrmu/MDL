@@ -16,9 +16,16 @@ class NcclP2PEnvTest(unittest.TestCase):
         self.assertNotIn("NCCL_IGNORE_DISABLED_P2P", env)
         self.assertNotIn("NCCL_P2P_DISABLE", env)
         self.assertEqual(env.get("TORCH_NCCL_ASYNC_ERROR_HANDLING"), "1")
-        self.assertEqual(env.get("NCCL_BUFFSIZE"), str(2 * 1024 * 1024))
-        self.assertEqual(env.get("NCCL_CUMEM_ENABLE"), "0")
-        # Channel cap only kicks in at ≥6 ranks.
+        # 2–4 GPU keeps full NCCL BW; buffer/channel caps only at ≥6.
+        self.assertNotIn("NCCL_BUFFSIZE", env)
+        self.assertNotIn("NCCL_CUMEM_ENABLE", env)
+        self.assertNotIn("NCCL_MAX_NCHANNELS", env)
+
+    def test_four_gpu_leaves_nccl_bandwidth_defaults(self) -> None:
+        env: dict[str, str] = {"WORLD_SIZE": "4"}
+        with mock.patch("src.train._local_cuda_p2p_accessible", return_value=True):
+            _configure_nccl_runtime_env(env)
+        self.assertNotIn("NCCL_BUFFSIZE", env)
         self.assertNotIn("NCCL_MAX_NCHANNELS", env)
 
     def test_p2p_broken_enables_fallback(self) -> None:

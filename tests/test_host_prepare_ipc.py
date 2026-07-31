@@ -20,14 +20,15 @@ class HostPrepareIpcModeTest(unittest.TestCase):
         self.assertEqual(_host_prepare_ipc_mode({"MDL_HOST_PREPARE_IPC": "memfd"}), "memfd")
         self.assertEqual(_host_prepare_ipc_mode({"MDL_HOST_PREPARE_IPC": "share"}), "share")
 
-    def test_auto_defaults_to_memfd_even_when_shm_large(self) -> None:
-        # share is opt-in: automatic share selection previously ratcheted RSS.
+    def test_auto_picks_share_when_shm_large(self) -> None:
+        # Prod nodes have large /dev/shm: prefer zero-copy share for util.
+        # Parent privatize + pinned pool prevents the old RSS ratchet.
         with mock.patch(
             "src.train._dev_shm_free_bytes",
             return_value=_HOST_PREPARE_SHARE_SHM_BYTES,
         ):
-            self.assertEqual(_host_prepare_ipc_mode({}), "memfd")
-            self.assertEqual(_host_prepare_ipc_mode({"MDL_HOST_PREPARE_IPC": "auto"}), "memfd")
+            self.assertEqual(_host_prepare_ipc_mode({}), "share")
+            self.assertEqual(_host_prepare_ipc_mode({"MDL_HOST_PREPARE_IPC": "auto"}), "share")
 
     def test_auto_picks_memfd_when_shm_tiny(self) -> None:
         with mock.patch("src.train._dev_shm_free_bytes", return_value=64 * 1024 * 1024):

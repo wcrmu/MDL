@@ -697,18 +697,18 @@ def _configure_nccl_runtime_env(
     # Fail collectives when a peer dies/errors instead of blocking until the
     # 600s step watchdog. Explicit exports always win over this default.
     env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
-    # Cap NCCL scratch / channel memory so 6–8 GPU jobs keep HBM headroom for
-    # activation peaks (8-GPU OneTrans OOMed in backward under default buffers).
-    env.setdefault("NCCL_BUFFSIZE", str(2 * 1024 * 1024))
-    env.setdefault("NCCL_CUMEM_ENABLE", "0")
     # Read WORLD_SIZE from the target mapping (launcher may pass a child env
     # before torchrun rewrites the parent process environ).
     try:
         world_size = int(env.get("WORLD_SIZE", "1") or "1")
     except ValueError:
         world_size = 1
-    # Fewer channels → less per-rank NCCL HBM; slight collective BW trade.
+    # NCCL scratch/channel caps are HBM insurance for 6–8 GPU peaks. Applying
+    # them on 2–4 GPU jobs cut emb A2A / allreduce BW and showed up as a
+    # "util cliff" even when users scaled back down to 4 GPUs.
     if world_size >= 6:
+        env.setdefault("NCCL_BUFFSIZE", str(2 * 1024 * 1024))
+        env.setdefault("NCCL_CUMEM_ENABLE", "0")
         env.setdefault("NCCL_MAX_NCHANNELS", "4")
     if "NCCL_IGNORE_DISABLED_P2P" in env:
         return
@@ -2474,15 +2474,18 @@ def _host_prepare_ipc_mode(
     """Pick host-prepare IPC transport: ``share`` (zero-copy) or ``memfd``.
 
     Override with ``MDL_HOST_PREPARE_IPC=share|memfd|auto`` (default auto).
-    ``auto`` and unknown values resolve to ``memfd``: long industrial runs with
-    automatic ``share`` selection saw linear container RSS growth from
-    ``share_memory_`` / pinned IPC handles. Opt back into ``share`` explicitly
-    when shm headroom and RSS behavior have been validated on the cluster.
+    ``auto`` prefers ``share`` when ``/dev/shm`` has headroom (zero-copy Queue
+    handles — critical for RankMixer util on 2–4 GPU). Tiny containers fall
+    back to ``memfd``. Parent always privatizes/pins via the recycled pool so
+    ``share`` no longer ratchets RSS the way the old pin-before-share path did.
     """
 
     env = os.environ if environ is None else environ
     forced = str(env.get("MDL_HOST_PREPARE_IPC", "auto")).strip().lower()
-    if forced == "share":
+    if forced in {"share", "memfd"}:
+        return forced
+    shm_free = _dev_shm_free_bytes()
+    if shm_free >= _HOST_PREPARE_SHARE_SHM_BYTES:
         return "share"
     return "memfd"
 
