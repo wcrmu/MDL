@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import queue
 import time
 import unittest
@@ -16,6 +17,7 @@ from src.dataloader import (
 )
 from src.train import (
     _ProcessHostPrepareIterator,
+    _is_host_prepare_ipc_teardown_error,
     _terminate_process_group,
 )
 
@@ -163,6 +165,46 @@ class HostPrepareWatchdogTest(unittest.TestCase):
         iterator._queue._reader.close.assert_called_once_with()
         iterator._queue._writer.close.assert_called_once_with()
         iterator._queue.join_thread.assert_not_called()
+
+    def test_teardown_error_helper_narrows_oserror(self) -> None:
+        self.assertTrue(_is_host_prepare_ipc_teardown_error(BrokenPipeError()))
+        self.assertTrue(_is_host_prepare_ipc_teardown_error(EOFError()))
+        self.assertTrue(
+            _is_host_prepare_ipc_teardown_error(OSError(errno.EPIPE, "Broken pipe"))
+        )
+        # Mid-run HDFS / shm failures must surface to the parent queue.
+        self.assertFalse(
+            _is_host_prepare_ipc_teardown_error(OSError("Filesystem closed"))
+        )
+        self.assertFalse(
+            _is_host_prepare_ipc_teardown_error(OSError(errno.ENOMEM, "Cannot allocate"))
+        )
+
+    def test_dead_child_without_terminal_is_remote_io_stall(self) -> None:
+        iterator = _ProcessHostPrepareIterator.__new__(_ProcessHostPrepareIterator)
+        iterator._pin_memory = False
+        iterator._ipc_mode = "memfd"
+        iterator._closed = False
+        iterator._startup_timeout_sec = None
+        iterator._idle_timeout_sec = None
+        iterator._started_at = 0.0
+        iterator._last_progress_at = 0.0
+        iterator._received_item = True
+        iterator._progress_mtime = None
+        iterator._queue = MagicMock()
+        iterator._queue.get.side_effect = queue.Empty
+        iterator._queue.empty.return_value = True
+        iterator._process = MagicMock()
+        iterator._process.is_alive.return_value = False
+        iterator._process.exitcode = -9
+
+        with patch.object(iterator, "close") as close, self.assertRaises(
+            RemoteIoStallError
+        ) as raised:
+            next(iterator)
+        self.assertIn("exitcode=-9", str(raised.exception))
+        self.assertIn("without a terminal queue item", str(raised.exception))
+        close.assert_called_once()
 
     def test_close_unblocks_queue_before_terminate(self) -> None:
         iterator = _ProcessHostPrepareIterator.__new__(_ProcessHostPrepareIterator)

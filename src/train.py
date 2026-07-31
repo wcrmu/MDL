@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from importlib import import_module
+import errno
 import gc
 import inspect
 import logging
@@ -2279,18 +2280,35 @@ def _host_prepare_ipc_mode(
     """Pick host-prepare IPC transport: ``share`` (zero-copy) or ``memfd``.
 
     Override with ``MDL_HOST_PREPARE_IPC=share|memfd|auto`` (default auto).
-    ``share`` needs enough ``/dev/shm`` for pinned ``share_memory_`` queues;
-    otherwise we keep the memfd path that works under 64MiB containers.
+    ``auto`` and unknown values resolve to ``memfd``: long industrial runs with
+    automatic ``share`` selection saw linear container RSS growth from
+    ``share_memory_`` / pinned IPC handles. Opt back into ``share`` explicitly
+    when shm headroom and RSS behavior have been validated on the cluster.
     """
 
     env = os.environ if environ is None else environ
     forced = str(env.get("MDL_HOST_PREPARE_IPC", "auto")).strip().lower()
-    if forced in {"share", "memfd"}:
-        return forced
-    shm_free = _dev_shm_free_bytes()
-    if shm_free >= _HOST_PREPARE_SHARE_SHM_BYTES:
+    if forced == "share":
         return "share"
     return "memfd"
+
+
+def _release_cached_host_allocator_memory() -> None:
+    """Return idle CUDA host-allocator slabs to the OS when the runtime allows.
+
+    Variable-length ``pin_memory()`` traffic otherwise leaves the host caching
+    allocator at its high-water mark so container RSS climbs for hours after
+    FeatureBatch Python refs are already gone.
+    """
+
+    try:
+        empty = getattr(torch._C, "_host_emptyCache", None)
+        if empty is None:
+            empty = getattr(torch._C, "_accelerator_emptyHostCache", None)
+        if callable(empty):
+            empty()
+    except Exception:
+        pass
 
 
 def _share_cpu_tensor_tree(value: Any) -> Any:
@@ -2570,12 +2588,11 @@ def _host_prepare_process_body(
     _beat = progress_beat
     os.environ["MDL_HOST_PREPARE_PROCESS"] = "1"
     use_share = ipc_mode == "share"
-    shm_free = _dev_shm_free_bytes()
-    shm_ok_for_pin_share = shm_free >= _HOST_PREPARE_SHARE_SHM_BYTES
-    if not use_share or not shm_ok_for_pin_share:
-        # Memfd, or forced share under tiny /dev/shm: pin on the parent and
-        # hide CUDA so the child never steals a torchrun-remapped device.
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # CPU-only child: never touch a torchrun-remapped CUDA device. Pinning is
+    # done in the parent after privatizing IPC buffers (avoids pinned pages in
+    # /dev/shm that ratchet container RSS across long runs).
+    del pin_memory
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
     share_dir = _configure_host_prepare_tensor_sharing()
     if use_share:
         try:
@@ -2600,10 +2617,6 @@ def _host_prepare_process_body(
         split = config.data.train if split_name == "train" else config.data.test
         if split is None:
             raise ValueError(f"split {split_name!r} is not configured")
-        # Pin-in-child needs CUDA + enough /dev/shm for pinned share_memory_.
-        child_pin = bool(
-            pin_memory and use_share and shm_ok_for_pin_share and torch.cuda.is_available()
-        )
         _beat("before-table-iter")
         table_iter = _iter_batch_tables(
             config,
@@ -2629,9 +2642,7 @@ def _host_prepare_process_body(
                         include_group_id,
                     )
                     if coalesce_tensors:
-                        batch = _coalesce_feature_batch(batch, pin_memory=child_pin)
-                    elif child_pin:
-                        batch = pin_feature_batch(batch, coalesce_tensors=False)
+                        batch = _coalesce_feature_batch(batch, pin_memory=False)
                 if use_share:
                     _queue_put_interruptible(
                         queue, _share_feature_batch_for_ipc(batch)
@@ -2653,14 +2664,20 @@ def _host_prepare_process_body(
                     except Exception:
                         pass
             _queue_put_interruptible(queue, None)
-        except (BrokenPipeError, EOFError, OSError):
-            # Parent closed the IPC queue during teardown; exit quietly.
-            return
+        except BaseException as error:  # noqa: BLE001 - classify teardown vs real IO
+            # Only swallow parent-closed-queue teardown. A bare ``except OSError``
+            # previously hid HDFS/shm failures: the child exited with an empty
+            # queue and the parent only saw "exited without a terminal queue item".
+            if _is_host_prepare_ipc_teardown_error(error):
+                return
+            raise
         finally:
             close = getattr(table_iter, "close", None)
             if callable(close):
                 close()
     except BaseException as error:  # noqa: BLE001 - propagate to parent
+        if _is_host_prepare_ipc_teardown_error(error):
+            return
         if isinstance(error, RemoteIoStallError):
             try:
                 _queue_put_interruptible(queue, error)
@@ -2699,6 +2716,29 @@ def _install_host_prepare_shutdown_handlers() -> None:
 
     signal.signal(signal.SIGTERM, _exit_immediately)
     signal.signal(signal.SIGINT, _exit_immediately)
+
+
+def _is_host_prepare_ipc_teardown_error(error: BaseException) -> bool:
+    """True when the parent already tore down the host-prepare IPC queue.
+
+    Mid-run HDFS/shm ``OSError`` must NOT match: those need to be reported on
+    the queue so the train rank fails with a real root cause instead of
+    ``host prepare process exited without a terminal queue item``.
+    """
+
+    if isinstance(error, (BrokenPipeError, EOFError)):
+        return True
+    if not isinstance(error, OSError):
+        return False
+    errno_value = getattr(error, "errno", None)
+    if errno_value in {errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED}:
+        return True
+    text = str(error).lower()
+    return (
+        "broken pipe" in text
+        or "connection reset" in text
+        or "handle is closed" in text
+    )
 
 
 def _queue_put_interruptible(
@@ -2925,16 +2965,18 @@ class _ProcessHostPrepareIterator:
                 torch_mp.set_sharing_strategy("file_system")
             except (RuntimeError, ValueError, AttributeError):
                 pass
+        # Platform trainjob logs often capture stdout only (Train step | …),
+        # not the Python logging handlers — print so IPC mode is searchable.
+        ipc_message = (
+            f"host-prepare IPC mode={self._ipc_mode} "
+            f"shm_free_mib={(_dev_shm_free_bytes() or 0) / (1024 * 1024):.1f} "
+            f"pin_memory={self._pin_memory} "
+            f"startup_timeout={self._startup_timeout_sec} "
+            f"idle_timeout={self._idle_timeout_sec}"
+        )
+        logger.info("%s", ipc_message)
         if is_main_process():
-            logger.info(
-                "host-prepare IPC mode=%s (shm_free=%.1fMiB, pin_memory=%s, "
-                "startup_timeout=%s idle_timeout=%s)",
-                self._ipc_mode,
-                (_dev_shm_free_bytes() or 0) / (1024 * 1024),
-                self._pin_memory,
-                self._startup_timeout_sec,
-                self._idle_timeout_sec,
-            )
+            print(ipc_message, flush=True)
         self._queue: Any = self._ctx.Queue(maxsize=int(queue_size))
         self._process = self._ctx.Process(
             target=_host_prepare_process_main,
@@ -3054,9 +3096,15 @@ class _ProcessHostPrepareIterator:
                 except Exception:
                     alive = False
                 if not alive and self._queue.empty():
+                    exitcode = getattr(self._process, "exitcode", None)
                     self.close()
-                    raise RuntimeError(
-                        "host prepare process exited without a terminal queue item"
+                    # Treat as retryable remote/IO stall: platform launchers map
+                    # exit 70 to restart. Include exitcode so SIGKILL (-9) /
+                    # native crashes are distinguishable from swallowed errors.
+                    raise RemoteIoStallError(
+                        "host-prepare process exited without a terminal queue "
+                        f"item (exitcode={exitcode!r}); child likely crashed in "
+                        "native/HDFS code or failed before reporting an error"
                     )
                 self._raise_if_child_stalled()
                 continue
@@ -3082,16 +3130,22 @@ class _ProcessHostPrepareIterator:
             # share_memory_ IPC: always clone off shared storages in the parent.
             # Returning already-pinned shared buffers used to keep /dev/shm files
             # alive across steps and ratchet parent RSS.
-            if self._pin_memory:
-                return pin_feature_batch(item, coalesce_tensors=False)
-            return privatize_shared_feature_batch(item)
+            try:
+                if self._pin_memory:
+                    return pin_feature_batch(item, coalesce_tensors=False)
+                return privatize_shared_feature_batch(item)
+            finally:
+                del item
         if not isinstance(item, dict):
             self.close()
             raise TypeError(
                 f"host prepare process returned {type(item).__name__}, "
                 "expected FeatureBatch or memfd payload dict"
             )
-        return _load_feature_batch_from_ipc(item, pin_memory=self._pin_memory)
+        try:
+            return _load_feature_batch_from_ipc(item, pin_memory=self._pin_memory)
+        finally:
+            del item
 
     def close(self) -> None:
         if self._closed:
@@ -5314,6 +5368,15 @@ def train_mdl(
                 and context.rank == 0
                 and steps % config.training.log_every_steps == 0
             )
+            # Drop idle pinned-host slabs on every rank at the log cadence so
+            # variable-length pin_memory traffic cannot ratchet container RSS
+            # for the whole job. Cheap when the host allocator has nothing idle.
+            if (
+                device.type == "cuda"
+                and config.training.log_every_steps > 0
+                and steps % config.training.log_every_steps == 0
+            ):
+                _release_cached_host_allocator_memory()
             if should_log:
                 last_loss = float(last_loss_tensor.float().cpu().item())
                 payload_mib = sparse_sync_stats.logical_payload_bytes / (1024 ** 2)
