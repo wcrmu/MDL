@@ -7595,6 +7595,10 @@ class FeatureBatch:
     # Optional same-dtype base buffers. Tensor leaves are views into these
     # buffers so one H2D copy per dtype replaces hundreds of small copies.
     _packed_buffers: tuple[Tensor, ...] = field(default_factory=tuple, repr=False)
+    # Opaque owner for recycled pinned-host leases (see train._PinnedHostBufferPool).
+    # Kept alive for the FeatureBatch lifetime so pooled storages are not reused
+    # while views still exist; ignored by equality / repr.
+    _keepalive: Any = field(default=None, repr=False, compare=False)
 
 
 # --- Column accessors ---

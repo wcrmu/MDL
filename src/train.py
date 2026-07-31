@@ -52,6 +52,7 @@ from .dataloader import (
     _adapter_request_level_sources,
     _coalesce_feature_batch,
     _column_array,
+    _map_feature_value,
     _require_pyarrow,
     _safe_table_take,
     abort_rank_for_remote_io_stall,
@@ -2472,6 +2473,92 @@ def _release_cached_host_allocator_memory() -> None:
         pass
 
 
+class _PinnedPoolLease:
+    """Owns one pooled pinned-buffer slot until the FeatureBatch is collected."""
+
+    __slots__ = ("_pool", "_slot", "_released")
+
+    def __init__(
+        self,
+        pool: "_PinnedHostBufferPool",
+        slot: dict[torch.dtype, Tensor],
+    ) -> None:
+        self._pool = pool
+        self._slot = slot
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        slot = self._slot
+        self._slot = {}
+        pool = self._pool
+        self._pool = None  # type: ignore[assignment]
+        if slot is not None and pool is not None:
+            pool._release(slot)
+
+    def __del__(self) -> None:
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+class _PinnedHostBufferPool:
+    """Recycle pinned host storages across variable-length FeatureBatches.
+
+    Fresh ``torch.empty(..., pin_memory=True)`` per batch lets the CUDA caching
+    host allocator ratchet RSS with every new size class. Outstanding batches
+    instead exclusive-lease a small set of grow-only buffers; when the batch is
+    GC'd the lease returns the slot for the next materialization.
+    """
+
+    def __init__(self, *, max_free_slots: int = 8) -> None:
+        self._free: list[dict[torch.dtype, Tensor]] = []
+        self._lock = threading.Lock()
+        self._max_free_slots = max(1, int(max_free_slots))
+        self._checkouts = 0
+        self._reuses = 0
+
+    def checkout(
+        self,
+        specs: list[tuple[torch.dtype, int]],
+    ) -> tuple[list[Tensor], _PinnedPoolLease]:
+        with self._lock:
+            slot = self._free.pop() if self._free else {}
+            reused = bool(slot)
+            if reused:
+                self._reuses += 1
+            self._checkouts += 1
+        views: list[Tensor] = []
+        grew = False
+        for dtype, numel in specs:
+            if numel <= 0:
+                raise ValueError("pinned pool numel must be positive")
+            buf = slot.get(dtype)
+            if buf is None or int(buf.numel()) < int(numel):
+                alloc = max(int(numel), int(int(numel) * 5 // 4))
+                if buf is not None:
+                    grew = True
+                buf = torch.empty(alloc, dtype=dtype, pin_memory=True)
+                slot[dtype] = buf
+            views.append(buf.narrow(0, 0, int(numel)))
+        if grew:
+            # Previous smaller slab is now unreferenced; return it to the OS.
+            _release_cached_host_allocator_memory()
+        return views, _PinnedPoolLease(self, slot)
+
+    def _release(self, slot: dict[torch.dtype, Tensor]) -> None:
+        with self._lock:
+            if len(self._free) < self._max_free_slots:
+                self._free.append(slot)
+                return
+        # Drop the extra slot so idle high-water pinned pages can be reclaimed.
+        del slot
+        _release_cached_host_allocator_memory()
+
+
 def _share_cpu_tensor_tree(value: Any) -> Any:
     """Move CPU tensor storages into shared memory for ForkingPickler IPC."""
 
@@ -2561,6 +2648,48 @@ def _tensor_to_raw_bytes(buffer: Tensor) -> bytes:
     return array.tobytes()
 
 
+def _pin_feature_batch_with_pool(
+    batch: FeatureBatch,
+    *,
+    pool: _PinnedHostBufferPool | None,
+) -> FeatureBatch:
+    """Clone shared/unpinned coalesced buffers into a recycled pinned lease."""
+
+    if pool is None or not batch._packed_buffers:
+        return pin_feature_batch(batch, coalesce_tensors=False)
+    specs = [
+        (buffer.dtype, int(buffer.numel())) for buffer in batch._packed_buffers
+    ]
+    views, lease = pool.checkout(specs)
+    for dst, src in zip(views, batch._packed_buffers):
+        dst.copy_(src.detach().reshape(-1))
+    pinned_by_dtype = {buffer.dtype: buffer for buffer in views}
+
+    def pin_view(tensor: Tensor) -> Tensor:
+        base = pinned_by_dtype[tensor.dtype]
+        return base.as_strided(
+            tensor.size(),
+            tensor.stride(),
+            tensor.storage_offset(),
+        )
+
+    return FeatureBatch(
+        features={
+            key: _map_feature_value(value, pin_view)
+            for key, value in batch.features.items()
+        },
+        labels=None if batch.labels is None else pin_view(batch.labels),
+        label_mask=(
+            None if batch.label_mask is None else pin_view(batch.label_mask)
+        ),
+        scenario_id=pin_view(batch.scenario_id),
+        group_id=batch.group_id,
+        prediction_keys=batch.prediction_keys,
+        _packed_buffers=tuple(views),
+        _keepalive=lease,
+    )
+
+
 def _raw_bytes_to_tensor(
     raw: memoryview | bytes,
     *,
@@ -2581,11 +2710,27 @@ def _raw_bytes_to_tensor(
     return tensor
 
 
+def _write_tensor_into_mmap(mapped: Any, offset: int, buffer: Tensor) -> int:
+    """Copy one CPU tensor into ``mapped`` at ``offset``; return bytes written."""
+
+    contiguous = buffer.detach().contiguous()
+    if contiguous.dtype == torch.bfloat16:
+        array = contiguous.view(torch.uint16).numpy().reshape(-1)
+    else:
+        array = contiguous.numpy().reshape(-1)
+        if not array.flags["C_CONTIGUOUS"]:
+            array = np.ascontiguousarray(array)
+    raw = memoryview(array).cast("B")
+    end = offset + len(raw)
+    mapped[offset:end] = raw
+    return len(raw)
+
+
 def _spill_feature_batch_for_ipc(batch: FeatureBatch, share_dir: Path) -> dict[str, Any]:
     """Pack coalesced buffers into an anonymous memfd Queue payload.
 
-    Writes each buffer sequentially into the memfd (no giant ``b"".join`` peak)
-    so large batches stay within tiny-container memory headroom.
+    Writes each buffer straight into the memfd (no intermediate ``bytes`` list)
+    so the child does not hold a second full copy of the batch while queuing.
     """
 
     del share_dir
@@ -2594,23 +2739,29 @@ def _spill_feature_batch_for_ipc(batch: FeatureBatch, share_dir: Path) -> dict[s
     import mmap
     from multiprocessing.reduction import DupFd
 
-    chunks = [_tensor_to_raw_bytes(buffer) for buffer in batch._packed_buffers]
+    sizes = [
+        int(buffer.numel()) * int(buffer.element_size())
+        for buffer in batch._packed_buffers
+    ]
+    total = int(sum(sizes))
     buffer_records: list[tuple[str, int, int]] = []
     offset = 0
-    for buffer, chunk in zip(batch._packed_buffers, chunks):
-        buffer_records.append((str(buffer.dtype), len(chunk), offset))
-        offset += len(chunk)
-    total = offset
+    for buffer, nbytes in zip(batch._packed_buffers, sizes):
+        buffer_records.append((str(buffer.dtype), int(nbytes), offset))
+        offset += int(nbytes)
     fd = os.memfd_create(f"mdl-host-prep-{time_ns()}", 0)
     try:
         os.ftruncate(fd, total)
         mapped = mmap.mmap(fd, total)
         try:
             cursor = 0
-            for chunk in chunks:
-                end = cursor + len(chunk)
-                mapped[cursor:end] = chunk
-                cursor = end
+            for buffer, nbytes in zip(batch._packed_buffers, sizes):
+                written = _write_tensor_into_mmap(mapped, cursor, buffer)
+                if written != nbytes:
+                    raise RuntimeError(
+                        f"memfd write size mismatch: wrote {written}, expected {nbytes}"
+                    )
+                cursor += written
             mapped.flush()
         finally:
             mapped.close()
@@ -2634,6 +2785,7 @@ def _load_feature_batch_from_ipc(
     payload: dict[str, Any],
     *,
     pin_memory: bool,
+    pinned_pool: _PinnedHostBufferPool | None = None,
 ) -> FeatureBatch:
     import mmap
 
@@ -2642,12 +2794,38 @@ def _load_feature_batch_from_ipc(
     try:
         mapped = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
         try:
-            buffers: list[Tensor] = []
-            for dtype_name, nbytes, offset in payload["buffers"]:
+            records = list(payload["buffers"])
+            dtypes: list[torch.dtype] = []
+            raw_slices: list[Any] = []
+            specs: list[tuple[torch.dtype, int]] = []
+            for dtype_name, nbytes, offset in records:
                 dtype = getattr(torch, dtype_name.removeprefix("torch."))
+                dtypes.append(dtype)
                 # mmap slice returns bytes (a copy); safe to close afterward.
-                raw = mapped[offset : offset + nbytes]
-                buffers.append(_raw_bytes_to_tensor(raw, dtype=dtype, pin_memory=pin_memory))
+                raw = mapped[offset : offset + int(nbytes)]
+                raw_slices.append(raw)
+                itemsize = 2 if dtype == torch.bfloat16 else dtype.itemsize
+                specs.append((dtype, int(nbytes) // int(itemsize)))
+            lease: _PinnedPoolLease | None = None
+            if pin_memory and pinned_pool is not None:
+                buffers, lease = pinned_pool.checkout(specs)
+                for buffer, raw, dtype in zip(buffers, raw_slices, dtypes):
+                    if dtype == torch.bfloat16:
+                        buffer.view(torch.uint16).numpy()[:] = np.frombuffer(
+                            raw, dtype=np.uint16
+                        )
+                    else:
+                        np_dtype = _DTYPE_TO_NUMPY.get(dtype)
+                        if np_dtype is None:
+                            raise TypeError(
+                                f"unsupported packed dtype for host-prepare IPC: {dtype}"
+                            )
+                        buffer.numpy()[:] = np.frombuffer(raw, dtype=np_dtype)
+            else:
+                buffers = [
+                    _raw_bytes_to_tensor(raw, dtype=dtype, pin_memory=pin_memory)
+                    for raw, dtype in zip(raw_slices, dtypes)
+                ]
             buffer_tuple = tuple(buffers)
             labels = payload["labels"]
             label_mask = payload["label_mask"]
@@ -2661,6 +2839,7 @@ def _load_feature_batch_from_ipc(
                 group_id=list(payload["group_id"]),
                 prediction_keys=dict(payload["prediction_keys"]),
                 _packed_buffers=buffer_tuple,
+                _keepalive=lease,
             )
         finally:
             mapped.close()
@@ -2754,7 +2933,13 @@ def _host_prepare_process_body(
     # /dev/shm that ratchet container RSS across long runs).
     del pin_memory
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    share_dir = _configure_host_prepare_tensor_sharing()
+    # memfd mode must not redirect TMPDIR onto /dev/shm — leftover torch/Arrow
+    # temp files there count against container Working Set and look like a leak.
+    share_dir = (
+        _configure_host_prepare_tensor_sharing()
+        if use_share
+        else Path(tempfile.gettempdir())
+    )
     if use_share:
         try:
             import torch.multiprocessing as torch_mp
@@ -2817,13 +3002,16 @@ def _host_prepare_process_body(
                 # arenas are not pinned by the previous loop iteration.
                 del batch
                 produced += 1
-                if produced % 32 == 0:
-                    try:
-                        import pyarrow as pa
+                # Release every batch: industrial Arrow/HDFS pools otherwise
+                # climb for the whole epoch and dominate pod Working Set.
+                try:
+                    import pyarrow as pa
 
-                        pa.default_memory_pool().release_unused()
-                    except Exception:
-                        pass
+                    pa.default_memory_pool().release_unused()
+                except Exception:
+                    pass
+                if produced % 64 == 0:
+                    gc.collect()
             _queue_put_interruptible(queue, None)
         except BaseException as error:  # noqa: BLE001 - classify teardown vs real IO
             # Only swallow parent-closed-queue teardown. A bare ``except OSError``
@@ -3096,6 +3284,13 @@ class _ProcessHostPrepareIterator:
         self._pin_memory = bool(pin_memory)
         self._ipc_mode = _host_prepare_ipc_mode()
         self._closed = False
+        # Recycle pinned pages across the prefetch depth so variable-length
+        # batches cannot ratchet the CUDA host caching allocator forever.
+        self._pinned_pool = (
+            _PinnedHostBufferPool(max_free_slots=max(4, int(queue_size) + 2))
+            if self._pin_memory
+            else None
+        )
         split = config.data.train if split_name == "train" else config.data.test
         reader = split.reader if split is not None else None
         self._startup_timeout_sec = (
@@ -3117,8 +3312,9 @@ class _ProcessHostPrepareIterator:
         # child can no longer run Python).
         self._ctx = mp.get_context("spawn")
         self._progress_mtime = self._ctx.Value("d", time())
-        _configure_host_prepare_tensor_sharing()
+        # Only share-mode needs torch file_system IPC under /dev/shm.
         if self._ipc_mode == "share":
+            _configure_host_prepare_tensor_sharing()
             try:
                 import torch.multiprocessing as torch_mp
 
@@ -3132,6 +3328,7 @@ class _ProcessHostPrepareIterator:
             f"host-prepare IPC mode={self._ipc_mode} "
             f"shm_free_mib={(_dev_shm_free_bytes() or 0) / (1024 * 1024):.1f} "
             f"pin_memory={self._pin_memory} "
+            f"pinned_pool={'on' if self._pinned_pool is not None else 'off'} "
             f"startup_timeout={self._startup_timeout_sec} "
             f"idle_timeout={self._idle_timeout_sec}"
         )
@@ -3293,7 +3490,9 @@ class _ProcessHostPrepareIterator:
             # alive across steps and ratchet parent RSS.
             try:
                 if self._pin_memory:
-                    return pin_feature_batch(item, coalesce_tensors=False)
+                    return _pin_feature_batch_with_pool(
+                        item, pool=self._pinned_pool
+                    )
                 return privatize_shared_feature_batch(item)
             finally:
                 del item
@@ -3304,7 +3503,11 @@ class _ProcessHostPrepareIterator:
                 "expected FeatureBatch or memfd payload dict"
             )
         try:
-            return _load_feature_batch_from_ipc(item, pin_memory=self._pin_memory)
+            return _load_feature_batch_from_ipc(
+                item,
+                pin_memory=self._pin_memory,
+                pinned_pool=self._pinned_pool,
+            )
         finally:
             del item
 
@@ -3413,7 +3616,7 @@ class _OverlappedHostPrepareIterator:
             close()
 
 
-@dataclass(frozen=True)
+@dataclass
 class _DevicePrefetchItem:
     host_batch: FeatureBatch | None = None
     batch: FeatureBatch | None = None
@@ -3553,7 +3756,13 @@ class _DevicePrefetchIterator:
     def __next__(self) -> FeatureBatch:
         item = self._next_item()
         assert item.batch is not None
-        return item.batch
+        device_batch = item.batch
+        # H2D has completed (wait_event in _next_item). Drop the host FeatureBatch
+        # immediately so recycled pinned leases return to the pool instead of
+        # lingering until the next GC cycle.
+        item.host_batch = None
+        item.batch = None
+        return device_batch
 
     def next_with_host(self) -> tuple[FeatureBatch, FeatureBatch]:
         """Return matching host/device views for pre-update evaluation replay."""
@@ -3562,7 +3771,11 @@ class _DevicePrefetchIterator:
         if item.host_batch is None or item.batch is None:
             self.close()
             raise RuntimeError("CUDA-prefetch item did not retain its host batch")
-        return item.host_batch, item.batch
+        host_batch = item.host_batch
+        device_batch = item.batch
+        item.host_batch = None
+        item.batch = None
+        return host_batch, device_batch
 
     def close(self) -> None:
         self.stop_event.set()
@@ -5531,15 +5744,14 @@ def train_mdl(
                 and context.rank == 0
                 and steps % config.training.log_every_steps == 0
             )
-            # Drop idle pinned-host slabs on every rank at the log cadence so
-            # variable-length pin_memory traffic cannot ratchet container RSS
-            # for the whole job. Cheap when the host allocator has nothing idle.
-            if (
-                device.type == "cuda"
-                and config.training.log_every_steps > 0
-                and steps % config.training.log_every_steps == 0
-            ):
+            # Flush idle pinned-host slabs frequently. With variable-length
+            # batches the CUDA caching host allocator otherwise keeps every
+            # size-class high-water mark for the whole job (pod RSS climbs
+            # linearly for hours even after FeatureBatch refs are gone).
+            if device.type == "cuda" and steps > 0 and steps % 10 == 0:
                 _release_cached_host_allocator_memory()
+                if steps % 100 == 0:
+                    gc.collect()
             if should_log:
                 last_loss = float(last_loss_tensor.float().cpu().item())
                 payload_mib = sparse_sync_stats.logical_payload_bytes / (1024 ** 2)
