@@ -7090,13 +7090,17 @@ def _initialize_adapter_process(
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-    # Pin each adapter worker away from the parent's first cores so
-    # prepare/tensorize keep warm cache/bandwidth for the critical path.
+    # Stay inside the parent process affinity (rank-local slice on 6/8 GPU).
+    # The old ``4 + pid % (n-4)`` pin stole cores from sibling ranks' prepare.
     try:
         import psutil
 
-        n_cpu = psutil.cpu_count(logical=True) or 4
-        core = 4 + (os.getpid() % max(1, n_cpu - 4))
+        allowed = list(psutil.Process().cpu_affinity())
+        if allowed:
+            core = allowed[os.getpid() % len(allowed)]
+        else:
+            n_cpu = psutil.cpu_count(logical=True) or 4
+            core = 4 + (os.getpid() % max(1, n_cpu - 4))
         psutil.Process().cpu_affinity([core])
     except Exception:
         pass
@@ -7164,15 +7168,10 @@ def _iter_process_adapter_results(
     try:
         import psutil
 
-        # Prefer parent prepare/tensorize when cores are contended: adapter
-        # workers are throughput-oriented background producers. A dedicated
-        # host-prepare process keeps a wider affinity so pack+tensorize is not
-        # stuck on 4 cores while training occupies the rest of the machine.
-        n_cpu = int(psutil.cpu_count(logical=True) or 4)
-        if os.environ.get("MDL_HOST_PREPARE_PROCESS") == "1":
-            prepare_cores = min(max(16, n_cpu // 3), n_cpu)
-            psutil.Process().cpu_affinity(list(range(prepare_cores)))
-        else:
+        # Host-prepare already applied a LOCAL_RANK CPU slice — do not stomp
+        # it back onto cores 0..N/3 (that collapses 6/8-GPU prepare onto the
+        # same CPUs). In-process prepare keeps a small default pin.
+        if os.environ.get("MDL_HOST_PREPARE_PROCESS") != "1":
             psutil.Process().cpu_affinity([0, 1, 2, 3])
     except Exception:
         pass

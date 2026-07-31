@@ -676,6 +676,8 @@ def _local_cuda_p2p_accessible() -> bool | None:
 
 def _configure_nccl_runtime_env(
     environ: MutableMapping[str, str] | None = None,
+    *,
+    prefer_collective_bw: bool = False,
 ) -> None:
     """Use CUDA P2P when healthy; otherwise tell NCCL to fall back safely.
 
@@ -688,6 +690,10 @@ def _configure_nccl_runtime_env(
       ``NCCL_IGNORE_DISABLED_P2P=1``: still try P2P when the fabric allows
       it, but do not abort if the driver/NVLink reports disabled P2P.
     - Explicit env exports always win.
+
+    ``prefer_collective_bw`` (RankMixer-family): keep larger NCCL buffers /
+    full channel count so emb A2A is not BW-starved on 6–8 GPU. OneTrans-style
+    models keep the tighter HBM caps.
 
     ``environ`` defaults to ``os.environ``; the DDP launcher may pass a copied
     dict so child processes inherit the decision.
@@ -707,9 +713,14 @@ def _configure_nccl_runtime_env(
     # them on 2–4 GPU jobs cut emb A2A / allreduce BW and showed up as a
     # "util cliff" even when users scaled back down to 4 GPUs.
     if world_size >= 6:
-        env.setdefault("NCCL_BUFFSIZE", str(2 * 1024 * 1024))
         env.setdefault("NCCL_CUMEM_ENABLE", "0")
-        env.setdefault("NCCL_MAX_NCHANNELS", "4")
+        if prefer_collective_bw:
+            # Emb-bound shallow backbones: larger scratch, leave channel count
+            # to NCCL so A2A can use the full NVLink/PCIe fabric.
+            env.setdefault("NCCL_BUFFSIZE", str(8 * 1024 * 1024))
+        else:
+            env.setdefault("NCCL_BUFFSIZE", str(2 * 1024 * 1024))
+            env.setdefault("NCCL_MAX_NCHANNELS", "4")
     if "NCCL_IGNORE_DISABLED_P2P" in env:
         return
     accessible = _local_cuda_p2p_accessible()
@@ -743,6 +754,53 @@ def _configure_nccl_runtime_env(
 
 def _is_rankmixer_family(config: AppConfig) -> bool:
     return str(getattr(config.model, "name", "")) in {"rankmixer", "mdl_rankmixer"}
+
+
+def _local_world_size() -> int:
+    """Ranks co-located on this node (torchrun ``LOCAL_WORLD_SIZE``)."""
+
+    local = _env_int("LOCAL_WORLD_SIZE", 0)
+    if local > 0:
+        return local
+    return max(1, _env_int("WORLD_SIZE", 1))
+
+
+def _apply_local_rank_cpu_affinity(role: str) -> list[int]:
+    """Partition host CPUs across local ranks so 6/8-GPU prepare does not collide.
+
+    Every rank used to pin its host-prepare child to ``0..n_cpu//3`` and the
+    train parent to the remainder — on 6–8 GPU that means six prepare children
+    fighting over the same cores while train threads also overlap. Slice the
+    machine by ``LOCAL_RANK`` instead.
+    """
+
+    try:
+        import psutil
+    except ImportError:
+        return []
+    n_cpu = int(psutil.cpu_count(logical=True) or 4)
+    local_world = _local_world_size()
+    local_rank = max(0, min(_env_int("LOCAL_RANK", 0), local_world - 1))
+    slice_size = max(1, n_cpu // local_world)
+    start = local_rank * slice_size
+    end = n_cpu if local_rank == local_world - 1 else start + slice_size
+    slice_cores = list(range(start, end))
+    if not slice_cores:
+        return []
+    if role == "host_prepare":
+        # Pack/tensorize is CPU-heavy: take ~2/3 of the rank slice.
+        n_prep = max(2, (len(slice_cores) * 2) // 3)
+        cores = slice_cores[:n_prep]
+    elif role == "train":
+        n_prep = max(2, (len(slice_cores) * 2) // 3)
+        cores = slice_cores[n_prep:] or slice_cores[-1:]
+    else:
+        cores = slice_cores
+    try:
+        psutil.Process().cpu_affinity(cores)
+    except Exception:
+        return []
+    return cores
 
 
 def _local_batch_scale_for_world_size(
@@ -831,13 +889,14 @@ def _apply_world_size_training_profile(
     # Explicit launcher exports always win.
     if world_size >= 6:
         if rankmixer_family:
-            emb_cap = "768" if world_size >= 8 else "1024"
+            # Keep a full 1 GiB chunk even at 8 GPU — fewer fused-group splits.
+            emb_cap = "1024"
         else:
             emb_cap = "384" if world_size >= 8 else "512"
         os.environ.setdefault("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", emb_cap)
 
     # 8-GPU OneTrans: drop device prefetch (~1× activation) for HBM headroom.
-    # RankMixer keeps device prefetch — util is dominated by emb/H2D bubbles,
+    # RankMixer deepens device prefetch — util is dominated by emb/H2D bubbles,
     # not activation footprint of the 2-layer backbone.
     train = data.train
     if train is not None:
@@ -850,16 +909,33 @@ def _apply_world_size_training_profile(
         ):
             reader = replace(reader, device_prefetch_batches=0)
             reader_changed = True
+        if (
+            rankmixer_family
+            and world_size >= 6
+            and 0 < reader.device_prefetch_batches < 2
+        ):
+            reader = replace(reader, device_prefetch_batches=2)
+            reader_changed = True
         # Deepen host-prepare so pack/tensorize stays ahead of compute when
         # more ranks contend on HDFS/shard tails (6/8 GPU util regressions).
-        target_host = 5 if rankmixer_family and world_size >= 6 else (
-            4 if world_size >= 6 else reader.host_prepare_prefetch
-        )
+        if rankmixer_family and world_size >= 8:
+            target_host = 6
+        elif rankmixer_family and world_size >= 6:
+            target_host = 5
+        elif world_size >= 6:
+            target_host = 4
+        else:
+            target_host = reader.host_prepare_prefetch
         if (
             reader.host_prepare_prefetch > 0
             and reader.host_prepare_prefetch < target_host
         ):
             reader = replace(reader, host_prepare_prefetch=target_host)
+            reader_changed = True
+        # Slightly deeper Arrow/table prefetch on multi-GPU so HDFS shard tails
+        # do not idle the prepare child (host RAM only; not HBM).
+        if world_size >= 6 and 0 < reader.prefetch_batches < 3:
+            reader = replace(reader, prefetch_batches=3)
             reader_changed = True
         if reader_changed:
             train = replace(train, reader=reader)
@@ -870,9 +946,9 @@ def _apply_world_size_training_profile(
     # on 6–8 GPU (YAML often still has 50). RankMixer benefits from even
     # wider buckets (shallow dense finishes before small allreduces overlap).
     if world_size >= 8:
-        target_bucket = 150.0 if rankmixer_family else 125.0
+        target_bucket = 200.0 if rankmixer_family else 125.0
     elif world_size >= 6:
-        target_bucket = 125.0 if rankmixer_family else 100.0
+        target_bucket = 175.0 if rankmixer_family else 100.0
     else:
         target_bucket = ddp.bucket_cap_mb
     if world_size >= 6 and ddp.bucket_cap_mb < target_bucket:
@@ -955,11 +1031,11 @@ def _setup_distributed(config: AppConfig) -> DistributedContext:
 
     if enabled and not torch_dist.is_initialized():
         if device.type == "cuda":
-            # WORLD_SIZE is already set by torchrun here; apply NCCL HBM caps
-            # before ProcessGroupNCCL allocates channel/scratch buffers.
-            _configure_nccl_runtime_env()
-            if world_size >= 8:
-                os.environ.setdefault("NCCL_MAX_NCHANNELS", "4")
+            # WORLD_SIZE is already set by torchrun here; apply NCCL HBM/BW
+            # knobs before ProcessGroupNCCL allocates channel/scratch buffers.
+            _configure_nccl_runtime_env(
+                prefer_collective_bw=_is_rankmixer_family(config),
+            )
         backend = _resolve_process_group_backend(device)
         torch_dist.init_process_group(
             backend=backend,
@@ -2986,14 +3062,9 @@ def _host_prepare_process_body(
             torch_mp.set_sharing_strategy("file_system")
         except (RuntimeError, ValueError, AttributeError):
             pass
-    try:
-        import psutil
-
-        n_cpu = int(psutil.cpu_count(logical=True) or 4)
-        prepare_cores = min(max(16, n_cpu // 3), n_cpu)
-        psutil.Process().cpu_affinity(list(range(prepare_cores)))
-    except Exception:
-        prepare_cores = 16
+    # Inherit LOCAL_RANK from the train parent and take this rank's CPU slice
+    # so 6–8 co-located prepare children do not all fight over cores 0..N/3.
+    _apply_local_rank_cpu_affinity("host_prepare")
     try:
         split = config.data.train if split_name == "train" else config.data.test
         if split is None:
@@ -3391,15 +3462,8 @@ class _ProcessHostPrepareIterator:
             daemon=False,
         )
         self._process.start()
-        try:
-            import psutil
-
-            n_cpu = int(psutil.cpu_count(logical=True) or 4)
-            prepare_cores = min(max(16, n_cpu // 3), n_cpu)
-            if prepare_cores < n_cpu:
-                psutil.Process().cpu_affinity(list(range(prepare_cores, n_cpu)))
-        except Exception:
-            pass
+        # Train parent keeps the complementary slice of this LOCAL_RANK's CPUs.
+        _apply_local_rank_cpu_affinity("train")
 
     def __iter__(self) -> "_ProcessHostPrepareIterator":
         return self
@@ -5172,6 +5236,8 @@ def train_mdl(
         return _coerce_train_result(adapter(config=config, max_steps=max_steps))
 
     context = _setup_distributed(config)
+    # Partition host CPUs by LOCAL_RANK before host-prepare / adapter pools start.
+    _apply_local_rank_cpu_affinity("train")
     # World-size-aware batch/prefetch/NCCL headroom before model+reader start.
     config = _apply_world_size_training_profile(config, context.world_size)
     batch_iterator: Iterator[FeatureBatch] | None = None
@@ -6655,6 +6721,7 @@ def evaluate_mdl(
     auc_bins: int = 65536,
 ) -> EvaluateResult:
     context = _setup_distributed(config)
+    _apply_local_rank_cpu_affinity("train")
     batch_iterator: Iterator[FeatureBatch] | None = None
     grouped_auc: _DiskBackedGroupAUC | None = None
     try:

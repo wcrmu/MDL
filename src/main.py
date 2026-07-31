@@ -629,13 +629,15 @@ def _launch_ddp_command(args: argparse.Namespace, config) -> int:
     # Fail NCCL collectives quickly when a peer dies instead of waiting for the
     # step watchdog with no traceback.
     env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
-    if nproc_per_node >= 6:
-        env.setdefault("NCCL_MAX_NCHANNELS", "4")
-    # Emb A2A chunk caps are model-aware (RankMixer vs OneTrans) and applied
-    # in train._apply_world_size_training_profile after config load.
+    # Emb A2A chunk caps + RankMixer-vs-OneTrans NCCL BW/HBM tradeoffs are
+    # applied in train._configure_nccl_runtime_env / world-size profile.
+    prefer_collective_bw = str(getattr(config.model, "name", "")) in {
+        "rankmixer",
+        "mdl_rankmixer",
+    }
     # Probe local CUDA P2P: keep NVLink/P2P when healthy, otherwise fall back
     # via NCCL_IGNORE_DISABLED_P2P / NCCL_P2P_DISABLE (see train.py).
-    _configure_nccl_runtime_env(env)
+    _configure_nccl_runtime_env(env, prefer_collective_bw=prefer_collective_bw)
     # Tiny container /dev/shm (often 64MiB) cannot hold NCCL's ~32MiB/rank
     # host segments. Prefer a same-length string-patched libnccl that writes
     # under /tmp/msh (see artifacts/gpu_util_e2e_mock/nccl_patched/). Fall back

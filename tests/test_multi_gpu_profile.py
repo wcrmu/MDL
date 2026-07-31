@@ -8,6 +8,7 @@ from unittest import mock
 
 from src.config import load_app_config
 from src.train import (
+    _apply_local_rank_cpu_affinity,
     _apply_world_size_training_profile,
     _configure_nccl_runtime_env,
     _local_batch_scale_for_world_size,
@@ -41,6 +42,7 @@ class MultiGpuProfileTest(unittest.TestCase):
         self.assertGreaterEqual(
             updated.data.train.reader.host_prepare_prefetch, 4
         )
+        self.assertGreaterEqual(updated.data.train.reader.prefetch_batches, 3)
         self.assertGreaterEqual(updated.training.ddp.bucket_cap_mb, 125.0)
         self.assertEqual(os.environ.get("MDL_GROUPED_EMB_MAX_OUTPUT_MIB"), "384")
 
@@ -60,7 +62,7 @@ class MultiGpuProfileTest(unittest.TestCase):
         self.assertGreaterEqual(updated.training.ddp.bucket_cap_mb, 100.0)
         self.assertEqual(os.environ.get("MDL_GROUPED_EMB_MAX_OUTPUT_MIB"), "512")
 
-    def test_rankmixer_profile_keeps_prefetch_and_larger_emb_cap(self) -> None:
+    def test_rankmixer_profile_deepens_prefetch_pipeline(self) -> None:
         os.environ.pop("MDL_LOCAL_BATCH_SCALE", None)
         os.environ.pop("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", None)
         config = load_app_config("configs/rankmixer.yaml")
@@ -69,12 +71,12 @@ class MultiGpuProfileTest(unittest.TestCase):
         updated = _apply_world_size_training_profile(config, world_size=8)
         # 1280 * 0.9
         self.assertEqual(updated.training.batch_size, 1152)
-        self.assertEqual(updated.data.train.reader.device_prefetch_batches, 1)
+        self.assertEqual(updated.data.train.reader.device_prefetch_batches, 2)
         self.assertGreaterEqual(
-            updated.data.train.reader.host_prepare_prefetch, 5
+            updated.data.train.reader.host_prepare_prefetch, 6
         )
-        self.assertGreaterEqual(updated.training.ddp.bucket_cap_mb, 150.0)
-        self.assertEqual(os.environ.get("MDL_GROUPED_EMB_MAX_OUTPUT_MIB"), "768")
+        self.assertGreaterEqual(updated.training.ddp.bucket_cap_mb, 200.0)
+        self.assertEqual(os.environ.get("MDL_GROUPED_EMB_MAX_OUTPUT_MIB"), "1024")
 
     def test_mdl_rankmixer_six_gpu_emb_cap(self) -> None:
         os.environ.pop("MDL_LOCAL_BATCH_SCALE", None)
@@ -85,8 +87,9 @@ class MultiGpuProfileTest(unittest.TestCase):
         self.assertTrue(config.training.fused_dense_optimizer)
         updated = _apply_world_size_training_profile(config, world_size=6)
         self.assertEqual(updated.training.batch_size, config.training.batch_size)
+        self.assertEqual(updated.data.train.reader.device_prefetch_batches, 2)
         self.assertEqual(os.environ.get("MDL_GROUPED_EMB_MAX_OUTPUT_MIB"), "1024")
-        self.assertGreaterEqual(updated.training.ddp.bucket_cap_mb, 125.0)
+        self.assertGreaterEqual(updated.training.ddp.bucket_cap_mb, 175.0)
 
     def test_nccl_env_sets_buffer_caps(self) -> None:
         env: dict[str, str] = {"WORLD_SIZE": "8"}
@@ -102,6 +105,39 @@ class MultiGpuProfileTest(unittest.TestCase):
         with mock.patch("src.train._local_cuda_p2p_accessible", return_value=True):
             _configure_nccl_runtime_env(env)
         self.assertEqual(env.get("NCCL_MAX_NCHANNELS"), "4")
+
+    def test_nccl_prefer_collective_bw_for_rankmixer(self) -> None:
+        env: dict[str, str] = {"WORLD_SIZE": "8"}
+        with mock.patch("src.train._local_cuda_p2p_accessible", return_value=True):
+            _configure_nccl_runtime_env(env, prefer_collective_bw=True)
+        self.assertEqual(env.get("NCCL_BUFFSIZE"), str(8 * 1024 * 1024))
+        self.assertEqual(env.get("NCCL_CUMEM_ENABLE"), "0")
+        self.assertNotIn("NCCL_MAX_NCHANNELS", env)
+
+    def test_local_rank_cpu_affinity_partitions_cores(self) -> None:
+        assigned: dict[str, list[int]] = {}
+
+        class _FakeProc:
+            def cpu_affinity(self, cores=None):
+                if cores is None:
+                    return assigned.get("cores", [])
+                assigned["cores"] = list(cores)
+                return None
+
+        with mock.patch.dict(
+            "os.environ",
+            {"LOCAL_RANK": "1", "LOCAL_WORLD_SIZE": "4", "WORLD_SIZE": "4"},
+            clear=False,
+        ), mock.patch("psutil.cpu_count", return_value=32), mock.patch(
+            "psutil.Process", return_value=_FakeProc()
+        ):
+            prep = _apply_local_rank_cpu_affinity("host_prepare")
+            train = _apply_local_rank_cpu_affinity("train")
+        # Rank 1 owns cores 8..15; prepare takes ~2/3, train the rest.
+        self.assertTrue(prep)
+        self.assertTrue(train)
+        self.assertTrue(set(prep).isdisjoint(set(train)))
+        self.assertTrue(all(8 <= c < 16 for c in prep + train))
 
 
 if __name__ == "__main__":
