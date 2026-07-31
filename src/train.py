@@ -4472,6 +4472,7 @@ def _prepare_forward_model(
 
     # CUDA-graph the dense RankMixer stack before DDP installs reducer hooks on
     # parameters; make_graphed_callables bwd capture is incompatible with those hooks.
+    ddp_config = getattr(config.training, "ddp", DDPConfig())
     if (
         bool(getattr(config.runtime, "cuda_graph_backbone", False))
         and context.device.type == "cuda"
@@ -4479,13 +4480,26 @@ def _prepare_forward_model(
     ):
         base_model.prewarm_cuda_graph_backbone(context.device)
         # Freeze further captures before DDP reducer hooks are installed.
+        # Non-prewarmed shapes may eager-fallback; wrappers register the live
+        # dense modules so graph/eager share one DDP parameter surface.
         if hasattr(base_model, "_cuda_graph_backbone_capture_allowed"):
             base_model._cuda_graph_backbone_capture_allowed = False
+        if is_main_process():
+            pool = getattr(base_model, "_cuda_graph_backbone_pool", {}) or {}
+            captured_trainable_params = int(
+                getattr(base_model, "_cuda_graph_backbone_parameter_count", 0)
+            )
+            print(
+                "CUDA graph backbone | "
+                f"prewarmed_shapes={len(pool)} "
+                f"captured_trainable_params={captured_trainable_params} "
+                f"static_graph={bool(ddp_config.static_graph)}",
+                flush=True,
+            )
 
     forward_model: nn.Module = base_model
     if context.enabled:
         _exclude_sparse_parameters_from_ddp(base_model, ddp_ignored)
-        ddp_config = getattr(config.training, "ddp", DDPConfig())
         forward_model = DistributedDataParallel(
             base_model,
             device_ids=[context.local_rank] if context.device.type == "cuda" else None,

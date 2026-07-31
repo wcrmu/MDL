@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 import math
+import os
 from typing import Any
 
 import torch
@@ -71,17 +72,24 @@ def _activation_checkpoint_enabled(
     return value == "full" if full_only else value in {"selective", "full"}
 
 
-def _cuda_graph_prewarm_batch_sizes(config: AppConfig, *, limit: int = 2) -> list[int]:
-    """Pick the largest train batch sizes for pre-DDP CUDA Graph capture.
+def _cuda_graph_prewarm_batch_sizes(
+    config: AppConfig,
+    *,
+    limit: int | None = None,
+) -> list[int]:
+    """Pick train batch sizes for pre-DDP CUDA Graph capture.
 
-    Capturing every length-bucket shape before DDP is correct but can take tens
-    of minutes on large industrial stacks. The dominant util path is the top
-    one or two bucket sizes; remaining shapes fall back to eager after DDP
-    freezes further captures.
+    Default: capture every train length-bucket shape so production jobs stay on
+    the CUDA-graph path after DDP freezes further captures. Override with
+    ``MDL_CUDA_GRAPH_PREWARM_LIMIT`` (``0`` = all; ``2`` for small-GPU smoke).
+    Non-prewarmed shapes still fall back to eager with the same live dense
+    parameters registered on the graph wrapper.
     """
 
     batch_sizes: list[int] = []
-    buckets = getattr(config.data.train.reader, "length_buckets", None) or ()
+    train = getattr(config.data, "train", None)
+    reader = getattr(train, "reader", None) if train is not None else None
+    buckets = getattr(reader, "length_buckets", None) or ()
     for bucket in buckets:
         batch_size = getattr(bucket, "batch_size", None)
         if batch_size is not None and int(batch_size) > 0:
@@ -92,7 +100,57 @@ def _cuda_graph_prewarm_batch_sizes(config: AppConfig, *, limit: int = 2) -> lis
     if not batch_sizes:
         return [1]
     unique = sorted(set(batch_sizes), reverse=True)
+    if limit is None:
+        raw = os.environ.get("MDL_CUDA_GRAPH_PREWARM_LIMIT", "").strip()
+        if raw:
+            parsed = int(raw)
+            limit = None if parsed <= 0 else max(1, parsed)
+        else:
+            limit = None
+    if limit is None or int(limit) <= 0:
+        return unique
     return unique[: max(1, int(limit))]
+
+
+def _validate_cuda_graph_module_pool(
+    pool: Mapping[tuple[Any, ...], Any],
+    *,
+    label: str,
+) -> int:
+    """Require every captured shape to expose one identical parameter surface.
+
+    ``make_graphed_callables`` treats registered module parameters as implicit
+    autograd inputs. A wrapper that only keeps an unregistered owner reference
+    can replay forward successfully while silently omitting parameter gradients
+    and DDP hooks in backward.
+    """
+
+    reference: frozenset[int] | None = None
+    for shape_key, graphed in pool.items():
+        if not isinstance(graphed, nn.Module):
+            raise RuntimeError(
+                f"{label} CUDA graph for {shape_key!r} is not an nn.Module; "
+                "its trainable parameter surface cannot be validated"
+            )
+        surface = frozenset(
+            id(parameter)
+            for parameter in graphed.parameters()
+            if parameter.requires_grad
+        )
+        if not surface:
+            raise RuntimeError(
+                f"{label} CUDA graph for {shape_key!r} exposes no trainable "
+                "parameters; register the live dense modules on the graph "
+                "wrapper or DDP backward hooks will be omitted"
+            )
+        if reference is None:
+            reference = surface
+        elif surface != reference:
+            raise RuntimeError(
+                f"{label} CUDA graph parameter surface changes across captured "
+                "batch shapes; DDP static_graph requires identical parameters"
+            )
+    return len(reference or ())
 
 
 def _project_sequence_in_chunks(
@@ -6513,22 +6571,24 @@ class RankMixerBlock(nn.Module):
 class _RankMixerGraphedStack(nn.Module):
     """Dense RankMixer blocks+logits for CUDA Graph capture.
 
-    Holds only a weak owner reference so DDP / optimizers keep a single copy of
-    the live parameters while ``make_graphed_callables`` records the dense
-    launch sequence for one static shape. ``object.__setattr__`` avoids
-    registering the owner as a submodule (which would create a module cycle).
+    The live dense modules must be registered on this wrapper. CUDA graph
+    capture discovers trainable inputs through ``wrapper.parameters()``; hiding
+    them makes a graph replay omit their gradients and therefore their DDP
+    reducer hooks. The wrapper is kept in a plain cache (not registered back on
+    the owner), so sharing these module references does not create a cycle or a
+    second parameter copy.
     """
 
     def __init__(self, owner: "RankMixerModel") -> None:
         super().__init__()
-        object.__setattr__(self, "_owner", owner)
+        self.blocks = owner.blocks
+        self.logit_layers = owner.logit_layers
 
     def forward(self, feature_tokens: Tensor) -> Tensor:
-        owner = self._owner
-        for block in owner.blocks:
+        for block in self.blocks:
             feature_tokens = block(feature_tokens)
         pooled = feature_tokens.mean(dim=1)
-        return torch.cat([layer(pooled) for layer in owner.logit_layers], dim=1)
+        return torch.cat([layer(pooled) for layer in self.logit_layers], dim=1)
 
 
 class RankMixerModel(nn.Module):
@@ -6694,7 +6754,7 @@ class RankMixerModel(nn.Module):
             if precision == "fp16"
             else torch.float32
         )
-        ordered_batches = _cuda_graph_prewarm_batch_sizes(self.config, limit=2)
+        ordered_batches = _cuda_graph_prewarm_batch_sizes(self.config)
 
         amp_dtype = None if precision == "fp32" else dtype
         for batch_size in ordered_batches:
@@ -6720,6 +6780,10 @@ class RankMixerModel(nn.Module):
                     self._run_rankmixer_blocks_cuda_graph(feature_tokens)
             for parameter in self.parameters():
                 parameter.grad = None
+        self._cuda_graph_backbone_parameter_count = _validate_cuda_graph_module_pool(
+            self._cuda_graph_backbone_pool,
+            label=type(self).__name__,
+        )
         if not was_training:
             self.eval()
 
@@ -7304,14 +7368,17 @@ class MDLRankMixerBlock(nn.Module):
 class _MDLRankMixerGraphedStack(nn.Module):
     """Published/coupled RankMixer blocks+logits for CUDA Graph capture.
 
-    Holds only a weak owner reference so DDP / optimizers keep a single copy of
-    the live parameters while ``make_graphed_callables`` records the dense
-    launch sequence for one static shape.
+    Register exactly the live modules executed inside the graph so their
+    parameters are explicit autograd inputs. The wrapper itself is cached in a
+    plain dict and is not registered back on the owning model.
     """
 
     def __init__(self, owner: "MDLRankMixerModel") -> None:
         super().__init__()
-        self._owner = owner
+        self.config = owner.config
+        self.blocks = owner.blocks
+        self.logit_layers = owner.logit_layers
+        self.scenario_tower = owner.scenario_tower
 
     def forward(
         self,
@@ -7320,8 +7387,7 @@ class _MDLRankMixerGraphedStack(nn.Module):
         task_tokens: Tensor,
         scenario_mask: Tensor,
     ) -> Tensor:
-        owner = self._owner
-        for block in owner.blocks:
+        for block in self.blocks:
             feature_tokens, scenario_tokens, task_tokens = block(
                 feature_tokens,
                 scenario_tokens,
@@ -7329,7 +7395,7 @@ class _MDLRankMixerGraphedStack(nn.Module):
                 scenario_mask,
             )
         return _mdl_logits(
-            owner,
+            self,
             feature_tokens,
             scenario_tokens,
             task_tokens,
@@ -7338,11 +7404,14 @@ class _MDLRankMixerGraphedStack(nn.Module):
 
 
 class _MDLRankMixerSplitGraphedStack(nn.Module):
-    """Query/readout-split RankMixer stack for CUDA Graph capture."""
+    """Query/readout-split stack with an explicit dense parameter surface."""
 
     def __init__(self, owner: "MDLRankMixerModel") -> None:
         super().__init__()
-        self._owner = owner
+        self.config = owner.config
+        self.blocks = owner.blocks
+        self.logit_layers = owner.logit_layers
+        self.scenario_tower = owner.scenario_tower
 
     def forward(
         self,
@@ -7353,8 +7422,7 @@ class _MDLRankMixerSplitGraphedStack(nn.Module):
         scenario_prompts: Tensor,
         task_prompts: Tensor,
     ) -> Tensor:
-        owner = self._owner
-        for block in owner.blocks:
+        for block in self.blocks:
             feature_tokens, scenario_tokens, task_tokens = block(
                 feature_tokens,
                 scenario_tokens,
@@ -7364,7 +7432,7 @@ class _MDLRankMixerSplitGraphedStack(nn.Module):
                 task_prompts,
             )
         return _mdl_logits(
-            owner,
+            self,
             feature_tokens,
             scenario_tokens,
             task_tokens,
@@ -7631,7 +7699,7 @@ class MDLRankMixerModel(nn.Module):
             if precision == "fp16"
             else torch.float32
         )
-        ordered_batches = _cuda_graph_prewarm_batch_sizes(self.config, limit=2)
+        ordered_batches = _cuda_graph_prewarm_batch_sizes(self.config)
 
         amp_dtype = None if precision == "fp32" else dtype
         for batch_size in ordered_batches:
@@ -7722,6 +7790,10 @@ class MDLRankMixerModel(nn.Module):
                     )
             for parameter in self.parameters():
                 parameter.grad = None
+        self._cuda_graph_backbone_parameter_count = _validate_cuda_graph_module_pool(
+            self._cuda_graph_backbone_pool,
+            label=type(self).__name__,
+        )
         if not was_training:
             self.eval()
 
