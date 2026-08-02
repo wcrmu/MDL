@@ -24,8 +24,8 @@ MDL 提出了一个更适合大型排序主干的问题：**当大部分参数�
 
 |  | Click | Favorite |
 |---|---|---|
-| Single-column | \(D_{single,click}\) | \(D_{single,fav}\) |
-| Double-column | \(D_{double,click}\) | \(D_{double,fav}\) |
+| Single-column | $$D_{single,click}$$ | $$D_{single,fav}$$ |
+| Double-column | $$D_{double,click}$$ | $$D_{double,fav}$$ |
 
 <!-- IMAGE_PLACEHOLDER_START: FIG_02 -->
 > **【插图占位｜图 2】Scenario × Task 形成的多分布问题**
@@ -37,13 +37,13 @@ MDL 提出了一个更适合大型排序主干的问题：**当大部分参数�
 
 这四个格子不是四个普通类别，而是四个相关但并不相同的预测分布。场景影响样本怎样产生：同屏候选数量、位置偏置、浏览节奏、曝光竞争关系和上下文特征都可能变化。任务则改变监督信号的定义：Click 通常更高频、更接近即时相关性；Favorite 更稀疏，也更依赖长期兴趣和内容价值。
 
-对来自场景 \(s\) 的样本 \(x\)，任务 \(t\) 的预测可写为：
+对来自场景 $$s$$ 的样本 $$x$$，任务 $$t$$ 的预测可写为：
 
-\[
+$$
 \hat y_{s,t}=p_\Theta(y_t=1\mid x,s).
-\]
+$$
 
-Scenario 改变样本如何产生，例如 \(p(x\mid s)\)；Task 改变标签定义以及 \(p(y_t\mid x,s)\)。前者描述输入分布，后者描述预测目标，两者都需要共享知识，也都需要保留差异。[MDL §2](https://arxiv.org/html/2602.07520v2)
+Scenario 改变样本如何产生，例如 $$p(x\mid s)$$；Task 改变标签定义以及 $$p(y_t\mid x,s)$$。前者描述输入分布，后者描述预测目标，两者都需要共享知识，也都需要保留差异。[MDL §2](https://arxiv.org/html/2602.07520v2)
 
 最直接的方案是训练四套独立模型。这样每个组合都能拥有专属参数，但会重复特征工程、训练、部署和监控链路，稀疏任务也难以利用其他分布的统计信息。另一个极端是完全共享：所有样本通过同一主干，仅在末端分出不同 head。它具有较高统计效率，但共享表示容易受高流量场景与高频任务主导，分布差异只能由较浅的输出模块恢复。
 
@@ -108,7 +108,7 @@ Task 更麻烦：同一曝光样本要同时预测 Click、Like、Favorite。如
 > **图注：** MDL 选择读取侧条件化：保留共享 Feature computation，同时让不同 Domain states 形成持续演化的专属表示。
 <!-- IMAGE_PLACEHOLDER_END: FIG_04 -->
 
-MDL 优先保持昂贵 Feature path 的共享，用 \(N_s+N_t\) 条较窄的 Domain states 获得分布特定读取；相应代价是 Feature states 在单次前向中仍不具备 task-specific 写入。它的关键不在 token 形式本身，而在于让条件路径覆盖已经迁入深层 backbone 的主要容量。
+MDL 优先保持昂贵 Feature path 的共享，用 $$N_s+N_t$$ 条较窄的 Domain states 获得分布特定读取；相应代价是 Feature states 在单次前向中仍不具备 task-specific 写入。它的关键不在 token 形式本身，而在于让条件路径覆盖已经迁入深层 backbone 的主要容量。
 
 ---
 
@@ -116,18 +116,18 @@ MDL 优先保持昂贵 Feature path 的共享，用 \(N_s+N_t\) 条较窄的 Dom
 
 MDL 的完整状态可以写为：
 
-\[
+$$
 F^{(l)}\in\mathbb{R}^{N_f\times d_f},\qquad
 S^{(l)}\in\mathbb{R}^{(N_s+1)\times d_s},\qquad
 T^{(l)}\in\mathbb{R}^{N_t\times d_t}.
-\]
+$$
 
-其中 \(N_f\) 是 Feature token 数量，\(N_s\) 是业务场景数，额外的 1 对应 Global Scenario token，\(N_t\) 是预测任务数。三类状态在交互前通过 projection 对齐到相同的 attention width。
+其中 $$N_f$$ 是 Feature token 数量，$$N_s$$ 是业务场景数，额外的 1 对应 Global Scenario token，$$N_t$$ 是预测任务数。三类状态在交互前通过 projection 对齐到相同的 attention width。
 
 <!-- IMAGE_PLACEHOLDER_START: FIG_05 -->
 > **【插图占位｜图 5】MDL 整体模型架构**
 >
-> **内容：** 完整说明 Feature、Scenario、Task 三类 token 的初始化与跨层传播：Feature 先完成共享交互；Scenario/Task 分别以 Query 读取 Feature；active Scenario 与 Global Scenario 聚合后进入所有 Task states；最终每个 Task state 连接对应输出层。还需体现不存在独立的 Task–Task 或 Scenario–Scenario mixing，最终输出数为 \(N_t\) 而非 \(N_sN_t\)。
+> **内容：** 完整说明 Feature、Scenario、Task 三类 token 的初始化与跨层传播：Feature 先完成共享交互；Scenario/Task 分别以 Query 读取 Feature；active Scenario 与 Global Scenario 聚合后进入所有 Task states；最终每个 Task state 连接对应输出层。还需体现不存在独立的 Task–Task 或 Scenario–Scenario mixing，最终输出数为 $$N_t$$ 而非 $$N_sN_t$$。
 >
 > **图注：** MDL 共享 Feature backbone，并用逐层演化的 Scenario/Task states 完成多分布条件化。
 <!-- IMAGE_PLACEHOLDER_END: FIG_05 -->
@@ -185,17 +185,17 @@ logits = [head_t(T[:, t]) for t in range(Nt)]
 
 ### 5.1 Feature token：把异构字段组织成固定计算槽位
 
-工业推荐输入通常包括 user、item、query、context、统计交叉和多个行为序列。离散字段先经过 embedding table，序列字段通过 DIN、LONGER 等序列模块编码，最终得到宽度不一的表示。MDL 沿用 RankMixer 的 semantic tokenization：人工按业务语义把字段分成 \(N_f\) 组，每组拼接后投影到固定维度。[MDL Eq. 2–3](https://arxiv.org/html/2602.07520v2)；[LONGER 原文](https://arxiv.org/abs/2505.04421)
+工业推荐输入通常包括 user、item、query、context、统计交叉和多个行为序列。离散字段先经过 embedding table，序列字段通过 DIN、LONGER 等序列模块编码，最终得到宽度不一的表示。MDL 沿用 RankMixer 的 semantic tokenization：人工按业务语义把字段分成 $$N_f$$ 组，每组拼接后投影到固定维度。[MDL Eq. 2–3](https://arxiv.org/html/2602.07520v2)；[LONGER 原文](https://arxiv.org/abs/2505.04421)
 
-\[
+$$
 e_{input}=[e_1;e_2;\ldots;e_{N_f}],
 \qquad
 t_j=\operatorname{Proj}(e_j),
-\]
+$$
 
-\[
+$$
 F^{(0)}=[t_1;t_2;\ldots;t_{N_f}].
-\]
+$$
 
 在这个最小例子中，可以将数百个字段压缩为四个语义组：
 
@@ -219,17 +219,17 @@ F^{(0)}=[t_1;t_2;\ldots;t_{N_f}].
 
 随后，每个 Scenario token 经过自己的 Per-token FFN：[MDL Eq. 4](https://arxiv.org/html/2602.07520v2)
 
-\[
+$$
 s_k^{(0)}=\operatorname{ReLU}
 \left(\operatorname{FFN}_k^s
 (\hat e_{imp}\oplus\hat e_{spec}^{k})\right).
-\]
+$$
 
-如果有 \(N_s\) 个业务场景，模型构造 \(N_s\) 个 specific Scenario tokens，并额外构造一个 Global Scenario token：
+如果有 $$N_s$$ 个业务场景，模型构造 $$N_s$$ 个 specific Scenario tokens，并额外构造一个 Global Scenario token：
 
-\[
+$$
 S^{(0)}=[s_1^{(0)};\ldots;s_{N_s}^{(0)};s_{global}^{(0)}].
-\]
+$$
 
 Global token 用于学习跨场景共性；specific token 负责保留各场景差异。
 
@@ -271,7 +271,7 @@ Feature token 是共享证据的结构化表示；Scenario/Task token 是由样�
 
 ## 6. 一个 MDL Block：严格按执行顺序拆开
 
-设第 \(l\) 层输入为 \(F^{(l)},S^{(l)},T^{(l)}\)。每层按三步执行。
+设第 $$l$$ 层输入为 $$F^{(l)},S^{(l)},T^{(l)}$$。每层按三步执行。
 
 <!-- IMAGE_PLACEHOLDER_START: FIG_08 -->
 > **【插图占位｜图 8】一个 MDL Block 的完整执行逻辑**
@@ -285,37 +285,37 @@ Feature token 是共享证据的结构化表示；Scenario/Task token 是由样�
 
 抽象地写，Feature 路径为：
 
-\[
+$$
 F^{(l+1)}=B_l(F^{(l)}).
-\]
+$$
 
 默认实现采用 RankMixer：Token Mixing 负责跨 Feature tokens 交换信息，Per-token FFN 负责每个语义子空间的非线性变换。[MDL Eq. 6](https://arxiv.org/html/2602.07520v2)
 
-\[
+$$
 F^{(l+1)}=\operatorname{PerTokenFFN}
 \left(\operatorname{LN}
 (\operatorname{TokenMixing}(F^{(l)})+F^{(l)})\right).
-\]
+$$
 
 这部分可以替换为其他 Feature-interaction methods；MDL 只要求每层输出一组新的 Feature states。[MDL §3.2.1](https://arxiv.org/html/2602.07520v2)
 
 ### 6.2 第二步：Scenario 与 Task 以 Query 读取 Feature
 
-对任意一组 Domain tokens \(D\in\{S,T\}\)，Domain-aware Attention 可写成标准 cross-attention 形式：
+对任意一组 Domain tokens $$D\in\{S,T\}$$，Domain-aware Attention 可写成标准 cross-attention 形式：
 
-\[
+$$
 Q=D^{(l)}W_Q,\qquad
 K=F^{(l+1)}W_K,\qquad
 V=F^{(l+1)}W_V,
-\]
+$$
 
-\[
+$$
 \operatorname{Attn}(D,F)=
 \operatorname{softmax}
 \left(\frac{QK^\top}{\sqrt {d_h}}\right)V.
-\]
+$$
 
-其中 \(d_h\) 是单个 attention head 的 Key 维度。
+其中 $$d_h$$ 是单个 attention head 的 Key 维度。
 
 Q/K/V 的方向定义了模型语义：Scenario/Task 是 Query，Feature 是 Key/Value。[MDL Eq. 7–8](https://arxiv.org/html/2602.07520v2)
 
@@ -325,73 +325,73 @@ Q/K/V projection 采用 Per-token FFN 形式，使不同 Domain states 可以学
 
 | 张量 | 单头简化 shape | 含义 |
 |---|---:|---|
-| Feature state \(F\) | \([B,N_f,d]\) | Key/Value 来源 |
-| Scenario state \(S\) | \([B,N_s+1,d]\) | Scenario Query |
-| Task state \(T\) | \([B,N_t,d]\) | Task Query |
-| Scenario attention map | \([B,N_s+1,N_f]\) | 每个 Scenario 对 Feature 的读取权重 |
-| Task attention map | \([B,N_t,N_f]\) | 每个 Task 对 Feature 的读取权重 |
-| Scenario mask | \([B,N_s]\) | 选择 active Scenario；Global 始终参与 |
+| Feature state $$F$$ | $$[B,N_f,d]$$ | Key/Value 来源 |
+| Scenario state $$S$$ | $$[B,N_s+1,d]$$ | Scenario Query |
+| Task state $$T$$ | $$[B,N_t,d]$$ | Task Query |
+| Scenario attention map | $$[B,N_s+1,N_f]$$ | 每个 Scenario 对 Feature 的读取权重 |
+| Task attention map | $$[B,N_t,N_f]$$ | 每个 Task 对 Feature 的读取权重 |
+| Scenario mask | $$[B,N_s]$$ | 选择 active Scenario；Global 始终参与 |
 
-若有 \(H\) 个 attention heads，权重张量相应变为 \([B,H,N_d,N_f]\)，其中 \(N_d\) 分别取 \(N_s+1\) 或 \(N_t\)。这张 shape 表也是最直接的单元测试清单：Query 轴与 Feature 轴一旦互换，模型语义就已经不再是论文中的 MDL。
+若有 $$H$$ 个 attention heads，权重张量相应变为 $$[B,H,N_d,N_f]$$，其中 $$N_d$$ 分别取 $$N_s+1$$ 或 $$N_t$$。这张 shape 表也是最直接的单元测试清单：Query 轴与 Feature 轴一旦互换，模型语义就已经不再是论文中的 MDL。
 
 <!-- IMAGE_PLACEHOLDER_START: FIG_09 -->
 > **【插图占位｜图 9】Domain-aware Cross-Attention 的张量与信息方向**
 >
-> **内容：** 说明 Query 来自 Scenario/Task states，Key 和 Value 来自 Feature states，attention 输出只更新 Domain states。需要体现 \([B,H,N_d,N_f]\) 中 Domain Query 轴与 Feature 轴的含义，并解释不同 Scenario/Task 可以对同一组 Feature states 形成不同读取分布；交换 Q 与 K/V 将改变模型语义。
+> **内容：** 说明 Query 来自 Scenario/Task states，Key 和 Value 来自 Feature states，attention 输出只更新 Domain states。需要体现 $$[B,H,N_d,N_f]$$ 中 Domain Query 轴与 Feature 轴的含义，并解释不同 Scenario/Task 可以对同一组 Feature states 形成不同读取分布；交换 Q 与 K/V 将改变模型语义。
 >
 > **图注：** MDL 的关键方向是 Domain 读取 Feature，而不是 Domain 写回 Feature。
 <!-- IMAGE_PLACEHOLDER_END: FIG_09 -->
 
 Click 与 Favorite 面对同一组 Feature states，可以产生不同 attention 分布；Single 与 Double 也可以读取不同 Feature 子空间。完成 attention 后，Scenario path 加 residual，再通过 Per-scenario FFN：[MDL Eq. 11–12](https://arxiv.org/html/2602.07520v2)
 
-\[
+$$
 \hat S^{(l+1)}=\operatorname{DomainAwareAttn}
 (S^{(l)},F^{(l+1)})+S^{(l)},
-\]
+$$
 
-\[
+$$
 S^{(l+1)}=\operatorname{PerTokenFFN}_s
 (\hat S^{(l+1)})+\hat S^{(l+1)}.
-\]
+$$
 
 Task path 首先采用相同读取方向：
 
-\[
+$$
 \hat T^{(l+1)}=\operatorname{DomainAwareAttn}
 (T^{(l)},F^{(l+1)})+T^{(l)}.
-\]
+$$
 
 ### 6.3 第三步：把当前 Scenario state 融入所有 Task states
 
-Scenario 与 Task 不会一直平行传播。对每个样本，模型根据 scenario information 选出对应的 specific Scenario token，同时保留 Global token。若一个样本属于重叠场景，也可以选出多个 specific tokens。这里被选中的是 attention 与 residual 之后、Scenario FFN 之前的 \(\hat S^{(l+1)}\)。论文使用简单 Mean Pool：[MDL Eq. 9](https://arxiv.org/html/2602.07520v2)
+Scenario 与 Task 不会一直平行传播。对每个样本，模型根据 scenario information 选出对应的 specific Scenario token，同时保留 Global token。若一个样本属于重叠场景，也可以选出多个 specific tokens。这里被选中的是 attention 与 residual 之后、Scenario FFN 之前的 $$\hat S^{(l+1)}$$。论文使用简单 Mean Pool：[MDL Eq. 9](https://arxiv.org/html/2602.07520v2)
 
-\[
+$$
 s_{avg}=\operatorname{MeanPool}
 (\{\hat s_{active,1},\ldots,\hat s_{active,m},\hat s_{global}\}).
-\]
+$$
 
-随后把同一个 \(s_{avg}\) 加入所有 Task tokens：[MDL Eq. 10](https://arxiv.org/html/2602.07520v2)
+随后把同一个 $$s_{avg}$$ 加入所有 Task tokens：[MDL Eq. 10](https://arxiv.org/html/2602.07520v2)
 
-\[
+$$
 \tilde T^{(l+1)}=\hat T^{(l+1)}+s_{avg}.
-\]
+$$
 
 每个 Task token 再经过自己的 FFN 与 residual：[MDL Eq. 13–15](https://arxiv.org/html/2602.07520v2)
 
-\[
+$$
 T^{(l+1)}=\operatorname{PerTokenFFN}_t
 (\tilde T^{(l+1)})+\tilde T^{(l+1)}.
-\]
+$$
 
-堆叠 \(L\) 层后，第 \(t\) 个 Task token 连接第 \(t\) 个 logits layer：[MDL Eq. 16](https://arxiv.org/html/2602.07520v2)
+堆叠 $$L$$ 层后，第 $$t$$ 个 Task token 连接第 $$t$$ 个 logits layer：[MDL Eq. 16](https://arxiv.org/html/2602.07520v2)
 
-\[
+$$
 \hat y_t=\operatorname{LogitsLayer}_t(T_t^{(L)}).
-\]
+$$
 
 论文列出的三类 interaction 是 Feature–Feature、Feature–Scenario/Task 和 Scenario–Task，并没有独立的 Task–Task interaction。因此，Task token 解决的是 task-aware representation；它不会自动表达 Click→Purchase 等任务之间的方向性依赖。
 
-最终输出数量是 \(N_t\)，而不是 \(N_sN_t\)。场景差异已经在每一层通过 selected Scenario state 进入 Task state，因此 Click head 可以跨场景复用。
+最终输出数量是 $$N_t$$，而不是 $$N_sN_t$$。场景差异已经在每一层通过 selected Scenario state 进入 Task state，因此 Click head 可以跨场景复用。
 
 “All-Token Interaction”并不是所有 token 两两 self-attention，其信息方向如下：
 
@@ -418,13 +418,13 @@ Feature self-interaction 可以替换，但需要保留 MDL 的核心计算契�
 
 ## 7. 用最小实例走完两层前向与梯度
 
-设隐藏维度 \(d=8\)，使用四个 Feature tokens、两个业务场景加一个 Global token、两个 Task tokens：
+设隐藏维度 $$d=8$$，使用四个 Feature tokens、两个业务场景加一个 Global token、两个 Task tokens：
 
 | 张量 | Shape | 槽位 |
 |---|---:|---|
-| \(F^{(0)}\) | \([4,8]\) | User、Query、Item、History |
-| \(S^{(0)}\) | \([3,8]\) | Single、Double、Global |
-| \(T^{(0)}\) | \([2,8]\) | Click、Favorite |
+| $$F^{(0)}$$ | $$[4,8]$$ | User、Query、Item、History |
+| $$S^{(0)}$$ | $$[3,8]$$ | Single、Double、Global |
+| $$T^{(0)}$$ | $$[2,8]$$ | Click、Favorite |
 
 对一个 Single-column 样本，第一层先更新四个 Feature tokens。User slot 可以结合 Query、Item 和 History；Item slot 也可以吸收用户与搜索上下文。随后 Click 和 Favorite 读取同一组更新后的 Feature states。设第一层得到以下平均 attention 权重：
 
@@ -437,11 +437,11 @@ Feature self-interaction 可以替换，但需要保留 MDL 的核心计算契�
 
 当前样本属于 Single，因此融合阶段只选 Single 与 Global：
 
-\[
+$$
 s_{avg}^{(1)}=\frac{\hat s_{single}^{(1)}+\hat s_{global}^{(1)}}{2}.
-\]
+$$
 
-这里的两个向量都已经读取第一层 Feature states 并完成 residual，但尚未经过 Scenario FFN。同一份 \(\hat S^{(1)}\) 一方面经 Scenario FFN 形成下一层输入 \(S^{(1)}\)，另一方面在当前层完成 Scenario–Task fusion。这一融合向量分别加入 Click 与 Favorite。进入第二层时，Task Query 已不再只是 initializer 输出：它已经包含第一层读取的样本证据以及当前场景状态。第二层 attention 因此可以在更深 Feature states 上执行新的条件化聚合。这就是论文所说 bottom-up、layer-wise interaction 的具体含义。
+这里的两个向量都已经读取第一层 Feature states 并完成 residual，但尚未经过 Scenario FFN。同一份 $$\hat S^{(1)}$$ 一方面经 Scenario FFN 形成下一层输入 $$S^{(1)}$$，另一方面在当前层完成 Scenario–Task fusion。这一融合向量分别加入 Click 与 Favorite。进入第二层时，Task Query 已不再只是 initializer 输出：它已经包含第一层读取的样本证据以及当前场景状态。第二层 attention 因此可以在更深 Feature states 上执行新的条件化聚合。这就是论文所说 bottom-up、layer-wise interaction 的具体含义。
 
 如果把同一用户—候选对放到 Double 场景，即使暂时假设普通 Feature inputs 完全相同，Scenario fusion 也会改为 Double + Global。Task heads 仍只有 Click 和 Favorite 两个；场景差异通过 Task state 到达共享的任务输出映射。
 
@@ -471,7 +471,7 @@ s_{avg}^{(1)}=\frac{\hat s_{single}^{(1)}+\hat s_{global}^{(1)}}{2}.
 
 **表示冲突**指不同任务需要不同信息，却只能使用同一份最终共享表示。MDL 为不同任务保留跨层 Task states，并允许它们形成不同 Feature 读取模式，因此直接针对这一瓶颈。
 
-**梯度冲突**指不同任务对共享参数产生方向不一致的更新，例如 \(g_i^\top g_j<0\)。所有 Task loss 仍会通过 attention 的 K/V 和 Feature path 回传到共享 backbone，MDL 没有显式 gradient projection、normalization 或 detach。因此，不能从 Task token 的存在推出梯度冲突已经被解决。
+**梯度冲突**指不同任务对共享参数产生方向不一致的更新，例如 $$g_i^\top g_j<0$$。所有 Task loss 仍会通过 attention 的 K/V 和 Feature path 回传到共享 backbone，MDL 没有显式 gradient projection、normalization 或 detach。因此，不能从 Task token 的存在推出梯度冲突已经被解决。
 
 2026 年提出的 OneRank 同时设计 task-private forward channels 与 cross-task gradient detachment，恰好说明 forward specialization 与 backward isolation 是两个独立设计维度。[OneRank 原文](https://arxiv.org/abs/2606.16838)
 
@@ -493,25 +493,25 @@ s_{avg}^{(1)}=\frac{\hat s_{single}^{(1)}+\hat s_{global}^{(1)}}{2}.
 
 观察 Feature 更新式：
 
-\[
+$$
 F^{(l+1)}=B_l(F^{(l)}).
-\]
+$$
 
-右侧没有 \(S^{(l)}\) 或 \(T^{(l)}\)。从该层前向依赖关系看：
+右侧没有 $$S^{(l)}$$ 或 $$T^{(l)}$$。从该层前向依赖关系看：
 
-\[
+$$
 \frac{\partial F^{(l+1)}}{\partial S^{(l)}}=0,
 \qquad
 \frac{\partial F^{(l+1)}}{\partial T^{(l)}}=0.
-\]
+$$
 
-随后 Scenario/Task 才用 \(F^{(l+1)}\) 作为 Key/Value 更新自己。于是，MDL 的主要结构不是“不同任务重新生成不同 Feature”，而是：
+随后 Scenario/Task 才用 $$F^{(l+1)}$$ 作为 Key/Value 更新自己。于是，MDL 的主要结构不是“不同任务重新生成不同 Feature”，而是：
 
-\[
+$$
 \text{共享主干生成 Feature states}
 \quad+\quad
 \text{不同 Domain states 逐层执行不同读取}.
-\]
+$$
 
 这是一种 **read-side conditioning**：Scenario/Task 进入了逐层交互，却不直接改写同层的 Feature path。
 
@@ -521,14 +521,14 @@ F^{(l+1)}=B_l(F^{(l)}).
 
 ### 8.2 MDL 对 Scenario × Task 空间做了因子化
 
-若为每个组合维护独立 tower，需要 \(N_sN_t\) 套场景—任务输出路径。MDL 的组合近似为：
+若为每个组合维护独立 tower，需要 $$N_sN_t$$ 套场景—任务输出路径。MDL 的组合近似为：
 
-\[
+$$
 H_{s,t}=\phi_t
 \left(T_t+\operatorname{Mean}(S_s,S_{global})\right),
-\]
+$$
 
-其中 \(\phi_t\) 是 Task-specific nonlinear mapping。联合差异由 Task state、Scenario state 及 Task-specific FFN 组合表达，而不是每个 \((s,t)\) 都拥有完整独立参数。
+其中 $$\phi_t$$ 是 Task-specific nonlinear mapping。联合差异由 Task state、Scenario state 及 Task-specific FFN 组合表达，而不是每个 $$(s,t)$$ 都拥有完整独立参数。
 
 这个因子化带来两个结果。第一，Task head 可以跨场景复用，最终输出数量不随场景数相乘。第二，模型施加了一个强假设：复杂 pair-specific interaction 能够被低维状态相加与后续 Task FFN 充分恢复。
 
@@ -538,13 +538,13 @@ Mean + Add 也隐含两项具体假设：被选中的 Scenario states 权重相�
 
 ### 8.3 输出成本解耦，不等于中间成本消失
 
-MDL 将输出 head 数量从潜在的 \(N_sN_t\) 降到 \(N_t\)。但按论文公式直接实现，\(N_s+1\) 个 Scenario tokens 与 \(N_t\) 个 Task tokens 都要先读取 \(N_f\) 个 Feature tokens，之后才选择 active Scenario。cross-attention 的主要交互规模近似为：
+MDL 将输出 head 数量从潜在的 $$N_sN_t$$ 降到 $$N_t$$。但按论文公式直接实现，$$N_s+1$$ 个 Scenario tokens 与 $$N_t$$ 个 Task tokens 都要先读取 $$N_f$$ 个 Feature tokens，之后才选择 active Scenario。cross-attention 的主要交互规模近似为：
 
-\[
+$$
 O\big((N_s+N_t)N_fd\big),
-\]
+$$
 
-不同 Domain token 的 Per-token FFN 参数和计算也大致随 \(N_s+N_t\) 增长。
+不同 Domain token 的 Per-token FFN 参数和计算也大致随 $$N_s+N_t$$ 增长。
 
 工程实现可以在 Domain-aware Attention 之前只 gather 当前 active Scenario 与 Global token，从而避免计算所有无关 Scenario states；但这是由稀疏执行得到的系统优化，不是论文已经描述和测量的实现。正式比较时应分别报告“按论文公式的 dense token path”和“active-token path”的成本。
 
@@ -552,7 +552,7 @@ O\big((N_s+N_t)N_fd\big),
 
 ### 8.4 固定 token slots 带来的是闭集组合，不是零样本扩展
 
-MDL 初始化固定的 \(N_s+1\) 个 Scenario slots 和 \(N_t\) 个 Task slots；不同 slot 拥有 Per-token FFN，最终每个 Task slot 还连接独立 LogitsLayer。[MDL Eq. 4、16](https://arxiv.org/html/2602.07520v2) 因此，任务或场景身份不仅编码在输入特征中，也编码在参数槽位和输出索引中。
+MDL 初始化固定的 $$N_s+1$$ 个 Scenario slots 和 $$N_t$$ 个 Task slots；不同 slot 拥有 Per-token FFN，最终每个 Task slot 还连接独立 LogitsLayer。[MDL Eq. 4、16](https://arxiv.org/html/2602.07520v2) 因此，任务或场景身份不仅编码在输入特征中，也编码在参数槽位和输出索引中。
 
 这使已知 Scenario × Task 的自由组合很便宜：新增组合不必新增一套完整 tower。但“组合已知槽位”与“处理从未训练过的新场景或新任务”是两个问题。若上线一个新的展示形态，原论文没有给出如何凭描述或少量样本生成新 Scenario token、如何把它映射到已有 Per-token FFN，或如何在不重训的情况下校准各 Task head。类似地，新增任务仍需要新的 Task initializer、Task FFN、LogitsLayer 和监督信号。
 
@@ -561,7 +561,7 @@ MDL 初始化固定的 \(N_s+1\) 个 Scenario slots 和 \(N_t\) 个 Task slots�
 <!-- IMAGE_PLACEHOLDER_START: FIG_12 -->
 > **【插图占位｜图 12】MDL 的结构收益与边界**
 >
-> **内容：** 集中说明三项边界：输出 head 从潜在的 \(N_sN_t\) 因子化为 \(N_t\)，但中间 cross-attention 与私有 FFN 成本仍随 Scenario/Task 数量增长；固定 Scenario/Task slots 支持训练时已知组合，却不等于新场景或新任务的零样本扩展。需要把“输出解耦”“中间成本仍存在”“闭集组合”三个结论同时讲清楚。
+> **内容：** 集中说明三项边界：输出 head 从潜在的 $$N_sN_t$$ 因子化为 $$N_t$$，但中间 cross-attention 与私有 FFN 成本仍随 Scenario/Task 数量增长；固定 Scenario/Task slots 支持训练时已知组合，却不等于新场景或新任务的零样本扩展。需要把“输出解耦”“中间成本仍存在”“闭集组合”三个结论同时讲清楚。
 >
 > **图注：** MDL减少组合式输出重复，但没有消除中间计算扩展，也没有自然获得开放集泛化。
 <!-- IMAGE_PLACEHOLDER_END: FIG_12 -->
@@ -578,9 +578,9 @@ MDL 的证据链包含工业离线主实验、组件消融、规模趋势、atte
 
 离线主要报告 Click、Like、Favorite 在三个场景上的 QAUC：先在每个 UID-query group 内计算 AUC，再对 group 平均。
 
-\[
+$$
 \operatorname{QAUC}=\frac{1}{N}\sum_{i=1}^{N}\operatorname{AUC}_i.
-\]
+$$
 
 比较方法包括 RankMixer、SharedBottom、MMoE、STAR、HMoE、PEPNet。除纯 RankMixer 外，其他多分布结构都接入 RankMixer backbone，总参数控制在约 0.5B。[MDL §4.1.3–4.1.4](https://arxiv.org/html/2602.07520v2) 这保证了近似等参数比较，但不等同于 activated FLOPs、访存和线上时延完全一致。
 
@@ -632,7 +632,7 @@ Table 1 的 `Improv.` 行以每个场景—任务格子的最强 baseline 为参
 
 ### 9.4 Scaling：支持趋势，但还不是完整定律
 
-论文改变 hidden dimension \(d\) 与层数 \(L\)，比较 MDL 和 MMoE 随参数量、FLOPs 增加时的 Single-column Click QAUC gain。MDL 曲线持续高于 MMoE，而且差距随规模扩大。[MDL Figure 2](https://arxiv.org/html/2602.07520v2)
+论文改变 hidden dimension $$d$$ 与层数 $$L$$，比较 MDL 和 MMoE 随参数量、FLOPs 增加时的 Single-column Click QAUC gain。MDL 曲线持续高于 MMoE，而且差距随规模扩大。[MDL Figure 2](https://arxiv.org/html/2602.07520v2)
 
 <!-- IMAGE_PLACEHOLDER_START: FIG_15 -->
 > **【插图占位｜图 15】MDL 与 MMoE 的 Scaling 趋势（基于原文 Figure 2）**
@@ -703,20 +703,20 @@ Table 3 报告的是相对变化，而不是指标绝对值：
 
 最有信息量的对照不是简单删除整个 token，而是保持 initializer、输入字段和 private capacity 完全一致，只改变交互位置：
 
-\[
+$$
 \begin{aligned}
 A&:\ \text{Same initializer + final tower},\\
 B&:\ \text{Same initializer + one-shot cross-attention},\\
 C&:\ \text{Same initializer + layer-wise cross-attention}.
 \end{aligned}
-\]
+$$
 
-在这一控制下，\(B-A\) 衡量条件化读取的价值，\(C-B\) 衡量逐层读取的增量。还需要加入等字段、等参数的 input-concat 或 FiLM 基线，判断收益究竟来自 read-side factorization，还是额外条件信息本身。
+在这一控制下，$$B-A$$ 衡量条件化读取的价值，$$C-B$$ 衡量逐层读取的增量。还需要加入等字段、等参数的 input-concat 或 FiLM 基线，判断收益究竟来自 read-side factorization，还是额外条件信息本身。
 
 <!-- IMAGE_PLACEHOLDER_START: FIG_19 -->
 > **【插图占位｜图 19】拆分 Initializer、条件读取与逐层读取的控制实验**
 >
-> **内容：** 比较三组保持 initializer、输入字段和 private capacity 相同的模型：A 只在最终 tower 使用条件状态，B 只做一次 cross-attention，C 在每层执行 cross-attention。需要明确 \(B-A\) 衡量条件化读取本身，\(C-B\) 衡量逐层交互的增量，并补充等字段、等参数的 input-concat 或 FiLM 对照，用于区分信息、参数和交互位置的贡献。
+> **内容：** 比较三组保持 initializer、输入字段和 private capacity 相同的模型：A 只在最终 tower 使用条件状态，B 只做一次 cross-attention，C 在每层执行 cross-attention。需要明确 $$B-A$$ 衡量条件化读取本身，$$C-B$$ 衡量逐层交互的增量，并补充等字段、等参数的 input-concat 或 FiLM 对照，用于区分信息、参数和交互位置的贡献。
 >
 > **图注：** 只有保持输入和容量一致，才能识别逐层读取的独立价值。
 <!-- IMAGE_PLACEHOLDER_END: FIG_19 -->
@@ -736,7 +736,7 @@ C&:\ \text{Same initializer + layer-wise cross-attention}.
 | Evidence | 直接携带用户—候选匹配证据 | item ID、内容特征、行为序列 |
 | Wide/Prior | 强统计先验 | 历史 CTR、CVR、频次统计 |
 
-最小诊断包括 initializer-only、Feature-only、Feature masking/shuffle，以及输出对 \(T^{(0)}\) 与 \(F^{(l)}\) 的梯度敏感度。
+最小诊断包括 initializer-only、Feature-only、Feature masking/shuffle，以及输出对 $$T^{(0)}$$ 与 $$F^{(l)}$$ 的梯度敏感度。
 
 <!-- IMAGE_PLACEHOLDER_START: FIG_20 -->
 > **【插图占位｜图 20】Domain Initializer 的信息职责与捷径审计**
@@ -752,7 +752,7 @@ MDL 对所有 active Scenario states 等权平均，再把同一结果加入所�
 
 对 Click、Like、Favorite 这类并行反馈，这个假设可能合理。对 impression→click→purchase 这类严格漏斗，MDL 没有显式 Task–Task probability decomposition 或 cascade information flow；“拥有 Task token”不等于“已经建模任务依赖”。
 
-工程上应检查分场景 PCOC/ECE、logit distribution、标签窗口和采样机制。如果共享 Task head 的校准差异过大，可以先尝试 scenario-specific bias 或 task-conditioned scenario aggregation，而不是立刻退回 \(N_sN_t\) 套完整 towers。
+工程上应检查分场景 PCOC/ECE、logit distribution、标签窗口和采样机制。如果共享 Task head 的校准差异过大，可以先尝试 scenario-specific bias 或 task-conditioned scenario aggregation，而不是立刻退回 $$N_sN_t$$ 套完整 towers。
 
 ### 10.4 前向专属化是否仍受梯度冲突限制？
 
@@ -772,7 +772,7 @@ MDL 引入更多 embedding tables、QKV projections、Per-token FFN、residual s
 | 计算 | Activated FLOPs、step time、MFU |
 | 内存 | 峰值显存、HBM bytes/request、embedding cache miss |
 | 在线 | QPS/GPU、P50/P95/P99 latency、timeout/fallback |
-| 扩展 | 随 \(N_s,N_t,N_f,L,d\) 增长的成本曲线 |
+| 扩展 | 随 $$N_s,N_t,N_f,L,d$$ 增长的成本曲线 |
 
 RankMixer 已经说明 Parameter Count、FLOPs 与实际系统成本不是同一个量；MDL 的公平评估也必须沿用这一系统视角。[RankMixer 原文](https://arxiv.org/html/2507.15551v1)
 
