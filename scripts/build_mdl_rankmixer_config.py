@@ -341,6 +341,16 @@ TASK_IMPORTANT_FIELDS_BY_TASK = {
         "price_hn",
         "adj_cartcvr_hn",
         "cart_cnt_3d_hn",
+        # Stage 1: add progressively finer target identity while retaining the
+        # dense price/conversion anchors used by the existing short-window
+        # training setup.
+        "cat_id_hn",
+        "goods_cluster_id_1w_hn",
+        "mall_id_hn",
+        # Stage 2: paper-style exact item identity.  This remains an
+        # independent task-extra table rather than aliasing the much larger
+        # feature/history goods union.
+        "goods_id_hn",
     ),
     "upid_pay": (
         "cat1_id_hn",
@@ -348,6 +358,10 @@ TASK_IMPORTANT_FIELDS_BY_TASK = {
         "price_hn",
         "sales_hn",
         "adj_cvr_hn",
+        "cat_id_hn",
+        "goods_cluster_id_1w_hn",
+        "mall_id_hn",
+        "goods_id_hn",
     ),
     "cateid_filter": (
         "cat1_id_hn",
@@ -355,6 +369,10 @@ TASK_IMPORTANT_FIELDS_BY_TASK = {
         "cat_id_hn",
         "rel_level_hn",
         "rel_score_hn",
+        # The active input contract has no scalar current_query_id.  Reuse the
+        # physically present original-query hash bag as the deployable query
+        # identity signal; it keeps its own task-extra embedding and mean pool.
+        "origin_query_hash_hn",
     ),
 }
 TASK_IMPORTANT_FIELDS = tuple(
@@ -642,6 +660,17 @@ PRIOR_INDEPENDENT_BUCKET_CAPS = {
     "cat2_id_hn": 1 << 14,
     "cat3_id_hn": 1 << 17,
     "cat4_id_hn": 1 << 19,
+}
+# Important identity tables are sized for the candidate/request source only;
+# they must not inherit the much larger shared feature/history union.  Explicit
+# floors for cluster/mall keep collision headroom cheap, while the exact goods
+# table follows the budgeted 32M candidate-only profile discussed in the MDL
+# token design audit.
+TASK_IMPORTANT_IDENTITY_SHAPES = {
+    "goods_cluster_id_1w_hn": (1 << 17, 32),
+    "mall_id_hn": (1 << 22, 32),
+    "goods_id_hn": (1 << 25, 32),
+    "origin_query_hash_hn": (1 << 20, 32),
 }
 SCENARIO_SHARED_PRIOR_UPS = ("impr", "clk_long", "view_long")
 # Concrete scenario tokens get one independent history clone (paper: one
@@ -3236,6 +3265,10 @@ def _apply_profile_driven_embedding_shapes(payload: dict[str, Any]) -> None:
             cap = PRIOR_INDEPENDENT_BUCKET_CAPS.get(field_name)
             if cap is not None:
                 num_buckets = min(num_buckets, int(cap))
+        elif table_name.startswith("task_important_"):
+            identity_shape = TASK_IMPORTANT_IDENTITY_SHAPES.get(source)
+            if identity_shape is not None:
+                num_buckets, embedding_dim = identity_shape
         _set_embedding_shape(
             payload,
             table_name,
@@ -4076,7 +4109,9 @@ def build_config(
             "fixed_test_eval": {
                 "enabled": True,
                 "every_steps": 5000,
-                "files_per_rank": 4,
+                # Production launches two ranks: 25/rank = 50 files spanning
+                # the held-out calendar day.
+                "files_per_rank": 25,
                 "auc_bins": 4096,
             },
             "checkpoint_path": _embedding_profile_checkpoint_path(

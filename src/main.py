@@ -950,7 +950,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Parquet files sampled per rank for the immutable test manifest; "
-            "default comes from training.fixed_test_eval (4)"
+            "default comes from training.fixed_test_eval (25)"
         ),
     )
     _add_data_input_args(train)

@@ -3078,6 +3078,42 @@ features:
   pooling_null_policy: exclude
   max_length: 1
   truncation: head
+- name: task_important_cat_id_hn
+  kind: categorical
+  source: cat_id_hn
+  embedding_scope: task
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 131072
+    padding_id: 0
+- name: task_important_goods_cluster_id_1w_hn
+  kind: categorical
+  source: goods_cluster_id_1w_hn
+  embedding_scope: task
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 131072
+    padding_id: 0
+- name: task_important_mall_id_hn
+  kind: categorical
+  source: mall_id_hn
+  embedding_scope: task
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 4194304
+    padding_id: 0
+- name: task_important_goods_id_hn
+  kind: categorical
+  source: goods_id_hn
+  embedding_scope: task
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 33554432
+    padding_id: 0
 - name: task_important_sales_hn
   kind: categorical
   source: sales_hn
@@ -3095,15 +3131,6 @@ features:
   encoding:
     type: pre_hashed
     num_buckets: 256
-    padding_id: 0
-- name: task_important_cat_id_hn
-  kind: categorical
-  source: cat_id_hn
-  embedding_scope: task
-  embedding_dim: 32
-  encoding:
-    type: pre_hashed
-    num_buckets: 131072
     padding_id: 0
 - name: task_important_rel_level_hn
   kind: categorical
@@ -3123,6 +3150,19 @@ features:
     type: pre_hashed
     num_buckets: 256
     padding_id: 0
+- name: task_important_origin_query_hash_hn
+  kind: categorical
+  source: origin_query_hash_hn
+  embedding_scope: task
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 1048576
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 46
+  truncation: head
 sequences:
 - name: impr
   embedding_scope: feature
@@ -4748,6 +4788,10 @@ sequences:
   - task_important_price_hn
   - task_important_adj_cartcvr_hn
   - task_important_cart_cnt_3d_hn
+  - task_important_cat_id_hn
+  - task_important_goods_cluster_id_1w_hn
+  - task_important_mall_id_hn
+  - task_important_goods_id_hn
   time_delta_field: time_delta_log1p_seconds
   null_anchor_field: goods_id_hn
   fields:
@@ -4856,6 +4900,10 @@ sequences:
   - task_important_price_hn
   - task_important_sales_hn
   - task_important_adj_cvr_hn
+  - task_important_cat_id_hn
+  - task_important_goods_cluster_id_1w_hn
+  - task_important_mall_id_hn
+  - task_important_goods_id_hn
   time_delta_field: time_delta_log1p_seconds
   null_anchor_field: goods_id_hn
   fields:
@@ -4972,6 +5020,7 @@ sequences:
   - task_important_cat_id_hn
   - task_important_rel_level_hn
   - task_important_rel_score_hn
+  - task_important_origin_query_hash_hn
   time_delta_field: time_delta_log1p_seconds
   null_anchor_field: goods_id_hn
   fields:
@@ -5238,6 +5287,10 @@ tokenization:
     - task_important_price_hn
     - task_important_adj_cartcvr_hn
     - task_important_cart_cnt_3d_hn
+    - task_important_cat_id_hn
+    - task_important_goods_cluster_id_1w_hn
+    - task_important_mall_id_hn
+    - task_important_goods_id_hn
     prior_inputs:
     - task_fst_cart_prior
   - name: upid_pay
@@ -5247,6 +5300,10 @@ tokenization:
     - task_important_price_hn
     - task_important_sales_hn
     - task_important_adj_cvr_hn
+    - task_important_cat_id_hn
+    - task_important_goods_cluster_id_1w_hn
+    - task_important_mall_id_hn
+    - task_important_goods_id_hn
     prior_inputs:
     - task_upid_pay_prior
   - name: cateid_filter
@@ -5256,6 +5313,7 @@ tokenization:
     - task_important_cat_id_hn
     - task_important_rel_level_hn
     - task_important_rel_score_hn
+    - task_important_origin_query_hash_hn
     prior_inputs:
     - task_cateid_filter_prior
   scenario_tokens:
@@ -5379,7 +5437,7 @@ training:
   fixed_test_eval:
     enabled: true
     every_steps: 5000
-    files_per_rank: 4
+    files_per_rank: 25
     auc_bins: 4096
   save_checkpoint: false
   checkpoint_path: artifacts/checkpoints/mdl_onetrans_2xh100_phase2_shared_dim

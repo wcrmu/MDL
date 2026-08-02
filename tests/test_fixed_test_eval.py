@@ -132,7 +132,9 @@ class FixedTestManifestTest(unittest.TestCase):
         self.assertEqual(selected, _evenly_spaced_file_uris(uris, 8))
         self.assertEqual(len(set(selected)), len(selected))
 
-    def test_prepare_freezes_four_files_per_rank_and_uses_train_batches(self) -> None:
+    def test_prepare_freezes_twenty_five_files_per_rank_and_uses_train_batches(
+        self,
+    ) -> None:
         config = load_app_config(ROOT / "configs" / "rankmixer.yaml")
         assert config.data.test is not None
         config = replace(
@@ -144,7 +146,7 @@ class FixedTestManifestTest(unittest.TestCase):
         )
         refs = [
             SimpleNamespace(canonical_uri=f"/test/hour/part-{index:03d}.parquet")
-            for index in range(40)
+            for index in range(100)
         ]
         context = DistributedContext(
             enabled=False,
@@ -158,7 +160,7 @@ class FixedTestManifestTest(unittest.TestCase):
             prepared = _prepare_fixed_test_eval(config, context)
 
         assert prepared.data.test is not None
-        self.assertEqual(len(prepared.data.test.inputs), 8)
+        self.assertEqual(len(prepared.data.test.inputs), 50)
         self.assertEqual(prepared.data.test.inputs[0], refs[0].canonical_uri)
         self.assertEqual(prepared.data.test.inputs[-1], refs[-1].canonical_uri)
         self.assertEqual(

@@ -121,8 +121,9 @@ python -m src.main benchmark --config configs/mixformer.yaml \
 When test hours are omitted, training uses the full calendar day after
 `--train-end-hour` (the example above evaluates 2026-07-30 00:00–24:00).
 Explicit test hours remain half-open. Rank 0 freezes a deterministic manifest
-sampled across that window (four Parquet files per rank by default), and the
-same held-out rows are evaluated every 5000 steps. Override the cost with
+sampled across that window (25 Parquet files per rank by default, 50 total on
+the production two-rank launch), and the same held-out rows are evaluated every
+5000 steps. Override the cost with
 `--test-files-per-rank` and `--eval-every-steps`.
 
 The supplied batch sizes are conservative starting points for 2xH100. They

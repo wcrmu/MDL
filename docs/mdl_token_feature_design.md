@@ -130,9 +130,9 @@ recommendation 的进一步差异由 coarse prior、important 组合和 PerToken
 
 | task | important raw fields | task prior |
 |---|---|---|
-| `fst_cart` | `cat1_id_hn`, `cat2_id_hn`, `price_hn`, `adj_cartcvr_hn`, `cart_cnt_3d_hn` | `cart_long` attention pool |
-| `upid_pay` | `cat1_id_hn`, `cat2_id_hn`, `price_hn`, `sales_hn`, `adj_cvr_hn` | `buy_long` attention pool |
-| `cateid_filter` | `cat1_id_hn`, `cat2_id_hn`, `cat_id_hn`, `rel_level_hn`, `rel_score_hn` | `srch_q2i` attention pool |
+| `fst_cart` | `cat1_id_hn`, `cat2_id_hn`, `price_hn`, `adj_cartcvr_hn`, `cart_cnt_3d_hn`, `cat_id_hn`, `goods_cluster_id_1w_hn`, `mall_id_hn`, `goods_id_hn` | `cart_long` attention pool |
+| `upid_pay` | `cat1_id_hn`, `cat2_id_hn`, `price_hn`, `sales_hn`, `adj_cvr_hn`, `cat_id_hn`, `goods_cluster_id_1w_hn`, `mall_id_hn`, `goods_id_hn` | `buy_long` attention pool |
+| `cateid_filter` | `cat1_id_hn`, `cat2_id_hn`, `cat_id_hn`, `rel_level_hn`, `rel_score_hn`, `origin_query_hash_hn` | `srch_q2i` attention pool |
 
 三条 task prior 都以本 task important embeddings 为 query。相比无条件 mean
 pool，它们回答“与当前候选/任务条件相关的历史是什么”。`cateid_filter` 的标签
@@ -142,10 +142,17 @@ pool，它们回答“与当前候选/任务条件相关的历史是什么”。
 表中写的是 raw source；YAML 中对应 logical name 带
 `task_important_` 前缀，并使用独立 task-scope embedding。
 
-task important 不再复制 locale，也不默认复制 `goods_id`：
+task important 不再复制 locale；在保留高支持度类目、价格和任务统计的基础上，
+分两层加入 identity：
 
 - locale 已由 active scenario token 经 DomainFused 注入；
-- task query 保留候选语义，但使用高支持度类目、价格和任务统计；
+- `fst_cart` / `upid_pay` 使用叶子类目、商品簇和商家作为低风险 identity，
+  并使用独立的 32M×32 `goods_id` task-extra 表作为论文同型的精确商品身份；
+- `cateid_filter` 已有叶子 `cat_id`，额外复用物理存在的
+  `origin_query_hash_hn` bag 作为可部署 query identity；若上游补充 scalar
+  current-query ID，应优先用 scalar 替换该 bag；
+- 所有 identity extra embeddings 均与主 feature/history 表独立，避免把主
+  `goods_id` union 的 268M 表复制进 task scope；
 - 各 task 的字段组合、prior 和 PerToken FFN 都不同，避免三个 task token
   仅靠同一套输入硬分化。
 
@@ -159,8 +166,8 @@ task important 不再复制 locale，也不默认复制 `goods_id`：
 - scenario history 的独立表尺寸跟随 profile 后 backbone 同 raw 字段的
   bucket/dim，独立不再隐含“回退到更大的估计维度”。
 
-当前 coarse MDL 配置约 286 张物理表，规划约 65.01 GiB/GPU
-（BF16 + Row-Wise Adagrad，2 GPU）；fine 配置约 284 张。
+当前 coarse MDL 配置约 290 张物理表，规划约 66.24 GiB/GPU
+（BF16 + Row-Wise Adagrad，2 GPU）；fine 配置约 288 张。
 
 ## 6. RankMixer feature token 边界
 
@@ -308,6 +315,9 @@ additive/FiLM scene bias 会重新引入 prompt→content/readout 路径，配�
 5. `scene_feature_bias`: `none` vs `additive` vs `film`，默认仍为 `none`。
 
 所有实验固定数据窗口、seed 和 holdout，按 task × scene 报告：
+
+当前生产两卡配置从训练结束后的下一自然日 24 小时窗口中均匀冻结
+`25 files/rank`，即总计 50 个 Parquet 文件；每 5000 step 重复评估同一 manifest。
 
 ```text
 AUC, COPC, BCE, prob_mean, logit_mean/std, positives, examples

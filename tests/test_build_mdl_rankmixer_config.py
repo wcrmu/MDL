@@ -33,6 +33,7 @@ from scripts.build_mdl_rankmixer_config import (
     SCENARIO_SHARED_PRIOR_UPS,
     TASK_IMPORTANT_FIELDS,
     TASK_IMPORTANT_FIELDS_BY_TASK,
+    TASK_IMPORTANT_IDENTITY_SHAPES,
     apply_embedding_profile,
     build_config,
     build_name_estimate_report,
@@ -469,6 +470,28 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             task_priors["task_fst_cart_prior"]["encoder"], "attention_pool"
         )
         self.assertEqual(task_priors["task_fst_cart_prior"]["pool_dim"], 32)
+        self.assertEqual(
+            TASK_IMPORTANT_FIELDS_BY_TASK["fst_cart"][-4:],
+            (
+                "cat_id_hn",
+                "goods_cluster_id_1w_hn",
+                "mall_id_hn",
+                "goods_id_hn",
+            ),
+        )
+        self.assertEqual(
+            TASK_IMPORTANT_FIELDS_BY_TASK["upid_pay"][-4:],
+            (
+                "cat_id_hn",
+                "goods_cluster_id_1w_hn",
+                "mall_id_hn",
+                "goods_id_hn",
+            ),
+        )
+        self.assertEqual(
+            TASK_IMPORTANT_FIELDS_BY_TASK["cateid_filter"][-1],
+            "origin_query_hash_hn",
+        )
         for task, prior in task_priors.items():
             task_name = task.removeprefix("task_").removesuffix("_prior")
             self.assertEqual(
@@ -478,6 +501,23 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     for source in TASK_IMPORTANT_FIELDS_BY_TASK[task_name]
                 ],
             )
+        for source, (num_buckets, embedding_dim) in (
+            TASK_IMPORTANT_IDENTITY_SHAPES.items()
+        ):
+            important = by_name[f"task_important_{source}"]
+            self.assertEqual(important["source"], source)
+            self.assertEqual(important["embedding_scope"], "task")
+            self.assertEqual(important["embedding_dim"], embedding_dim)
+            self.assertEqual(
+                important["encoding"]["num_buckets"], num_buckets
+            )
+            self.assertFalse(
+                important["encoding"].get("share_embedding", False)
+            )
+            self.assertNotIn("share_with", important["encoding"])
+        query_identity = by_name["task_important_origin_query_hash_hn"]
+        self.assertEqual(query_identity["pooling"], "mean")
+        self.assertEqual(query_identity["max_length"], 46)
         self.assertTrue(
             any(
                 field["source"] == "cart_long_x_goods_id_hn"
@@ -684,7 +724,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             {
                 "enabled": True,
                 "every_steps": 5000,
-                "files_per_rank": 4,
+                "files_per_rank": 25,
                 "auc_bins": 4096,
             },
         )
@@ -936,7 +976,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         self.assertEqual(onetrans["model"]["num_ns_tokens"], 32)
 
         mdl_onetrans = payloads["mdl_onetrans"]
-        self.assertEqual(len(mdl_onetrans["features"]), 171)
+        self.assertEqual(len(mdl_onetrans["features"]), 175)
         self.assertEqual(len(mdl_onetrans["sequences"]), 16)
         self.assertTrue(mdl_onetrans["model"]["experimental_model_acknowledged"])
         self.assertEqual(mdl_onetrans["model"]["first_domain_sequence_layer"], 4)
@@ -1476,7 +1516,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     )
                 self.assertTrue(config.training.fixed_test_eval.enabled)
                 self.assertEqual(config.training.fixed_test_eval.every_steps, 5000)
-                self.assertEqual(config.training.fixed_test_eval.files_per_rank, 4)
+                self.assertEqual(config.training.fixed_test_eval.files_per_rank, 25)
                 self.assertEqual(config.data.train.reader.shard_unit, "file")
                 self.assertEqual(config.data.train.reader.shuffle_buffer_rows, 512)
                 self.assertEqual(config.data.train.reader.shuffle_seed, 2025)
@@ -1542,8 +1582,8 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         if not getattr(item.encoding, "share_embedding", False)
                     )
                     # Phase-2 keeps task/scenario-history priors independent;
-                    # only main UPS spec/sku merges plus non-prior shares remain.
-                    self.assertEqual(physical, 286)
+                    # this now includes four candidate/query identity tables.
+                    self.assertEqual(physical, 290)
                     if model_name == "mdl_onetrans":
                         self.assertEqual(len(config.sequences), 16)
                         self.assertEqual(
@@ -1634,13 +1674,14 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             # Growth-aware PROFILE_DRIVEN_EMBEDDING_SHAPES win after every Phase-2
             # tier, so shared/query/aggressive bucket profiles collapse to the same
             # planned memory once those overrides apply.
-            # Counts include independent global scenario priors + task
-            # importants (goods capped at 16M); dead near-constants removed.
-            "baseline": (285, 65.009),
-            "shared": (284, 65.009),
-            "shared_dim": (284, 65.009),
-            "shared_dim_query_bucket": (284, 65.009),
-            "shared_dim_aggressive_bucket": (284, 65.009),
+            # Counts include independent global scenario priors plus the
+            # cluster/mall/goods/query task-identity tables; dead
+            # near-constants are removed.
+            "baseline": (289, 66.242),
+            "shared": (288, 66.242),
+            "shared_dim": (288, 66.242),
+            "shared_dim_query_bucket": (288, 66.242),
+            "shared_dim_aggressive_bucket": (288, 66.242),
         }
         for profile, (tables, gib) in expected.items():
             with self.subTest(profile=profile):
