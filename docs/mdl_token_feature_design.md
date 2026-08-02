@@ -260,7 +260,8 @@ model:
 
 ```bash
 python -m src.main train --config configs/mdl_rankmixer.yaml \
-  --mdl-token-state split
+  --mdl-token-state split \
+  --train-start-hour 2026-07-22-22 --train-end-hour 2026-07-29-22
 ```
 
 该模式保留原 important/prior projector 作为静态、样本相关的 domain prompt，

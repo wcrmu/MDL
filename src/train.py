@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -38,8 +37,8 @@ from torch.nn.parallel import DistributedDataParallel
 from .config import (
     AppConfig,
     DDPConfig,
+    FixedTestEvalConfig,
     ParquetSplitConfig,
-    QuickEvalConfig,
     ReaderConfig,
 )
 from .checkpoint import load_model_checkpoint, save_model_checkpoint
@@ -59,6 +58,7 @@ from .dataloader import (
     axis_batch_to_feature_batch,
     build_packed_request_plan,
     build_request_deduplication_from_pack,
+    discover_parquet_inputs,
     discover_scenario_values,
     io_progress_pulses,
     is_remote_io_stall_error,
@@ -463,10 +463,11 @@ class EvaluateResult:
 
 
 @dataclass(frozen=True)
-class QuickEvalResult:
+class FixedTestEvalResult:
     rows: int
     metrics: dict[str, dict[str, float | int | None]]
     elapsed_seconds: float
+    files: int
 
 
 ExternalTrainAdapter = Callable[..., TrainResult | dict[str, Any]]
@@ -709,18 +710,16 @@ def _configure_nccl_runtime_env(
         world_size = int(env.get("WORLD_SIZE", "1") or "1")
     except ValueError:
         world_size = 1
-    # NCCL scratch/channel caps are HBM insurance for 6–8 GPU peaks. Applying
-    # them on 2–4 GPU jobs cut emb A2A / allreduce BW and showed up as a
-    # "util cliff" even when users scaled back down to 4 GPUs.
-    if world_size >= 6:
+    # Emb-bound RankMixer needs larger scratch from 2-GPU up. Other models keep
+    # tighter 6–8 GPU HBM caps (applying those on 2–4 GPU cut A2A BW).
+    if prefer_collective_bw and world_size >= 2:
         env.setdefault("NCCL_CUMEM_ENABLE", "0")
-        if prefer_collective_bw:
-            # Emb-bound shallow backbones: larger scratch, leave channel count
-            # to NCCL so A2A can use the full NVLink/PCIe fabric.
-            env.setdefault("NCCL_BUFFSIZE", str(8 * 1024 * 1024))
-        else:
-            env.setdefault("NCCL_BUFFSIZE", str(2 * 1024 * 1024))
-            env.setdefault("NCCL_MAX_NCHANNELS", "4")
+        env.setdefault("NCCL_BUFFSIZE", str(8 * 1024 * 1024))
+        env.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "8")
+    elif world_size >= 6:
+        env.setdefault("NCCL_CUMEM_ENABLE", "0")
+        env.setdefault("NCCL_BUFFSIZE", str(2 * 1024 * 1024))
+        env.setdefault("NCCL_MAX_NCHANNELS", "4")
     if "NCCL_IGNORE_DISABLED_P2P" in env:
         return
     accessible = _local_cuda_p2p_accessible()
@@ -803,6 +802,19 @@ def _apply_local_rank_cpu_affinity(role: str) -> list[int]:
     return cores
 
 
+def _small_hbm_cuda_device(*, threshold_gib: float = 32.0) -> bool:
+    """True when the visible CUDA device looks like ≤``threshold_gib`` HBM."""
+
+    if not torch.cuda.is_available():
+        return False
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        total = float(getattr(props, "total_memory", 0) or 0)
+    except Exception:  # noqa: BLE001 - probe must never crash launch
+        return False
+    return total > 0.0 and total <= float(threshold_gib) * (1024**3)
+
+
 def _local_batch_scale_for_world_size(
     world_size: int,
     *,
@@ -811,8 +823,8 @@ def _local_batch_scale_for_world_size(
     """Scale per-rank batch so large world sizes keep HBM headroom for NCCL.
 
     Override with ``MDL_LOCAL_BATCH_SCALE`` (e.g. ``0.75`` / ``1.0``).
-    RankMixer is emb-bound with a shallow dense stack: milder 8-GPU derate
-    keeps per-step work large enough to hide A2A.
+    RankMixer-family keeps full batch at 8 GPUs by default on large HBM; the
+    small-HBM mild derate is applied in ``_apply_world_size_training_profile``.
     """
 
     forced = os.environ.get("MDL_LOCAL_BATCH_SCALE", "").strip()
@@ -824,9 +836,9 @@ def _local_batch_scale_for_world_size(
     if world_size <= 6:
         return 1.0
     if world_size <= 8:
-        # OneTrans 8×1024 OOMed in backward → 0.75. RankMixer needs more
-        # dense/emb work per step for util; 0.9 is the util/HBM compromise.
-        return 0.9 if rankmixer_family else 0.75
+        # OneTrans 8×1024 OOMed in backward → 0.75. RankMixer-family keeps
+        # full per-rank batch so dense/emb work can hide HDFS/A2A bubbles.
+        return 1.0 if rankmixer_family else 0.75
     return max(0.5, 6.0 / float(world_size))
 
 
@@ -848,24 +860,59 @@ def _apply_world_size_training_profile(
     config: AppConfig,
     world_size: int,
 ) -> AppConfig:
-    """Derate local batch / prefetch and widen DDP buckets for 6–8 GPU jobs.
+    """Derate local batch / prefetch and widen DDP buckets for multi-GPU jobs.
 
-    Aggressive multi-GPU defaults (override via env):
+    Aggressive multi-GPU defaults kick in at ``world_size >= 2`` so 2/3/4-GPU
+    local DDP gets emb/prefetch/bucket treatment (not only 6/8-GPU).
+    Override via env:
     - ``MDL_LOCAL_BATCH_SCALE``: per-rank batch multiplier
-      (default 1.0 ≤6; 0.75 @8, or 0.9 for RankMixer family)
     - ``MDL_GROUPED_EMB_MAX_OUTPUT_MIB``: emb A2A chunk cap
-      (RankMixer keeps larger caps — emb-bound util)
-    - ``NCCL_MAX_NCHANNELS``: already setdefault in NCCL env for ≥6
     """
 
     if world_size <= 1:
         return config
     rankmixer_family = _is_rankmixer_family(config)
+    multi_gpu = world_size >= 2
+    model_name = str(getattr(config.model, "name", ""))
+    accessible = _local_cuda_p2p_accessible()
+    if accessible is True:
+        p2p_ok = True
+    elif accessible is False:
+        p2p_ok = False
+    else:
+        p2p_ok = os.environ.get("NCCL_P2P_DISABLE", "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    small_hbm = _small_hbm_cuda_device()
     scale = _local_batch_scale_for_world_size(
         world_size, rankmixer_family=rankmixer_family
     )
+    # ≤32 GiB 7–8 GPU: mild RankMixer-family derate next to graph/NCCL pools.
+    # Large-HBM (H100) keeps scale=1.0 for util protect.
+    if (
+        rankmixer_family
+        and small_hbm
+        and 6 < world_size <= 8
+        and not os.environ.get("MDL_LOCAL_BATCH_SCALE", "").strip()
+        and abs(scale - 1.0) < 1.0e-9
+    ):
+        scale = 0.9
+    # Plain RankMixer is emb-A2A–bound: on no-P2P multi-GPU, mild upscale
+    # lengthens dense work so it can hide collectives (4×4090 A/B: 1.42).
+    if (
+        abs(scale - 1.0) < 1.0e-9
+        and model_name == "rankmixer"
+        and multi_gpu
+        and not p2p_ok
+        and not os.environ.get("MDL_LOCAL_BATCH_SCALE", "").strip()
+    ):
+        scale = 1.42
     training = config.training
     data = config.data
+    runtime = config.runtime
     if abs(scale - 1.0) >= 1.0e-9:
         old_bs = int(training.batch_size)
         new_bs = _scale_int_batch(old_bs, scale)
@@ -884,20 +931,31 @@ def _apply_world_size_training_profile(
             )
         data = replace(data, train=train_split, test=test_split)
 
-    # Cap emb A2A staging. RankMixer is emb-heavy / dense-light: keep larger
-    # chunks so 6–8 GPU jobs are not sliced into extra collective bubbles.
-    # Explicit launcher exports always win.
-    if world_size >= 6:
-        if rankmixer_family:
-            # Keep a full 1 GiB chunk even at 8 GPU — fewer fused-group splits.
+    # Cap emb A2A staging. Explicit launcher exports always win.
+    if multi_gpu:
+        if rankmixer_family and p2p_ok and not small_hbm:
             emb_cap = "1024"
+        elif rankmixer_family:
+            # No-P2P / 24GB: medium chunks — 768+ regressed sps on 4×4090.
+            emb_cap = "512"
         else:
             emb_cap = "384" if world_size >= 8 else "512"
         os.environ.setdefault("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", emb_cap)
 
-    # 8-GPU OneTrans: drop device prefetch (~1× activation) for HBM headroom.
-    # RankMixer deepens device prefetch — util is dominated by emb/H2D bubbles,
-    # not activation footprint of the 2-layer backbone.
+    # MDL-RankMixer CUDA-graph pools are huge on ≤32 GiB; disable graph.
+    if (
+        small_hbm
+        and bool(runtime.cuda_graph_backbone)
+        and model_name == "mdl_rankmixer"
+    ):
+        runtime = replace(runtime, cuda_graph_backbone=False)
+        if is_main_process():
+            print(
+                "Multi-GPU profile | disabled cuda_graph_backbone for "
+                "mdl_rankmixer on ≤32GiB GPU (graph private pools OOM)",
+                flush=True,
+            )
+
     train = data.train
     if train is not None:
         reader = train.reader
@@ -909,57 +967,84 @@ def _apply_world_size_training_profile(
         ):
             reader = replace(reader, device_prefetch_batches=0)
             reader_changed = True
-        if (
+        # Deepen device prefetch only when P2P + HBM can absorb it.
+        deepen_device = (
             rankmixer_family
+            and multi_gpu
+            and p2p_ok
+            and not small_hbm
+            and 0 < reader.device_prefetch_batches < 2
+        )
+        # Keep prior ≥6-GPU RankMixer deepen even when P2P probe is unclear
+        # (matches existing 6/8-GPU util profile tests).
+        if (
+            not deepen_device
+            and rankmixer_family
             and world_size >= 6
             and 0 < reader.device_prefetch_batches < 2
         ):
+            deepen_device = True
+        if deepen_device:
             reader = replace(reader, device_prefetch_batches=2)
             reader_changed = True
-        # Deepen host-prepare so pack/tensorize stays ahead of compute when
-        # more ranks contend on HDFS/shard tails (6/8 GPU util regressions).
-        if rankmixer_family and world_size >= 8:
+        if (
+            small_hbm
+            and bool(runtime.cuda_graph_backbone)
+            and model_name == "mdl_rankmixer"
+            and reader.device_prefetch_batches > 1
+        ):
+            reader = replace(reader, device_prefetch_batches=1)
+            reader_changed = True
+        # Deep host-prepare / Arrow prefetch for all multi-GPU families.
+        # RankMixer-family util-protect mock: host=10/pf=6.
+        if rankmixer_family and multi_gpu:
+            target_host = 10
+            target_prefetch = 6
+        elif multi_gpu:
             target_host = 6
-        elif rankmixer_family and world_size >= 6:
-            target_host = 5
-        elif world_size >= 6:
-            target_host = 4
+            target_prefetch = 4
         else:
             target_host = reader.host_prepare_prefetch
+            target_prefetch = reader.prefetch_batches
         if (
             reader.host_prepare_prefetch > 0
             and reader.host_prepare_prefetch < target_host
         ):
             reader = replace(reader, host_prepare_prefetch=target_host)
             reader_changed = True
-        # Slightly deeper Arrow/table prefetch on multi-GPU so HDFS shard tails
-        # do not idle the prepare child (host RAM only; not HBM).
-        if world_size >= 6 and 0 < reader.prefetch_batches < 3:
-            reader = replace(reader, prefetch_batches=3)
+        if multi_gpu and 0 < reader.prefetch_batches < target_prefetch:
+            reader = replace(reader, prefetch_batches=target_prefetch)
+            reader_changed = True
+        if (
+            rankmixer_family
+            and multi_gpu
+            and float(reader.hdfs_op_timeout) > 15.0
+        ):
+            reader = replace(reader, hdfs_op_timeout=15.0)
             reader_changed = True
         if reader_changed:
             train = replace(train, reader=reader)
             data = replace(data, train=train)
 
     ddp = training.ddp
-    # Wider reducer buckets → fewer allreduces → better compute/comm overlap
-    # on 6–8 GPU (YAML often still has 50). RankMixer benefits from even
-    # wider buckets (shallow dense finishes before small allreduces overlap).
     if world_size >= 8:
-        target_bucket = 200.0 if rankmixer_family else 125.0
-    elif world_size >= 6:
-        target_bucket = 175.0 if rankmixer_family else 100.0
+        target_bucket = 250.0 if rankmixer_family else 125.0
+    elif multi_gpu:
+        target_bucket = 250.0 if rankmixer_family else 100.0
     else:
         target_bucket = ddp.bucket_cap_mb
-    if world_size >= 6 and ddp.bucket_cap_mb < target_bucket:
+    if multi_gpu and ddp.bucket_cap_mb < target_bucket:
         training = replace(
             training,
             ddp=replace(ddp, bucket_cap_mb=target_bucket),
         )
 
-    if training is config.training and data is config.data:
-        # Still emit the emb-cap side effect even when config is unchanged.
-        if is_main_process() and world_size >= 6:
+    if (
+        training is config.training
+        and data is config.data
+        and runtime is config.runtime
+    ):
+        if is_main_process() and multi_gpu:
             print(
                 "Multi-GPU profile | "
                 f"world_size={world_size} local_batch_scale={scale:.3f} "
@@ -970,11 +1055,13 @@ def _apply_world_size_training_profile(
                 f"{0 if config.data.train is None else config.data.train.reader.host_prepare_prefetch} "
                 f"ddp_bucket_cap_mb={config.training.ddp.bucket_cap_mb:g} "
                 f"emb_max_output_mib="
-                f"{os.environ.get('MDL_GROUPED_EMB_MAX_OUTPUT_MIB', '')}",
+                f"{os.environ.get('MDL_GROUPED_EMB_MAX_OUTPUT_MIB', '')} "
+                f"p2p={int(p2p_ok)} small_hbm={int(small_hbm)} "
+                f"cuda_graph={int(bool(runtime.cuda_graph_backbone))}",
                 flush=True,
             )
         return config
-    updated = replace(config, training=training, data=data)
+    updated = replace(config, training=training, data=data, runtime=runtime)
     if is_main_process():
         train_reader = updated.data.train.reader if updated.data.train else None
         print(
@@ -987,7 +1074,9 @@ def _apply_world_size_training_profile(
             f"{0 if train_reader is None else train_reader.host_prepare_prefetch} "
             f"ddp_bucket_cap_mb={updated.training.ddp.bucket_cap_mb:g} "
             f"emb_max_output_mib="
-            f"{os.environ.get('MDL_GROUPED_EMB_MAX_OUTPUT_MIB', '')}",
+            f"{os.environ.get('MDL_GROUPED_EMB_MAX_OUTPUT_MIB', '')} "
+            f"p2p={int(p2p_ok)} small_hbm={int(small_hbm)} "
+            f"cuda_graph={int(bool(updated.runtime.cuda_graph_backbone))}",
             flush=True,
         )
     return updated
@@ -1156,6 +1245,122 @@ def _resolve_distributed_auto_scenarios(
     if context.rank == 0:
         logger.info("Discovered raw scene_id values: %s", resolved.scenarios.names)
     return resolved
+
+
+def _evenly_spaced_file_uris(
+    uris: list[str],
+    limit: int,
+) -> tuple[str, ...]:
+    """Choose a deterministic subset that spans the full sorted time range."""
+
+    if limit <= 0:
+        raise ValueError("fixed-test file limit must be positive")
+    if len(uris) <= limit:
+        return tuple(uris)
+    if limit == 1:
+        return (uris[len(uris) // 2],)
+    last = len(uris) - 1
+    return tuple(uris[(index * last) // (limit - 1)] for index in range(limit))
+
+
+def _prepare_fixed_test_eval(
+    config: AppConfig,
+    context: DistributedContext,
+) -> AppConfig:
+    """Freeze one representative test manifest and tune its forward-only reader."""
+
+    evaluation = config.training.fixed_test_eval
+    if not evaluation.enabled:
+        return config
+    test = config.data.test
+    if test is None:
+        raise ValueError("fixed-test evaluation requires data.test")
+    test.require_inputs("test")
+    file_limit = int(evaluation.files_per_rank) * max(1, context.world_size)
+    payload: list[dict[str, Any] | None] = [None]
+    if not context.enabled or context.rank == 0:
+        try:
+            refs = discover_parquet_inputs(
+                test.inputs,
+                remote_list_timeout_sec=(
+                    float(test.reader.hdfs_open_timeout)
+                    if any(
+                        str(item).startswith(("hdfs://", "viewfs://"))
+                        for item in test.inputs
+                    )
+                    else None
+                ),
+            )
+            available = len(refs)
+            if (
+                test.reader.shard_unit == "file"
+                and available < context.world_size
+            ):
+                raise ValueError(
+                    "fixed test window contains fewer Parquet files than ranks: "
+                    f"files={available} ranks={context.world_size}"
+                )
+            selected = _evenly_spaced_file_uris(
+                [ref.canonical_uri for ref in refs],
+                file_limit,
+            )
+            payload[0] = {
+                "paths": list(selected),
+                "available": available,
+                "error": None,
+            }
+        except Exception as error:  # Broadcast the failure so peers do not hang.
+            payload[0] = {"paths": None, "available": None, "error": str(error)}
+    if context.enabled:
+        torch_dist.broadcast_object_list(
+            payload,
+            src=0,
+            group=context.control_group,
+        )
+    result = payload[0]
+    if not isinstance(result, dict):
+        raise RuntimeError("fixed-test manifest broadcast returned an invalid payload")
+    failure = result.get("error")
+    if failure:
+        raise RuntimeError(f"fixed-test manifest discovery failed: {failure}")
+    paths = result.get("paths")
+    if not isinstance(paths, list) or not paths:
+        raise RuntimeError("fixed-test manifest discovery returned no Parquet files")
+
+    # Evaluation has no backward activations, so training-sized batches improve
+    # GPU occupancy without exceeding the already-proven training batch budget.
+    # Keep only one CUDA-prefetched batch and leave deeper buffering in host RAM.
+    train_reader = config.data.train.reader
+    test_reader = replace(
+        test.reader,
+        length_buckets=train_reader.length_buckets,
+        shuffle_buffer_rows=0,
+        prefetch_batches=max(
+            test.reader.prefetch_batches,
+            min(train_reader.prefetch_batches, 4),
+        ),
+        host_prepare_prefetch=max(
+            test.reader.host_prepare_prefetch,
+            min(train_reader.host_prepare_prefetch, 4),
+        ),
+        device_prefetch_batches=min(test.reader.device_prefetch_batches, 1),
+    )
+    frozen_test = replace(
+        test,
+        inputs=tuple(paths),
+        reader=test_reader,
+        prediction_keys={},
+    )
+    prepared = replace(config, data=replace(config.data, test=frozen_test))
+    if context.rank == 0:
+        print(
+            "Fixed test manifest | "
+            f"files_selected={len(paths)} files_available={result.get('available')} "
+            f"files_per_rank={evaluation.files_per_rank} "
+            f"world_size={context.world_size}",
+            flush=True,
+        )
+    return prepared
 
 
 def _resolve_distributed_cardinality_audit(
@@ -2837,18 +3042,40 @@ def _write_tensor_into_mmap(mapped: Any, offset: int, buffer: Tensor) -> int:
     return len(raw)
 
 
-def _spill_feature_batch_for_ipc(batch: FeatureBatch, share_dir: Path) -> dict[str, Any]:
-    """Pack coalesced buffers into an anonymous memfd Queue payload.
+def _create_anonymous_ipc_fd(name: str) -> int:
+    """Create an anonymous, send_handle-compatible file descriptor."""
 
-    Writes each buffer straight into the memfd (no intermediate ``bytes`` list)
-    so the child does not hold a second full copy of the batch while queuing.
+    create_memfd = getattr(os, "memfd_create", None)
+    if callable(create_memfd):
+        return int(create_memfd(name, 0))
+    # Some Linux Python builds omit os.memfd_create even when the kernel has
+    # tmpfs. TemporaryFile is already unlinked; dup keeps its backing alive
+    # after the Python file object closes.
+    shm_dir = (
+        "/dev/shm"
+        if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)
+        else None
+    )
+    with tempfile.TemporaryFile(prefix=f"{name}-", dir=shm_dir) as temporary:
+        return os.dup(temporary.fileno())
+
+
+def _spill_feature_batch_for_ipc(batch: FeatureBatch) -> tuple[dict[str, Any], int]:
+    """Pack coalesced buffers into an anonymous FD + metadata payload.
+
+    Returns ``(metadata, memfd)``. The caller owns ``memfd`` and must pass it
+    to ``_publish_memfd_payload`` or ``_load_feature_batch_from_ipc``; both
+    close it.
+
+    Cross-process transfer must NOT use ``multiprocessing.reduction.DupFd`` /
+    ``resource_sharer``: detaching those tokens races with child exit and shows
+    up in production as ``ConnectionResetError`` or ``FileNotFoundError`` after
+    many thousands of steps. Use a dedicated Pipe + ``send_handle`` instead.
     """
 
-    del share_dir
     if not batch._packed_buffers:
         raise ValueError("host-prepare IPC requires coalesced _packed_buffers")
     import mmap
-    from multiprocessing.reduction import DupFd
 
     sizes = [
         int(buffer.numel()) * int(buffer.element_size())
@@ -2860,7 +3087,7 @@ def _spill_feature_batch_for_ipc(batch: FeatureBatch, share_dir: Path) -> dict[s
     for buffer, nbytes in zip(batch._packed_buffers, sizes):
         buffer_records.append((str(buffer.dtype), int(nbytes), offset))
         offset += int(nbytes)
-    fd = os.memfd_create(f"mdl-host-prep-{time_ns()}", 0)
+    fd = _create_anonymous_ipc_fd(f"mdl-host-prep-{time_ns()}")
     try:
         os.ftruncate(fd, total)
         mapped = mmap.mmap(fd, total)
@@ -2870,14 +3097,13 @@ def _spill_feature_batch_for_ipc(batch: FeatureBatch, share_dir: Path) -> dict[s
                 written = _write_tensor_into_mmap(mapped, cursor, buffer)
                 if written != nbytes:
                     raise RuntimeError(
-                        f"memfd write size mismatch: wrote {written}, expected {nbytes}"
+                        f"IPC write size mismatch: wrote {written}, expected {nbytes}"
                     )
                 cursor += written
             mapped.flush()
         finally:
             mapped.close()
         payload = {
-            "fd": DupFd(fd),
             "size": total,
             "buffers": buffer_records,
             "features": _encode_feature_batch_views(batch.features, batch._packed_buffers),
@@ -2887,22 +3113,23 @@ def _spill_feature_batch_for_ipc(batch: FeatureBatch, share_dir: Path) -> dict[s
             "group_id": batch.group_id,
             "prediction_keys": batch.prediction_keys,
         }
-    finally:
+    except BaseException:
         os.close(fd)
-    return payload
+        raise
+    return payload, fd
 
 
 def _load_feature_batch_from_ipc(
     payload: dict[str, Any],
     *,
+    fd: int,
     pin_memory: bool,
     pinned_pool: _PinnedHostBufferPool | None = None,
 ) -> FeatureBatch:
     import mmap
 
-    fd = payload["fd"].detach()
-    size = int(payload["size"])
     try:
+        size = int(payload["size"])
         mapped = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
         try:
             records = list(payload["buffers"])
@@ -2958,6 +3185,51 @@ def _load_feature_batch_from_ipc(
         os.close(fd)
 
 
+def _memfd_handle_channel(ctx: Any) -> tuple[Any, Any]:
+    """Create the Unix socketpair required by ``send_handle``/``recv_handle``."""
+
+    # On POSIX, Pipe(duplex=False) is os.pipe(), which cannot carry SCM_RIGHTS.
+    # Duplex is deliberate even though ownership makes this channel one-way.
+    return ctx.Pipe(duplex=True)
+
+
+def _publish_memfd_payload(
+    queue: Any,
+    fd_conn: Any,
+    parent_pid: int,
+    payload: dict[str, Any],
+    memfd: int,
+) -> None:
+    """Transfer one memfd, then publish its paired metadata."""
+
+    from multiprocessing.reduction import send_handle
+
+    try:
+        # The parent must never observe metadata for an fd that failed to send.
+        send_handle(fd_conn, memfd, int(parent_pid))
+        _queue_put_interruptible(queue, payload)
+    finally:
+        os.close(memfd)
+
+
+def _wait_for_host_prepare_terminal_ack(conn: Any | None) -> None:
+    """Keep share-memory files alive until the parent consumes the terminal item."""
+
+    if conn is None:
+        return
+    try:
+        while True:
+            if conn.poll(0.5):
+                try:
+                    conn.recv_bytes()
+                except EOFError:
+                    pass
+                return
+    except (EOFError, OSError):
+        # Parent closed or exited before acknowledging; teardown owns cleanup.
+        return
+
+
 def _host_prepare_process_main(
     queue: Any,
     config: AppConfig,
@@ -2972,10 +3244,14 @@ def _host_prepare_process_main(
     ipc_mode: str,
     pin_memory: bool,
     progress_mtime: Any | None = None,
+    fd_conn: Any | None = None,
+    parent_pid: int | None = None,
+    terminal_ack_conn: Any | None = None,
 ) -> None:
     """Child entry: pack+tensorize and push FeatureBatches to the train process.
 
     - ``memfd``: hide CUDA, coalesce unpinned, spill via anonymous memfd (tiny shm).
+      File descriptors travel on ``fd_conn`` via ``send_handle`` (not DupFd).
     - ``share``: keep CUDA visible so we can pin in-child, then ``share_memory_``
       so the parent receives already-pinned handles (large ``/dev/shm``).
     """
@@ -3016,9 +3292,22 @@ def _host_prepare_process_main(
             ipc_mode=ipc_mode,
             pin_memory=pin_memory,
             progress_beat=_beat,
+            fd_conn=fd_conn,
+            parent_pid=parent_pid,
+            terminal_ack_conn=terminal_ack_conn,
         )
     finally:
         set_io_progress_hook(None)
+        if fd_conn is not None:
+            try:
+                fd_conn.close()
+            except Exception:
+                pass
+        if terminal_ack_conn is not None:
+            try:
+                terminal_ack_conn.close()
+            except Exception:
+                pass
 
 
 def _host_prepare_process_body(
@@ -3035,6 +3324,9 @@ def _host_prepare_process_body(
     ipc_mode: str,
     pin_memory: bool,
     progress_beat: Callable[[str], None],
+    fd_conn: Any | None = None,
+    parent_pid: int | None = None,
+    terminal_ack_conn: Any | None = None,
 ) -> None:
     _beat = progress_beat
     os.environ["MDL_HOST_PREPARE_PROCESS"] = "1"
@@ -3044,14 +3336,8 @@ def _host_prepare_process_body(
     # /dev/shm that ratchet container RSS across long runs).
     del pin_memory
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    # memfd mode must not redirect TMPDIR onto /dev/shm — leftover torch/Arrow
-    # temp files there count against container Working Set and look like a leak.
-    share_dir = (
-        _configure_host_prepare_tensor_sharing()
-        if use_share
-        else Path(tempfile.gettempdir())
-    )
     if use_share:
+        _configure_host_prepare_tensor_sharing()
         try:
             import torch.multiprocessing as torch_mp
 
@@ -3100,8 +3386,13 @@ def _host_prepare_process_body(
                         queue, _share_feature_batch_for_ipc(batch)
                     )
                 else:
-                    _queue_put_interruptible(
-                        queue, _spill_feature_batch_for_ipc(batch, share_dir)
+                    if fd_conn is None or parent_pid is None:
+                        raise RuntimeError(
+                            "memfd host-prepare IPC requires fd_conn + parent_pid"
+                        )
+                    payload, memfd = _spill_feature_batch_for_ipc(batch)
+                    _publish_memfd_payload(
+                        queue, fd_conn, parent_pid, payload, memfd
                     )
                 _beat("batch-queued")
                 # Free the child's handle promptly so shared IPC files / Arrow
@@ -3119,6 +3410,7 @@ def _host_prepare_process_body(
                 if produced % 64 == 0:
                     gc.collect()
             _queue_put_interruptible(queue, None)
+            _wait_for_host_prepare_terminal_ack(terminal_ack_conn)
         except BaseException as error:  # noqa: BLE001 - classify teardown vs real IO
             # Only swallow parent-closed-queue teardown. A bare ``except OSError``
             # previously hid HDFS/shm failures: the child exited with an empty
@@ -3136,6 +3428,7 @@ def _host_prepare_process_body(
         if isinstance(error, RemoteIoStallError):
             try:
                 _queue_put_interruptible(queue, error)
+                _wait_for_host_prepare_terminal_ack(terminal_ack_conn)
             except Exception:
                 pass
             return
@@ -3150,6 +3443,7 @@ def _host_prepare_process_body(
                     f"{type(error).__name__}: {error}\n{traceback.format_exc()}"
                 ),
             )
+            _wait_for_host_prepare_terminal_ack(terminal_ack_conn)
         except Exception:
             # Parent may already have closed the queue during teardown.
             pass
@@ -3442,6 +3736,24 @@ class _ProcessHostPrepareIterator:
         if is_main_process():
             print(ipc_message, flush=True)
         self._queue: Any = self._ctx.Queue(maxsize=int(queue_size))
+        # memfd fds travel on this Pipe via send_handle/recv_handle so we never
+        # depend on the child's multiprocessing.resource_sharer socket.
+        self._fd_recv: Any | None = None
+        fd_send: Any | None = None
+        parent_pid: int | None = None
+        if self._ipc_mode == "memfd":
+            self._fd_recv, fd_send = _memfd_handle_channel(self._ctx)
+            parent_pid = int(os.getpid())
+        # file_system share handles are owned by the producer's torch-shm
+        # manager. Keep that producer alive until the parent has consumed the
+        # FIFO terminal item, which proves all earlier batches were unpickled
+        # and privatized.
+        terminal_ack_recv: Any | None = None
+        self._terminal_ack_send: Any | None = None
+        if self._ipc_mode == "share":
+            terminal_ack_recv, self._terminal_ack_send = self._ctx.Pipe(
+                duplex=False
+            )
         self._process = self._ctx.Process(
             target=_host_prepare_process_main,
             kwargs={
@@ -3457,11 +3769,26 @@ class _ProcessHostPrepareIterator:
                 "ipc_mode": self._ipc_mode,
                 "pin_memory": self._pin_memory,
                 "progress_mtime": self._progress_mtime,
+                "fd_conn": fd_send,
+                "parent_pid": parent_pid,
+                "terminal_ack_conn": terminal_ack_recv,
             },
             name=f"mdl-host-prepare-{split_name}",
             daemon=False,
         )
         self._process.start()
+        # Parent only needs the recv end; close our copy of the send end so the
+        # pipe drains / EOFs when the child exits.
+        if fd_send is not None:
+            try:
+                fd_send.close()
+            except Exception:
+                pass
+        if terminal_ack_recv is not None:
+            try:
+                terminal_ack_recv.close()
+            except Exception:
+                pass
         # Train parent keeps the complementary slice of this LOCAL_RANK's CPUs.
         _apply_local_rank_cpu_affinity("train")
 
@@ -3565,7 +3892,7 @@ class _ProcessHostPrepareIterator:
                     )
                 self._raise_if_child_stalled()
                 continue
-            except (OSError, ValueError, EOFError) as error:
+            except (OSError, ValueError, EOFError, RuntimeError) as error:
                 self.close()
                 raise RuntimeError(
                     "host prepare IPC queue closed while waiting for a batch"
@@ -3573,12 +3900,15 @@ class _ProcessHostPrepareIterator:
             break
         self._mark_progress()
         if item is self._SENTINEL:
+            self._ack_share_terminal()
             self.close()
             raise StopIteration
         if isinstance(item, RemoteIoStallError):
+            self._ack_share_terminal()
             self.close()
             abort_rank_for_remote_io_stall(item)
         if isinstance(item, BaseException):
+            self._ack_share_terminal()
             self.close()
             if is_remote_io_stall_error(item):
                 abort_rank_for_remote_io_stall(item)
@@ -3602,21 +3932,94 @@ class _ProcessHostPrepareIterator:
                 "expected FeatureBatch or memfd payload dict"
             )
         try:
+            memfd = self._recv_memfd_handle()
             return _load_feature_batch_from_ipc(
                 item,
                 pin_memory=self._pin_memory,
                 pinned_pool=self._pinned_pool,
+                fd=memfd,
             )
+        except BaseException:
+            self.close()
+            raise
         finally:
             del item
+
+    def _recv_memfd_handle(self) -> int:
+        """Receive the next memfd from the child Pipe (paired with Queue meta)."""
+
+        from multiprocessing.reduction import recv_handle
+
+        conn = self._fd_recv
+        if conn is None:
+            raise RuntimeError("memfd host-prepare IPC pipe was not created")
+        while True:
+            try:
+                if conn.poll(0.5):
+                    return int(recv_handle(conn))
+            except (EOFError, ConnectionResetError, BrokenPipeError, OSError) as error:
+                raise RemoteIoStallError(
+                    "host-prepare memfd handle transfer failed "
+                    f"({type(error).__name__}: {error}); child likely exited "
+                    "before send_handle completed"
+                ) from error
+            if self._closed:
+                raise RemoteIoStallError(
+                    "host-prepare closed while waiting for memfd handle"
+                )
+            try:
+                alive = bool(self._process.is_alive())
+            except Exception:
+                alive = False
+            if not alive:
+                raise RemoteIoStallError(
+                    "host-prepare process exited while parent waited for memfd "
+                    f"handle (exitcode={getattr(self._process, 'exitcode', None)!r})"
+                )
+            self._raise_if_child_stalled()
+
+    def _ack_share_terminal(self) -> None:
+        conn = getattr(self, "_terminal_ack_send", None)
+        if conn is None:
+            return
+        try:
+            conn.send_bytes(b"done")
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._terminal_ack_send = None
+        # This is the clean terminal path. Give the child a short opportunity
+        # to exit normally before close() applies the bounded kill policy.
+        try:
+            self._process.join(timeout=1.0)
+        except Exception:
+            pass
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        terminal_ack_send = getattr(self, "_terminal_ack_send", None)
+        if terminal_ack_send is not None:
+            try:
+                terminal_ack_send.close()
+            except Exception:
+                pass
+            self._terminal_ack_send = None
         # Unblock a child stuck in Queue.put (full prefetch) before SIGTERM so
         # the grace window is spent on real teardown, not a deadlocked feeder.
         _close_process_queue(self._queue)
+        fd_recv = getattr(self, "_fd_recv", None)
+        if fd_recv is not None:
+            try:
+                fd_recv.close()
+            except Exception:
+                pass
+            self._fd_recv = None
         _terminate_process_group(
             self._process,
             grace_sec=2.0,
@@ -5242,7 +5645,7 @@ def train_mdl(
     step_observer: TrainStepObserver | None = None,
     training_started_observer: Callable[[], None] | None = None,
     synchronize_step_observer: bool = True,
-    run_quick_eval: bool = True,
+    run_fixed_test_eval: bool = True,
 ) -> TrainResult:
     if config.training.sparse_update_mode == "external_parameter_server":
         config = resolve_auto_scenarios(config)
@@ -5270,6 +5673,18 @@ def train_mdl(
         if log_steps and context.rank == 0:
             print(f"Attention backend | {attention_runtime}")
         config = _resolve_distributed_auto_scenarios(config, context)
+        fixed_test_eval = getattr(
+            config.training,
+            "fixed_test_eval",
+            FixedTestEvalConfig(enabled=False),
+        )
+        if (
+            run_fixed_test_eval
+            and fixed_test_eval.enabled
+            and (max_steps is None or max_steps >= fixed_test_eval.every_steps)
+        ):
+            config = _prepare_fixed_test_eval(config, context)
+            fixed_test_eval = config.training.fixed_test_eval
         config = _resolve_distributed_cardinality_audit(config, context, "train")
         vocab_maps = load_vocab_maps(config)
         base_model = _build_model_on_device(config, vocab_maps, device)
@@ -5375,7 +5790,6 @@ def train_mdl(
             dtype=torch.float32,
         )
         non_blocking = _non_blocking_transfer(config, "train", device)
-        quick_eval = getattr(config.training, "quick_eval", QuickEvalConfig())
         gradient_accumulation_steps = int(
             getattr(config.training, "gradient_accumulation_steps", 1)
         )
@@ -5471,7 +5885,6 @@ def train_mdl(
             if batches_on_device
             else host_batch_iterator
         )
-        pending_train_batches: deque[FeatureBatch | None] = deque()
         last_device_batch: FeatureBatch | None = None
         last_trace_batch: FeatureBatch | None = None
         accumulation_index = 0
@@ -5531,26 +5944,20 @@ def train_mdl(
                 detail=f"steps={steps}",
                 device=device,
             )
-            if pending_train_batches:
-                local_batch = pending_train_batches.popleft()
-                local_batch_on_device = False
-                if collect_batch_stats:
-                    trace_batch = local_batch
-            else:
-                try:
-                    if (
-                        collect_batch_stats
-                        and batches_on_device
-                        and isinstance(batch_iterator, _DevicePrefetchIterator)
-                    ):
-                        trace_batch, local_batch = batch_iterator.next_with_host()
-                    else:
-                        local_batch = next(batch_iterator)
-                        if collect_batch_stats and not batches_on_device:
-                            trace_batch = local_batch
-                except StopIteration:
-                    local_batch = None
-                local_batch_on_device = batches_on_device
+            try:
+                if (
+                    collect_batch_stats
+                    and batches_on_device
+                    and isinstance(batch_iterator, _DevicePrefetchIterator)
+                ):
+                    trace_batch, local_batch = batch_iterator.next_with_host()
+                else:
+                    local_batch = next(batch_iterator)
+                    if collect_batch_stats and not batches_on_device:
+                        trace_batch = local_batch
+            except StopIteration:
+                local_batch = None
+            local_batch_on_device = batches_on_device
             dataloader_wait_seconds = perf_counter() - dataloader_started
             rank_active = local_batch is not None
             # Kick the Gloo/NCCL active-rank reduction immediately so pinned H2D
@@ -5928,54 +6335,29 @@ def train_mdl(
                 window_task_monitors = None
                 gc.collect()
             if (
-                run_quick_eval
-                and quick_eval.enabled
-                and steps % quick_eval.every_steps == 0
-                and (
-                    quick_eval.split != "train"
-                    or not pending_train_batches
-                )
-                and (
-                    quick_eval.split != "train"
-                    or max_steps is None
-                    or steps < max_steps
-                )
+                run_fixed_test_eval
+                and fixed_test_eval.enabled
+                and steps % fixed_test_eval.every_steps == 0
             ):
-                quick_eval_batch_limit = quick_eval.max_batches
-                if quick_eval.split == "train" and max_steps is not None:
-                    quick_eval_batch_limit = min(
-                        quick_eval_batch_limit,
-                        (max_steps - steps) * gradient_accumulation_steps,
-                    )
-                quick_eval_result, staged_batches = _run_training_quick_eval(
+                fixed_test_result = _run_fixed_test_eval(
                     config,
                     model,
                     vocab_maps,
                     context,
-                    quick_eval,
+                    fixed_test_eval,
                     fallback_batch=last_device_batch,
-                    training_batch_iterator=(
-                        batch_iterator if quick_eval.split == "train" else None
-                    ),
-                    training_batches_on_device=batches_on_device,
-                    max_batches=quick_eval_batch_limit,
+                    watchdog=step_watchdog,
                 )
-                pending_train_batches.extend(staged_batches)
-                # Drop the caller's strong refs immediately. Leaving
-                # ``staged_batches`` bound until the next eval keeps every
-                # FeatureBatch (often pinned / share_memory_) alive for the
-                # whole every_steps window and ratchets RSS on each eval.
-                del staged_batches
                 # Evaluation forwards also touch sharded-embedding diagnostics;
                 # keep them out of the following training step's trace/log.
                 consume_sharded_embedding_stats(base_model)
                 if context.rank == 0:
-                    _print_training_quick_eval(
+                    _print_fixed_test_eval(
                         steps,
-                        quick_eval,
-                        quick_eval_result,
+                        fixed_test_eval,
+                        fixed_test_result,
                     )
-                del quick_eval_result
+                del fixed_test_result
         audit_report = ddp_auditor.report(context)
         if log_steps and context.rank == 0 and audit_report is not None:
             print(f"DDP graph audit | {audit_report}")
@@ -6330,44 +6712,24 @@ def _reduce_evaluation_task_monitors(
         _all_reduce_cpu_sum_(accumulator.totals, context)
 
 
-def _run_training_quick_eval(
+def _run_fixed_test_eval(
     config: AppConfig,
     model: nn.Module,
     vocab_maps: dict[str, dict[str, int]],
     context: DistributedContext,
-    quick_eval: QuickEvalConfig,
+    evaluation: FixedTestEvalConfig,
     *,
     fallback_batch: FeatureBatch | None,
-    training_batch_iterator: Iterator[FeatureBatch] | None = None,
-    training_batches_on_device: bool = False,
-    max_batches: int | None = None,
-) -> tuple[QuickEvalResult, tuple[FeatureBatch | None, ...]]:
-    """Evaluate upcoming train batches or a deterministic held-out prefix.
+    watchdog: _StepWatchdog | None = None,
+) -> FixedTestEvalResult:
+    """Evaluate every row in the frozen held-out Parquet manifest."""
 
-    When ``quick_eval.split`` is ``train``, batches are consumed from the main
-    training iterator and returned untouched so the caller can train those exact
-    batches immediately afterward. No separate training reader is created.
-    """
-
-    split = (
-        config.data.train if quick_eval.split == "train" else config.data.test
-    )
+    split = config.data.test
     if split is None:
-        raise ValueError(
-            f"quick evaluation split {quick_eval.split!r} is not configured"
-        )
-
-    retain_batches = quick_eval.split == "train"
-    if retain_batches and training_batch_iterator is None:
-        raise ValueError(
-            "training quick evaluation requires the main training batch iterator"
-        )
-    batch_limit = quick_eval.max_batches if max_batches is None else max_batches
-    if batch_limit <= 0:
-        raise ValueError("quick-evaluation max_batches must be positive")
+        raise ValueError("fixed-test evaluation requires data.test")
 
     accumulators = [
-        [_StreamingHistogramAUC(quick_eval.auc_bins)]
+        [_StreamingHistogramAUC(evaluation.auc_bins)]
         for _ in config.task_names
     ]
     copc_accumulators = [_StreamingCOPC() for _ in config.task_names]
@@ -6375,8 +6737,6 @@ def _run_training_quick_eval(
     rows = 0
     local_batches = 0
     batch_iterator: Iterator[FeatureBatch] | None = None
-    owns_batch_iterator = False
-    staged_batches: list[FeatureBatch | None] = []
     replay_batch = fallback_batch
     was_training = model.training
     started = perf_counter()
@@ -6384,65 +6744,69 @@ def _run_training_quick_eval(
     try:
         non_blocking = _non_blocking_transfer(
             config,
-            quick_eval.split,
+            "test",
             context.device,
         )
-        if retain_batches:
-            assert training_batch_iterator is not None
-            batch_iterator = training_batch_iterator
-        else:
-            batch_iterator = iter(
-                iter_feature_batches(
-                    config,
-                    quick_eval.split,
-                    vocab_maps,
-                    require_labels=True,
-                    shard_rank=context.rank,
-                    shard_world_size=context.world_size,
-                    pin_memory=non_blocking,
-                    include_group_id=False,
-                )
+        host_iterator = iter(
+            iter_feature_batches(
+                config,
+                "test",
+                vocab_maps,
+                require_labels=True,
+                shard_rank=context.rank,
+                shard_world_size=context.world_size,
+                pin_memory=non_blocking,
+                include_group_id=False,
             )
-            owns_batch_iterator = True
-        with torch.no_grad():
+        )
+        device_prefetch_depth = (
+            int(split.reader.device_prefetch_batches)
+            if context.device.type == "cuda"
+            else 0
+        )
+        batches_on_device = device_prefetch_depth > 0
+        batch_iterator = (
+            _DevicePrefetchIterator(
+                host_iterator,
+                context.device,
+                device_prefetch_depth,
+            )
+            if batches_on_device
+            else host_iterator
+        )
+        _step_watchdog_beat(
+            watchdog,
+            "fixed_test_eval",
+            detail="waiting_for_first_batch",
+            device=context.device,
+        )
+        with torch.inference_mode():
             while True:
-                prefetched_device_batch: FeatureBatch | None = None
-                if local_batches >= batch_limit:
+                try:
+                    local_batch = next(batch_iterator)
+                except StopIteration:
                     local_batch = None
-                else:
-                    try:
-                        if retain_batches and training_batches_on_device:
-                            if not isinstance(
-                                batch_iterator,
-                                _DevicePrefetchIterator,
-                            ):
-                                raise RuntimeError(
-                                    "device-resident training batches require the "
-                                    "CUDA prefetch iterator"
-                                )
-                            (
-                                local_batch,
-                                prefetched_device_batch,
-                            ) = batch_iterator.next_with_host()
-                        else:
-                            local_batch = next(batch_iterator)
-                        local_batches += 1
-                    except StopIteration:
-                        local_batch = None
+                if local_batch is not None:
+                    local_batches += 1
+                    if local_batches == 1 or local_batches % 16 == 0:
+                        _step_watchdog_beat(
+                            watchdog,
+                            "fixed_test_eval",
+                            detail=f"local_batches={local_batches}",
+                            device=context.device,
+                        )
                 rank_active = local_batch is not None
                 active_ranks = _active_rank_count(context, rank_active)
                 if active_ranks == 0:
                     break
-                if retain_batches:
-                    staged_batches.append(local_batch)
                 if rank_active:
                     if local_batch is None:
                         raise AssertionError(
-                            "active quick-evaluation rank is missing its batch"
+                            "active fixed-test rank is missing its batch"
                         )
                     batch = (
-                        prefetched_device_batch
-                        if prefetched_device_batch is not None
+                        local_batch
+                        if batches_on_device
                         else move_feature_batch(
                             local_batch,
                             context.device,
@@ -6453,8 +6817,8 @@ def _run_training_quick_eval(
                 else:
                     if replay_batch is None:
                         raise RuntimeError(
-                            "quick evaluation requires every rank to have either an "
-                            "evaluation batch or a previous training batch for replay"
+                            "fixed-test evaluation requires every rank to have a "
+                            "previous training batch for uneven-tail replay"
                         )
                     batch = replay_batch
 
@@ -6463,9 +6827,7 @@ def _run_training_quick_eval(
                 if not rank_active:
                     continue
                 if batch.labels is None:
-                    raise RuntimeError(
-                        "quick-evaluation batch did not contain labels"
-                    )
+                    raise RuntimeError("fixed-test batch did not contain labels")
                 logits_cpu = logits.float().cpu()
                 probabilities = torch.sigmoid(logits_cpu)
                 labels = batch.labels.float().cpu()
@@ -6495,6 +6857,12 @@ def _run_training_quick_eval(
                     )
                     task_monitors[task_index].update(task_logits, task_labels)
 
+        _step_watchdog_beat(
+            watchdog,
+            "fixed_test_eval_reduce",
+            detail=f"local_batches={local_batches}",
+            device=context.device,
+        )
         rows = _reduce_evaluation_histograms(context, accumulators, rows)
         _reduce_evaluation_copc(context, copc_accumulators)
         _reduce_evaluation_task_monitors(context, task_monitors)
@@ -6517,45 +6885,47 @@ def _run_training_quick_eval(
         _sync_device(context.device)
         # Do not retain the last device replay batch across the return path.
         replay_batch = None
-        retained = tuple(staged_batches)
-        staged_batches.clear()
-        return (
-            QuickEvalResult(
-                rows=rows,
-                metrics=metrics,
-                elapsed_seconds=perf_counter() - started,
-            ),
-            retained,
+        return FixedTestEvalResult(
+            rows=rows,
+            metrics=metrics,
+            elapsed_seconds=perf_counter() - started,
+            files=len(split.inputs),
         )
     finally:
-        if owns_batch_iterator and batch_iterator is not None:
+        if batch_iterator is not None:
             close = getattr(batch_iterator, "close", None)
             if callable(close):
                 close()
         model.train(was_training)
 
 
-def _print_training_quick_eval(
+def _print_fixed_test_eval(
     step: int,
-    quick_eval: QuickEvalConfig,
-    result: QuickEvalResult,
+    evaluation: FixedTestEvalConfig,
+    result: FixedTestEvalResult,
 ) -> None:
+    rows_per_second = (
+        result.rows / result.elapsed_seconds
+        if result.elapsed_seconds > 0.0
+        else 0.0
+    )
     print(
-        f"Quick eval | step={step} split={quick_eval.split} rows={result.rows} "
-        f"staged_for_training={str(quick_eval.split == 'train').lower()} "
-        f"max_batches_per_rank={quick_eval.max_batches} "
-        f"elapsed_seconds={result.elapsed_seconds:.6f}"
+        f"Fixed test eval | step={step} rows={result.rows} files={result.files} "
+        f"files_per_rank={evaluation.files_per_rank} "
+        f"elapsed_seconds={result.elapsed_seconds:.6f} "
+        f"rows_per_second={rows_per_second:.2f}"
     )
     for task_name, metrics in result.metrics.items():
         auc = metrics["auc"]
         auc_value = None if auc is None else float(auc)
+        copc = metrics.get("copc")
+        copc_value = None if copc is None else float(copc)
         prob_mean = metrics.get("prob_mean")
         prob_mean_value = None if prob_mean is None else float(prob_mean)
-        # COPC is still computed into metrics for debugging, but not printed:
-        # rare tasks + small quick-eval windows make it too noisy to trust.
         print(
-            f"Quick eval task | step={step} task={task_name} "
+            f"Fixed test eval task | step={step} task={task_name} "
             f"auc={_format_optional_float(auc_value, 8)} "
+            f"copc={_format_optional_float(copc_value)} "
             f"logloss={_format_optional_float(metrics.get('loss'))} "
             f"prob_mean={_format_optional_float(prob_mean_value)} "
             f"logit_mean={_format_optional_float(metrics.get('logit_mean'))} "
@@ -6565,11 +6935,12 @@ def _print_training_quick_eval(
         )
         warning_parts = _task_monitor_warning_parts(
             prob_mean=prob_mean_value,
+            copc=copc_value,
             auc=auc_value,
         )
         if warning_parts:
             print(
-                f"Quick eval warning | step={step} task={task_name} "
+                f"Fixed test eval warning | step={step} task={task_name} "
                 + " ".join(warning_parts)
             )
 

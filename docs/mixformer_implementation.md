@@ -112,10 +112,18 @@ Validate or run them through the existing CLI:
 ```bash
 python -m src.main validate-config --config configs/mixformer.yaml
 python -m src.main validate-config --config configs/mdl_mixformer.yaml
-python -m src.main train --config configs/mixformer.yaml --max-steps 100
+python -m src.main train --config configs/mixformer.yaml --max-steps 100 \
+  --train-start-hour 2026-07-22-22 --train-end-hour 2026-07-29-22
 python -m src.main benchmark --config configs/mixformer.yaml \
   --mode compute --batch-size 8 --sequence-length 128
 ```
+
+When test hours are omitted, training uses the full calendar day after
+`--train-end-hour` (the example above evaluates 2026-07-30 00:00–24:00).
+Explicit test hours remain half-open. Rank 0 freezes a deterministic manifest
+sampled across that window (four Parquet files per rank by default), and the
+same held-out rows are evaluated every 5000 steps. Override the cost with
+`--test-files-per-rank` and `--eval-every-steps`.
 
 The supplied batch sizes are conservative starting points for 2xH100. They
 must be tuned on the deployment driver/runtime because this environment cannot

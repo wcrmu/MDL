@@ -5,7 +5,8 @@ extends: mdl_onetrans.yaml
 
 runtime:
   activation_checkpoint: full
-  sequence_projection_chunk_tokens: 512
+  # Match plain MixFormer util/sps winner (512 launch-starves SMs on 24GB).
+  sequence_projection_chunk_tokens: 8192
 
 data:
   train:
@@ -45,7 +46,7 @@ model:
 training:
   step_watchdog_sec: 600.0
   batch_size: 512
-  lr_dense: 0.01
+  lr_dense: 0.0001
   dense_optimizer: rmsprop
   task_loss_weights:
     fst_cart: 0.5

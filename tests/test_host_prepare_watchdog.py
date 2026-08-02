@@ -68,6 +68,7 @@ class HostPrepareWatchdogTest(unittest.TestCase):
         iterator = _ProcessHostPrepareIterator.__new__(_ProcessHostPrepareIterator)
         iterator._pin_memory = False
         iterator._ipc_mode = "memfd"
+        iterator._fd_recv = None
         iterator._closed = False
         iterator._startup_timeout_sec = 0.05
         iterator._idle_timeout_sec = None
@@ -108,7 +109,9 @@ class HostPrepareWatchdogTest(unittest.TestCase):
         iterator = _ProcessHostPrepareIterator.__new__(_ProcessHostPrepareIterator)
         iterator._pin_memory = False
         iterator._ipc_mode = "memfd"
+        iterator._fd_recv = None
         iterator._closed = False
+        self.addCleanup(setattr, iterator, "_closed", True)
         iterator._startup_timeout_sec = 0.2
         iterator._idle_timeout_sec = None
         iterator._started_at = 0.0
@@ -172,6 +175,11 @@ class HostPrepareWatchdogTest(unittest.TestCase):
         self.assertTrue(
             _is_host_prepare_ipc_teardown_error(OSError(errno.EPIPE, "Broken pipe"))
         )
+        self.assertTrue(
+            _is_host_prepare_ipc_teardown_error(
+                ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+            )
+        )
         # Mid-run HDFS / shm failures must surface to the parent queue.
         self.assertFalse(
             _is_host_prepare_ipc_teardown_error(OSError("Filesystem closed"))
@@ -184,6 +192,7 @@ class HostPrepareWatchdogTest(unittest.TestCase):
         iterator = _ProcessHostPrepareIterator.__new__(_ProcessHostPrepareIterator)
         iterator._pin_memory = False
         iterator._ipc_mode = "memfd"
+        iterator._fd_recv = None
         iterator._closed = False
         iterator._startup_timeout_sec = None
         iterator._idle_timeout_sec = None

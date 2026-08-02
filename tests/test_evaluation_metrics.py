@@ -7,7 +7,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from src.config import QuickEvalConfig
+from src.config import FixedTestEvalConfig
 from src.dataloader import FeatureBatch
 from src.train import (
     DistributedContext,
@@ -16,9 +16,9 @@ from src.train import (
     _StreamingTaskMonitor,
     _binary_auc,
     _group_auc,
-    _print_training_quick_eval,
+    _print_fixed_test_eval,
     _reduce_evaluation_histograms,
-    _run_training_quick_eval,
+    _run_fixed_test_eval,
     _task_monitor_stats_from_batch,
     _task_monitor_warning_parts,
 )
@@ -39,7 +39,7 @@ class _ModeTrackingEvaluationModel(nn.Module):
         return {"logits": features["logits"]}
 
 
-def _quick_eval_batch(logits: list[float], labels: list[float]) -> FeatureBatch:
+def _evaluation_batch(logits: list[float], labels: list[float]) -> FeatureBatch:
     return FeatureBatch(
         features={"logits": torch.tensor(logits).unsqueeze(1)},
         labels=torch.tensor(labels).unsqueeze(1),
@@ -50,11 +50,17 @@ def _quick_eval_batch(logits: list[float], labels: list[float]) -> FeatureBatch:
 
 
 class EvaluationMetricTest(unittest.TestCase):
-    def test_training_quick_eval_stages_exact_batches_and_restores_training(self) -> None:
+    def test_fixed_test_eval_reads_full_manifest_and_restores_training(self) -> None:
         model = _ModeTrackingEvaluationModel().train()
         config = SimpleNamespace(
             runtime=SimpleNamespace(precision="fp32"),
-            data=SimpleNamespace(train=object(), test=object()),
+            data=SimpleNamespace(
+                train=object(),
+                test=SimpleNamespace(
+                    inputs=("part-0.parquet", "part-1.parquet"),
+                    reader=SimpleNamespace(device_prefetch_batches=0),
+                ),
+            ),
             task_names=["click"],
         )
         context = DistributedContext(
@@ -65,33 +71,34 @@ class EvaluationMetricTest(unittest.TestCase):
             device=torch.device("cpu"),
         )
         batches = [
-            _quick_eval_batch([-2.0, 2.0], [0.0, 1.0]),
-            _quick_eval_batch([-1.0, 1.0], [0.0, 1.0]),
+            _evaluation_batch([-2.0, 2.0], [0.0, 1.0]),
+            _evaluation_batch([-1.0, 1.0], [0.0, 1.0]),
         ]
 
-        with patch("src.train.iter_feature_batches") as separate_reader:
-            result, staged_batches = _run_training_quick_eval(
+        with patch(
+            "src.train.iter_feature_batches",
+            return_value=iter(batches),
+        ) as test_reader, patch(
+            "src.train._non_blocking_transfer",
+            return_value=False,
+        ):
+            result = _run_fixed_test_eval(
                 config,
                 model,
                 {},
                 context,
-                QuickEvalConfig(
+                FixedTestEvalConfig(
                     enabled=True,
-                    max_batches=2,
-                    split="train",
                     auc_bins=128,
                 ),
                 fallback_batch=None,
-                training_batch_iterator=iter(batches),
             )
 
-        separate_reader.assert_not_called()
+        test_reader.assert_called_once()
         self.assertTrue(model.training)
         self.assertEqual(model.training_modes, [False, False])
-        self.assertEqual(len(staged_batches), 2)
-        self.assertIs(staged_batches[0], batches[0])
-        self.assertIs(staged_batches[1], batches[1])
         self.assertEqual(result.rows, 4)
+        self.assertEqual(result.files, 2)
         self.assertEqual(result.metrics["click"]["auc"], 1.0)
         # logits [-2,2] + [-1,1] → sigmoid sums to ~2 with two positives → COPC≈1
         self.assertAlmostEqual(float(result.metrics["click"]["copc"]), 1.0, places=5)
@@ -111,22 +118,17 @@ class EvaluationMetricTest(unittest.TestCase):
         )
         self.assertGreater(float(result.metrics["click"]["logit_std"]), 0.0)
 
-    def test_staged_quick_eval_batches_release_after_caller_drops_refs(self) -> None:
-        """Train-split quick eval must not pin FeatureBatches until the next eval.
-
-        The training loop extends ``pending_train_batches`` then must ``del`` the
-        returned tuple; otherwise every staged batch stays alive for the whole
-        ``every_steps`` window and RSS ratchets on each eval.
-        """
-
-        import gc
-        import weakref
-        from collections import deque
-
+    def test_fixed_test_eval_closes_its_reader(self) -> None:
         model = _ModeTrackingEvaluationModel().train()
         config = SimpleNamespace(
             runtime=SimpleNamespace(precision="fp32"),
-            data=SimpleNamespace(train=object(), test=object()),
+            data=SimpleNamespace(
+                train=object(),
+                test=SimpleNamespace(
+                    inputs=("part-0.parquet",),
+                    reader=SimpleNamespace(device_prefetch_batches=0),
+                ),
+            ),
             task_names=["click"],
         )
         context = DistributedContext(
@@ -136,34 +138,38 @@ class EvaluationMetricTest(unittest.TestCase):
             world_size=1,
             device=torch.device("cpu"),
         )
-        batches = [
-            _quick_eval_batch([-2.0, 2.0], [0.0, 1.0]),
-            _quick_eval_batch([-1.0, 1.0], [0.0, 1.0]),
-        ]
-        refs = [weakref.ref(batch) for batch in batches]
 
-        _result, staged_batches = _run_training_quick_eval(
-            config,
-            model,
-            {},
-            context,
-            QuickEvalConfig(
-                enabled=True,
-                max_batches=2,
-                split="train",
-                auc_bins=128,
-            ),
-            fallback_batch=None,
-            training_batch_iterator=iter(batches),
-        )
-        pending: deque = deque()
-        pending.extend(staged_batches)
-        del staged_batches
-        del batches
-        while pending:
-            pending.popleft()
-        gc.collect()
-        self.assertTrue(all(ref() is None for ref in refs))
+        class _CloseableIterator:
+            def __init__(self) -> None:
+                self._iterator = iter(
+                    [_evaluation_batch([-2.0, 2.0], [0.0, 1.0])]
+                )
+                self.closed = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self._iterator)
+
+            def close(self) -> None:
+                self.closed = True
+
+        reader = _CloseableIterator()
+        with patch(
+            "src.train.iter_feature_batches",
+            return_value=reader,
+        ), patch("src.train._non_blocking_transfer", return_value=False):
+            _run_fixed_test_eval(
+                config,
+                model,
+                {},
+                context,
+                FixedTestEvalConfig(enabled=True, auc_bins=128),
+                fallback_batch=None,
+            )
+
+        self.assertTrue(reader.closed)
 
     def test_binary_auc_handles_ordering_and_ties_exactly(self) -> None:
         labels = torch.tensor([0.0, 0.0, 1.0, 1.0])
@@ -272,12 +278,13 @@ class EvaluationMetricTest(unittest.TestCase):
         self.assertGreater(float(stats[0]["prob_mean"]), 0.99)
         self.assertIsNone(stats[1]["prob_mean"])
 
-    def test_quick_eval_print_emits_monitor_fields_and_warnings(self) -> None:
+    def test_fixed_test_print_emits_metrics_and_warnings(self) -> None:
         result = type(
-            "QuickEvalResult",
+            "FixedTestEvalResult",
             (),
             {
                 "rows": 10,
+                "files": 4,
                 "elapsed_seconds": 0.01,
                 "metrics": {
                     "fst_cart": {
@@ -296,19 +303,23 @@ class EvaluationMetricTest(unittest.TestCase):
         )()
         lines: list[str] = []
         with patch("builtins.print", side_effect=lambda *args, **_kwargs: lines.append(" ".join(str(a) for a in args))):
-            _print_training_quick_eval(
+            _print_fixed_test_eval(
                 3000,
-                QuickEvalConfig(enabled=True, max_batches=20, split="train"),
+                FixedTestEvalConfig(enabled=True, files_per_rank=4),
                 result,
             )
-        task_line = next(line for line in lines if line.startswith("Quick eval task"))
+        task_line = next(
+            line for line in lines if line.startswith("Fixed test eval task")
+        )
         self.assertIn("prob_mean=0.970000", task_line)
         self.assertIn("logit_mean=3.500000", task_line)
         self.assertIn("logloss=0.900000", task_line)
-        self.assertNotIn("copc=", task_line)
-        warning_line = next(line for line in lines if line.startswith("Quick eval warning"))
+        self.assertIn("copc=5.000000", task_line)
+        warning_line = next(
+            line for line in lines if line.startswith("Fixed test eval warning")
+        )
         self.assertIn("prob_mean=", warning_line)
-        self.assertNotIn("copc=", warning_line)
+        self.assertIn("copc=", warning_line)
         self.assertIn("auc=", warning_line)
 
 

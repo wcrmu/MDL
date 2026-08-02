@@ -480,7 +480,7 @@ class MixFormerIntegrationTest(unittest.TestCase):
                 self.assertEqual(config.model.num_layers, 4)
                 self.assertEqual(config.model.hidden_dim, 1024)
                 self.assertEqual(config.training.dense_optimizer, "rmsprop")
-                self.assertEqual(config.training.lr_dense, 0.01)
+                self.assertEqual(config.training.lr_dense, 1.0e-4)
 
 
 if __name__ == "__main__":

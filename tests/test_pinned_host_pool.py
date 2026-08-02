@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gc
 import unittest
-from pathlib import Path
 
 import torch
 
@@ -16,6 +15,18 @@ from src.train import (
 )
 
 
+def _pinned_memory_available() -> bool:
+    try:
+        torch.empty(1, pin_memory=True)
+    except RuntimeError:
+        return False
+    return True
+
+
+@unittest.skipUnless(
+    _pinned_memory_available(),
+    "pinned host allocation requires a usable CUDA driver",
+)
 class PinnedHostPoolTest(unittest.TestCase):
     def test_checkout_reuses_storage_after_lease_release(self) -> None:
         pool = _PinnedHostBufferPool(max_free_slots=2)
@@ -42,9 +53,9 @@ class PinnedHostPoolTest(unittest.TestCase):
             group_id=["a", "b", "c", "d"],
             _packed_buffers=(packed,),
         )
-        payload = _spill_feature_batch_for_ipc(batch, share_dir=Path("."))
+        payload, memfd = _spill_feature_batch_for_ipc(batch)
         loaded = _load_feature_batch_from_ipc(
-            payload, pin_memory=True, pinned_pool=pool
+            payload, fd=memfd, pin_memory=True, pinned_pool=pool
         )
         self.assertTrue(loaded._packed_buffers[0].is_pinned())
         self.assertIsNotNone(loaded._keepalive)

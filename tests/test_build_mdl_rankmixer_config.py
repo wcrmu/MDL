@@ -666,6 +666,10 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         self.assertEqual(payload["runtime"]["activation_checkpoint"], "none")
         self.assertEqual(payload["training"]["embedding_distribution"], "sharded")
         self.assertEqual(payload["training"]["embedding_weight_dtype"], "bf16")
+        self.assertEqual(payload["training"]["lr_dense"], 1.0e-4)
+        self.assertEqual(payload["training"]["lr_sparse"], 1.0e-4)
+        self.assertEqual(payload["training"]["lr_schedule"], "constant")
+        self.assertEqual(payload["training"]["lr_warmup_steps"], 5000)
         self.assertEqual(payload["training"]["loss_reduction"], "mean_per_task")
         self.assertEqual(
             payload["training"]["task_loss_weights"],
@@ -676,12 +680,11 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             },
         )
         self.assertEqual(
-            payload["training"]["quick_eval"],
+            payload["training"]["fixed_test_eval"],
             {
                 "enabled": True,
-                "every_steps": 1000,
-                "max_batches": 20,
-                "split": "train",
+                "every_steps": 5000,
+                "files_per_rank": 4,
                 "auc_bins": 4096,
             },
         )
@@ -1242,7 +1245,11 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 config = replace(
                     config,
                     model=replace(config.model, mdl_token_state="split"),
-                    runtime=replace(config.runtime, activation_checkpoint="full"),
+                    runtime=replace(
+                        config.runtime,
+                        activation_checkpoint="full",
+                        cuda_graph_backbone=False,
+                    ),
                 )
                 config.validate()
                 model = build_model(
@@ -1329,16 +1336,37 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
 
     def test_production_profiles_use_expected_runtime(self) -> None:
         expected_runtime = {
-            # Current platform: 2×H100 flash-attn varlen + Row-Wise Adagrad + Phase 2.
-            "rankmixer": ("flash", False, 2),
-            "onetrans": ("flash", False, 2),
-            "mdl_onetrans": ("flash", False, 2),
-            "mdl_rankmixer": ("flash", False, 2),
+            # checkpoint, graph, packing and fused-dense reflect the latest
+            # measured HBM/util winners for each family.
+            "rankmixer": ("flash", False, 2, "none", True, "fixed", True),
+            "onetrans": ("flash", False, 2, "none", False, "fixed", True),
+            "mdl_onetrans": (
+                "flash",
+                False,
+                2,
+                "none",
+                False,
+                "fixed",
+                False,
+            ),
+            "mdl_rankmixer": (
+                "flash",
+                False,
+                2,
+                "none",
+                True,
+                "compact",
+                True,
+            ),
         }
         for model_name, (
             attention_backend,
             compile_enabled,
             nproc,
+            activation_checkpoint,
+            cuda_graph_backbone,
+            varlen_packing,
+            fused_dense_optimizer,
         ) in expected_runtime.items():
             with self.subTest(model=model_name):
                 config = load_app_config(ROOT / "configs" / f"{model_name}.yaml")
@@ -1346,11 +1374,16 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertEqual(config.runtime.compile, compile_enabled)
                 self.assertEqual(config.runtime.nproc_per_node, nproc)
                 memory_optimized = model_name.startswith("mdl_")
-                self.assertEqual(config.runtime.activation_checkpoint, "full")
-                self.assertFalse(config.runtime.cuda_graph_backbone)
                 self.assertEqual(
-                    config.runtime.varlen_packing,
-                    "compact" if memory_optimized else "fixed",
+                    config.runtime.activation_checkpoint, activation_checkpoint
+                )
+                self.assertEqual(
+                    config.runtime.cuda_graph_backbone, cuda_graph_backbone
+                )
+                self.assertEqual(config.runtime.varlen_packing, varlen_packing)
+                self.assertEqual(
+                    config.training.fused_dense_optimizer,
+                    fused_dense_optimizer,
                 )
                 self.assertEqual(
                     config.runtime.trim_all_invalid_sequence_prefix,
@@ -1398,6 +1431,10 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertFalse(config.data.train.label_masks)
                 self.assertFalse(config.data.test.label_masks)
                 self.assertEqual(config.training.loss_reduction, "mean_per_task")
+                self.assertEqual(config.training.lr_dense, 1.0e-4)
+                self.assertEqual(config.training.lr_sparse, 1.0e-4)
+                self.assertEqual(config.training.lr_schedule, "constant")
+                self.assertEqual(config.training.lr_warmup_steps, 5000)
                 if memory_optimized:
                     expected_proj_chunk = (
                         131072 if model_name == "mdl_rankmixer" else 81920
@@ -1426,7 +1463,6 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         config.training.gradient_accumulation_steps,
                         1,
                     )
-                    self.assertFalse(config.training.fused_dense_optimizer)
                     self.assertEqual(
                         config.training.dense_optimizer_foreach_bucket_mb,
                         128,
@@ -1438,8 +1474,9 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         ],
                         expected_buckets,
                     )
-                self.assertTrue(config.training.quick_eval.enabled)
-                self.assertEqual(config.training.quick_eval.split, "train")
+                self.assertTrue(config.training.fixed_test_eval.enabled)
+                self.assertEqual(config.training.fixed_test_eval.every_steps, 5000)
+                self.assertEqual(config.training.fixed_test_eval.files_per_rank, 4)
                 self.assertEqual(config.data.train.reader.shard_unit, "file")
                 self.assertEqual(config.data.train.reader.shuffle_buffer_rows, 512)
                 self.assertEqual(config.data.train.reader.shuffle_seed, 2025)

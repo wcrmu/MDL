@@ -11,7 +11,7 @@ import torch.distributed as torch_dist
 import torch.multiprocessing as torch_mp
 from torch import nn
 
-from src.config import DDPConfig, QuickEvalConfig
+from src.config import DDPConfig, FixedTestEvalConfig
 from src.dataloader import FeatureBatch
 from src.train import (
     DistributedContext,
@@ -23,6 +23,7 @@ from src.train import (
     _clip_sparse_grad_norm,
     _exclude_sparse_parameters_from_ddp,
     _mark_sparse_invariant_checks_explicitly_disabled,
+    _run_fixed_test_eval,
     _synchronize_sparse_parameter_replicas,
     evaluate_mdl,
     train_mdl,
@@ -180,25 +181,6 @@ class _ToySparseModel(nn.Module):
         return {"logits": self.output(values)}
 
 
-class _RecordingToySparseModel(_ToySparseModel):
-    def __init__(self) -> None:
-        super().__init__()
-        self.forward_calls: list[tuple[bool, tuple[int, ...]]] = []
-
-    def forward(
-        self,
-        features: dict[str, torch.Tensor],
-        scenario_id: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        self.forward_calls.append(
-            (
-                self.training,
-                tuple(int(value) for value in features["ids"].tolist()),
-            )
-        )
-        return super().forward(features, scenario_id)
-
-
 class _AllUsedToySparseModel(_ToySparseModel):
     def forward(
         self,
@@ -341,6 +323,63 @@ def _uneven_evaluation_worker(
     )
 
 
+def _uneven_fixed_test_worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    output_queue: object,
+) -> None:
+    _init_gloo(rank, world_size, port)
+    try:
+        split = SimpleNamespace(
+            labels={"task": "label"},
+            group_id=None,
+            inputs=("part-0.parquet", "part-1.parquet"),
+            reader=SimpleNamespace(device_prefetch_batches=0),
+        )
+        config = SimpleNamespace(
+            runtime=SimpleNamespace(precision="fp32"),
+            task_names=["task"],
+            data=SimpleNamespace(train=split, test=split),
+        )
+        batches = (
+            [
+                _evaluation_batch([-2.0], [0.0]),
+                _evaluation_batch([2.0], [1.0]),
+            ]
+            if rank == 0
+            else [_evaluation_batch([1.0], [1.0])]
+        )
+        context = DistributedContext(
+            enabled=True,
+            rank=rank,
+            local_rank=rank,
+            world_size=world_size,
+            device=torch.device("cpu"),
+        )
+        with patch(
+            "src.train.iter_feature_batches",
+            return_value=iter(batches),
+        ), patch("src.train._non_blocking_transfer", return_value=False):
+            result = _run_fixed_test_eval(
+                config,
+                _ToyEvaluationModel(),
+                {},
+                context,
+                FixedTestEvalConfig(enabled=True, auc_bins=128),
+                fallback_batch=_evaluation_batch([0.0], [0.0]),
+            )
+        output_queue.put(
+            {
+                "rank": rank,
+                "rows": result.rows,
+                "metrics": result.metrics,
+            }
+        )
+    finally:
+        torch_dist.destroy_process_group()
+
+
 def _uneven_train_worker(
     rank: int,
     world_size: int,
@@ -398,6 +437,10 @@ def _uneven_train_worker(
         patch("src.train.build_model", side_effect=build_model),
         patch("src.train.iter_feature_batches", return_value=iter(batches)),
         patch("src.train._non_blocking_transfer", return_value=False),
+        patch(
+            "src.train._apply_world_size_training_profile",
+            side_effect=lambda candidate, _world_size: candidate,
+        ),
     ):
         result = train_mdl(
             config,
@@ -512,7 +555,7 @@ class SparseDDPTest(unittest.TestCase):
                 log_steps=False,
                 step_observer=traces.append,
                 synchronize_step_observer=False,
-                run_quick_eval=False,
+                run_fixed_test_eval=False,
             )
 
         combined_config = _toy_config()
@@ -531,7 +574,7 @@ class SparseDDPTest(unittest.TestCase):
                 max_steps=1,
                 save_checkpoint=False,
                 log_steps=False,
-                run_quick_eval=False,
+                run_fixed_test_eval=False,
             )
 
         self.assertEqual(accumulated_result.steps, 1)
@@ -545,49 +588,6 @@ class SparseDDPTest(unittest.TestCase):
             combined_model.parameters(),
         ):
             torch.testing.assert_close(accumulated, combined, rtol=1e-6, atol=1e-7)
-
-    def test_quick_eval_trains_the_exact_staged_batches_in_order(self) -> None:
-        config = _toy_config()
-        config.data = SimpleNamespace(train=object(), test=None)
-        config.training.quick_eval = QuickEvalConfig(
-            enabled=True,
-            every_steps=1,
-            max_batches=1,
-            split="train",
-            auc_bins=128,
-        )
-        batches = [
-            _feature_batch([1]),
-            _feature_batch([2]),
-            _feature_batch([3]),
-        ]
-        model = _RecordingToySparseModel()
-
-        with (
-            patch("src.train.load_vocab_maps", return_value={}),
-            patch("src.train.build_model", return_value=model),
-            patch("src.train.iter_feature_batches", return_value=iter(batches)),
-            patch("src.train._non_blocking_transfer", return_value=False),
-            patch("src.train._print_training_quick_eval"),
-        ):
-            result = train_mdl(
-                config,
-                max_steps=3,
-                save_checkpoint=False,
-                log_steps=False,
-            )
-
-        self.assertEqual(result.steps, 3)
-        self.assertEqual(
-            model.forward_calls,
-            [
-                (True, (1,)),
-                (False, (2,)),
-                (True, (2,)),
-                (False, (3,)),
-                (True, (3,)),
-            ],
-        )
 
     def test_evaluation_replays_exhausted_rank_and_reduces_auc_histograms(self) -> None:
         context = torch_mp.get_context("spawn")
@@ -612,6 +612,29 @@ class SparseDDPTest(unittest.TestCase):
             self.assertEqual(metrics["negatives"], 1)
             self.assertEqual(metrics["auc"], 1.0)
             self.assertEqual(metrics["scene_default_auc"], 1.0)
+
+    def test_fixed_test_replays_exhausted_rank_and_reduces_metrics(self) -> None:
+        context = torch_mp.get_context("spawn")
+        output_queue = context.SimpleQueue()
+        torch_mp.start_processes(
+            _uneven_fixed_test_worker,
+            args=(2, _free_port(), output_queue),
+            nprocs=2,
+            join=True,
+            start_method="spawn",
+        )
+        results = sorted(
+            [output_queue.get(), output_queue.get()],
+            key=lambda item: item["rank"],
+        )
+
+        self.assertEqual([item["rows"] for item in results], [3, 3])
+        for item in results:
+            metrics = item["metrics"]["task"]
+            self.assertEqual(metrics["examples"], 3)
+            self.assertEqual(metrics["positives"], 2)
+            self.assertEqual(metrics["negatives"], 1)
+            self.assertEqual(metrics["auc"], 1.0)
 
     def test_sharded_sparse_clip_uses_one_global_norm(self) -> None:
         torch_mp.start_processes(

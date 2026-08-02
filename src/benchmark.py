@@ -1529,7 +1529,7 @@ def _benchmark_end_to_end(
         step_observer=collector.observe,
         training_started_observer=collector.start_if_zero_warmup,
         synchronize_step_observer=False,
-        run_quick_eval=False,
+        run_fixed_test_eval=False,
     )
     collector.stop_measurement()
     profiler = _profile_callable(
@@ -1538,7 +1538,7 @@ def _benchmark_end_to_end(
             max_steps=1,
             save_checkpoint=False,
             log_steps=False,
-            run_quick_eval=False,
+            run_fixed_test_eval=False,
         ),
         context.device,
         options.profile_steps,

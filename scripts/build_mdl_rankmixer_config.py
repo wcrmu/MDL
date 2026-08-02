@@ -4038,10 +4038,10 @@ def build_config(
                 "validated_no_unused_parameters": False,
                 "validated_static_graph": False,
             },
-            "lr_dense": 0.001,
-            "lr_sparse": 0.001,
+            "lr_dense": 1.0e-4,
+            "lr_sparse": 1.0e-4,
             "lr_schedule": "constant",
-            "lr_warmup_steps": 500,
+            "lr_warmup_steps": 5000,
             "lr_decay_steps": None,
             "lr_min_ratio": 0.0,
             "dense_optimizer": "rmsprop",
@@ -4073,11 +4073,10 @@ def build_config(
             },
             # Avoid a CUDA scalar readback on every production step.
             "log_every_steps": 100,
-            "quick_eval": {
+            "fixed_test_eval": {
                 "enabled": True,
-                "every_steps": 1000,
-                "max_batches": 20,
-                "split": "train",
+                "every_steps": 5000,
+                "files_per_rank": 4,
                 "auc_bins": 4096,
             },
             "checkpoint_path": _embedding_profile_checkpoint_path(

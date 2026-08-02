@@ -2821,42 +2821,43 @@ class DDPConfig:
 
 
 @dataclass(frozen=True)
-class QuickEvalConfig:
-    """Small, periodic AUC/COPC evaluation performed inside the training loop."""
+class FixedTestEvalConfig:
+    """Periodic metrics over one immutable, bounded test-file manifest."""
 
     enabled: bool = True
-    # Run after every N completed optimizer steps.
-    every_steps: int = 1000
-    # This limit is per rank when distributed training is enabled.
-    max_batches: int = 20
-    # train stages the next batches before their first optimizer update; test
-    # uses a separate deterministic reader and does not feed samples to training.
-    split: Literal["train", "test"] = "train"
+    # Run after every N completed optimizer steps. A less frequent default keeps
+    # the held-out pass from dominating end-to-end training throughput.
+    every_steps: int = 5000
+    # Rank 0 samples this many files for each distributed rank, then broadcasts
+    # the exact manifest. Four files/rank gives file sharding enough runway while
+    # bounding repeated validation time on hourly datasets with hundreds of files.
+    files_per_rank: int = 4
     # Bounded-memory histogram resolution used by the streaming AUC metric.
     auc_bins: int = 4096
 
     @classmethod
-    def from_mapping(cls, payload: dict[str, Any] | None) -> "QuickEvalConfig":
+    def from_mapping(
+        cls,
+        payload: dict[str, Any] | None,
+    ) -> "FixedTestEvalConfig":
         if payload is None:
             return cls()
         return cls(**payload)
 
     def validate(self) -> None:
         if type(self.enabled) is not bool:
-            raise ValueError("training.quick_eval.enabled must be a boolean")
+            raise ValueError("training.fixed_test_eval.enabled must be a boolean")
         if type(self.every_steps) is not int or self.every_steps <= 0:
             raise ValueError(
-                "training.quick_eval.every_steps must be a positive integer"
+                "training.fixed_test_eval.every_steps must be a positive integer"
             )
-        if type(self.max_batches) is not int or self.max_batches <= 0:
+        if type(self.files_per_rank) is not int or self.files_per_rank <= 0:
             raise ValueError(
-                "training.quick_eval.max_batches must be a positive integer"
+                "training.fixed_test_eval.files_per_rank must be a positive integer"
             )
-        if self.split not in {"train", "test"}:
-            raise ValueError("training.quick_eval.split must be train or test")
         if type(self.auc_bins) is not int or self.auc_bins < 2:
             raise ValueError(
-                "training.quick_eval.auc_bins must be an integer of at least 2"
+                "training.fixed_test_eval.auc_bins must be an integer of at least 2"
             )
 
 
@@ -2870,11 +2871,11 @@ class TrainingConfig(_DeeplyImmutableConfig):
     batch_size: int = 2048
     gradient_accumulation_steps: int = 1
     # Dense optimizer learning rate. Sparse lr falls back to this when None.
-    lr_dense: float = 0.005
+    lr_dense: float = 1.0e-4
     lr_sparse: float | None = None
     # Learning-rate schedule parameters used by train.py.
     lr_schedule: LRScheduleType = "constant"
-    lr_warmup_steps: int = 0
+    lr_warmup_steps: int = 5000
     lr_decay_steps: int | None = None
     lr_min_ratio: float = 0.0
     # Optimizer names are constrained for paper alignment and implementation scope.
@@ -2936,8 +2937,8 @@ class TrainingConfig(_DeeplyImmutableConfig):
     # seconds, terminate the process (silent dataloader/NCCL hangs). Null
     # disables the watchdog.
     step_watchdog_sec: float | None = 600.0
-    # Periodic pre-update AUC check performed without saving/reloading a checkpoint.
-    quick_eval: QuickEvalConfig = field(default_factory=QuickEvalConfig)
+    # Periodic held-out evaluation performed without saving/reloading a checkpoint.
+    fixed_test_eval: FixedTestEvalConfig = field(default_factory=FixedTestEvalConfig)
     # Default checkpoint path used by train/predict when CLI does not override it.
     checkpoint_path: str | None = None
     # When false, train_mdl skips writing checkpoint_path at the end of the run.
@@ -2952,7 +2953,9 @@ class TrainingConfig(_DeeplyImmutableConfig):
             values.get("embedding_sharding")
         )
         values["ddp"] = DDPConfig.from_mapping(values.get("ddp"))
-        values["quick_eval"] = QuickEvalConfig.from_mapping(values.get("quick_eval"))
+        values["fixed_test_eval"] = FixedTestEvalConfig.from_mapping(
+            values.get("fixed_test_eval")
+        )
         return cls(**values)
 
     def validate(self) -> None:
@@ -3033,7 +3036,7 @@ class TrainingConfig(_DeeplyImmutableConfig):
             raise ValueError("training.dense_distribution must be ddp")
         self.embedding_sharding.validate()
         self.ddp.validate()
-        self.quick_eval.validate()
+        self.fixed_test_eval.validate()
         if (
             self.embedding_distribution == "sharded"
             and not self.embedding_sparse_gradients
@@ -4685,20 +4688,15 @@ def validate_app_config(config: AppConfig) -> None:
             "data.train.reader.deduplicate_request_features=true so each "
             "candidate carries an unambiguous candidate-to-request mapping"
         )
-    if config.training.quick_eval.enabled:
-        quick_eval_split = (
-            config.data.train
-            if config.training.quick_eval.split == "train"
-            else config.data.test
-        )
-        if quick_eval_split is None:
+    if config.training.fixed_test_eval.enabled:
+        if config.data.test is None:
             raise ValueError(
-                "training.quick_eval.split=test requires data.test to be configured"
+                "training.fixed_test_eval.enabled=true requires data.test"
             )
-        if list(quick_eval_split.labels) != config.task_names:
+        if list(config.data.test.labels) != config.task_names:
             raise ValueError(
-                f"data.{config.training.quick_eval.split}.labels must declare the "
-                "training tasks in the same order when training.quick_eval is enabled: "
+                "data.test.labels must declare the training tasks in the same order "
+                "when training.fixed_test_eval is enabled: "
                 + ", ".join(config.task_names)
             )
     validate_tokenization_config(

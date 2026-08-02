@@ -110,7 +110,10 @@ class RemoteIoHelperTest(unittest.TestCase):
         self.assertEqual(order, ["a-enter", "a-exit", "b-enter", "b-exit"])
 
     def test_worker_stagger_sleeps_for_nonzero_rank(self) -> None:
-        with patch("src.dataloader.time.sleep") as sleep:
+        with patch(
+            "src.dataloader.time.monotonic",
+            side_effect=[100.0, 100.0, 102.0],
+        ), patch("src.dataloader.time.sleep") as sleep:
             apply_worker_stagger(2, 1.0)
         sleep.assert_called_once_with(2.0)
 

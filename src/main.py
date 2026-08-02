@@ -75,6 +75,39 @@ def _expand_hour_partition(
     return tuple(inputs)
 
 
+def _resolve_train_test_hour_window(
+    args: argparse.Namespace,
+) -> tuple[str, str]:
+    """Return explicit test hours or the next calendar day after train end."""
+
+    test_start = getattr(args, "test_start_hour", None)
+    test_end = getattr(args, "test_end_hour", None)
+    if test_start or test_end:
+        if not test_start or not test_end:
+            raise ValueError(
+                "--test-start-hour and --test-end-hour must be provided together"
+            )
+        return test_start, test_end
+
+    train_start = getattr(args, "train_start_hour", None)
+    train_end = getattr(args, "train_end_hour", None)
+    if not train_start or not train_end:
+        raise ValueError(
+            "train requires an explicit test hour window, or both "
+            "--train-start-hour and --train-end-hour to derive the next-day test"
+        )
+    try:
+        train_end_value = datetime.strptime(train_end, "%Y-%m-%d-%H")
+    except ValueError as error:
+        raise ValueError("hour windows must use YYYY-MM-DD-HH") from error
+    test_start_value = train_end_value.replace(hour=0) + timedelta(days=1)
+    test_end_value = test_start_value + timedelta(days=1)
+    return (
+        test_start_value.strftime("%Y-%m-%d-%H"),
+        test_end_value.strftime("%Y-%m-%d-%H"),
+    )
+
+
 def _resolve_split_inputs(
     *,
     explicit: list[str] | None,
@@ -83,6 +116,10 @@ def _resolve_split_inputs(
     base_dir: str,
     configured: tuple[str, ...],
 ) -> tuple[str, ...]:
+    if explicit and (start_hour or end_hour):
+        raise ValueError(
+            "explicit split inputs cannot be combined with a start/end hour window"
+        )
     if explicit:
         return tuple(explicit)
     if start_hour or end_hour:
@@ -95,6 +132,10 @@ def _resolve_split_inputs(
 def _apply_data_input_overrides(config, args: argparse.Namespace):
     """Optionally override empty/fixed split inputs from CLI without editing YAML."""
     base_dir = getattr(args, "data_base_dir", None) or DEFAULT_DATA_BASE_DIR
+    test_start_hour = getattr(args, "test_start_hour", None)
+    test_end_hour = getattr(args, "test_end_hour", None)
+    if getattr(args, "command", None) == "train":
+        test_start_hour, test_end_hour = _resolve_train_test_hour_window(args)
     train_inputs = _resolve_split_inputs(
         explicit=getattr(args, "train_input", None),
         start_hour=getattr(args, "train_start_hour", None),
@@ -108,8 +149,8 @@ def _apply_data_input_overrides(config, args: argparse.Namespace):
     ):
         test_inputs = _resolve_split_inputs(
             explicit=getattr(args, "test_input", None),
-            start_hour=getattr(args, "test_start_hour", None),
-            end_hour=getattr(args, "test_end_hour", None),
+            start_hour=test_start_hour,
+            end_hour=test_end_hour,
             base_dir=base_dir,
             configured=test_inputs,
         )
@@ -208,6 +249,30 @@ def _apply_training_overrides(config, args: argparse.Namespace):
     return replace(config, training=training, data=data)
 
 
+def _apply_fixed_test_eval_overrides(config, args: argparse.Namespace):
+    """Apply train-only cadence and fixed-manifest sizing overrides."""
+
+    updates: dict[str, int] = {}
+    for arg_name, field_name in (
+        ("eval_every_steps", "every_steps"),
+        ("test_files_per_rank", "files_per_rank"),
+    ):
+        value = getattr(args, arg_name, None)
+        if value is None:
+            continue
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"--{arg_name.replace('_', '-')} must be positive")
+        updates[field_name] = value
+    if not updates:
+        return config
+    fixed_test_eval = replace(config.training.fixed_test_eval, **updates)
+    fixed_test_eval.validate()
+    return replace(
+        config,
+        training=replace(config.training, fixed_test_eval=fixed_test_eval),
+    )
+
+
 def _apply_runtime_overrides(config, args: argparse.Namespace):
     """Apply optional CLI runtime overrides (e.g. activation checkpoint)."""
 
@@ -218,6 +283,14 @@ def _apply_runtime_overrides(config, args: argparse.Namespace):
             updates[field_name] = value
     if not updates:
         return config
+    if (
+        updates.get("activation_checkpoint") in {"selective", "full"}
+        and "cuda_graph_backbone" not in updates
+    ):
+        # An explicit checkpointing mode takes precedence over the YAML's
+        # optional graph optimization. Explicitly requesting both remains a
+        # validation error below.
+        updates["cuda_graph_backbone"] = False
     runtime = replace(config.runtime, **updates)
     runtime.validate()
     return replace(config, runtime=runtime)
@@ -269,6 +342,11 @@ def _load_config(args: argparse.Namespace):
         config = _apply_data_input_overrides(config, args)
     if any(getattr(args, name, None) is not None for name in _TRAINING_OVERRIDE_FIELDS):
         config = _apply_training_overrides(config, args)
+    if any(
+        getattr(args, name, None) is not None
+        for name in ("eval_every_steps", "test_files_per_rank")
+    ):
+        config = _apply_fixed_test_eval_overrides(config, args)
     if any(getattr(args, name, None) is not None for name in _RUNTIME_OVERRIDE_FIELDS):
         config = _apply_runtime_overrides(config, args)
     if any(getattr(args, name, None) is not None for name in _MODEL_OVERRIDE_FIELDS):
@@ -338,12 +416,18 @@ def _add_data_input_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--test-start-hour",
         default=None,
-        help="inclusive test hour window start as YYYY-MM-DD-HH",
+        help=(
+            "inclusive test hour start as YYYY-MM-DD-HH; train defaults to the "
+            "calendar day after --train-end-hour"
+        ),
     )
     parser.add_argument(
         "--test-end-hour",
         default=None,
-        help="exclusive test hour window end as YYYY-MM-DD-HH",
+        help=(
+            "exclusive test hour end as YYYY-MM-DD-HH; train defaults to the "
+            "calendar day after --train-end-hour"
+        ),
     )
 
 
@@ -417,7 +501,10 @@ def _add_runtime_override_args(parser: argparse.ArgumentParser) -> None:
         "--activation-checkpoint",
         choices=["none", "selective", "full"],
         default=None,
-        help="override runtime.activation_checkpoint (none|selective|full)",
+        help=(
+            "override runtime.activation_checkpoint (none|selective|full); "
+            "selective/full disables an inherited CUDA graph"
+        ),
     )
     parser.add_argument(
         "--cuda-graph-backbone",
@@ -685,10 +772,20 @@ def _cmd_train(args: argparse.Namespace) -> int:
     # torchrun workers that import src.train without going through main.
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", _ALLOC_CONF)
     os.environ.setdefault("PYTORCH_ALLOC_CONF", _ALLOC_CONF)
+    _resolve_train_test_hour_window(args)
     config = _load_config(args)
+    config.data.train.require_inputs("train")
+    if config.data.test is None:
+        raise ValueError("train fixed-test evaluation requires data.test")
+    config.data.test.require_inputs("test")
+    overlap = sorted(set(config.data.train.inputs) & set(config.data.test.inputs))
+    if overlap:
+        raise ValueError(
+            "train and fixed test inputs must be disjoint; overlapping partition: "
+            + overlap[0]
+        )
     if _effective_distributed_mode(args, config) == "ddp" and not _in_distributed_launcher():
         return _launch_ddp_command(args, config)
-    config.data.train.require_inputs("train")
     try:
         result = train_mdl(config, max_steps=args.max_steps)
     except Exception as error:  # noqa: BLE001 - map fatal remote stalls to exit 70
@@ -841,6 +938,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--nproc-per-node", type=int, default=None)
     train.add_argument("--master-addr", default=None)
     train.add_argument("--master-port", type=int, default=None)
+    train.add_argument(
+        "--eval-every-steps",
+        type=int,
+        default=None,
+        help="fixed-test cadence; default comes from training.fixed_test_eval (5000)",
+    )
+    train.add_argument(
+        "--test-files-per-rank",
+        type=int,
+        default=None,
+        help=(
+            "Parquet files sampled per rank for the immutable test manifest; "
+            "default comes from training.fixed_test_eval (4)"
+        ),
+    )
     _add_data_input_args(train)
     _add_training_override_args(train)
     _add_runtime_override_args(train)

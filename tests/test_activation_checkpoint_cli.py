@@ -27,6 +27,7 @@ class ActivationCheckpointCliOverrideTest(unittest.TestCase):
     def test_runtime_override_replaces_yaml_value(self) -> None:
         config = load_app_config(ROOT / "configs" / "rankmixer.yaml")
         self.assertEqual(config.runtime.activation_checkpoint, "none")
+        self.assertTrue(config.runtime.cuda_graph_backbone)
         args = build_arg_parser().parse_args(
             [
                 "train",
@@ -38,7 +39,9 @@ class ActivationCheckpointCliOverrideTest(unittest.TestCase):
         )
         overridden = _apply_runtime_overrides(config, args)
         self.assertEqual(overridden.runtime.activation_checkpoint, "full")
+        self.assertFalse(overridden.runtime.cuda_graph_backbone)
         self.assertEqual(config.runtime.activation_checkpoint, "none")
+        self.assertTrue(config.runtime.cuda_graph_backbone)
 
     def test_load_config_applies_activation_checkpoint_override(self) -> None:
         args = build_arg_parser().parse_args(
@@ -56,6 +59,25 @@ class ActivationCheckpointCliOverrideTest(unittest.TestCase):
         ):
             config = _load_config(args)
         self.assertEqual(config.runtime.activation_checkpoint, "selective")
+        self.assertFalse(config.runtime.cuda_graph_backbone)
+
+    def test_explicit_incompatible_cuda_graph_override_is_rejected(self) -> None:
+        config = load_app_config(ROOT / "configs" / "rankmixer.yaml")
+        args = build_arg_parser().parse_args(
+            [
+                "train",
+                "--config",
+                str(ROOT / "configs" / "rankmixer.yaml"),
+                "--activation-checkpoint",
+                "full",
+                "--cuda-graph-backbone",
+            ]
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "cuda_graph_backbone requires runtime.activation_checkpoint=none",
+        ):
+            _apply_runtime_overrides(config, args)
 
     def test_omitted_flag_leaves_yaml_unchanged(self) -> None:
         config = load_app_config(ROOT / "configs" / "rankmixer.yaml")

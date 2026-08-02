@@ -5,9 +5,10 @@ extends: onetrans.yaml
 
 runtime:
   activation_checkpoint: full
-  # Tighter than OneTrans: MixFormer sequence FFN is N*D wide and cross-attn
-  # score tensors scale with L; also enables length/request attention chunking.
-  sequence_projection_chunk_tokens: 512
+  # Chunk sequence projection to bound peak activation HBM. 512 under-fills the
+  # GPU (launch overhead dominates; 2×4090 util-push: MFU ~0.04 vs ~0.26 at
+  # 8192). 8192 matches all6_post_opt winners on 24GB.
+  sequence_projection_chunk_tokens: 8192
 
 data:
   train:
@@ -64,7 +65,7 @@ model:
 training:
   step_watchdog_sec: 600.0
   batch_size: 512
-  lr_dense: 0.01
+  lr_dense: 0.0001
   dense_optimizer: rmsprop
   task_loss_weights:
     fst_cart: 0.5

@@ -21,6 +21,31 @@ from src.features import load_vocab_maps, plan_vocab_fit
 
 
 class ModelConfigOverlayTest(unittest.TestCase):
+    def test_default_and_production_learning_rate_profile(self) -> None:
+        defaults = TrainingConfig()
+        self.assertEqual(defaults.lr_dense, 1.0e-4)
+        self.assertIsNone(defaults.lr_sparse)
+        self.assertEqual(defaults.lr_schedule, "constant")
+        self.assertEqual(defaults.lr_warmup_steps, 5000)
+
+        root = Path(__file__).resolve().parents[1]
+        for model_name in (
+            "rankmixer",
+            "mdl_rankmixer",
+            "onetrans",
+            "mdl_onetrans",
+            "mixformer",
+            "mdl_mixformer",
+        ):
+            for suffix in ("", "_fine"):
+                config_name = f"{model_name}{suffix}.yaml"
+                with self.subTest(config=config_name):
+                    config = load_app_config(root / "configs" / config_name)
+                    self.assertEqual(config.training.lr_dense, 1.0e-4)
+                    self.assertEqual(config.training.lr_sparse, 1.0e-4)
+                    self.assertEqual(config.training.lr_schedule, "constant")
+                    self.assertEqual(config.training.lr_warmup_steps, 5000)
+
     def test_training_loss_logs_every_100_steps_by_default_and_in_production(
         self,
     ) -> None:
@@ -359,19 +384,16 @@ class ModelConfigOverlayTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, expected_error):
                         load_app_config(config_path)
 
-    def test_quick_eval_requires_labels_on_the_selected_split(self) -> None:
+    def test_fixed_test_eval_requires_test_labels(self) -> None:
         root = Path(__file__).resolve().parents[1]
         config = load_app_config(root / "configs" / "reference" / "default.yaml")
-        self.assertTrue(config.training.quick_eval.enabled)
-        self.assertEqual(config.training.quick_eval.split, "train")
-        quick_eval = replace(
-            config.training.quick_eval,
-            enabled=True,
-            split="test",
-        )
+        self.assertTrue(config.training.fixed_test_eval.enabled)
         configured = replace(
             config,
-            training=replace(config.training, quick_eval=quick_eval),
+            data=replace(
+                config.data,
+                test=replace(config.data.test, labels={}),
+            ),
         )
 
         with self.assertRaisesRegex(
