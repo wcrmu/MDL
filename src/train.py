@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left
+from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -2821,21 +2822,58 @@ class _PinnedPoolLease:
             pass
 
 
+def _pinned_pool_max_slot_bytes_from_env(
+    environ: MutableMapping[str, str] | None = None,
+) -> int | None:
+    """Optional hard cap on idle pinned bytes retained per dtype buffer.
+
+    Set ``MDL_PINNED_POOL_MAX_SLOT_BYTES`` (positive int). Unset / empty keeps
+    the default soft policy (sliding high-water shrink only).
+    """
+
+    env = os.environ if environ is None else environ
+    raw = str(env.get("MDL_PINNED_POOL_MAX_SLOT_BYTES", "")).strip()
+    if not raw:
+        return None
+    value = int(raw)
+    if value <= 0:
+        raise ValueError("MDL_PINNED_POOL_MAX_SLOT_BYTES must be positive")
+    return value
+
+
 class _PinnedHostBufferPool:
     """Recycle pinned host storages across variable-length FeatureBatches.
 
     Fresh ``torch.empty(..., pin_memory=True)`` per batch lets the CUDA caching
     host allocator ratchet RSS with every new size class. Outstanding batches
-    instead exclusive-lease a small set of grow-only buffers; when the batch is
-    GC'd the lease returns the slot for the next materialization.
+    exclusive-lease a small set of buffers; when the lease returns, oversized
+    idle slabs are dropped against a *sliding* recent high-water mark so an
+    occasional long pack cannot pin container RSS at the historical peak.
     """
 
-    def __init__(self, *, max_free_slots: int = 8) -> None:
+    def __init__(
+        self,
+        *,
+        max_free_slots: int = 4,
+        recent_window: int = 256,
+        shrink_factor: float = 2.0,
+        max_slot_bytes: int | None = None,
+    ) -> None:
         self._free: list[dict[torch.dtype, Tensor]] = []
         self._lock = threading.Lock()
         self._max_free_slots = max(1, int(max_free_slots))
+        self._recent_window = max(8, int(recent_window))
+        self._shrink_factor = max(1.0, float(shrink_factor))
+        if max_slot_bytes is None:
+            max_slot_bytes = _pinned_pool_max_slot_bytes_from_env()
+        self._max_slot_bytes = (
+            None if max_slot_bytes is None else max(1, int(max_slot_bytes))
+        )
+        self._recent: dict[torch.dtype, deque[int]] = {}
         self._checkouts = 0
         self._reuses = 0
+        self._grows = 0
+        self._shrinks = 0
 
     def checkout(
         self,
@@ -2847,32 +2885,86 @@ class _PinnedHostBufferPool:
             if reused:
                 self._reuses += 1
             self._checkouts += 1
+            for dtype, numel in specs:
+                if numel <= 0:
+                    raise ValueError("pinned pool numel must be positive")
+                self._note_request_locked(dtype, int(numel))
         views: list[Tensor] = []
         grew = False
         for dtype, numel in specs:
-            if numel <= 0:
-                raise ValueError("pinned pool numel must be positive")
+            need = int(numel)
             buf = slot.get(dtype)
-            if buf is None or int(buf.numel()) < int(numel):
-                alloc = max(int(numel), int(int(numel) * 5 // 4))
+            if buf is None or int(buf.numel()) < need:
+                alloc = self._alloc_numel(dtype, need)
                 if buf is not None:
                     grew = True
                 buf = torch.empty(alloc, dtype=dtype, pin_memory=True)
                 slot[dtype] = buf
-            views.append(buf.narrow(0, 0, int(numel)))
+            views.append(buf.narrow(0, 0, need))
         if grew:
+            with self._lock:
+                self._grows += 1
             # Previous smaller slab is now unreferenced; return it to the OS.
             _release_cached_host_allocator_memory()
         return views, _PinnedPoolLease(self, slot)
 
+    def _note_request_locked(self, dtype: torch.dtype, numel: int) -> None:
+        window = self._recent.get(dtype)
+        if window is None:
+            window = deque(maxlen=self._recent_window)
+            self._recent[dtype] = window
+        window.append(int(numel))
+
+    def _recent_high_water(self, dtype: torch.dtype) -> int:
+        window = self._recent.get(dtype)
+        if not window:
+            return 0
+        return max(window)
+
+    def _alloc_numel(self, dtype: torch.dtype, need: int) -> int:
+        # Modest headroom (12.5%) cuts realloc chatter without the old 25% ratchet.
+        alloc = max(int(need), int(need * 9 // 8))
+        if self._max_slot_bytes is None:
+            return alloc
+        elem = max(1, int(torch.empty((), dtype=dtype).element_size()))
+        cap = max(1, int(self._max_slot_bytes) // elem)
+        # Always satisfy the live batch; skip headroom when already over the
+        # idle retention cap so release-time trim can reclaim promptly.
+        if need >= cap:
+            return need
+        return min(alloc, cap)
+
+    def _trim_slot_locked(self, slot: dict[torch.dtype, Tensor]) -> bool:
+        """Drop idle buffers far above the sliding high-water / byte cap."""
+
+        trimmed = False
+        for dtype, buf in list(slot.items()):
+            hwm = self._recent_high_water(dtype)
+            drop = False
+            if hwm > 0 and int(buf.numel()) > int(self._shrink_factor * hwm):
+                drop = True
+            elif self._max_slot_bytes is not None:
+                bytes_per = max(1, int(buf.element_size()))
+                if int(buf.numel()) * bytes_per > int(self._max_slot_bytes):
+                    drop = True
+            if drop:
+                del slot[dtype]
+                trimmed = True
+                self._shrinks += 1
+        return trimmed
+
     def _release(self, slot: dict[torch.dtype, Tensor]) -> None:
+        reclaim = False
         with self._lock:
-            if len(self._free) < self._max_free_slots:
+            reclaim = self._trim_slot_locked(slot)
+            if slot and len(self._free) < self._max_free_slots:
                 self._free.append(slot)
-                return
-        # Drop the extra slot so idle high-water pinned pages can be reclaimed.
-        del slot
-        _release_cached_host_allocator_memory()
+            else:
+                # Empty after trim, or free-list full: drop so pages can return.
+                reclaim = True
+                del slot
+        if reclaim:
+            _release_cached_host_allocator_memory()
 
 
 def _share_cpu_tensor_tree(value: Any) -> Any:
@@ -3684,10 +3776,13 @@ class _ProcessHostPrepareIterator:
         self._pin_memory = bool(pin_memory)
         self._ipc_mode = _host_prepare_ipc_mode()
         self._closed = False
-        # Recycle pinned pages across the prefetch depth so variable-length
-        # batches cannot ratchet the CUDA host caching allocator forever.
+        # Recycle pinned pages across the prefetch depth. Cap free slots so a
+        # deep host_prepare queue cannot multiply peak-sized idle slabs; the
+        # pool itself also shrinks against a sliding high-water mark.
         self._pinned_pool = (
-            _PinnedHostBufferPool(max_free_slots=max(4, int(queue_size) + 2))
+            _PinnedHostBufferPool(
+                max_free_slots=min(4, max(2, int(queue_size))),
+            )
             if self._pin_memory
             else None
         )

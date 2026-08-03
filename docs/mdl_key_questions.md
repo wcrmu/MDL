@@ -229,6 +229,40 @@ OOM 很少由单一张量决定，而是 **embedding 静态占用、激活、pac
 
 ---
 
+## 问题 8：开了 recycled pinned pool，为什么 host RSS 仍可能跟历史尖峰一起爬？
+
+**问题：**  
+`331b6ac` / `64ba075` 之后，host-prepare 已用 memfd + recycled pinned pool，不再每个变长 shape 都 `pin_memory()` 新 slab。但长跑里偶发超长 pack（尖峰 batch）仍可能把 container RSS 顶上去，之后即使多数 batch 变短，**idle pinned 页也不回落**，RSS 继续贴着历史峰值斜着爬，最终可能先被平台 host-mem protect 杀掉。
+
+**根因：**  
+第一代 pool 是 **grow-only 复用**：lease 归还后按历史最大 `numel` 留着 buffer，以便下次免分配。这对“稳定长度分布”很省，但对“偶发长尾 pack”是单向下棘轮——一次尖峰把 slot 撑大，后续小 batch 只 `narrow` 使用前缀，**整块 pinned storage 仍被 CUDA host caching allocator 握着**。再叠加：
+
+- 扩容余量原先偏大（约 25%），每次 grow 多锁一截；
+- free slot 数若跟 `queue_size+2` 走，深 prefetch 会同时留住多份峰值级 idle slab。
+
+Python 对象都释放了也看不见：泄漏在 allocator / pinned page，不在 `gc.get_objects()`。
+
+**解决方案：**  
+`_PinnedHostBufferPool` 改为**可缩的滑动高水位**，不再按全局历史峰值永久长大：
+
+| 手段 | 作用 |
+|---|---|
+| 滑动窗口（默认 256）记近期请求 `numel` | lease 归还时若 `buf > 2× recent_hwm`，丢掉过大 idle slab，并 `_host_emptyCache` |
+| 扩容余量 `25% → 12.5%` | 降低每次 grow 的锁页幅度 |
+| `max_free_slots = min(4, max(2, queue_size))` | 深 queue 不再成倍堆峰值级 idle slot |
+| 可选 `MDL_PINNED_POOL_MAX_SLOT_BYTES` | idle 保留硬上限；**live batch 仍保证能装下**（超 cap 时跳过 headroom，归还后再 trim） |
+
+默认即可靠滑动缩容；更狠的 idle 上限示例：
+
+```bash
+export MDL_PINNED_POOL_MAX_SLOT_BYTES=1073741824  # 1GiB
+```
+
+**边界：**  
+回归覆盖复用、尖峰后缩容、byte cap 与 env 解析（见 `tests/test_pinned_host_pool.py`）。仓库仍没有可引用的完整“修复前后 24h RSS 曲线”，长跑验收应看**偶发尖峰后 RSS 是否回落/平台**，而不是只看短 smoke 的峰值。这是对串讲 §3.5「recycled pinned pool」的增强，不替代 memfd / 私有化 / H2D 后放 ref 那几条。
+
+---
+
 ## 修订时相对原稿的主要修正
 
 | 原稿问题 | 修正 |

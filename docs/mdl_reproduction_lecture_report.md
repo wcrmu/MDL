@@ -343,12 +343,12 @@ F^{l+1}=\operatorname{LN}
 |---|---|
 | 默认 IPC 改为 memfd | child 只写匿名 memfd，parent 读取后再 pin；不把 pinned tensor 直接放入 shared memory |
 | parent 立即私有化 | shared FeatureBatch 出队后 clone/privatize，并删除 IPC payload 引用 |
-| recycled pinned pool | 少量 grow-only slot 按 dtype 复用 storage；FeatureBatch 生命周期结束后 lease 自动归还 |
+| recycled pinned pool | 少量 slot 按 dtype 复用 storage；lease 归还后按**滑动高水位**丢掉过大 idle slab（可选 `MDL_PINNED_POOL_MAX_SLOT_BYTES`），避免跟历史尖峰永久上棘轮 |
 | H2D 后释放 host refs | 防止 device prefetch 队列继续持有上一个 batch |
 | 周期性清空 idle host allocator slab | 在 log cadence 触发 host cache release；pool grow/drop 时也主动归还旧 slab |
 | 收紧 memfd/Arrow cleanup | 不生成第二份巨型 bytes copy，关闭 mmap/fd/table iterator |
 
-**验证与边界：** `331b6ac` 与 `64ba075` 分别修复 IPC ratchet 和变长 pinned allocator ratchet，回归测试覆盖 memfd 传输、pool 复用、子进程退出和 host-prepare watchdog。仓库没有一条可引用的完整“修复前后 24 小时 RSS 曲线”，因此只陈述根因与回归，不编造下降百分比。
+**验证与边界：** `331b6ac` 与 `64ba075` 分别修复 IPC ratchet 和变长 pinned allocator ratchet；后续 pool 从 grow-only 改为滑动缩容（见 [`mdl_key_questions.md`](./mdl_key_questions.md) 问题 8）。回归覆盖 memfd 传输、pool 复用/尖峰缩容、子进程退出和 host-prepare watchdog。仓库没有一条可引用的完整“修复前后 24 小时 RSS 曲线”，因此只陈述根因与回归，不编造下降百分比。
 
 另一个重要 trade-off 来自 direct pipeline：同一 data-only 基准吞吐从 361.28 提升到 475.85 samples/s（+31.71%），但当时 peak host RSS 从 1.603 GB 增至 2.588 GB（+61.47%）。数据路径优化必须同时报告吞吐与内存 runway。
 
