@@ -382,6 +382,33 @@ F^{l+1}=\operatorname{LN}
 
 **代价必须明说：** 该方案不是“无损压缩”。均匀哈希假设下，主 `goods_id`、`sku_id`、`cart_long.sku_ids` 的理论 distinct collision 分别约 **41.2% / 51.5% / 44.7%**。如果碰撞成为质量瓶颈，下一步应考虑高频精确词表 + 尾部 hash、remix 或参数服务器，而不是继续盲目放大本地表。
 
+### 实际遇到的 RankMixer / MDL-RankMixer 显存问题
+
+> 本节与 §2.7 OneTrans 表对照阅读，**不占第 3 节 8 个核心问题的名额**。  
+> 静态表预算见 3.6；host RSS / pinned IPC 见 3.5（两族模型共用数据路径）。  
+> 口径：`rankmixer` 与 `mdl_rankmixer` 同属浅层 32×768 / 2-layer 家族；MDL 额外 Domain 与 scoped embedding 抬高静态占用，但运行时峰值机制大体相同。
+
+| 现场问题 | 根因 | 修复 |
+|---|---|---|
+| 24h 理想 embedding ≈399 GiB/GPU，两卡直接不可训 | 短 profile 低估长尾；标准 Adagrad state 为 \(O(ND)\)；shared root 若只按单列估会漏算 alias | load≤1.75、大表 dim 封顶 32、sharded Row-Wise Adagrad、shared union；粗粒度 MDL 落到约 65～66 GiB/GPU，非 MDL RankMixer 约 57.86 GiB/GPU（详 3.6；`859902e`、`1a0579d`、`f8e0dad`） |
+| 把 per-rank batch 拉到 1024 后，LONGER / 序列投影峰值失控 | 9 条历史最长到 2048，整 batch 一次投影会让激活随 \(B\times L\) 线性涨；`device_prefetch_batches=2` 还会在执行当前 batch 时再钉住一份大序列 | 按 token 预算切块 LONGER（`sequence_encoder_chunk_tokens`）与序列投影；prefetch 降到 1；flash varlen + compact packing（`9529ae2`）。当前生产再调到 `mdl_rankmixer` batch **1536** + length bucket（1536/960/640/480/768） |
+| 打开 full activation checkpoint 后，6/8 卡 util 反而崩 | 浅层 2-layer dense 重算成本高，且 full remat 挡住 `cuda_graph_backbone`，无法用 dense 计算掩盖 emb A2A | 曾为省激活全开 full remat（`659ad1c`），后对 RankMixer 族回到验证过的 `activation_checkpoint=none + cuda_graph_backbone`（`bd4a367`）。这与 OneTrans「full remat 仍 mid-run OOM」是同一旋钮的不同失败模式 |
+| 8 卡时 NCCL / emb staging 挤占激活余量 | 大 world size 下 NCCL buffer/channel 与 emb A2A scratch 与激活同相；OneTrans 曾在 8×1024 backward OOM | ≥6 卡才 cap NCCL buffer/channel；emb A2A 设 `MDL_GROUPED_EMB_MAX_OUTPUT_MIB`；大 HBM 上 RankMixer 族默认保持满 per-rank batch，仅 ≤32 GiB 卡在 7–8 GPU 做 mild derate（`6a768f8`、`bd4a367`） |
+| 为 HBM 加的安全旋钮反过来饿死 2–4 卡 util | NCCL cap 与强制 memfd 被无条件套到小 world；`/dev/shm` 充足时 RankMixer 仍走 memfd 拷贝 | NCCL 保险仅保留在 ≥6 GPU；host-prepare `auto` 在 shm 充裕时回 `share` IPC，小容器才回退 memfd（`bfaba79`） |
+| CUDA graph 路径看起来在跑，dense 参数却可能没进 DDP | graph wrapper 用普通属性藏 live modules 时，`make_graphed_callables` 能执行，但 static_graph reducer 看不到完整参数面 | 注册精确 modules、预热全部 train bucket shape，并加两卡 graph/eager 交错回归（`3e53d18`）。这首先是正确性事故，但也锁死了 RankMixer「none + cuda graph」这条生产 HBM/util 剖面 |
+
+**和 OneTrans 对照时的结论：**
+
+| 维度 | RankMixer / `mdl_rankmixer` | OneTrans / `mdl_onetrans` |
+|---|---|---|
+| 静态大头 | embedding + Row-Wise state（MDL 因 Domain scope 更高） | 同左，另加长 S 的激活/cache |
+| 动态大头 | LONGER 与序列投影、device prefetch、emb A2A scratch | varlen pack、多层 S cache、Domain×S cross-attn |
+| 默认省激活旋钮 | **不要** full remat；用 none + CUDA graph | **不要**盲开 full remat；用 none + fixed packing 基线 |
+| 当前生产 batch | 1536（`rankmixer` 1280） | 1408 |
+| 不能外推的点 | 短跑 peak ≠ 长跑；world size 改变 NCCL/emb 占用 | 同左，且 candidates/request 会放大 cache |
+
+真正的结论与 §2.7 相同：**安全 batch 必须在真实长度分布、embedding 预算、chunk/prefetch、allocator、world-size profile 与完整长跑下联合验证**；不能把「降 batch」或「开 checkpoint」当成单调更省的旋钮。
+
 ### 3.7 Loss 明明在下降，为什么每张卡可能训练的是不同 Embedding？
 
 **问题：** 大表启用 `nn.Embedding(sparse=True)` 后，backward 产生 row-sparse COO grad。标准 NCCL DDP 不会像 dense grad 一样自动 all-reduce；如果只是把 sparse parameter 从 DDP reducer 中排除，每个 rank 会根据自己的样本更新不同的行，loss 仍可下降，但 replicas 已经静默分叉。
@@ -432,9 +459,9 @@ F^{l+1}=\operatorname{LN}
 
 ---
 
-## 4. 12 个备选的高吸引力问题
+## 4. 13 个备选的高吸引力问题
 
-下面 12 个题目均来自现有实现或提交，可替换进主讲；每个都可以独立展开成 3～5 分钟。
+下面 13 个题目均来自现有实现或提交，可替换进主讲；每个都可以独立展开成 3～5 分钟。
 
 | # | 题目 | 真正值得讲的 insight | 证据/切入点 |
 |---:|---|---|---|
@@ -450,13 +477,14 @@ F^{l+1}=\operatorname{LN}
 | 10 | **最多 256 个 fine scenes，但每条样本只有一个 active scene，为什么还要算 257 个 Scenario states？** | MDL 减少的是输出 head 数，并未自动消除中间 Domain 参数与 FLOPs；active-token execution 是下一阶段系统问题 | fine config `max_discovered=256` + global token；需要 dense/active path 分开报告 |
 | 11 | **增量 cache 命中率 100%，为什么输出仍可能和 full recompute 不一致？** | pyramid 改变深层窗口时，旧 token 的深层表示也会变化；只按 raw append 判断 K/V 可复用会留下 stale cache | `extend_precomputed_s` 的 overlap tensor/mask 校验与 rebuild 分支 |
 | 12 | **数据路径快了 31.71%，为什么 GPU util 最终仍只有约 11%？** | Amdahl 定律：direct tensorization 消掉一段等待后，Arrow→Python adapter normalization 成为主瓶颈；局部 fast path 不等于端到端供数能力足够 | [`AGG_DIRECT_RESULTS.md`](../AGG_DIRECT_RESULTS.md)：独占 4090 E2E +16.6%，direct util 10.79%，adapter normalization 仍是最大 CPU 项 |
+| 13 | **RankMixer 开了 full remat，为什么 6/8 卡 util 反而更差、也不一定更省 HBM？** | 浅层 2-layer 重算贵，且挡住 CUDA graph，dense 无法掩盖 emb A2A；同一「省激活」旋钮在 RankMixer 与 OneTrans 上失败模式不同 | `659ad1c`→`bd4a367`；对照 RankMixer/MDL 显存节与 §2.7 |
 
 ### 备选题选择建议
 
 - 偏算法听众：4、5、6、10、11；
-- 偏训练系统听众：1、2、3、12；
+- 偏训练系统听众：1、2、3、12、13；
 - 偏特征与数据平台听众：7、8、9；
-- 若只有 10 分钟加餐，优先选 1、3、10：三题都属于“系统看起来正常，但模型或成本口径已经错了”。
+- 若只有 10 分钟加餐，优先选 1、3、10、13：都属于“系统看起来正常，但模型、显存或成本口径已经错了”。
 
 ---
 
@@ -468,7 +496,7 @@ F^{l+1}=\operatorname{LN}
 |---:|---|---|
 | 5 min | 当前两个模型与证据边界 | 先区分论文复现、生产变体和实验性组合 |
 | 18 min | MDL-OneTrans 专题 | 按难点讲：sidecar、读层取舍、coupled/split、request cache、OOM、线上变量；底稿见 [`mdl_onetrans_adaptation_hardships.md`](./mdl_onetrans_adaptation_hardships.md) |
-| 28 min | 8 个核心问题中精选 6～8 个 | 每题只讲现象、根因、方案、验证 |
+| 28 min | 8 个核心问题中精选 6～8 个；穿插 RankMixer 显存表与 §2.7 对照 | 每题只讲现象、根因、方案、验证；强调两族模型 HBM 失败模式不同 |
 | 6 min | 当前仍不能下的质量结论 | fixed holdout、equal-readout、task×scene 指标缺口 |
 | 3 min | 讨论 | 聚焦线上迁移变量与下一轮实验 |
 
@@ -478,7 +506,7 @@ F^{l+1}=\operatorname{LN}
 2. 三轴错位为何不 crash；
 3. sparse DDP 静默分叉；
 4. OneTrans sidecar 与 request-sized cache；
-5. 399.49 GiB 的 24h Embedding 预算；
+5. 399.49 GiB 的 24h Embedding 预算，以及 RankMixer「none + CUDA graph」与 OneTrans「none + fixed packing」两条不同的 HBM 剖面；
 6. fixed holdout 之前不能讲 AUC 坍缩。
 
 ## 6. 当前结论与下一步
@@ -488,6 +516,7 @@ F^{l+1}=\operatorname{LN}
 - MDL 论文同型计算图与生产稳定变体已显式分离；
 - Feature token、Domain initializer、request/candidate/event 轴都有可检查合同；
 - HDFS、host RSS、稀疏多卡与 OneTrans cache 的主要长跑故障已有针对性解法；
+- RankMixer / `mdl_rankmixer` 已形成可训的静态 embedding 预算，并用 LONGER chunk、prefetch=1、`none + CUDA graph` 与 world-size profile 压住运行时峰值；
 - `mdl_onetrans` 已形成 sidecar layer-wise Domain 方案，并解决了候选展开造成的 cache/HBM 放大；
 - 训练中评测已经从滚动 train quick eval 切换到冻结 test manifest。
 
@@ -525,6 +554,7 @@ F^{l+1}=\operatorname{LN}
 | HDFS 挂起与 teardown | `705878d`、`48f243a`、`fd5edb6`、`457d2e6`、`8c31ae3` |
 | host RSS | `331b6ac`、`64ba075` |
 | 24h Embedding 与 Row-Wise | `859902e`、`f8e0dad`、`1a0579d` |
+| RankMixer / MDL-RankMixer HBM | `9529ae2`、`659ad1c`、`6a768f8`、`bd4a367`、`bfaba79`、`3e53d18` |
 | sparse DDP 与 collective fusion | `cf7019b`、`079946d` |
 | OneTrans HBM/cache | `cc92f47`、`1eef46f`、`4861e0e`、`5e040d6`、`304c1d0`、`f6fdb68` |
 | CUDA Graph DDP 参数面 | `3e53d18` |
