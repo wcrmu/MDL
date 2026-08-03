@@ -4,6 +4,7 @@
 > 事实基线：仓库 `main@5a7f1c1` 及之后的 fixed-test 默认调整，截至 2026-08-03。  
 > 配套细稿：
 >
+> - 离线数据简介：[`mdl_offline_data_intro.md`](./mdl_offline_data_intro.md)
 > - 字段与 Domain 合同：[`mdl_token_feature_design.md`](./mdl_token_feature_design.md)
 > - 全字段处理：[`current_field_processing_report.md`](./current_field_processing_report.md)
 > - Embedding 容量：[`embedding_shape_24h_audit.md`](./embedding_shape_24h_audit.md)
