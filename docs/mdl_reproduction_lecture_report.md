@@ -537,6 +537,7 @@ F^{l+1}=\operatorname{LN}
 | MDL 原理与整体叙事 | [`document.md`](../document.md)、`paper/MDL/main.tex` |
 | Domain 字段、groupwise token、coupled/split | [`mdl_token_feature_design.md`](./mdl_token_feature_design.md) |
 | MDL→OneTrans 适配难点 | [`mdl_onetrans_adaptation_hardships.md`](./mdl_onetrans_adaptation_hardships.md) |
+| 关键问答（问题/根因/方案） | [`mdl_key_questions.md`](./mdl_key_questions.md) |
 | 当前字段与 S/NS 处理 | [`current_field_processing_report.md`](./current_field_processing_report.md)；文件头已标出历史快照边界 |
 | 三轴数据合同与空值 | [`DATA_FORMAT.md`](../DATA_FORMAT.md)、`tests/test_agg_direct.py`、`tests/test_null_semantics.py` |
 | direct pipeline 正确性与性能 | [`AGG_DIRECT_RESULTS.md`](../AGG_DIRECT_RESULTS.md) |

@@ -11,6 +11,7 @@
 > - 全字段处理：[`current_field_processing_report.md`](./current_field_processing_report.md)
 > - Embedding 容量审计：[`embedding_shape_24h_audit.md`](./embedding_shape_24h_audit.md)
 > - OneTrans 适配难点：[`mdl_onetrans_adaptation_hardships.md`](./mdl_onetrans_adaptation_hardships.md)
+> - 关键问答（问题/根因/方案）：[`mdl_key_questions.md`](./mdl_key_questions.md)
 > - 串讲总稿：[`mdl_reproduction_lecture_report.md`](./mdl_reproduction_lecture_report.md)
 
 ## 0. 一句话结论
