@@ -6,6 +6,7 @@
 >
 > - 离线数据简介：[`mdl_offline_data_intro.md`](./mdl_offline_data_intro.md)
 > - 词表与 Embedding：[`mdl_vocab_embedding_design.md`](./mdl_vocab_embedding_design.md)
+> - 实现超参数表：[`mdl_implementation_hyperparameters.md`](./mdl_implementation_hyperparameters.md)
 > - 字段与 Domain 合同：[`mdl_token_feature_design.md`](./mdl_token_feature_design.md)
 > - 全字段处理：[`current_field_processing_report.md`](./current_field_processing_report.md)
 > - Embedding 容量审计：[`embedding_shape_24h_audit.md`](./embedding_shape_24h_audit.md)
