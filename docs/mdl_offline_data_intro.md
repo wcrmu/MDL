@@ -1,7 +1,7 @@
 # MDL 离线数据简介
 
 > 简单介绍当前训练使用的离线数据：特征规模、来源、目标与场景，以及训练/测试如何选取。  
-> 更细的字段合同见 [`DATA_FORMAT.md`](../DATA_FORMAT.md)、[`current_field_processing_report.md`](./current_field_processing_report.md)；实现总览见 [`mdl_data_adaptation_overview.md`](./mdl_data_adaptation_overview.md)。
+> 更细的字段合同见 [`DATA_FORMAT.md`](../DATA_FORMAT.md)、[`current_field_processing_report.md`](./current_field_processing_report.md)；词表与 Embedding 见 [`mdl_vocab_embedding_design.md`](./mdl_vocab_embedding_design.md)；实现总览见 [`mdl_data_adaptation_overview.md`](./mdl_data_adaptation_overview.md)。
 
 ## 1. 数据来源
 
@@ -28,15 +28,19 @@
 |---|---:|---|
 | 上游物理列 | **630** | Parquet schema 全宽；多数不进本模型 |
 | Adapter 必扫 raw 列 | **约 260～280** | 训练必须投影的物理列（随可选列略变） |
-| 主非序列逻辑字段 | **147** | **47 request + 100 candidate**（配置生成器 `EXPECTED_FEATURE_COUNT`） |
-| 主 UPS 历史 | **9** | `impr` / `clk_long` / `view_long` / `cart_long` / `buy_long` / `semi_clk` / `srch_q2i` / `ups_clk_sku` / `flatten_query_hash` |
-| UPS 原始属性 | **107** | 9 个绝对时间戳 + 98 个预编码类别属性 |
-| 真正连续输入 | **9** | 每条历史由 `impr_time - event_time` 派生的 `time_delta_log1p_seconds` |
-| 其余主特征 | 几乎全是 **categorical / pre_hashed** | 名称像价格、CTR、计数，实际仍走 embedding |
+| 主非序列逻辑字段 | **147** | **47 request + 100 candidate**；配置生成器 `EXPECTED_FEATURE_COUNT`。**这 147 个全部是 categorical / pre_hashed**（含名字像价格、CTR、计数的字段），没有 top-level dense |
+| 主 UPS 历史 | **9** | `impr` / `clk_long` / `view_long` / `cart_long` / `buy_long` / `semi_clk` / `srch_q2i` / `ups_clk_sku` / `flatten_query_hash`（**不计入**上面的 147） |
+| UPS 原始属性 | **107** | 9 个绝对时间戳 + 98 个预编码类别属性（挂在 9 条历史上，也**不计入** 147） |
+| 真正连续输入 | **9** | 每条历史派生的 `time_delta_log1p_seconds`；属于序列侧 dense，**不是** 147 里的非序列字段 |
+
+计数口径不要混：
+
+- **147** = 非序列主逻辑字段（request/candidate scalar + bag）。
+- **9 路历史 + 其上属性/时间差** = 序列合同，另计。
+- MDL 的 scenario/task important、prior 是额外 logical name（常共用物理 source、独立 embedding scope），也不并进这 147。
 
 补充：
 
-- MDL 还会为 Scenario/Task 增加 **scope 独立** 的 important / prior 逻辑字段（与主 147 共用物理 source，但常不共享参数）。
 - RankMixer 侧最终压成 **32×768** Feature token；OneTrans 侧是 **变长 S + 32 NS**——那是模型消费方式，不是上游又多了一套特征表。
 
 ---
@@ -169,6 +173,7 @@ HDFS 小时分区 (pt/hr, ~500 parquet/hour)
 | HDFS 合同与字段枚举 | [`DATA_FORMAT.md`](../DATA_FORMAT.md) |
 | 字段处理全景 | [`current_field_processing_report.md`](./current_field_processing_report.md) |
 | Domain 字段设计 | [`mdl_token_feature_design.md`](./mdl_token_feature_design.md) |
+| 词表与 Embedding | [`mdl_vocab_embedding_design.md`](./mdl_vocab_embedding_design.md) |
 | 数据适配总览 | [`mdl_data_adaptation_overview.md`](./mdl_data_adaptation_overview.md) |
 | 小时窗展开 / 不相交检查 | `src/main.py`（`_expand_hour_partition`、`_resolve_train_test_hour_window`） |
 | fixed-test manifest | `src/train.py`（`_prepare_fixed_test_eval`） |

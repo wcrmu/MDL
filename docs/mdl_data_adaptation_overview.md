@@ -5,9 +5,10 @@
 > 配套细稿：
 >
 > - 离线数据简介：[`mdl_offline_data_intro.md`](./mdl_offline_data_intro.md)
+> - 词表与 Embedding：[`mdl_vocab_embedding_design.md`](./mdl_vocab_embedding_design.md)
 > - 字段与 Domain 合同：[`mdl_token_feature_design.md`](./mdl_token_feature_design.md)
 > - 全字段处理：[`current_field_processing_report.md`](./current_field_processing_report.md)
-> - Embedding 容量：[`embedding_shape_24h_audit.md`](./embedding_shape_24h_audit.md)
+> - Embedding 容量审计：[`embedding_shape_24h_audit.md`](./embedding_shape_24h_audit.md)
 > - OneTrans 适配难点：[`mdl_onetrans_adaptation_hardships.md`](./mdl_onetrans_adaptation_hardships.md)
 > - 串讲总稿：[`mdl_reproduction_lecture_report.md`](./mdl_reproduction_lecture_report.md)
 
@@ -105,7 +106,7 @@ Parquet row
 - 生产采用显存约束：24h projected load 上限约 1.75、大表 dim 封顶 32、bucket 硬上限 \(2^{30}\)；
 - **shared root 按 union 定桶**（如 `goods_id` 要合并主特征 + 各历史来源），禁止只看单列 distinct。
 
-结果落到各 YAML：coarse MDL embedding+Adagrad 规划约 **65～66 GiB/GPU**，给 dense/激活留余量。细节见 [`embedding_shape_24h_audit.md`](./embedding_shape_24h_audit.md)。
+结果落到各 YAML：coarse MDL embedding+Adagrad 规划约 **65～66 GiB/GPU**，给 dense/激活留余量。总览见 [`mdl_vocab_embedding_design.md`](./mdl_vocab_embedding_design.md)，容量审计见 [`embedding_shape_24h_audit.md`](./embedding_shape_24h_audit.md)。
 
 ### 2.3 参数共享 vs 复制
 
