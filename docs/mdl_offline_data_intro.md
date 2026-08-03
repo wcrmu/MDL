@@ -1,6 +1,6 @@
 # MDL 离线数据简介
 
-> 简单介绍当前训练使用的离线数据：特征规模、来源、目标与场景，以及训练/测试如何选取。  
+> 简单介绍当前训练使用的离线数据：来源、特征分类（UPS / Context / Item / Creative）、目标与场景，以及训练/测试如何选取。  
 > 更细的字段合同见 [`DATA_FORMAT.md`](../DATA_FORMAT.md)、[`current_field_processing_report.md`](./current_field_processing_report.md)；词表与 Embedding 见 [`mdl_vocab_embedding_design.md`](./mdl_vocab_embedding_design.md)；实现总览见 [`mdl_data_adaptation_overview.md`](./mdl_data_adaptation_overview.md)。
 
 ## 1. 数据来源
@@ -20,28 +20,28 @@
 
 ---
 
-## 2. 特征数量（怎么数）
+## 2. 特征怎么分：UPS / Context / Item / Creative
 
-上游很宽，模型只扫其中一部分。常用口径如下（以当前生产配置为准）：
+上游 Parquet 很宽，训练只用其中一部分。按业务语义分成四类（举例）：
 
-| 口径 | 数量 | 含义 |
-|---|---:|---|
-| 上游物理列 | **630** | Parquet schema 全宽；多数不进本模型 |
-| Adapter 必扫 raw 列 | **约 260～280** | 训练必须投影的物理列（随可选列略变） |
-| 主非序列逻辑字段 | **147** | **47 request + 100 candidate**；配置生成器 `EXPECTED_FEATURE_COUNT`。**这 147 个全部是 categorical / pre_hashed**（含名字像价格、CTR、计数的字段），没有 top-level dense |
-| 主 UPS 历史 | **9** | `impr` / `clk_long` / `view_long` / `cart_long` / `buy_long` / `semi_clk` / `srch_q2i` / `ups_clk_sku` / `flatten_query_hash`（**不计入**上面的 147） |
-| UPS 原始属性 | **107** | 9 个绝对时间戳 + 98 个预编码类别属性（挂在 9 条历史上，也**不计入** 147） |
-| 真正连续输入 | **9** | 每条历史派生的 `time_delta_log1p_seconds`；属于序列侧 dense，**不是** 147 里的非序列字段 |
+| 维度 | 轴 | 含义 | 举例 |
+|---|---|---|---|
+| **UPS** | 请求级序列 | 用户行为历史，变长 event 序列 | 曝光 / 点击 / 浏览 / 加购 / 购买；搜索 q2i、SKU 点击、历史 query；事件上常见类目、goods/mall、价格、时间差 |
+| **Context** | 请求 | 当前请求与用户上下文，多候选共享 | 站点 / 语言 / 地域 / 端；页面与 scene；query 与召回；近几天点击页、加购类目、购物车摘要等 bag |
+| **Item** | 候选 | 当前候选商品本身 | 类目、goods/SKU、标题；价格促销、销量、转化统计；i2i / 相关性、商家供给 |
+| **Creative** | 候选 | 创意与近期投放行为 | campaign / creative id；近几日点击、加购计数 |
 
-计数口径不要混：
+| 归属 | 包含 |
+|---|---|
+| Request | Context + UPS |
+| Candidate | Item + Creative |
 
-- **147** = 非序列主逻辑字段（request/candidate scalar + bag）。
-- **9 路历史 + 其上属性/时间差** = 序列合同，另计。
-- MDL 的 scenario/task important、prior 是额外 logical name（常共用物理 source、独立 embedding scope），也不并进这 147。
+说明：
 
-补充：
-
-- RankMixer 侧最终压成 **32×768** Feature token；OneTrans 侧是 **变长 S + 32 NS**——那是模型消费方式，不是上游又多了一套特征表。
+- Creative 语义单独一类，数据上通常仍和 Item 同在 candidate 轴。
+- UPS 在 `mdl_rankmixer` 多走 LONGER summary，在 `mdl_onetrans` 多走 raw S。
+- 主非序列字段几乎都是 categorical / pre_hashed；真正连续的主要是 UPS 时间差。
+- 更细枚举见 [`DATA_FORMAT.md`](../DATA_FORMAT.md)。
 
 ---
 
