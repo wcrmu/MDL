@@ -100,8 +100,7 @@ class EvaluationMetricTest(unittest.TestCase):
         self.assertEqual(result.rows, 4)
         self.assertEqual(result.files, 2)
         self.assertEqual(result.metrics["click"]["auc"], 1.0)
-        # logits [-2,2] + [-1,1] → sigmoid sums to ~2 with two positives → COPC≈1
-        self.assertAlmostEqual(float(result.metrics["click"]["copc"]), 1.0, places=5)
+        self.assertNotIn("copc", result.metrics["click"])
         self.assertEqual(result.metrics["click"]["examples"], 4)
         self.assertEqual(result.metrics["click"]["positives"], 2)
         self.assertEqual(result.metrics["click"]["negatives"], 2)
@@ -289,7 +288,6 @@ class EvaluationMetricTest(unittest.TestCase):
                 "metrics": {
                     "fst_cart": {
                         "auc": 0.43,
-                        "copc": 5.0,
                         "loss": 0.9,
                         "prob_mean": 0.97,
                         "logit_mean": 3.5,
@@ -314,12 +312,12 @@ class EvaluationMetricTest(unittest.TestCase):
         self.assertIn("prob_mean=0.970000", task_line)
         self.assertIn("logit_mean=3.500000", task_line)
         self.assertIn("logloss=0.900000", task_line)
-        self.assertIn("copc=5.000000", task_line)
+        self.assertNotIn("copc=", task_line)
         warning_line = next(
             line for line in lines if line.startswith("Fixed test eval warning")
         )
         self.assertIn("prob_mean=", warning_line)
-        self.assertIn("copc=", warning_line)
+        self.assertNotIn("copc=", warning_line)
         self.assertIn("auc=", warning_line)
 
 

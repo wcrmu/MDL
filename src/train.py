@@ -6521,37 +6521,8 @@ class _StreamingHistogramAUC:
         return positives + negatives, positives, negatives
 
 
-class _StreamingCOPC:
-    """Calibration metric: COPC = sum(pred) / sum(label). Closer to 1 is better."""
-
-    def __init__(self) -> None:
-        # [sum_predictions, sum_labels]
-        self.totals = torch.zeros(2, dtype=torch.float64)
-
-    def update(self, scores: Tensor, labels: Tensor) -> None:
-        scores = scores.detach().float().flatten().cpu()
-        labels = labels.detach().float().flatten().cpu()
-        if scores.numel() != labels.numel():
-            raise ValueError("COPC scores and labels must have the same length")
-        if not scores.numel():
-            return
-        if not bool(torch.isfinite(scores).all()):
-            raise ValueError("COPC scores must be finite")
-        self.totals[0] += float(scores.sum().item())
-        self.totals[1] += float(labels.sum().item())
-
-    def compute(self) -> float | None:
-        predicted = float(self.totals[0].item())
-        labeled = float(self.totals[1].item())
-        if labeled <= 0.0:
-            return None
-        return predicted / labeled
-
-
 # Collapse / miscalibration heuristics for train and quick-eval monitors.
 _MONITOR_PROB_MEAN_WARN = 0.9
-_MONITOR_COPC_HIGH_WARN = 2.0
-_MONITOR_COPC_LOW_WARN = 0.5
 _MONITOR_AUC_WARN = 0.55
 
 
@@ -6639,16 +6610,11 @@ def _task_monitor_stats_from_batch(
 def _task_monitor_warning_parts(
     *,
     prob_mean: float | None = None,
-    copc: float | None = None,
     auc: float | None = None,
 ) -> list[str]:
     warnings: list[str] = []
     if prob_mean is not None and prob_mean > _MONITOR_PROB_MEAN_WARN:
         warnings.append(f"prob_mean={prob_mean:.4f}>{_MONITOR_PROB_MEAN_WARN}")
-    if copc is not None and copc > _MONITOR_COPC_HIGH_WARN:
-        warnings.append(f"copc={copc:.4f}>{_MONITOR_COPC_HIGH_WARN}")
-    if copc is not None and 0.0 <= copc < _MONITOR_COPC_LOW_WARN:
-        warnings.append(f"copc={copc:.4f}<{_MONITOR_COPC_LOW_WARN}")
     if auc is not None and auc < _MONITOR_AUC_WARN:
         warnings.append(f"auc={auc:.4f}<{_MONITOR_AUC_WARN}")
     return warnings
@@ -6692,16 +6658,6 @@ def _reduce_evaluation_histograms(
     return int(row_count.item())
 
 
-def _reduce_evaluation_copc(
-    context: DistributedContext,
-    accumulators: list[_StreamingCOPC],
-) -> None:
-    if not context.enabled:
-        return
-    for accumulator in accumulators:
-        _all_reduce_cpu_sum_(accumulator.totals, context)
-
-
 def _reduce_evaluation_task_monitors(
     context: DistributedContext,
     accumulators: list[_StreamingTaskMonitor],
@@ -6732,7 +6688,6 @@ def _run_fixed_test_eval(
         [_StreamingHistogramAUC(evaluation.auc_bins)]
         for _ in config.task_names
     ]
-    copc_accumulators = [_StreamingCOPC() for _ in config.task_names]
     task_monitors = [_StreamingTaskMonitor() for _ in config.task_names]
     rows = 0
     local_batches = 0
@@ -6851,10 +6806,6 @@ def _run_fixed_test_eval(
                         task_scores,
                         task_labels,
                     )
-                    copc_accumulators[task_index].update(
-                        task_scores,
-                        task_labels,
-                    )
                     task_monitors[task_index].update(task_logits, task_labels)
 
         _step_watchdog_beat(
@@ -6864,7 +6815,6 @@ def _run_fixed_test_eval(
             device=context.device,
         )
         rows = _reduce_evaluation_histograms(context, accumulators, rows)
-        _reduce_evaluation_copc(context, copc_accumulators)
         _reduce_evaluation_task_monitors(context, task_monitors)
         metrics: dict[str, dict[str, float | int | None]] = {}
         for task_index, task_name in enumerate(config.task_names):
@@ -6873,7 +6823,6 @@ def _run_fixed_test_eval(
             monitor = task_monitors[task_index].compute()
             metrics[task_name] = {
                 "auc": accumulator.compute(),
-                "copc": copc_accumulators[task_index].compute(),
                 "loss": monitor["loss"],
                 "prob_mean": monitor["prob_mean"],
                 "logit_mean": monitor["logit_mean"],
@@ -6918,14 +6867,11 @@ def _print_fixed_test_eval(
     for task_name, metrics in result.metrics.items():
         auc = metrics["auc"]
         auc_value = None if auc is None else float(auc)
-        copc = metrics.get("copc")
-        copc_value = None if copc is None else float(copc)
         prob_mean = metrics.get("prob_mean")
         prob_mean_value = None if prob_mean is None else float(prob_mean)
         print(
             f"Fixed test eval task | step={step} task={task_name} "
             f"auc={_format_optional_float(auc_value, 8)} "
-            f"copc={_format_optional_float(copc_value)} "
             f"logloss={_format_optional_float(metrics.get('loss'))} "
             f"prob_mean={_format_optional_float(prob_mean_value)} "
             f"logit_mean={_format_optional_float(metrics.get('logit_mean'))} "
@@ -6935,7 +6881,6 @@ def _print_fixed_test_eval(
         )
         warning_parts = _task_monitor_warning_parts(
             prob_mean=prob_mean_value,
-            copc=copc_value,
             auc=auc_value,
         )
         if warning_parts:

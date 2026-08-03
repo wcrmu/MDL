@@ -724,7 +724,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             {
                 "enabled": True,
                 "every_steps": 5000,
-                "files_per_rank": 25,
+                "files_per_rank": 4,
                 "auc_bins": 4096,
             },
         )
@@ -1516,7 +1516,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     )
                 self.assertTrue(config.training.fixed_test_eval.enabled)
                 self.assertEqual(config.training.fixed_test_eval.every_steps, 5000)
-                self.assertEqual(config.training.fixed_test_eval.files_per_rank, 25)
+                self.assertEqual(config.training.fixed_test_eval.files_per_rank, 4)
                 self.assertEqual(config.data.train.reader.shard_unit, "file")
                 self.assertEqual(config.data.train.reader.shuffle_buffer_rows, 512)
                 self.assertEqual(config.data.train.reader.shuffle_seed, 2025)

@@ -2829,9 +2829,9 @@ class FixedTestEvalConfig:
     # the held-out pass from dominating end-to-end training throughput.
     every_steps: int = 5000
     # Rank 0 samples this many files for each distributed rank, then broadcasts
-    # the exact manifest. Production uses two ranks, so 25 files/rank freezes a
-    # 50-file validation slice while keeping the repeated pass bounded.
-    files_per_rank: int = 25
+    # the exact manifest. Keep the held-out pass short so platform GPU-util
+    # protect windows are not dominated by evaluation stalls.
+    files_per_rank: int = 4
     # Bounded-memory histogram resolution used by the streaming AUC metric.
     auc_bins: int = 4096
 

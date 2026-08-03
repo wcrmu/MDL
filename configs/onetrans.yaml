@@ -4478,7 +4478,7 @@ training:
   fixed_test_eval:
     enabled: true
     every_steps: 5000
-    files_per_rank: 25
+    files_per_rank: 4
     auc_bins: 4096
   save_checkpoint: false
   checkpoint_path: artifacts/checkpoints/onetrans_2xh100_phase2_shared_dim

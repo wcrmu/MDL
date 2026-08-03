@@ -4109,9 +4109,9 @@ def build_config(
             "fixed_test_eval": {
                 "enabled": True,
                 "every_steps": 5000,
-                # Production launches two ranks: 25/rank = 50 files spanning
-                # the held-out calendar day.
-                "files_per_rank": 25,
+                # Bound the held-out pass: 4 files/rank keeps eval short on
+                # multi-GPU launches without dominating training throughput.
+                "files_per_rank": 4,
                 "auc_bins": 4096,
             },
             "checkpoint_path": _embedding_profile_checkpoint_path(
