@@ -308,7 +308,8 @@ F^{l+1}=\operatorname{LN}
 1. 并发 worker 复用 `HadoopFileSystem`/Parquet session，native handle 可能损坏；
 2. timeout thread 仍持有 generator 时，再次 `next()` 会报 `generator already executing`；
 3. 对仍有挂起 `pread` 的 poisoned session 调 native `close`，close 本身也可能永久挂起；
-4. 训练前 scene discovery 在冷 HDFS 上耗时很长，若直接走 NCCL 广播，会把 IO 冷启动与 GPU collective 绑死。
+4. 训练前 scene discovery 在冷 HDFS 上耗时很长，若直接走 NCCL 广播，会把 IO 冷启动与 GPU collective 绑死；
+5. **更根本的一层：每步取 batch 的等待没有预算。** 训练循环其实早就支持「某个 rank 这步没有 batch」——它照常投票、照常进集合通信，然后用上一个 batch 做零损失重放来保持 DDP 对齐（本来是给 epoch 末尾各 rank 先后读完准备的）。但 `next(batch_iterator)` 会一直阻塞，慢的 rank 永远走不到投票那一行，也就没机会告诉其它 rank「这步跳过我」。前面几条修的都是「如何发现这个阻塞不会结束」，而不是「阻塞本身为什么必须致命」。
 
 **解决方案：**
 
@@ -321,21 +322,39 @@ F^{l+1}=\operatorname{LN}
 | `REMOTE_IO_STALL -> exit 70` | 让平台按可重启 IO 故障处理，而不是无限等 NCCL |
 | Gloo control group | scene discovery 使用 Arrow unique 扫描后经 CPU control group 广播，避免冷 HDFS 阻塞 NCCL |
 | bounded teardown | 先关 IPC pipe，再 join CUDA prefetch；删除无界 queue join，并限制 `destroy_process_group` 等待 |
+| **每步读取预算 + 饥饿投票** | `reader.step_batch_budget_sec`（默认 30s）到期后返回 `BATCH_NOT_READY` 而非继续阻塞；该 rank 这步投「饥饿」，其它 rank 照常训练，它欠的那个 batch 下一步再消费，一条数据都不丢 |
+| **三态投票（active / starved / exhausted）** | allreduce 从 0/1 计数改成 `[active, exhausted]` 两个计数器 |
 
-**影响：** 修复目标不是“永远不遇到坏 HDFS”，而是把不可观测的永久挂起转换成**有阶段、有 HBM 快照、有退出码、可自动重启**的失败。
+**为什么必须是三态：** 原来 `active_ranks == 0` 的语义是「数据读完了」，直接 `break`。四个 rank 共用同一个 HDFS 集群、同一份内存压力，同时卡住完全可能——如果那时大家都因超时投 0，会被误判成 epoch 结束，**训练静默地提前终止**。所以「暂时没有」和「永远没有」必须分开：只有全员 exhausted 才结束；全员 starved 则一起重试；有人还在训练时，饥饿的 rank 做零损失重放。判定逻辑抽成了纯函数 `_supply_verdict()` 以便单测覆盖。
 
-**对应提交：** `705878d`、`48f243a`、`fd5edb6`、`457d2e6`、`8c31ae3`。
+另外第 0 步的预算强制为 `None`——replicated sparse DDP 要求每个 rank 都提供首个 batch，此时只能等，由 startup timeout 兜底。
+
+**一个此前无效的计时器：** `host_prepare_idle_timeout_sec` 曾把「距上次交付 batch」和「距上次子进程心跳」取 `min`。子进程每读一个 record batch 就心跳，`io_progress_pulses` 还每 15s 补一次，所以这个值恒 ≤ 15s，**idle timeout 从来没能触发过**，600s 的 step watchdog 是唯一后盾——而它会把四个 rank 全杀掉。现在 startup 仍认心跳（冷启动阶段 HDFS list/footer/adapt 确实只有心跳，且 JNI 挂死会让心跳停），idle 只认真正交付的 batch：首个 batch 之后，「活着但不产出」恰恰就是该中止的状态。
+
+**唯一天花板：** 饥饿容忍不能是无限的，否则一个彻底卡死的 reader 会永远投饥饿（重试循环每轮都会 beat step watchdog，600s 那道后盾不再生效）。为避免两个上限互相抢先，这里只保留一个：`host_prepare_idle_timeout_sec`，默认从 300 提到 900。**提高默认值实际是收紧**——修复前它等效于无穷大。配置校验强制它大于 `step_batch_budget_sec`，防止配出「来不及饥饿一次就被判死」的组合。
+
+**影响：** 修复目标不是“永远不遇到坏 HDFS”，而是分两层：先把不可观测的永久挂起转换成**有阶段、有 HBM 快照、有退出码、可自动重启**的失败；再把爆炸半径从「一个 rank 慢 → 全 job 死」降到「一个 rank 慢 → 吞吐掉一个坑」。代价是被跳过的那步在该 rank 上多做一次零损失前反向，远小于丢掉数万步进度重启。行/token 计数只在 `rank_active` 时累加，所以重放不会污染指标；`starved_steps` 非零时会打进 Train step 日志，避免降级完全静默。
+
+**边界：** 这不会让 reader 变快，HDFS 抖动和内存压力仍在（见 3.5）。评测路径**不**做饥饿容忍——跳过一个 rank 会静默丢掉测试行、污染 AUC，所以 `_active_rank_count()` 保持阻塞语义。`host_prepare_prefetch=0` 的 in-process 路径没有预算读取，退回阻塞 + step watchdog。
+
+**对应提交：** `705878d`、`48f243a`、`fd5edb6`、`457d2e6`、`8c31ae3`；饥饿容忍与 idle 计时器修复随 `50ed954` 提交（该 commit 的 message 只描述了 checkpoint resume，实际混入了本节与 3.5 的改动）。
 
 ### 3.5 Python 对象都释放了，为什么 DataLoader RSS 仍持续上涨？
 
 **问题：** 长跑时 host-prepare/parent RSS 持续抬升；Python 引用已经释放，GC 也看不到等量存活对象。最终可能先耗尽 container RAM，而不是 HBM。
 
-**根因：** 这里也不是示例中的 glibc arena 单一问题，而是两条独立的 high-water path：
+**根因：** 这里也不是示例中的 glibc arena 单一问题，而是多条独立的 high-water / 单调增长 path：
 
 | 内存来源 | 为什么不下降 |
 |---|---|
 | `share_memory_` + pinned IPC | child 中先 pin 再 share，会让 `/dev/shm` handle 与 pinned page 跨 batch 存活；shared `FeatureBatch` 未及时私有化也会延长底层 storage 生命周期 |
 | 变长 `pin_memory()` | 每个不同 batch/sequence shape 都申请新的 size class；CUDA host caching allocator 保留旧 slab，RSS 随新高水位只升不降 |
+| `_PinnedHostBufferPool` 只扩不缩 | idle slot 按**历史峰值**保留，遇到一次大 batch 就永久上棘轮 |
+| HDFS poisoned session quarantine | 为避免 native `close` 挂死而永久持有整个 `ParquetSession`，连同已 pre-buffer 的 Arrow 数据与 exception traceback 一起留住——**单调增长**，且与内存压力构成正反馈：越挤 → 越多 timeout → 越多 quarantine → 越挤 |
+| 线程 churn × glibc arena | `scanner_batch_rows=128` 让每个小 batch 都起一个 timeout 线程，glibc 为每个线程新建 arena，碎片与虚拟保留一起抬 RSS |
+| `_ARANGE_CACHE` / `_NP_ARANGE_CACHE` | 按 length 做 key 的 dict，`group_total` 每出现一个新长度就多留一个 buffer，长跑下 key 空间不收敛 |
+| `PerFileLock._thread_locks` | class 级 dict 按 file URI 累积 `RLock`，每个新文件一把，永不回收 |
+| parent 侧缺 Arrow / heap trim | 主循环只 flush PyTorch host cache，没有 `pa.default_memory_pool().release_unused()` 与 `malloc_trim`，in-process 数据路径的空闲页留在进程里 |
 
 **解决方案：**
 
@@ -347,8 +366,15 @@ F^{l+1}=\operatorname{LN}
 | H2D 后释放 host refs | 防止 device prefetch 队列继续持有上一个 batch |
 | 周期性清空 idle host allocator slab | 在 log cadence 触发 host cache release；pool grow/drop 时也主动归还旧 slab |
 | 收紧 memfd/Arrow cleanup | 不生成第二份巨型 bytes copy，关闭 mmap/fd/table iterator |
+| quarantine 分级释放 | 只永久保留可能被 native 调用触碰的 `filesystem` / `native_file`；timed operation 一结束就放掉 `batch_iterator`、`parquet_file`、`RecordBatch` 与 traceback（改存 `repr(failure)`），把「单调增长」降回「常数级 handle」 |
+| timeout 线程池 | 用可复用的 daemon worker 池替代每次调用起一个线程；挂死的 worker 自行退休，不回池 |
+| `MALLOC_ARENA_MAX=2` + `malloc_trim(0)` | 在 `import torch` 之前设好 arena 上限（父子进程都生效），并在 child 与 parent 的 `gc.collect()` 之后主动 trim |
+| arange 缓存改为单 buffer | 不再按 length 建 dict，而是一个按需翻倍增长的 buffer，取 view 返回；已发出的 view 在增长后仍然有效 |
+| `PerFileLock` 改用 `WeakValueDictionary` | 没有活的 `PerFileLock` 持有时，锁自动从 registry 清掉；同 key 的活实例仍共享同一把锁 |
 
-**验证与边界：** `331b6ac` 与 `64ba075` 分别修复 IPC ratchet 和变长 pinned allocator ratchet；后续 pool 从 grow-only 改为滑动缩容（见 [`mdl_key_questions.md`](./mdl_key_questions.md) 问题 8）。回归覆盖 memfd 传输、pool 复用/尖峰缩容、子进程退出和 host-prepare watchdog。仓库没有一条可引用的完整“修复前后 24 小时 RSS 曲线”，因此只陈述根因与回归，不编造下降百分比。
+**验证与边界：** `331b6ac` 与 `64ba075` 分别修复 IPC ratchet 和变长 pinned allocator ratchet；后续 pool 从 grow-only 改为滑动缩容（见 [`mdl_key_questions.md`](./mdl_key_questions.md) 问题 8）。上表后半部分的 quarantine 分级释放、线程池、arena/trim、arange 与 lock registry 随 `50ed954` 提交。回归覆盖 memfd 传输、pool 复用/尖峰缩容、quarantine 释放、线程池复用、arange 视图有效性、lock registry 回收、子进程退出和 host-prepare watchdog。仓库没有一条可引用的完整“修复前后 24 小时 RSS 曲线”，因此只陈述根因与回归，不编造下降百分比。
+
+**为什么值得单独讲 quarantine：** 其余几条是「高水位不回落」，而 quarantine 是真正的**单调泄漏**，并且会自我放大——它是把「HDFS 偶发抖动」升级成「几小时后必然填满 250GB 内存、进而让 HDFS 读取更容易 timeout」的那个环节。3.4 的饥饿容忍处理的是卡顿的**表现**，这一条处理的是卡顿变频繁的**成因**，两者要一起看。
 
 另一个重要 trade-off 来自 direct pipeline：同一 data-only 基准吞吐从 361.28 提升到 475.85 samples/s（+31.71%），但当时 peak host RSS 从 1.603 GB 增至 2.588 GB（+61.47%）。数据路径优化必须同时报告吞吐与内存 runway。
 
@@ -545,6 +571,8 @@ F^{l+1}=\operatorname{LN}
 | MDL/OneTrans 结构测试 | `tests/test_model_alignment.py` |
 | sparse/sharded 多卡 | `tests/test_sparse_ddp.py`、`tests/test_sharded_embedding.py` |
 | HDFS 与 watchdog | `tests/test_remote_io.py`、`tests/test_host_prepare_watchdog.py`、`tests/test_step_watchdog.py` |
+| reader 饥饿容忍与三态投票 | `tests/test_batch_starvation.py`、`tests/test_active_rank_count_async.py` |
+| pinned pool 缩容与 host heap | `tests/test_pinned_host_pool.py` |
 | CUDA Graph 参数面 | `tests/test_cuda_graph_static_graph.py` |
 | 固定 holdout | `tests/test_fixed_test_eval.py`、`tests/test_evaluation_metrics.py` |
 
@@ -553,6 +581,7 @@ F^{l+1}=\operatorname{LN}
 | MDL Eq. 6 与论文路径 | `edaf19d` |
 | 三轴与空值语义 | `053257b`、`81a53d1`、`a729b00` |
 | HDFS 挂起与 teardown | `705878d`、`48f243a`、`fd5edb6`、`457d2e6`、`8c31ae3` |
+| reader 饥饿容忍、idle 计时器、host RSS 二轮 | `50ed954`（message 只写了 checkpoint resume，实际混入 3.4/3.5 改动） |
 | host RSS | `331b6ac`、`64ba075` |
 | 24h Embedding 与 Row-Wise | `859902e`、`f8e0dad`、`1a0579d` |
 | RankMixer / MDL-RankMixer HBM | `9529ae2`、`659ad1c`、`6a768f8`、`bd4a367`、`bfaba79`、`3e53d18` |
