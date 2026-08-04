@@ -237,6 +237,61 @@ def trim_process_heap() -> bool:
         return False
 
 
+def _page_size() -> int | None:
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def process_resident_bytes(pid: int | None = None) -> int | None:
+    """Current RSS of ``pid`` (default: this process), or ``None`` if unreadable.
+
+    Reads ``/proc`` directly rather than via psutil: this runs on the periodic
+    logging path, where an optional dependency must never break training.
+    """
+
+    target = "self" if pid is None else str(int(pid))
+    try:
+        with open(f"/proc/{target}/statm", "rb") as handle:
+            resident_pages = int(handle.read().split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+    page_size = _page_size()
+    if page_size is None:
+        return None
+    return resident_pages * page_size
+
+
+def process_peak_resident_bytes() -> int | None:
+    """High-water RSS of this process, or ``None`` when unavailable."""
+
+    try:
+        import platform
+        import resource
+
+        value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:  # noqa: BLE001 - diagnostics must not break training
+        return None
+    # Linux reports KiB, macOS reports bytes.
+    return value if platform.system() == "Darwin" else value * 1024
+
+
+def arrow_pool_bytes() -> int | None:
+    """Bytes currently held by Arrow's default pool, or ``None`` if unavailable.
+
+    Separates "Arrow is still holding it" from "Arrow released it but the
+    allocator kept it", which RSS alone cannot tell apart.
+    """
+
+    try:
+        import pyarrow as pa
+
+        return int(pa.default_memory_pool().bytes_allocated())
+    except Exception:  # noqa: BLE001 - diagnostics must not break training
+        return None
+
+
 def set_io_progress_hook(hook: Callable[[], None] | None) -> None:
     """Install or clear the process-wide remote-IO progress heartbeat callback."""
 

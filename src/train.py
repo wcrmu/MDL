@@ -56,6 +56,7 @@ from .checkpoint import (
     step_directory_name,
 )
 from .dataloader import (
+    arrow_pool_bytes,
     FeatureBatch,
     PreparedAxisBatch,
     PreparedBatchTable,
@@ -84,6 +85,8 @@ from .dataloader import (
     materialize_packed_blocks,
     move_feature_batch,
     pin_feature_batch,
+    process_peak_resident_bytes,
+    process_resident_bytes,
     privatize_shared_feature_batch,
     prepare_packed_arrow_axis_batch,
     prepare_packed_axis_batch,
@@ -3023,6 +3026,16 @@ class _PinnedHostBufferPool:
         if reclaim:
             _release_cached_host_allocator_memory()
 
+    def idle_bytes(self) -> int:
+        """Pinned bytes parked in the free list (the part that can ratchet)."""
+
+        with self._lock:
+            return sum(
+                _tensor_nbytes(buffer)
+                for slot in self._free
+                for buffer in slot.values()
+            )
+
 
 def _share_cpu_tensor_tree(value: Any) -> Any:
     """Move CPU tensor storages into shared memory for ForkingPickler IPC."""
@@ -3996,6 +4009,25 @@ class _ProcessHostPrepareIterator:
         self._received_item = True
         self._last_progress_at = perf_counter()
 
+    def memory_report(self) -> str:
+        """Reader-side memory counters that only this iterator can see.
+
+        The child does all the HDFS/Arrow work, so a climb in ``child_rss_mib``
+        against a flat parent points somewhere completely different from the
+        reverse — worth separating rather than reading one total.
+        """
+
+        fields: list[str] = []
+        child_pid = getattr(self._process, "pid", None)
+        child_rss = None if child_pid is None else process_resident_bytes(child_pid)
+        if child_rss is not None:
+            fields.append(f"child_rss_mib={child_rss / _MIB:.1f}")
+        if self._pinned_pool is not None:
+            fields.append(
+                f"pinned_idle_mib={self._pinned_pool.idle_bytes() / _MIB:.1f}"
+            )
+        return " ".join(fields)
+
     def _delivery_silence_sec(self, now: float) -> float:
         """Seconds since the last *delivered* batch, ignoring heartbeats."""
 
@@ -4373,6 +4405,37 @@ def _record_feature_batch_stream(
 # so a long HDFS/open timeout no longer has to be paid here. Keep a bounded
 # fallback for CUDA calls that cannot be interrupted from Python.
 _DEVICE_PREFETCH_JOIN_TIMEOUT_SEC = 30.0
+
+_MIB = 1024 * 1024
+
+
+def _host_memory_report(iterator: Any) -> str:
+    """Host memory counters for the periodic log; empty when unreadable.
+
+    Host RSS is the number the container OOM killer acts on, and until now
+    nothing on the training path recorded it — a multi-hour climb could only be
+    seen from outside, with no way to tell which layer was holding the memory.
+    """
+
+    fields: list[str] = []
+    resident = process_resident_bytes()
+    if resident is not None:
+        fields.append(f"rank_rss_mib={resident / _MIB:.1f}")
+    peak = process_peak_resident_bytes()
+    if peak is not None:
+        fields.append(f"rank_peak_rss_mib={peak / _MIB:.1f}")
+    arrow_bytes = arrow_pool_bytes()
+    if arrow_bytes is not None:
+        fields.append(f"rank_arrow_mib={arrow_bytes / _MIB:.1f}")
+    reporter = getattr(iterator, "memory_report", None)
+    if reporter is not None:
+        try:
+            reader_fields = str(reporter())
+        except Exception:  # noqa: BLE001 - diagnostics must not break training
+            reader_fields = ""
+        if reader_fields:
+            fields.append(reader_fields)
+    return " ".join(fields)
 
 
 class _BatchNotReady:
@@ -7034,6 +7097,9 @@ def train_mdl(
                     # replays is invisible until it trips the idle ceiling.
                     + (f" starved_steps={starved_steps}" if starved_steps else "")
                 )
+                memory_report = _host_memory_report(host_batch_iterator)
+                if memory_report:
+                    print(f"Host memory | step={steps} {memory_report}", flush=True)
                 # Window-aggregated per-task moments for collapse detection.
                 for task_name, stats in zip(config.task_names, task_stats):
                     print(

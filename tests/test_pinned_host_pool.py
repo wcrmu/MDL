@@ -70,6 +70,21 @@ class PinnedHostPoolTest(unittest.TestCase):
         self.assertEqual(int(views2[0].numel()), 96)
         lease2.release()
 
+    def test_idle_bytes_measures_only_the_free_list(
+        self, _empty: mock.MagicMock
+    ) -> None:
+        # The free list is the part that can ratchet, so it is what the
+        # periodic Host memory log reports.
+        del _empty
+        pool = _PinnedHostBufferPool(max_free_slots=2)
+        self.assertEqual(pool.idle_bytes(), 0)
+        views, lease = pool.checkout([(torch.int64, 128)])
+        self.assertEqual(pool.idle_bytes(), 0, "leased buffers are in use, not idle")
+        lease.release()
+        del views
+        gc.collect()
+        self.assertGreaterEqual(pool.idle_bytes(), 128 * 8)
+
     def test_release_shrinks_spike_after_sliding_window(
         self, _empty: mock.MagicMock
     ) -> None:
