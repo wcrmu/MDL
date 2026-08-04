@@ -146,5 +146,113 @@ class PinnedHostPoolMemfdTest(unittest.TestCase):
         lease.release()
 
 
+class HostHeapTuningTest(unittest.TestCase):
+    """glibc arena capping and heap trimming keep freed memory from staying charged."""
+
+    def test_helpers_report_success_on_glibc(self) -> None:
+        import platform
+
+        from src.dataloader import _glibc, limit_malloc_arenas, trim_process_heap
+
+        capped = limit_malloc_arenas(2)
+        trimmed = trim_process_heap()
+        if _glibc() is None:
+            self.assertFalse(capped)
+            self.assertFalse(trimmed)
+            return
+        self.assertTrue(capped, f"mallopt failed on {platform.libc_ver()}")
+        self.assertTrue(trimmed)
+
+    def test_helpers_are_inert_without_glibc(self) -> None:
+        from src import dataloader
+
+        with mock.patch.object(dataloader, "_glibc", return_value=None):
+            self.assertFalse(dataloader.limit_malloc_arenas())
+            self.assertFalse(dataloader.trim_process_heap())
+
+
+class ArangeCacheTest(unittest.TestCase):
+    """The shared aranges must cost the max length, not the sum of lengths."""
+
+    def setUp(self) -> None:
+        from src import dataloader
+
+        self.dataloader = dataloader
+        self._saved = (dataloader._ARANGE_BUFFER, dataloader._NP_ARANGE_BUFFER)
+        dataloader._ARANGE_BUFFER = None
+        dataloader._NP_ARANGE_BUFFER = None
+
+    def tearDown(self) -> None:
+        self.dataloader._ARANGE_BUFFER, self.dataloader._NP_ARANGE_BUFFER = self._saved
+
+    def test_values_match_a_fresh_arange(self) -> None:
+        import numpy as np
+
+        for length in (0, 1, 7, 4096, 33, 8191):
+            with self.subTest(length=length):
+                torch.testing.assert_close(
+                    self.dataloader._cached_arange(length),
+                    torch.arange(length, dtype=torch.long),
+                )
+                np.testing.assert_array_equal(
+                    self.dataloader._cached_np_arange(length),
+                    np.arange(length, dtype=np.int64),
+                )
+
+    def test_many_distinct_lengths_keep_one_buffer(self) -> None:
+        # Mirrors _build_abs_window_gather_plan asking for one arange per
+        # unique request: thousands of distinct window totals per run.
+        largest = 0
+        for length in range(1, 4000, 7):
+            self.dataloader._cached_arange(length)
+            self.dataloader._cached_np_arange(length)
+            largest = length
+
+        torch_numel = self.dataloader._ARANGE_BUFFER.numel()
+        numpy_numel = int(self.dataloader._NP_ARANGE_BUFFER.shape[0])
+        # Doubling growth, so at most 2x the largest length ever requested.
+        self.assertLessEqual(torch_numel, 2 * max(largest, 1024))
+        self.assertLessEqual(numpy_numel, 2 * max(largest, 1024))
+        self.assertGreaterEqual(torch_numel, largest)
+        self.assertGreaterEqual(numpy_numel, largest)
+
+    def test_growth_does_not_invalidate_earlier_views(self) -> None:
+        small = self.dataloader._cached_np_arange(16).copy()
+        held = self.dataloader._cached_np_arange(16)
+        self.dataloader._cached_np_arange(1 << 16)
+        import numpy as np
+
+        np.testing.assert_array_equal(held, small)
+
+
+class PerFileLockRegistryTest(unittest.TestCase):
+    def test_registry_drops_keys_once_no_lock_is_held(self) -> None:
+        from src.dataloader import PerFileLock
+
+        keys = [f"hdfs://ns/part-{index:05d}.parquet" for index in range(200)]
+        for key in keys:
+            with PerFileLock(key, enabled=True):
+                pass
+        gc.collect()
+        self.assertEqual(
+            [key for key in keys if key in PerFileLock._thread_locks],
+            [],
+            "one RLock plus its HDFS path per file touched would grow all job",
+        )
+
+    def test_live_holders_share_one_lock(self) -> None:
+        from src.dataloader import PerFileLock
+
+        key = "hdfs://ns/shared.parquet"
+        first = PerFileLock(key, enabled=True)
+        second = PerFileLock(key, enabled=True)
+        self.assertIs(first._thread_lock, second._thread_lock)
+        self.assertIn(key, PerFileLock._thread_locks)
+
+        del first, second
+        gc.collect()
+        self.assertNotIn(key, PerFileLock._thread_locks)
+
+
 if __name__ == "__main__":
     unittest.main()

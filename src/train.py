@@ -16,6 +16,7 @@ import os
 import pickle
 from pathlib import Path
 import queue
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -42,12 +43,25 @@ from .config import (
     ParquetSplitConfig,
     ReaderConfig,
 )
-from .checkpoint import load_model_checkpoint, save_model_checkpoint
+from .checkpoint import (
+    CheckpointUploader,
+    DataCursor,
+    fetch_checkpoint_for_rank,
+    load_model_checkpoint,
+    load_training_checkpoint,
+    open_run_store,
+    resolve_resume_checkpoint,
+    save_model_checkpoint,
+    stage_training_checkpoint,
+    step_directory_name,
+)
 from .dataloader import (
     FeatureBatch,
     PreparedAxisBatch,
     PreparedBatchTable,
     RemoteIoStallError,
+    ScanCursorChannel,
+    ScanResumePlan,
     SourceRegistry,
     _adapter_request_level_sources,
     _coalesce_feature_batch,
@@ -66,6 +80,7 @@ from .dataloader import (
     iter_adapted_axis_bundles,
     iter_flat_tables,
     iter_length_bucketed_packs,
+    limit_malloc_arenas,
     materialize_packed_blocks,
     move_feature_batch,
     pin_feature_batch,
@@ -76,11 +91,17 @@ from .dataloader import (
     request_group_blocks_from_adapted_table,
     request_group_blocks_from_arrow_source,
     request_group_blocks_from_axis_bundle,
+    note_scan_emitted_rows,
     reset_direct_pipeline_stats,
     resolve_auto_scenarios,
     run_feature_cardinality_audit,
+    scan_resume_rewind,
+    scan_split_key,
     set_io_progress_hook,
+    set_scan_cursor_channel,
+    set_scan_resume_plan,
     table_to_feature_batch,
+    trim_process_heap,
 )
 from .features import load_vocab_maps
 from .embeddings import (
@@ -2488,6 +2509,15 @@ def _estimate_prepared_batch_bytes(config: AppConfig, table: object) -> int:
     return max(1, arrow_bytes + tensor_bytes + tensor_bytes // 8)
 
 
+def _feature_batch_row_count(batch: FeatureBatch) -> int:
+    """Rows in one prepared batch, counted the way the training loop counts them."""
+
+    scenario_id = getattr(batch, "scenario_id", None)
+    if scenario_id is None:
+        return 0
+    return int(scenario_id.size(0))
+
+
 def _prepare_feature_batch(
     config: AppConfig,
     split: ParquetSplitConfig,
@@ -2571,6 +2601,8 @@ def iter_feature_batches(
     shard_world_size: int = 1,
     pin_memory: bool = False,
     include_group_id: bool = True,
+    scan_cursor: ScanCursorChannel | None = None,
+    scan_resume_plan: ScanResumePlan | None = None,
 ) -> Iterator[FeatureBatch]:
     split = config.data.train if split_name == "train" else config.data.test
     if split is None:
@@ -2590,7 +2622,12 @@ def iter_feature_batches(
                 shard_world_size=shard_world_size,
                 pin_memory=pin_memory,
                 include_group_id=include_group_id,
+                scan_cursor=scan_cursor,
+                scan_resume_plan=scan_resume_plan,
             )
+        # Compare mode runs two readers over the same rows, so neither may own
+        # the cursor. Checkpoints still resume the step and the weights; the
+        # input scan restarts from the beginning of the shard.
         return _iter_compare_feature_batches(
             config,
             split_name,
@@ -2619,7 +2656,22 @@ def iter_feature_batches(
             coalesce_pinned_tensors=coalesce_pinned_tensors,
             include_group_id=include_group_id,
             queue_size=int(reader.host_prepare_prefetch),
+            scan_cursor=scan_cursor,
+            scan_resume_plan=scan_resume_plan,
         )
+
+    # In-process reader: the scanner runs here, so install the cursor and the
+    # resume offset on this process instead of handing them to a child.
+    split_key: str | None = None
+    if scan_cursor is not None or scan_resume_plan is not None:
+        split_key = scan_split_key(
+            split,
+            shard_rank=shard_rank,
+            shard_world_size=shard_world_size,
+        )
+        if scan_cursor is not None:
+            set_scan_cursor_channel(scan_cursor, split_key=split_key)
+        set_scan_resume_plan(scan_resume_plan)
 
     table_iter = _iter_batch_tables(
         config,
@@ -2630,7 +2682,7 @@ def iter_feature_batches(
     )
 
     def _prepare(table: object) -> FeatureBatch:
-        return _prepare_feature_batch(
+        batch = _prepare_feature_batch(
             config,
             split,
             table,
@@ -2640,6 +2692,11 @@ def iter_feature_batches(
             coalesce_pinned_tensors,
             include_group_id,
         )
+        if split_key is not None:
+            note_scan_emitted_rows(
+                _feature_batch_row_count(batch), split_key=split_key
+            )
+        return batch
 
     # Same-thread overlap with leftover CUDA backward when process prefetch is off.
     if reader.overlap_host_prepare and reader.device_prefetch_batches == 0:
@@ -3339,6 +3396,9 @@ def _host_prepare_process_main(
     fd_conn: Any | None = None,
     parent_pid: int | None = None,
     terminal_ack_conn: Any | None = None,
+    scan_cursor_storage: Any | None = None,
+    scan_resume_plan: ScanResumePlan | None = None,
+    scan_cursor_split_key: str | None = None,
 ) -> None:
     """Child entry: pack+tensorize and push FeatureBatches to the train process.
 
@@ -3368,6 +3428,15 @@ def _host_prepare_process_main(
             pass
     _install_host_prepare_shutdown_handlers()
     set_io_progress_hook(_beat)
+    # The scanner runs here, so this is where the resume offset is applied and
+    # where the position the parent checkpoints is published from.
+    if scan_cursor_storage is not None:
+        set_scan_cursor_channel(
+            ScanCursorChannel(scan_cursor_storage),
+            split_key=scan_cursor_split_key,
+        )
+    if scan_resume_plan is not None:
+        set_scan_resume_plan(scan_resume_plan)
     _beat("child-start")
 
     try:
@@ -3390,6 +3459,8 @@ def _host_prepare_process_main(
         )
     finally:
         set_io_progress_hook(None)
+        set_scan_cursor_channel(None)
+        set_scan_resume_plan(None)
         if fd_conn is not None:
             try:
                 fd_conn.close()
@@ -3443,6 +3514,7 @@ def _host_prepare_process_body(
     # Inherit LOCAL_RANK from the train parent and take this rank's CPU slice
     # so 6–8 co-located prepare children do not all fight over cores 0..N/3.
     _apply_local_rank_cpu_affinity("host_prepare")
+    limit_malloc_arenas()
     try:
         split = config.data.train if split_name == "train" else config.data.test
         if split is None:
@@ -3487,6 +3559,9 @@ def _host_prepare_process_body(
                         queue, fd_conn, parent_pid, payload, memfd
                     )
                 _beat("batch-queued")
+                # Queued rows are rows the trainer will count, so this is what
+                # the checkpoint compares its own row total against.
+                note_scan_emitted_rows(_feature_batch_row_count(batch))
                 # Free the child's handle promptly so shared IPC files / Arrow
                 # arenas are not pinned by the previous loop iteration.
                 del batch
@@ -3501,6 +3576,9 @@ def _host_prepare_process_body(
                     pass
                 if produced % 64 == 0:
                     gc.collect()
+                    # release_unused() only reaches Arrow's free lists; without
+                    # this the freed heap tops stay charged to the pod.
+                    trim_process_heap()
             _queue_put_interruptible(queue, None)
             _wait_for_host_prepare_terminal_ack(terminal_ack_conn)
         except BaseException as error:  # noqa: BLE001 - classify teardown vs real IO
@@ -3769,6 +3847,8 @@ class _ProcessHostPrepareIterator:
         coalesce_pinned_tensors: bool,
         include_group_id: bool,
         queue_size: int,
+        scan_resume_plan: ScanResumePlan | None = None,
+        scan_cursor: ScanCursorChannel | None = None,
     ) -> None:
         if queue_size <= 0:
             raise ValueError("host_prepare_prefetch queue_size must be positive")
@@ -3807,6 +3887,10 @@ class _ProcessHostPrepareIterator:
         # child can no longer run Python).
         self._ctx = mp.get_context("spawn")
         self._progress_mtime = self._ctx.Value("d", time())
+        # Reader lives in the child, so the checkpointer reads its scan position
+        # out of shared memory rather than through the batch queue.
+        self._scan_cursor = scan_cursor
+        self._scan_resume_plan = scan_resume_plan
         # Only share-mode needs torch file_system IPC under /dev/shm.
         if self._ipc_mode == "share":
             _configure_host_prepare_tensor_sharing()
@@ -3867,6 +3951,19 @@ class _ProcessHostPrepareIterator:
                 "fd_conn": fd_send,
                 "parent_pid": parent_pid,
                 "terminal_ack_conn": terminal_ack_recv,
+                "scan_cursor_storage": (
+                    None if self._scan_cursor is None else self._scan_cursor.storage
+                ),
+                "scan_resume_plan": scan_resume_plan,
+                "scan_cursor_split_key": (
+                    None
+                    if split is None
+                    else scan_split_key(
+                        split,
+                        shard_rank=shard_rank,
+                        shard_world_size=shard_world_size,
+                    )
+                ),
             },
             name=f"mdl-host-prepare-{split_name}",
             daemon=False,
@@ -3890,14 +3987,28 @@ class _ProcessHostPrepareIterator:
     def __iter__(self) -> "_ProcessHostPrepareIterator":
         return self
 
+    def scan_position(self) -> Any | None:
+        """Return the child reader's latest published scan position."""
+
+        return None if self._scan_cursor is None else self._scan_cursor.read()
+
     def _mark_progress(self) -> None:
         self._received_item = True
         self._last_progress_at = perf_counter()
 
-    def _silence_sec(self, now: float) -> float:
-        """Seconds since the freshest child heartbeat or delivered batch."""
+    def _delivery_silence_sec(self, now: float) -> float:
+        """Seconds since the last *delivered* batch, ignoring heartbeats."""
 
-        silence = now - self._last_progress_at
+        return now - self._last_progress_at
+
+    def _startup_silence_sec(self, now: float) -> float:
+        """Seconds since the freshest child heartbeat or delivered batch.
+
+        Only meaningful before the first batch: HDFS list/footer/adapt work is
+        legitimately long and heartbeat-only, and a JNI hang stops the beats.
+        """
+
+        silence = self._delivery_silence_sec(now)
         progress_mtime = getattr(self, "_progress_mtime", None)
         if progress_mtime is None:
             return silence
@@ -3911,11 +4022,10 @@ class _ProcessHostPrepareIterator:
 
     def _raise_if_child_stalled(self) -> None:
         now = perf_counter()
-        silence = self._silence_sec(now)
         if (
             not self._received_item
             and self._startup_timeout_sec is not None
-            and silence >= float(self._startup_timeout_sec)
+            and self._startup_silence_sec(now) >= float(self._startup_timeout_sec)
         ):
             self._abort_stalled_child(
                 RemoteIoStallError(
@@ -3923,15 +4033,19 @@ class _ProcessHostPrepareIterator:
                     f"{float(self._startup_timeout_sec):.0f}s without progress"
                 )
             )
+        # Deliberately heartbeat-blind. Once batches have flowed, "child is alive
+        # but delivering nothing" is precisely the state to abort on; honouring
+        # heartbeats here made this timer unreachable, because the child beats
+        # per record batch and every 15s from io_progress_pulses.
         if (
             self._received_item
             and self._idle_timeout_sec is not None
-            and silence >= float(self._idle_timeout_sec)
+            and self._delivery_silence_sec(now) >= float(self._idle_timeout_sec)
         ):
             self._abort_stalled_child(
                 RemoteIoStallError(
-                    f"host-prepare idle exceeded "
-                    f"{float(self._idle_timeout_sec):.0f}s without progress"
+                    f"host-prepare delivered no batch for "
+                    f"{float(self._idle_timeout_sec):.0f}s while still alive"
                 )
             )
 
@@ -3962,8 +4076,18 @@ class _ProcessHostPrepareIterator:
         abort_rank_for_remote_io_stall(error)
 
     def __next__(self) -> FeatureBatch:
+        return self.next_within(None)
+
+    def next_within(self, budget_sec: float | None) -> Any:
+        """Next batch, or ``BATCH_NOT_READY`` once ``budget_sec`` elapses.
+
+        Reporting starvation lets the caller sit out one step rather than block
+        the whole world; the batch stays queued and arrives on a later step.
+        """
+
         if self._closed:
             raise StopIteration
+        deadline = _budget_deadline(budget_sec)
         while True:
             try:
                 item = self._queue.get(timeout=0.5)
@@ -3986,6 +4110,8 @@ class _ProcessHostPrepareIterator:
                         "native/HDFS code or failed before reporting an error"
                     )
                 self._raise_if_child_stalled()
+                if deadline is not None and perf_counter() >= deadline:
+                    return BATCH_NOT_READY
                 continue
             except (OSError, ValueError, EOFError, RuntimeError) as error:
                 self.close()
@@ -4249,6 +4375,42 @@ def _record_feature_batch_stream(
 _DEVICE_PREFETCH_JOIN_TIMEOUT_SEC = 30.0
 
 
+class _BatchNotReady:
+    """Sentinel: the reader has no batch *yet*, but is not exhausted.
+
+    Distinct from ``StopIteration``. A starved rank sits out one step and picks
+    the batch up later; an exhausted rank is done for good. Collapsing the two
+    would make a transient world-wide stall look like the end of the epoch.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "BATCH_NOT_READY"
+
+
+BATCH_NOT_READY = _BatchNotReady()
+
+
+def _budget_deadline(budget_sec: float | None) -> float | None:
+    return None if budget_sec is None else perf_counter() + float(budget_sec)
+
+
+def _next_batch_within(iterator: Any, budget_sec: float | None) -> Any:
+    """Read the next batch, reporting starvation instead of blocking forever.
+
+    Iterators with no budgeted read (in-process paths with no remote reader
+    behind them) keep the plain blocking contract.
+    """
+
+    if budget_sec is None:
+        return next(iterator)
+    reader = getattr(iterator, "next_within", None)
+    if reader is None:
+        return next(iterator)
+    return reader(budget_sec)
+
+
 class _DevicePrefetchIterator:
     """Prepare and copy future batches on a dedicated CUDA stream/thread."""
 
@@ -4323,7 +4485,9 @@ class _DevicePrefetchIterator:
             if callable(close):
                 close()
 
-    def _next_item(self) -> _DevicePrefetchItem:
+    def _next_item(self, deadline: float | None = None) -> _DevicePrefetchItem | None:
+        """Pop the next ready item, or ``None`` once ``deadline`` passes."""
+
         while True:
             try:
                 item = self.queue.get(timeout=0.5)
@@ -4334,6 +4498,8 @@ class _DevicePrefetchIterator:
                     raise RuntimeError(
                         "CUDA prefetch worker exited without a terminal queue item"
                     )
+                if deadline is not None and perf_counter() >= deadline:
+                    return None
                 continue
             break
         if item.error is not None:
@@ -4351,7 +4517,14 @@ class _DevicePrefetchIterator:
         return item
 
     def __next__(self) -> FeatureBatch:
-        item = self._next_item()
+        return self.next_within(None)
+
+    def next_within(self, budget_sec: float | None) -> Any:
+        """Next device batch, or ``BATCH_NOT_READY`` once the budget expires."""
+
+        item = self._next_item(_budget_deadline(budget_sec))
+        if item is None:
+            return BATCH_NOT_READY
         assert item.batch is not None
         device_batch = item.batch
         # H2D has completed (wait_event in _next_item). Drop the host FeatureBatch
@@ -4364,7 +4537,14 @@ class _DevicePrefetchIterator:
     def next_with_host(self) -> tuple[FeatureBatch, FeatureBatch]:
         """Return matching host/device views for pre-update evaluation replay."""
 
-        item = self._next_item()
+        return self.next_with_host_within(None)
+
+    def next_with_host_within(self, budget_sec: float | None) -> Any:
+        """Host/device view pair, or ``BATCH_NOT_READY`` once the budget expires."""
+
+        item = self._next_item(_budget_deadline(budget_sec))
+        if item is None:
+            return BATCH_NOT_READY
         if item.host_batch is None or item.batch is None:
             self.close()
             raise RuntimeError("CUDA-prefetch item did not retain its host batch")
@@ -5210,11 +5390,31 @@ def _set_optimizer_lrs(
 
 
 def _active_rank_count(context: DistributedContext, rank_active: bool) -> int:
-    return _start_active_rank_count(context, rank_active).wait()
+    """Blocking active-rank count for paths that must consume every row.
+
+    Evaluation cannot sit out a starved rank without silently dropping test
+    rows, so it keeps the plain blocking contract and treats "no batch" as
+    exhausted.
+    """
+
+    supply = _start_rank_supply_count(
+        context,
+        rank_active=rank_active,
+        rank_exhausted=not rank_active,
+    ).wait()
+    return supply.active
 
 
-class _ActiveRankCountHandle:
-    """Async world-active-rank reduction; wait before loss scaling / exit checks."""
+@dataclass(frozen=True)
+class _RankSupply:
+    """How many peers had a batch, and how many will never have one again."""
+
+    active: int
+    exhausted: int
+
+
+class _RankSupplyHandle:
+    """Async supply-state reduction; wait before loss scaling / exit checks."""
 
     __slots__ = ("_value", "_work")
 
@@ -5222,41 +5422,65 @@ class _ActiveRankCountHandle:
         self._value = value
         self._work = work
 
-    def wait(self) -> int:
+    def wait(self) -> _RankSupply:
         if self._work is not None:
             self._work.wait()
-        return int(self._value.item())
+        counts = self._value.tolist()
+        return _RankSupply(active=int(counts[0]), exhausted=int(counts[1]))
 
 
-def _start_active_rank_count(
+def _supply_verdict(supply: _RankSupply, world_size: int) -> str:
+    """Classify a step for a rank that has no batch of its own.
+
+    ``"stop"`` only once every rank is exhausted. ``"retry"`` when nobody has
+    data but somebody may still get some: a world-wide reader stall is not the
+    end of the epoch, and stopping there would silently truncate training.
+    ``"replay"`` when peers are training, so this rank owes them a zero-loss
+    step to keep the DDP collectives aligned.
+    """
+
+    if supply.exhausted >= world_size:
+        return "stop"
+    if supply.active == 0:
+        return "retry"
+    return "replay"
+
+
+def _start_rank_supply_count(
     context: DistributedContext,
+    *,
     rank_active: bool,
-) -> _ActiveRankCountHandle:
-    """Kick off active-rank allreduce so H2D can overlap the host collective."""
+    rank_exhausted: bool,
+) -> _RankSupplyHandle:
+    """Kick off the supply allreduce so H2D can overlap the host collective.
 
+    Two counters rather than one flag: a rank without a batch is either
+    *starved* (slow reader, retry later) or *exhausted* (end of its shard).
+    Collapsing them would make a world-wide transient stall indistinguishable
+    from the end of the epoch, and training would stop early and silently.
+    """
+
+    counts = [int(rank_active), int(rank_exhausted)]
     if not context.enabled:
-        value = torch.tensor(int(rank_active), dtype=torch.long)
-        return _ActiveRankCountHandle(value, None)
+        return _RankSupplyHandle(torch.tensor(counts, dtype=torch.long), None)
     # Prefer CPU + Gloo control group so this never inserts a CUDA device sync
     # into the training critical path.
     if context.control_group is not None:
-        value = torch.tensor(int(rank_active), dtype=torch.long, device="cpu")
+        value = torch.tensor(counts, dtype=torch.long, device="cpu")
         work = torch_dist.all_reduce(
             value,
             op=torch_dist.ReduceOp.SUM,
             group=context.control_group,
             async_op=True,
         )
-        return _ActiveRankCountHandle(value, work)
-    value = torch.tensor(
-        int(rank_active), dtype=torch.long, device=context.device
-    )
+        return _RankSupplyHandle(value, work)
+    value = torch.tensor(counts, dtype=torch.long, device=context.device)
     work = torch_dist.all_reduce(
         value,
         op=torch_dist.ReduceOp.SUM,
         async_op=True,
     )
-    return _ActiveRankCountHandle(value, work)
+    return _RankSupplyHandle(value, work)
 
 
 def _tensor_nbytes(tensor: Tensor) -> int:
@@ -5732,6 +5956,334 @@ def _aggregate_train_result(
     )
 
 
+class _CheckpointCoordinator:
+    """Periodic resumable checkpoints for one rank of a training run.
+
+    Saving stages this rank's files on local disk and hands them to a background
+    uploader, so a multi-GiB step costs the training loop a local write rather
+    than an HDFS round trip. Resuming restores weights, optimizer accumulators,
+    the global step, and the rank's input-scan position.
+    """
+
+    def __init__(
+        self,
+        settings: Any,
+        store: Any,
+        uploader: CheckpointUploader,
+        context: DistributedContext,
+        *,
+        scan_cursor: ScanCursorChannel | None,
+        staging_root: Path,
+        run_name: str,
+        log_steps: bool,
+    ) -> None:
+        self._settings = settings
+        self._store = store
+        self._uploader = uploader
+        self._context = context
+        self._staging_root = staging_root
+        self._run_name = run_name
+        self._log = log_steps and context.rank == 0
+        self.scan_cursor = scan_cursor
+        self.scan_resume_plan: ScanResumePlan | None = None
+        self._last_saved_step = -1
+        # The reader's emitted-row counter starts at zero in every process, so
+        # the reader's lead is only comparable against rows trained since this
+        # process resumed.
+        self._rows_at_start = 0
+
+    @classmethod
+    def create(
+        cls,
+        config: AppConfig,
+        context: DistributedContext,
+        log_steps: bool,
+    ) -> "_CheckpointCoordinator | None":
+        settings = getattr(config.training, "checkpoint", None)
+        if settings is None or not settings.enabled:
+            return None
+        run_name = settings.run_name or config.model.name
+        store = open_run_store(str(settings.dir), run_name)
+        staging_root = Path(
+            settings.staging_dir or tempfile.gettempdir()
+        ) / "mdl-checkpoint-staging"
+        uploader = CheckpointUploader(
+            store,
+            rank=context.rank,
+            world_size=context.world_size,
+            keep_last=settings.keep_last,
+            ready_timeout_sec=settings.ready_timeout_sec,
+            asynchronous=settings.async_upload,
+        )
+        if log_steps and context.rank == 0:
+            print(
+                "Checkpointing | "
+                f"run_dir={store.root_uri} "
+                f"every_steps={settings.every_steps} "
+                f"keep_last={settings.keep_last} "
+                f"async_upload={settings.async_upload} "
+                f"data_resume={settings.data_resume} "
+                f"resume={settings.resume}",
+                flush=True,
+            )
+        return cls(
+            settings,
+            store,
+            uploader,
+            context,
+            scan_cursor=(
+                ScanCursorChannel.shared(mp.get_context("spawn"))
+                if settings.data_resume
+                else None
+            ),
+            staging_root=staging_root,
+            run_name=run_name,
+            log_steps=log_steps,
+        )
+
+    # --- Resume ---
+
+    def _agreed_resume_directory(self) -> str | None:
+        """Pick one committed step for the whole job, decided by rank 0.
+
+        Ranks start seconds apart, so each resolving ``auto`` independently could
+        split the job across two steps if a commit lands during startup.
+        """
+
+        directory: str | None = None
+        if self._context.rank == 0:
+            checkpoint = resolve_resume_checkpoint(
+                self._store,
+                self._settings.resume,
+            )
+            directory = None if checkpoint is None else checkpoint.directory
+        if self._context.enabled:
+            payload = [directory]
+            torch_dist.broadcast_object_list(payload, src=0)
+            directory = payload[0]
+        return directory
+
+    def restore(
+        self,
+        config: AppConfig,
+        model: nn.Module,
+        context: DistributedContext,
+        device: torch.device,
+        *,
+        dense_optimizer: torch.optim.Optimizer | None,
+        replicated_sparse_optimizer: torch.optim.Optimizer | None,
+        sharded_optimizer: ShardedAdagrad | ShardedRowWiseAdagrad | None,
+    ) -> Any | None:
+        directory = self._agreed_resume_directory()
+        if directory is None:
+            if self._log:
+                print(
+                    f"Checkpoint resume | none found under {self._store.root_uri}; "
+                    "starting from a fresh model",
+                    flush=True,
+                )
+            return None
+
+        from .checkpoint import CommittedCheckpoint
+
+        checkpoint = CommittedCheckpoint(
+            step=int(directory.split("-")[-1]),
+            directory=directory,
+            uri=self._store.uri(directory),
+        )
+        local_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f"mdl-resume-rank{context.rank}-",
+                dir=str(self._staging_root_ready()),
+            )
+        )
+        try:
+            fetch_checkpoint_for_rank(
+                self._store,
+                checkpoint,
+                local_dir,
+                rank=context.rank,
+                world_size=context.world_size,
+            )
+            resumed = load_training_checkpoint(
+                config,
+                model,
+                local_dir,
+                device=device,
+                rank=context.rank,
+                world_size=context.world_size,
+                dense_optimizer=dense_optimizer,
+                replicated_sparse_optimizer=replicated_sparse_optimizer,
+                sharded_optimizer=sharded_optimizer,
+                source_uri=checkpoint.uri,
+            )
+        finally:
+            shutil.rmtree(local_dir, ignore_errors=True)
+
+        self._last_saved_step = resumed.step
+        self._rows_at_start = int(resumed.rows)
+        self.scan_resume_plan = self._resume_plan(resumed.data_cursor)
+        if self._log:
+            plan = self.scan_resume_plan
+            position = (
+                "restart"
+                if plan is None
+                else f"{plan.work_unit}[{max(0, plan.position - plan.rewind)}] "
+                f"(reader_stopped_at={plan.position} rewind={plan.rewind})"
+            )
+            print(
+                f"Checkpoint resume | step={resumed.step} rows={resumed.rows} "
+                f"data_position={position} uri={checkpoint.uri}",
+                flush=True,
+            )
+        return resumed
+
+    def _resume_plan(self, cursor: DataCursor | None) -> ScanResumePlan | None:
+        if cursor is None or not self._settings.data_resume or cursor.position <= 0:
+            return None
+        return ScanResumePlan(
+            work_unit=cursor.work_unit,
+            position=int(cursor.position),
+            prefix_digest=cursor.prefix_digest,
+            split_key=cursor.split_key,
+            # Computed when the checkpoint was written, from the row lead the
+            # reader had over the trainer at that moment.
+            rewind=max(int(cursor.rewind), int(self._settings.data_resume_rewind)),
+        )
+
+    # --- Saving ---
+
+    def due(self, step: int) -> bool:
+        every = int(self._settings.every_steps)
+        return (
+            every > 0
+            and step > 0
+            and step % every == 0
+            and step != self._last_saved_step
+        )
+
+    def due_on_exit(self, step: int) -> bool:
+        return (
+            bool(self._settings.save_on_exit)
+            and step > 0
+            and step != self._last_saved_step
+        )
+
+    def _staging_root_ready(self) -> Path:
+        self._staging_root.mkdir(parents=True, exist_ok=True)
+        return self._staging_root
+
+    def _data_cursor(
+        self,
+        config: AppConfig,
+        context: DistributedContext,
+        rows: int,
+    ):
+        if self.scan_cursor is None:
+            return None
+        position = self.scan_cursor.read()
+        if position is None:
+            return None
+        # The reader is ahead of the trainer by whatever the queues hold. Record
+        # how far back a restart must start so those read-but-untrained rows are
+        # replayed instead of skipped.
+        rows_this_run = max(0, int(rows) - self._rows_at_start)
+        rewind = scan_resume_rewind(
+            position,
+            rows_trained=rows_this_run,
+            extra_items=int(self._settings.data_resume_rewind),
+        )
+        return DataCursor(
+            work_unit=position.work_unit,
+            position=position.position,
+            prefix_digest=position.prefix_digest,
+            split_key=scan_split_key(
+                config.data.train,
+                shard_rank=context.rank,
+                shard_world_size=context.world_size,
+            ),
+            rank=context.rank,
+            world_size=context.world_size,
+            rewind=rewind,
+            emitted_rows=int(position.emitted_rows),
+            rows_trained=rows_this_run,
+        )
+
+    def save(
+        self,
+        config: AppConfig,
+        model: nn.Module,
+        context: DistributedContext,
+        *,
+        step: int,
+        rows: int,
+        elapsed_seconds: float,
+        dense_optimizer: torch.optim.Optimizer | None,
+        replicated_sparse_optimizer: torch.optim.Optimizer | None,
+        sharded_optimizer: ShardedAdagrad | ShardedRowWiseAdagrad | None,
+        watchdog: _StepWatchdog | None = None,
+    ) -> None:
+        _step_watchdog_beat(
+            watchdog,
+            "checkpoint_stage",
+            detail=f"steps={step}",
+            device=context.device,
+        )
+        started = perf_counter()
+        directory = step_directory_name(step)
+        if self._store.is_remote:
+            staging_dir = self._staging_root_ready() / self._run_name / directory
+            cleanup_staging = True
+        else:
+            # A local run directory is already the destination; staging there
+            # turns the "upload" into marker writes instead of a second copy.
+            staging_dir = Path(self._store.uri(directory))
+            cleanup_staging = False
+        cursor = self._data_cursor(config, context, rows)
+        staged = stage_training_checkpoint(
+            config,
+            model,
+            staging_dir,
+            step=step,
+            rows=rows,
+            rank=context.rank,
+            world_size=context.world_size,
+            dense_optimizer=dense_optimizer,
+            replicated_sparse_optimizer=replicated_sparse_optimizer,
+            sharded_optimizer=sharded_optimizer,
+            data_cursor=cursor,
+            elapsed_seconds=elapsed_seconds,
+            run_name=self._run_name,
+            cleanup_staging=cleanup_staging,
+        )
+        self._last_saved_step = step
+        self._uploader.submit(staged)
+        _step_watchdog_beat(
+            watchdog,
+            "checkpoint_staged",
+            detail=f"steps={step}",
+            device=context.device,
+        )
+        if self._log:
+            data_position = (
+                "unknown"
+                if cursor is None
+                else (
+                    f"{cursor.work_unit}[{cursor.position}] rewind={cursor.rewind} "
+                    f"reader_rows={cursor.emitted_rows} "
+                    f"trained_rows={cursor.rows_trained}"
+                )
+            )
+            print(
+                f"Checkpoint | step={step} staged_in={perf_counter() - started:.1f}s "
+                f"data_position={data_position} uri={self._store.uri(directory)}",
+                flush=True,
+            )
+
+    def close(self) -> None:
+        self._uploader.close(timeout_sec=self._settings.ready_timeout_sec)
+
+
 def train_mdl(
     config: AppConfig,
     max_steps: int | None = None,
@@ -5754,6 +6306,7 @@ def train_mdl(
     config = _apply_world_size_training_profile(config, context.world_size)
     batch_iterator: Iterator[FeatureBatch] | None = None
     step_watchdog: _StepWatchdog | None = None
+    checkpointing: _CheckpointCoordinator | None = None
     steps = 0
     try:
         device = context.device
@@ -5872,10 +6425,26 @@ def train_mdl(
                 sharded_embedding_optimizer,
                 sparse_optimizer=config.training.sparse_optimizer,
             )
+        # Captured before any resume: the schedule rewrites group["lr"] every
+        # step, so a checkpointed optimizer carries a scheduled lr, not the base.
         optimizer_base_lrs = [
             [float(group["lr"]) for group in optimizer.param_groups]
             for optimizer in optimizers
         ]
+        checkpointing = _CheckpointCoordinator.create(config, context, log_steps)
+        resumed = (
+            None
+            if checkpointing is None
+            else checkpointing.restore(
+                config,
+                base_model,
+                context,
+                device,
+                dense_optimizer=dense_optimizer,
+                replicated_sparse_optimizer=embedding_optimizer,
+                sharded_optimizer=sharded_embedding_optimizer,
+            )
+        )
         lr_decay_steps = _resolve_lr_decay_steps(config, max_steps)
         scaler = _make_grad_scaler(config, device)
         ordered_task_loss_weights = _configured_task_loss_weights(config)
@@ -5927,8 +6496,11 @@ def train_mdl(
             )
             step_watchdog.start()
 
-        steps = 0
-        rows = 0
+        steps = 0 if resumed is None else int(resumed.step)
+        rows = 0 if resumed is None else int(resumed.rows)
+        # Restarts rebuild DDP and the reader, so "first iteration of this
+        # process" is the resumed step, not step zero.
+        initial_steps = steps
         last_loss = 0.0
         last_loss_numerator = 0.0
         last_loss_denominator = 0.0
@@ -5950,6 +6522,12 @@ def train_mdl(
                 shard_world_size=context.world_size,
                 pin_memory=non_blocking,
                 include_group_id=False,
+                scan_cursor=(
+                    None if checkpointing is None else checkpointing.scan_cursor
+                ),
+                scan_resume_plan=(
+                    None if checkpointing is None else checkpointing.scan_resume_plan
+                ),
             )
         )
         train_data = getattr(getattr(config, "data", None), "train", None)
@@ -5971,6 +6549,11 @@ def train_mdl(
                 device_prefetch_depth,
             )
         batches_on_device = device_prefetch_depth > 0
+        # A reader that is merely slow must not be fatal: past this budget the
+        # rank votes starved, peers keep training, and the batch is picked up on
+        # a later step. host_prepare_idle_timeout_sec remains the ceiling that
+        # eventually calls a permanently silent reader dead.
+        step_batch_budget_sec = getattr(train_reader, "step_batch_budget_sec", 30.0)
         batch_iterator = (
             _DevicePrefetchIterator(
                 host_batch_iterator,
@@ -5980,6 +6563,7 @@ def train_mdl(
             if batches_on_device
             else host_batch_iterator
         )
+        starved_steps = 0
         last_device_batch: FeatureBatch | None = None
         last_trace_batch: FeatureBatch | None = None
         accumulation_index = 0
@@ -6039,31 +6623,58 @@ def train_mdl(
                 detail=f"steps={steps}",
                 device=device,
             )
+            # Replicated sparse DDP needs a real batch from every rank on the
+            # very first micro-step, so starvation is not an option there yet.
+            batch_budget_sec = (
+                None
+                if steps == initial_steps and accumulation_index == 0
+                else step_batch_budget_sec
+            )
             try:
                 if (
                     collect_batch_stats
                     and batches_on_device
                     and isinstance(batch_iterator, _DevicePrefetchIterator)
                 ):
-                    trace_batch, local_batch = batch_iterator.next_with_host()
+                    read = batch_iterator.next_with_host_within(batch_budget_sec)
+                    if read is BATCH_NOT_READY:
+                        local_batch = BATCH_NOT_READY
+                    else:
+                        trace_batch, local_batch = read
                 else:
-                    local_batch = next(batch_iterator)
-                    if collect_batch_stats and not batches_on_device:
+                    local_batch = _next_batch_within(batch_iterator, batch_budget_sec)
+                    if (
+                        collect_batch_stats
+                        and not batches_on_device
+                        and local_batch is not BATCH_NOT_READY
+                    ):
                         trace_batch = local_batch
             except StopIteration:
                 local_batch = None
             local_batch_on_device = batches_on_device
             dataloader_wait_seconds = perf_counter() - dataloader_started
+            rank_starved = local_batch is BATCH_NOT_READY
+            if rank_starved:
+                local_batch = None
+                starved_steps += 1
             rank_active = local_batch is not None
-            # Kick the Gloo/NCCL active-rank reduction immediately so pinned H2D
-            # can overlap it. Wait only after the host→device copy is queued.
+            rank_exhausted = not rank_active and not rank_starved
+            # Kick the Gloo/NCCL supply reduction immediately so pinned H2D can
+            # overlap it. Wait only after the host→device copy is queued.
             _step_watchdog_beat(
                 step_watchdog,
                 "active_rank_sync",
-                detail=f"steps={steps} rank_active={int(rank_active)}",
+                detail=(
+                    f"steps={steps} rank_active={int(rank_active)} "
+                    f"rank_starved={int(rank_starved)}"
+                ),
                 device=device,
             )
-            active_rank_handle = _start_active_rank_count(context, rank_active)
+            supply_handle = _start_rank_supply_count(
+                context,
+                rank_active=rank_active,
+                rank_exhausted=rank_exhausted,
+            )
             h2d_started = perf_counter() if observing else 0.0
             if rank_active:
                 if local_batch is None:
@@ -6080,10 +6691,15 @@ def train_mdl(
                 last_device_batch = batch
                 if trace_batch is not None:
                     last_trace_batch = trace_batch
-                active_ranks = active_rank_handle.wait()
+                active_ranks = supply_handle.wait().active
             else:
-                active_ranks = active_rank_handle.wait()
-                if active_ranks == 0:
+                supply = supply_handle.wait()
+                active_ranks = supply.active
+                verdict = _supply_verdict(
+                    supply,
+                    context.world_size if context.enabled else 1,
+                )
+                if verdict == "stop":
                     if accumulation_index > 0:
                         for optimizer in optimizers:
                             optimizer.zero_grad(set_to_none=True)
@@ -6095,12 +6711,20 @@ def train_mdl(
                                 f"required={gradient_accumulation_steps}"
                             )
                     break
+                if verdict == "retry":
+                    if log_steps and context.rank == 0:
+                        print(
+                            "Dataloader starvation | "
+                            f"step={steps} every rank is waiting for data "
+                            f"(starved_steps={starved_steps})"
+                        )
+                    continue
                 if last_device_batch is None:
                     raise RuntimeError("inactive rank has no batch available for zero-loss replay")
                 batch = last_device_batch
                 trace_batch = last_trace_batch
             if (
-                steps == 0
+                steps == initial_steps
                 and accumulation_index == 0
                 and context.enabled
                 and active_ranks != context.world_size
@@ -6137,7 +6761,7 @@ def train_mdl(
             # releases trip an internal expect_autograd_hooks assertion. Only
             # the first optimizer window pays the extra reductions.
             static_graph_warmup = (
-                context.enabled and ddp_config.static_graph and steps == 0
+                context.enabled and ddp_config.static_graph and steps == initial_steps
             )
             forward_started = perf_counter() if observing else 0.0
             _step_watchdog_beat(
@@ -6369,6 +6993,10 @@ def train_mdl(
                 _release_cached_host_allocator_memory()
                 if steps % 100 == 0:
                     gc.collect()
+                    # The parent unpickles, privatizes and pins every batch, so
+                    # its glibc heap ratchets too; the host allocator flush
+                    # above only covers CUDA-pinned slabs.
+                    trim_process_heap()
             if should_log:
                 last_loss = float(last_loss_tensor.float().cpu().item())
                 payload_mib = sparse_sync_stats.logical_payload_bytes / (1024 ** 2)
@@ -6402,6 +7030,9 @@ def train_mdl(
                     f"sparse_local_rows={sparse_sync_stats.local_rows} "
                     f"sparse_global_rows={sparse_sync_stats.global_rows} "
                     f"sparse_payload_mib={payload_mib:.2f}"
+                    # Otherwise a reader degrading into repeated zero-loss
+                    # replays is invisible until it trips the idle ceiling.
+                    + (f" starved_steps={starved_steps}" if starved_steps else "")
                 )
                 # Window-aggregated per-task moments for collapse detection.
                 for task_name, stats in zip(config.task_names, task_stats):
@@ -6453,6 +7084,19 @@ def train_mdl(
                         fixed_test_result,
                     )
                 del fixed_test_result
+            if checkpointing is not None and checkpointing.due(steps):
+                checkpointing.save(
+                    config,
+                    base_model,
+                    context,
+                    step=steps,
+                    rows=rows,
+                    elapsed_seconds=perf_counter() - start,
+                    dense_optimizer=dense_optimizer,
+                    replicated_sparse_optimizer=embedding_optimizer,
+                    sharded_optimizer=sharded_embedding_optimizer,
+                    watchdog=step_watchdog,
+                )
         audit_report = ddp_auditor.report(context)
         if log_steps and context.rank == 0 and audit_report is not None:
             print(f"DDP graph audit | {audit_report}")
@@ -6478,6 +7122,19 @@ def train_mdl(
             last_loss_denominator,
         )
 
+        if checkpointing is not None and checkpointing.due_on_exit(steps):
+            checkpointing.save(
+                config,
+                base_model,
+                context,
+                step=steps,
+                rows=rows,
+                elapsed_seconds=elapsed,
+                dense_optimizer=dense_optimizer,
+                replicated_sparse_optimizer=embedding_optimizer,
+                sharded_optimizer=sharded_embedding_optimizer,
+                watchdog=step_watchdog,
+            )
         if save_checkpoint and config.training.save_checkpoint and config.training.checkpoint_path:
             save_model_checkpoint(
                 config,
@@ -6508,6 +7165,8 @@ def train_mdl(
         finally:
             if step_watchdog is not None:
                 step_watchdog.stop()
+            if checkpointing is not None:
+                checkpointing.close()
             _cleanup_distributed(context)
 
 

@@ -5,8 +5,14 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue as thread_queue
+import time
 import unittest
 from unittest import mock
+
+# Spawn children inherit this. On a conda numpy (mkl-service) plus pip torch
+# (libgomp) mix, the child aborts at import with "MKL_THREADING_LAYER=INTEL is
+# incompatible with libgomp.so.1" depending on which module imported first.
+os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
 
 import torch
 
@@ -63,6 +69,34 @@ def _memfd_send_handle_child(
         queue.put(None)
     finally:
         conn.close()
+
+
+def _next_from_live_producer(
+    queue: object,
+    proc: object,
+    *,
+    timeout: float = 60.0,
+) -> object:
+    """Read the next item, failing only if the producer dies or truly stalls.
+
+    A short fixed timeout here measures spawn cold start (the child re-imports
+    torch and ``src.train``, seconds on a cold page cache) rather than the
+    ordering property under test, so it flakes on loaded machines.
+    """
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return queue.get(timeout=0.1)
+        except thread_queue.Empty:
+            if not proc.is_alive():
+                raise AssertionError(
+                    f"producer exited with {proc.exitcode} before publishing"
+                ) from None
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"producer published nothing within {timeout:.0f}s"
+                ) from None
 
 
 def _share_memory_child(queue: object, terminal_ack: object) -> None:
@@ -169,7 +203,7 @@ class HostPrepareIpcModeTest(unittest.TestCase):
         proc.start()
         child_ack.close()
         try:
-            shared = metadata_queue.get(timeout=2)
+            shared = _next_from_live_producer(metadata_queue, proc)
             self.assertIsInstance(shared, FeatureBatch)
             private = privatize_shared_feature_batch(shared)
             self.assertFalse(private._packed_buffers[0].is_shared())
@@ -177,7 +211,7 @@ class HostPrepareIpcModeTest(unittest.TestCase):
                 private.features["x"],
                 torch.arange(16, dtype=torch.int64).view(4, 4),
             )
-            self.assertIsNone(metadata_queue.get(timeout=2))
+            self.assertIsNone(_next_from_live_producer(metadata_queue, proc))
             self.assertTrue(proc.is_alive())
             parent_ack.send_bytes(b"done")
             parent_ack.close()

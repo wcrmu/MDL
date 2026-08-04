@@ -552,13 +552,25 @@ class ReaderConfig(_DeeplyImmutableConfig):
     # avoid GIL fights with wide-batch forward (threaded prepare regresses).
     host_prepare_prefetch: int = 0
     # Parent-side bounds for the host-prepare child. None disables that timer.
-    # Timers measure silence since the last child heartbeat OR delivered batch.
-    # Heartbeats cover long HDFS list/footer/adapt work before the first batch;
-    # without them a healthy but slow startup looks identical to a JNI hang.
+    # Startup measures silence since the last child heartbeat OR delivered batch,
+    # because long HDFS list/footer/adapt work before the first batch is healthy
+    # and would otherwise look identical to a JNI hang. Idle measures delivered
+    # batches only: after the first batch, "alive but producing nothing" is
+    # exactly the state worth aborting on, and heartbeats would mask it forever.
     # On timeout the parent kills the child process group and aborts the rank
     # (exit 70) so torchrun can restart the job — it does not respawn the reader.
     host_prepare_startup_timeout_sec: float | None = 300.0
-    host_prepare_idle_timeout_sec: float | None = 300.0
+    # The single ceiling on "alive but delivering nothing". Until heartbeats
+    # stopped masking it this timer was unreachable, so raising the default only
+    # tightens the previous effective behaviour (never firing at all). It must
+    # leave room for several starved steps before declaring the reader dead.
+    host_prepare_idle_timeout_sec: float | None = 900.0
+    # Per-step budget for producing a training batch. On expiry the rank votes
+    # "starved" for that step instead of blocking: peers keep training and the
+    # batch is consumed on a later step. Without it one slow reader stalls the
+    # whole world until the step watchdog kills every rank. None restores the
+    # old unbounded wait.
+    step_batch_budget_sec: float | None = 30.0
     # Repeated candidates from one request can share Context and UPS tensors.
     # The adapter remains responsible for declaring context feature membership.
     deduplicate_request_features: bool = False
@@ -680,6 +692,7 @@ class ReaderConfig(_DeeplyImmutableConfig):
         for timeout_name in (
             "host_prepare_startup_timeout_sec",
             "host_prepare_idle_timeout_sec",
+            "step_batch_budget_sec",
         ):
             timeout_value = getattr(self, timeout_name)
             if timeout_value is not None and (
@@ -688,6 +701,17 @@ class ReaderConfig(_DeeplyImmutableConfig):
                 raise ValueError(
                     f"reader.{timeout_name} must be a positive number or null"
                 )
+        if (
+            self.step_batch_budget_sec is not None
+            and self.host_prepare_idle_timeout_sec is not None
+            and float(self.host_prepare_idle_timeout_sec)
+            <= float(self.step_batch_budget_sec)
+        ):
+            raise ValueError(
+                "reader.host_prepare_idle_timeout_sec must exceed "
+                "reader.step_batch_budget_sec so a slow reader gets at least one "
+                "starved step before it is declared dead"
+            )
         if self.cardinality_audit_raw_rows is not None and (
             type(self.cardinality_audit_raw_rows) is not int
             or self.cardinality_audit_raw_rows < 0
@@ -2862,6 +2886,78 @@ class FixedTestEvalConfig:
 
 
 @dataclass(frozen=True)
+class CheckpointConfig:
+    """Periodic resumable checkpoints written to a local or HDFS run directory."""
+
+    # Run directory root. Local paths and hdfs:// / viewfs:// URIs are both
+    # accepted; ``run_name`` is appended so several jobs can share one root.
+    dir: str | None = None
+    run_name: str | None = None
+    # Steps between saves. Zero disables periodic saving entirely.
+    every_steps: int = 0
+    # Committed steps to retain; older ones are deleted after each new commit.
+    keep_last: int = 3
+    # Save once more when the training loop ends normally.
+    save_on_exit: bool = True
+    # auto | latest | none | <step number> | step-000012000
+    resume: str = "auto"
+    # Stage locally and upload on a background thread so training does not block
+    # on HDFS. Synchronous writes are easier to reason about in tests.
+    async_upload: bool = True
+    # Local scratch for staged files; defaults to the system temp directory.
+    staging_dir: str | None = None
+    # Rank 0 waits this long for every peer's files before committing a step.
+    ready_timeout_sec: float = 1800.0
+    # Restart the input scan where the previous run stopped instead of rereading
+    # the whole shard. Requires reader.shard_unit file or row_group.
+    data_resume: bool = True
+    # Work items to re-read before the recorded cursor. One unit of overlap
+    # keeps prefetched-but-untrained rows from being skipped after a crash.
+    data_resume_rewind: int = 1
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any] | None) -> "CheckpointConfig":
+        if payload is None:
+            return cls()
+        return cls(**payload)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.dir)
+
+    def validate(self) -> None:
+        if self.dir is not None and not str(self.dir).strip():
+            raise ValueError("training.checkpoint.dir must not be empty")
+        if type(self.every_steps) is not int or self.every_steps < 0:
+            raise ValueError(
+                "training.checkpoint.every_steps must be a non-negative integer"
+            )
+        if type(self.keep_last) is not int or self.keep_last < 0:
+            raise ValueError(
+                "training.checkpoint.keep_last must be a non-negative integer"
+            )
+        if type(self.save_on_exit) is not bool:
+            raise ValueError("training.checkpoint.save_on_exit must be a boolean")
+        if type(self.async_upload) is not bool:
+            raise ValueError("training.checkpoint.async_upload must be a boolean")
+        if type(self.data_resume) is not bool:
+            raise ValueError("training.checkpoint.data_resume must be a boolean")
+        if type(self.data_resume_rewind) is not int or self.data_resume_rewind < 0:
+            raise ValueError(
+                "training.checkpoint.data_resume_rewind must be a non-negative integer"
+            )
+        if float(self.ready_timeout_sec) <= 0.0:
+            raise ValueError("training.checkpoint.ready_timeout_sec must be positive")
+        if not isinstance(self.resume, str) or not self.resume.strip():
+            raise ValueError("training.checkpoint.resume must be a non-empty string")
+        if self.every_steps == 0 and self.dir and not self.save_on_exit:
+            raise ValueError(
+                "training.checkpoint.dir is set but neither every_steps nor "
+                "save_on_exit would ever write a checkpoint"
+            )
+
+
+@dataclass(frozen=True)
 class TrainingConfig(_DeeplyImmutableConfig):
     """Optimizer, batch, schedule, and checkpoint settings."""
 
@@ -2943,6 +3039,9 @@ class TrainingConfig(_DeeplyImmutableConfig):
     checkpoint_path: str | None = None
     # When false, train_mdl skips writing checkpoint_path at the end of the run.
     save_checkpoint: bool = True
+    # Periodic resumable checkpoints (see CheckpointConfig). Independent of
+    # checkpoint_path, which stays a single final weights-only artifact.
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> "TrainingConfig":
@@ -2956,6 +3055,7 @@ class TrainingConfig(_DeeplyImmutableConfig):
         values["fixed_test_eval"] = FixedTestEvalConfig.from_mapping(
             values.get("fixed_test_eval")
         )
+        values["checkpoint"] = CheckpointConfig.from_mapping(values.get("checkpoint"))
         return cls(**values)
 
     def validate(self) -> None:
@@ -3037,6 +3137,7 @@ class TrainingConfig(_DeeplyImmutableConfig):
         self.embedding_sharding.validate()
         self.ddp.validate()
         self.fixed_test_eval.validate()
+        self.checkpoint.validate()
         if (
             self.embedding_distribution == "sharded"
             and not self.embedding_sparse_gradients

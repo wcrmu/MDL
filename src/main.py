@@ -7,6 +7,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
+from time import perf_counter
+from typing import Callable
 
 # Apply before importing torch (via src.train / src.benchmark). Expandable
 # segments cut near-capacity fragmentation OOMs; both names are recognized by
@@ -14,6 +17,11 @@ import sys
 _ALLOC_CONF = "expandable_segments:True,max_split_size_mb:256"
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", _ALLOC_CONF)
 os.environ.setdefault("PYTORCH_ALLOC_CONF", _ALLOC_CONF)
+
+# glibc only reads this at process start, so it governs the spawned
+# host-prepare child and adapter workers where the Arrow churn happens; this
+# rank tunes itself at runtime via ``limit_malloc_arenas``.
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
 MAIN_SCRIPT = Path(__file__).resolve()
 DEFAULT_DATA_BASE_DIR = (
@@ -34,10 +42,18 @@ def _bootstrap_import_path() -> None:
 _bootstrap_import_path()
 
 from src.benchmark import BenchmarkOptions, run_benchmark, write_benchmark_report
-from src.config import load_app_config
+from src.checkpoint import (
+    latest_committed_checkpoint,
+    list_committed_checkpoints,
+    open_run_store,
+    resolve_resume_checkpoint,
+)
+from src.checkpoint_store import CheckpointStoreError, is_remote_uri
+from src.config import CheckpointConfig, load_app_config
 from src.dataloader import (
     discover_parquet_inputs,
     iter_flat_tables,
+    limit_malloc_arenas,
     required_columns_for_split,
     scan_flat_table_stats,
     validate_matching_schemas,
@@ -325,6 +341,33 @@ def _apply_tokenization_overrides(config, args: argparse.Namespace):
     return replace(config, tokenization=tokenization)
 
 
+_CHECKPOINT_OVERRIDE_ARGS = (
+    ("checkpoint_dir", "dir"),
+    ("checkpoint_run_name", "run_name"),
+    ("checkpoint_every_steps", "every_steps"),
+    ("checkpoint_keep_last", "keep_last"),
+    ("resume", "resume"),
+)
+
+
+def _apply_checkpoint_overrides(config, args: argparse.Namespace):
+    """Apply CLI overrides for the resumable checkpoint run directory."""
+
+    updates: dict[str, object] = {}
+    for arg_name, field_name in _CHECKPOINT_OVERRIDE_ARGS:
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            updates[field_name] = value
+    if not updates:
+        return config
+    checkpoint = replace(config.training.checkpoint, **updates)
+    checkpoint.validate()
+    return replace(
+        config,
+        training=replace(config.training, checkpoint=checkpoint),
+    )
+
+
 def _load_config(args: argparse.Namespace):
     config = load_app_config(args.config)
     if any(
@@ -347,6 +390,11 @@ def _load_config(args: argparse.Namespace):
         for name in ("eval_every_steps", "test_files_per_rank")
     ):
         config = _apply_fixed_test_eval_overrides(config, args)
+    if any(
+        getattr(args, arg_name, None) is not None
+        for arg_name, _field in _CHECKPOINT_OVERRIDE_ARGS
+    ):
+        config = _apply_checkpoint_overrides(config, args)
     if any(getattr(args, name, None) is not None for name in _RUNTIME_OVERRIDE_FIELDS):
         config = _apply_runtime_overrides(config, args)
     if any(getattr(args, name, None) is not None for name in _MODEL_OVERRIDE_FIELDS):
@@ -496,6 +544,45 @@ def _add_training_override_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_checkpoint_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help=(
+            "override training.checkpoint.dir; local path or hdfs:// URI that "
+            "periodic resumable checkpoints are written under"
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-run-name",
+        default=None,
+        help=(
+            "override training.checkpoint.run_name (subdirectory of "
+            "--checkpoint-dir); defaults to the model name"
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-every-steps",
+        type=int,
+        default=None,
+        help="override training.checkpoint.every_steps (0 disables periodic saves)",
+    )
+    parser.add_argument(
+        "--checkpoint-keep-last",
+        type=int,
+        default=None,
+        help="override training.checkpoint.keep_last committed steps to retain",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help=(
+            "override training.checkpoint.resume: auto (newest committed step), "
+            "none, a step number, or a step-000012000 directory name"
+        ),
+    )
+
+
 def _add_runtime_override_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--activation-checkpoint",
@@ -566,6 +653,127 @@ def _add_tokenization_override_args(parser: argparse.ArgumentParser) -> None:
             "Use --no-omit-scene-features to keep request scene fields in the pack."
         ),
     )
+
+
+def _probe_step(label: str, operation: Callable[[], str | None]) -> None:
+    """Run one probe operation, printing its timing and result."""
+
+    started = perf_counter()
+    detail = operation()
+    elapsed = perf_counter() - started
+    suffix = f" {detail}" if detail else ""
+    print(f"  {label:<22} ok  {elapsed:6.2f}s{suffix}", flush=True)
+
+
+def _cmd_check_checkpoint_store(args: argparse.Namespace) -> int:
+    """Prove the checkpoint run directory is writable, readable, and prunable.
+
+    A checkpoint that fails to upload is only discovered thousands of steps into
+    a run, so this exercises every operation the uploader depends on — including
+    the delete that retention needs — against a throwaway probe directory.
+    """
+
+    config = _load_config(args) if args.config else None
+    settings = CheckpointConfig() if config is None else config.training.checkpoint
+    directory = args.checkpoint_dir or settings.dir
+    if not directory:
+        raise ValueError(
+            "no checkpoint directory to check: pass --checkpoint-dir, or a "
+            "--config whose training.checkpoint.dir is set"
+        )
+    # Match what a training launch would use: the run name defaults to the model.
+    run_name = args.checkpoint_run_name or settings.run_name
+    if run_name is None and config is not None:
+        run_name = config.model.name
+
+    try:
+        store = open_run_store(str(directory), run_name)
+    except Exception as error:
+        print(f"Checkpoint store: FAILED — cannot open {directory}: {error}", flush=True)
+        if is_remote_uri(str(directory)):
+            print(
+                "  A Hadoop URI needs libhdfs on this host: check CLASSPATH "
+                "(hadoop classpath --glob), HADOOP_HOME, and JAVA_HOME.",
+                flush=True,
+            )
+        return 1
+    print(
+        f"Checkpoint store | run_dir={store.root_uri} remote={store.is_remote}",
+        flush=True,
+    )
+    probe_name = f"_probe-{os.uname().nodename}-{os.getpid()}"
+    probe_bytes = max(1, int(args.probe_mib)) * 1024 * 1024
+    payload = os.urandom(probe_bytes)
+    print(f"Checkpoint store | probe={store.uri(probe_name)}", flush=True)
+
+    with tempfile.TemporaryDirectory() as scratch:
+        source = Path(scratch) / "payload.bin"
+        source.write_bytes(payload)
+        fetched = Path(scratch) / "fetched.bin"
+        rate = f"{probe_bytes / (1024 * 1024):.0f}MiB"
+        try:
+            _probe_step("create_dir", lambda: store.makedirs(probe_name))
+            _probe_step(
+                "write_json",
+                lambda: store.write_json({"probe": probe_name}, probe_name, "meta.json"),
+            )
+
+            def read_json() -> str:
+                if store.read_json(probe_name, "meta.json")["probe"] != probe_name:
+                    raise CheckpointStoreError("probe JSON read back with wrong content")
+                return "content verified"
+
+            _probe_step("read_json", read_json)
+            _probe_step(
+                f"upload {rate}",
+                lambda: store.upload_file(source, probe_name, "payload.bin"),
+            )
+
+            def download() -> str:
+                store.download_file(fetched, probe_name, "payload.bin")
+                if fetched.read_bytes() != payload:
+                    raise CheckpointStoreError("probe payload changed in transit")
+                return "bytes verified"
+
+            _probe_step(f"download {rate}", download)
+            _probe_step(
+                "list_entries",
+                lambda: f"{len(store.list_entries(probe_name))} entries",
+            )
+            # Retention deletes superseded steps, so a run directory that cannot
+            # be pruned fills up until the job dies.
+            _probe_step("remove_tree", lambda: store.remove_tree(probe_name))
+            if store.exists(probe_name):
+                raise CheckpointStoreError(f"{probe_name} survived remove_tree")
+        except Exception as error:
+            print(f"Checkpoint store: FAILED — {error}", flush=True)
+            # Never leave a probe directory behind for the next reader to wonder about.
+            try:
+                store.remove_tree(probe_name)
+            except Exception:
+                pass
+            return 1
+
+    committed = list_committed_checkpoints(store)
+    latest = latest_committed_checkpoint(store)
+    print(
+        f"Committed checkpoints | count={len(committed)} "
+        f"latest={'none' if latest is None else latest.directory}",
+        flush=True,
+    )
+    resume = settings.resume if args.resume is None else args.resume
+    try:
+        target = resolve_resume_checkpoint(store, resume)
+    except FileNotFoundError as error:
+        print(f"Checkpoint store: FAILED — resume={resume!r}: {error}", flush=True)
+        return 1
+    print(
+        f"Next launch | resume={resume} -> "
+        f"{'fresh model' if target is None else f'step {target.step}'}",
+        flush=True,
+    )
+    print("Checkpoint store: OK (writable, readable, prunable)", flush=True)
+    return 0
 
 
 def _cmd_validate_config(args: argparse.Namespace) -> int:
@@ -921,6 +1129,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_tokenization_override_args(profile)
     profile.set_defaults(func=_cmd_profile)
 
+    check_store = subparsers.add_parser(
+        "check-checkpoint-store",
+        help=(
+            "write, read back, and delete a probe file under the checkpoint run "
+            "directory, then report what the next launch would resume from"
+        ),
+    )
+    check_store.add_argument(
+        "--config",
+        default=None,
+        help="read training.checkpoint from this config; optional with --checkpoint-dir",
+    )
+    check_store.add_argument(
+        "--probe-mib",
+        type=int,
+        default=8,
+        help="size of the upload/download probe payload in MiB (default 8)",
+    )
+    _add_checkpoint_args(check_store)
+    check_store.set_defaults(func=_cmd_check_checkpoint_store)
+
     fit_vocab = subparsers.add_parser("fit-vocab")
     fit_vocab.add_argument("--config", required=True)
     _add_data_input_args(fit_vocab)
@@ -955,6 +1184,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     _add_data_input_args(train)
     _add_training_override_args(train)
+    _add_checkpoint_args(train)
     _add_runtime_override_args(train)
     _add_model_override_args(train)
     _add_tokenization_override_args(train)
@@ -1067,6 +1297,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    limit_malloc_arenas()
     args = build_arg_parser().parse_args()
     raise SystemExit(args.func(args))
 

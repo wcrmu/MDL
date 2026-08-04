@@ -5716,5 +5716,11 @@ training:
     auc_bins: 4096
   save_checkpoint: false
   checkpoint_path: artifacts/checkpoints/mdl_onetrans_2xh100_phase2_shared_dim
+  # See configs/mdl_rankmixer.yaml for what one step-<n> directory contains.
+  checkpoint:
+    dir: hdfs://temu-data-ns/apps/nothive/warehouse/searchrec/searchrec_dracarys_cvr_comm_us_8k/intern_train/aiden.fan
+    every_steps: 2000
+    keep_last: 3
+    resume: auto
   embedding_collect_stats: false
   embedding_validate_indices: false

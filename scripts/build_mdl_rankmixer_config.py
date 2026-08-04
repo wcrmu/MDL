@@ -2483,6 +2483,20 @@ def derive_fine_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "max_discovered": 256,
     }
 
+    # Coarse and fine share model.name, so the checkpoint run directory would
+    # default to the same path. Their vocabulary strategies differ, so a resume
+    # across the two must never be attempted; give fine its own run.
+    training = result.get("training")
+    if isinstance(training, dict):
+        checkpoint = training.get("checkpoint")
+        if isinstance(checkpoint, dict) and checkpoint.get("dir"):
+            model = result.get("model")
+            base = checkpoint.get("run_name") or (
+                str(model.get("name")) if isinstance(model, Mapping) else None
+            )
+            if base:
+                checkpoint["run_name"] = f"{base}_fine"
+
     features = result.get("features")
     if not isinstance(features, list):
         raise ValueError("payload.features must be a list")

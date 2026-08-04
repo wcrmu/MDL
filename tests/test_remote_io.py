@@ -707,6 +707,200 @@ class RemoteIoHelperTest(unittest.TestCase):
         self.assertGreaterEqual(abandoned_remote_session_count(), before + 1)
 
 
+class QuarantineReleaseTest(unittest.TestCase):
+    """Quarantine must free Arrow buffers once the abandoned call exits."""
+
+    @staticmethod
+    def _quarantine(payload: object, *, kind: str = "ignore"):
+        from src.dataloader import (
+            RemoteIoTimeoutError as TimeoutErr,
+            _TimedRemoteOperation,
+            _defer_remote_session_cleanup,
+            abandoned_remote_session_count,
+        )
+
+        operation = _TimedRemoteOperation()
+        error = TimeoutErr("probe timeout", operation=operation)
+        _defer_remote_session_cleanup(
+            error,
+            filesystem=object(),
+            batch_iterator=payload,
+            late_result_kind=kind,
+            label="release-probe",
+            quarantine_limit=abandoned_remote_session_count() + 8,
+        )
+        return operation
+
+    @staticmethod
+    def _settle() -> None:
+        import gc
+
+        # Observer runs on a daemon thread; give it a moment, then force GC.
+        deadline = time.perf_counter() + 1.0
+        while time.perf_counter() < deadline:
+            time.sleep(0.02)
+            for _ in range(3):
+                gc.collect()
+
+    def test_arrow_payload_is_released_after_operation_exits(self) -> None:
+        import weakref
+
+        class ArrowLike:
+            pass
+
+        payload = ArrowLike()
+        payload_ref = weakref.ref(payload)
+        operation = self._quarantine(payload)
+        del payload
+
+        operation.done.set()
+        self._settle()
+        self.assertIsNone(
+            payload_ref(),
+            "quarantined Arrow state must not outlive the abandoned call",
+        )
+
+    def test_late_data_result_is_not_retained(self) -> None:
+        import weakref
+
+        class RecordBatchLike:
+            pass
+
+        operation = self._quarantine(None)
+        late = RecordBatchLike()
+        late_ref = weakref.ref(late)
+        operation.result_box.append(late)
+        del late
+        operation.done.set()
+        self._settle()
+        self.assertIsNone(
+            late_ref(),
+            "a late record batch is data, not a handle, and must be freed",
+        )
+
+    def test_failure_traceback_is_not_pinned(self) -> None:
+        import weakref
+
+        class TrackedFailure(OSError):
+            """Subclass so the test can weakly observe the exception object."""
+
+        operation = self._quarantine(None)
+        try:
+            raise TrackedFailure("Filesystem closed")
+        except TrackedFailure as error:
+            failure = error
+        failure_ref = weakref.ref(failure)
+        operation.error_box.append(failure)
+        del failure
+        operation.done.set()
+        self._settle()
+        self.assertIsNone(
+            failure_ref(),
+            "retaining the exception pins its traceback frames and buffers",
+        )
+
+    def test_release_can_be_disabled_by_env(self) -> None:
+        import os
+        import weakref
+
+        class ArrowLike:
+            pass
+
+        payload = ArrowLike()
+        payload_ref = weakref.ref(payload)
+        with patch.dict(os.environ, {"MDL_HDFS_QUARANTINE_RELEASE": "0"}):
+            operation = self._quarantine(payload)
+        del payload
+
+        operation.done.set()
+        self._settle()
+        self.assertIsNotNone(
+            payload_ref(),
+            "the kill switch must restore retain-forever behaviour",
+        )
+
+    def test_release_waits_for_the_abandoned_call(self) -> None:
+        import weakref
+
+        class ArrowLike:
+            pass
+
+        payload = ArrowLike()
+        payload_ref = weakref.ref(payload)
+        operation = self._quarantine(payload)
+        del payload
+
+        # Still in flight: native code may touch these buffers.
+        self._settle()
+        self.assertIsNotNone(payload_ref())
+
+        operation.done.set()
+        self._settle()
+        self.assertIsNone(payload_ref())
+
+
+class TimeoutWorkerPoolTest(unittest.TestCase):
+    def test_pooled_workers_are_reused_across_calls(self) -> None:
+        from src.dataloader import _TimeoutWorkerPool, _TimedRemoteOperation
+
+        pool = _TimeoutWorkerPool(max_idle=2)
+        seen: list[int] = []
+
+        for _ in range(5):
+            operation = _TimedRemoteOperation()
+            pool.submit(
+                lambda: seen.append(threading.get_ident()),
+                operation,
+                "probe",
+            )
+            self.assertTrue(operation.done.wait(2.0))
+
+        self.assertEqual(len(seen), 5)
+        self.assertEqual(len(set(seen)), 1, "sequential calls must share a thread")
+        self.assertEqual(pool.idle_count(), 1)
+
+    def test_hung_worker_does_not_block_later_calls(self) -> None:
+        from src.dataloader import _TimeoutWorkerPool, _TimedRemoteOperation
+
+        pool = _TimeoutWorkerPool(max_idle=2)
+        release = threading.Event()
+
+        hung = _TimedRemoteOperation()
+        pool.submit(lambda: release.wait(5.0), hung, "hung")
+        self.assertFalse(hung.done.wait(0.1))
+
+        progressed = _TimedRemoteOperation()
+        pool.submit(lambda: "ok", progressed, "progress")
+        self.assertTrue(progressed.done.wait(2.0))
+        self.assertEqual(progressed.result_box, ["ok"])
+
+        release.set()
+        self.assertTrue(hung.done.wait(2.0))
+
+    def test_idle_worker_does_not_pin_previous_task(self) -> None:
+        import weakref
+
+        from src.dataloader import _TimeoutWorkerPool, _TimedRemoteOperation
+
+        class Payload:
+            pass
+
+        pool = _TimeoutWorkerPool(max_idle=2)
+        payload = Payload()
+        payload_ref = weakref.ref(payload)
+        operation = _TimedRemoteOperation()
+        pool.submit(lambda captured=payload: captured, operation, "pin-probe")
+        self.assertTrue(operation.done.wait(2.0))
+
+        del payload
+        operation.result_box.clear()
+        QuarantineReleaseTest._settle()
+        self.assertIsNone(
+            payload_ref(),
+            "a parked worker must not hold the previous call's data",
+        )
+
+
 class PrefetchScalingTest(unittest.TestCase):
     def test_prefetch_workers_reuse_thread_local_hdfs_clients(self) -> None:
         from src.dataloader import (
@@ -871,7 +1065,7 @@ class PrefetchScalingTest(unittest.TestCase):
             self.assertEqual(reader.max_prefetch_bytes, 2147483648)
             self.assertEqual(reader.cardinality_audit_raw_rows, 0)
             self.assertEqual(reader.host_prepare_startup_timeout_sec, 300.0)
-            self.assertEqual(reader.host_prepare_idle_timeout_sec, 300.0)
+            self.assertEqual(reader.host_prepare_idle_timeout_sec, 900.0)
             self.assertEqual(config.training.step_watchdog_sec, 600.0)
             if config.data.test is not None:
                 self.assertEqual(config.data.test.reader.shard_unit, "file")

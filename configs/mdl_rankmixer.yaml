@@ -5907,5 +5907,15 @@ training:
     auc_bins: 4096
   save_checkpoint: false
   checkpoint_path: artifacts/checkpoints/mdl_rankmixer_2xh100_phase2_shared_dim
+  # Periodic resumable checkpoints. Each save is one step-<n> directory holding
+  # per-rank weights, optimizer state, and the Parquet scan cursor; a restart
+  # with resume: auto picks the newest committed step and skips the files that
+  # step had already consumed. run_name defaults to the model name, so several
+  # models can share one dir without colliding.
+  checkpoint:
+    dir: hdfs://temu-data-ns/apps/nothive/warehouse/searchrec/searchrec_dracarys_cvr_comm_us_8k/intern_train/aiden.fan
+    every_steps: 2000
+    keep_last: 3
+    resume: auto
   embedding_collect_stats: true
   embedding_validate_indices: false

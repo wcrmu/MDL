@@ -50,3 +50,7 @@ training:
     cateid_filter: 0.01
     upid_pay: 0.01
   log_every_steps: 100
+  checkpoint:
+    # Overrides the run_name inherited from mdl_onetrans_fine.yaml; a resume
+    # must never cross two models' checkpoint directories.
+    run_name: mdl_mixformer_fine

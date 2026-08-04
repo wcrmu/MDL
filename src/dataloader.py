@@ -38,9 +38,19 @@ import queue
 import tempfile
 import threading
 import time
+import weakref
 from pathlib import Path
 from types import GeneratorType
-from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, TypeVar
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    Literal,
+    Mapping,
+    MutableMapping,
+    TypeVar,
+)
 from urllib.parse import unquote, urlsplit
 
 
@@ -146,6 +156,14 @@ _THREAD_LOCAL = threading.local()
 _ABANDONED_REMOTE_SESSION_LOCK = threading.Lock()
 _ABANDONED_REMOTE_SESSIONS: list[tuple[Any, ...]] = []
 _DEFAULT_HDFS_QUARANTINE_LIMIT = 32
+# Pooled timeout dispatch: park idle workers instead of spawning one thread per
+# timed call (a thread per Arrow record batch at small scanner_batch_rows).
+_TIMEOUT_WORKER_IDLE_SEC = 30.0
+_TIMEOUT_WORKER_MAX_IDLE = 16
+# How often a permanently wedged quarantined call is re-reported, and how many
+# times, so a stuck JNI handle is visible without flooding the log.
+_QUARANTINE_WAIT_LOG_SEC = 300.0
+_QUARANTINE_WAIT_LOG_LIMIT = 6
 # Reused by wide-sequence prehashed gathers; creating a pool per batch was measurable.
 _PREHASHED_GATHER_POOL: ThreadPoolExecutor | None = None
 _PREHASHED_GATHER_POOL_WORKERS = 0
@@ -154,6 +172,69 @@ _PREHASHED_GATHER_POOL_WORKERS = 0
 # progress before the first FeatureBatch is delivered.
 _IO_PROGRESS_HOOK: Callable[[], None] | None = None
 _IO_PROGRESS_HOOK_LOCK = threading.Lock()
+# glibc malloc.h: M_ARENA_MAX is the eighth negative mallopt parameter.
+_M_ARENA_MAX = -8
+_LIBC: Any = None
+_LIBC_LOADED = False
+_LIBC_LOCK = threading.Lock()
+
+
+def _glibc() -> Any:
+    """Return glibc if it exposes the heap-tuning entry points, else ``None``."""
+
+    global _LIBC, _LIBC_LOADED
+    with _LIBC_LOCK:
+        if _LIBC_LOADED:
+            return _LIBC
+        _LIBC_LOADED = True
+        try:
+            import ctypes
+
+            candidate = ctypes.CDLL("libc.so.6")
+            # musl and macOS ship neither; probing now keeps callers branch-free.
+            candidate.mallopt
+            candidate.malloc_trim
+        except (OSError, AttributeError):
+            _LIBC = None
+        else:
+            _LIBC = candidate
+        return _LIBC
+
+
+def limit_malloc_arenas(max_arenas: int = 2) -> bool:
+    """Cap glibc per-thread arenas so freed blocks coalesce into few heaps.
+
+    Left alone, glibc hands almost every allocating thread its own arena (up to
+    8x the CPU count). Short-lived Arrow/numpy buffers then fragment dozens of
+    heaps that never shrink, which reads as a linear RSS climb rather than a
+    plateau. ``MALLOC_ARENA_MAX`` is only consulted at process start, so a
+    long-lived rank needs this ``mallopt`` call as well.
+    """
+
+    libc = _glibc()
+    if libc is None:
+        return False
+    try:
+        return int(libc.mallopt(_M_ARENA_MAX, int(max_arenas))) == 1
+    except Exception:  # noqa: BLE001 - tuning is best-effort
+        return False
+
+
+def trim_process_heap() -> bool:
+    """Return free glibc heap tops to the kernel (``malloc_trim(0)``).
+
+    ``pa.default_memory_pool().release_unused()`` only hands memory back to the
+    allocator. Without this the pod's Working Set stays pinned at its
+    high-water mark even though nothing is using it.
+    """
+
+    libc = _glibc()
+    if libc is None:
+        return False
+    try:
+        return int(libc.malloc_trim(0)) == 1
+    except Exception:  # noqa: BLE001 - trimming is best-effort
+        return False
 
 
 def set_io_progress_hook(hook: Callable[[], None] | None) -> None:
@@ -472,19 +553,24 @@ class PerFileLock:
     when multiple ranks on one node touch the same URI (e.g. row_group LPT).
     """
 
-    _thread_locks: dict[str, threading.RLock] = {}
+    # Weak values so the registry holds an entry exactly while some live
+    # PerFileLock still references that URI's lock. A plain dict kept one lock
+    # plus its (long) HDFS path per file touched, for the life of the job.
+    _thread_locks: "weakref.WeakValueDictionary[str, Any]" = (
+        weakref.WeakValueDictionary()
+    )
     _registry_guard = threading.Lock()
 
     def __init__(self, key: str, *, enabled: bool) -> None:
         self.key = key
         self.enabled = enabled
-        self._thread_lock: threading.RLock | None = None
+        self._thread_lock: Any | None = None
         self._file_handle: Any | None = None
         if enabled:
             self._thread_lock = self._lock_for(key)
 
     @classmethod
-    def _lock_for(cls, key: str) -> threading.RLock:
+    def _lock_for(cls, key: str) -> Any:
         with cls._registry_guard:
             lock = cls._thread_locks.get(key)
             if lock is None:
@@ -618,6 +704,44 @@ def _retain_abandoned_remote_session(
     )
 
 
+def _quarantine_release_enabled(
+    environ: MutableMapping[str, str] | None = None,
+) -> bool:
+    """Whether quarantined Arrow buffers are freed once the call finally exits.
+
+    Set ``MDL_HDFS_QUARANTINE_RELEASE=0`` to restore retain-everything-forever
+    if a runtime is ever observed wedging on Arrow-side teardown.
+    """
+
+    env = os.environ if environ is None else environ
+    raw = str(env.get("MDL_HDFS_QUARANTINE_RELEASE", "1")).strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _wait_for_quarantined_operation(
+    operation: _TimedRemoteOperation,
+    label: str,
+) -> None:
+    """Block until an abandoned timed call exits, reporting it while stuck.
+
+    Nothing may be released while the native call can still touch it, so this
+    never gives up. The periodic warning turns a permanently wedged JNI handle
+    into a visible symptom instead of a silent retention.
+    """
+
+    logged = 0
+    while not operation.done.wait(_QUARANTINE_WAIT_LOG_SEC):
+        if logged >= _QUARANTINE_WAIT_LOG_LIMIT:
+            continue
+        logged += 1
+        logger.warning(
+            "%s timed operation has not returned after %.0fs; its resources "
+            "stay quarantined until it does",
+            label,
+            logged * _QUARANTINE_WAIT_LOG_SEC,
+        )
+
+
 def _defer_remote_session_cleanup(
     timeout_error: RemoteIoTimeoutError,
     *,
@@ -635,70 +759,77 @@ def _defer_remote_session_cleanup(
     HadoopFileSystem (or closing the native handle) while ``pread`` is still
     running closes the DFSClient under that read and can produce
     ``DFSClient.checkOpen: Filesystem closed``. Python also cannot cancel the
-    abandoned JNI close. The durable policy is: retain forever, open retries on
-    a fresh client, and fail-fast when the quarantine cap is hit.
+    abandoned JNI close. The durable policy for those handles is: retain
+    forever, open retries on a fresh client, and fail-fast at the quarantine cap.
+
+    Only *handles* need that treatment. Arrow-side state (reader buffers,
+    ``pre_buffer`` column chunks, the late record batch, the failure traceback)
+    is unsafe to drop solely while the abandoned call is still running, so it is
+    released once that call exits. Retaining it instead made every remote
+    timeout permanently cost a row group, which compounds into the memory
+    pressure that causes the next timeout.
     """
 
     operation = timeout_error.operation
     # Retain the list object itself in quarantine. A late-returning handle is
     # written into late_holder[0] after the caller has already moved on; if only
     # the pre-timeout (often None) resources were retained, GC would destroy the
-    # late native/iterator while JNI may still be using it.
+    # late native handle while JNI may still be using it.
     late_holder: list[Any] = [None]
+    late_is_native = late_result_kind == "native_file"
+    stage_release = operation is not None and _quarantine_release_enabled()
+    # Held by the observer alone under staged release, so clearing it frees the
+    # buffers; folded into the permanent entry otherwise.
+    payload: list[Any] = [batch_iterator, *retained_resources]
 
-    def _collect_resources() -> tuple[Any, ...]:
-        iterator = batch_iterator
-        native = native_file
-        late_result = late_holder[0]
-        if late_result_kind == "batch_iterator" and iterator is None:
-            iterator = late_result
-        elif late_result_kind == "native_file" and native is None:
-            native = late_result
-        return (
-            filesystem,
-            iterator,
-            native,
-            late_holder,
-            *retained_resources,
-        )
-
-    if operation is None:
-        _retain_abandoned_remote_session(
-            *_collect_resources(),
-            label=label,
-            quarantine_limit=quarantine_limit,
-        )
-        return
-
-    # Retain immediately so a late-returning handle cannot outlive the
-    # caller's stack without a strong reference, and so the quarantine cap
-    # applies before spawning the waiter thread.
+    # Retain immediately so a late-returning handle cannot outlive the caller's
+    # stack without a strong reference, and so the quarantine cap applies before
+    # spawning the waiter thread.
+    permanent: tuple[Any, ...] = () if stage_release else tuple(payload)
     _retain_abandoned_remote_session(
-        *_collect_resources(),
+        filesystem,
+        native_file,
+        late_holder,
+        *permanent,
         label=label,
         quarantine_limit=quarantine_limit,
     )
+    if operation is None:
+        return
 
     def observe_completion() -> None:
-        operation.done.wait()
+        _wait_for_quarantined_operation(operation, label)
         if operation.result_box:
-            late_holder[0] = operation.result_box[0]
-        if operation.error_box:
+            late_result = operation.result_box[0]
+            # A late *handle* must stay reachable; late Arrow data must not.
+            if late_is_native or not stage_release:
+                late_holder[0] = late_result
+            late_result = None
+        failure = operation.error_box[0] if operation.error_box else None
+        if failure is not None:
+            # Log the rendered text, never the exception object: a buffering
+            # handler would otherwise keep its traceback (and the Arrow buffers
+            # those frames reference) alive exactly as long as the record.
             logger.warning(
-                "%s timed operation eventually failed while quarantined "
-                "(resources remain unclosed): %s",
+                "%s timed operation eventually failed while quarantined: %s",
                 label,
-                operation.error_box[0],
+                repr(failure),
             )
         else:
             logger.warning(
-                "%s timed operation finished while quarantined; "
-                "resources remain unclosed until process exit",
+                "%s timed operation finished while quarantined; native handles "
+                "remain unclosed%s",
                 label,
+                "; Arrow buffers released" if stage_release else "",
             )
-        # late_holder is already in _ABANDONED_REMOTE_SESSIONS; keep a local
-        # strong reference until this observer returns as belt-and-suspenders.
-        _ = _collect_resources()
+        failure = None
+        if stage_release:
+            # The caller already raised RemoteIoTimeoutError, so nothing reads
+            # these again. Holding them pins the traceback frames — and every
+            # Arrow buffer those frames reference — for the process lifetime.
+            operation.error_box.clear()
+            operation.result_box.clear()
+            payload.clear()
 
     logger.warning(
         "tracking %s until its timed operation exits; retry uses a fresh "
@@ -772,33 +903,123 @@ def maybe_skip_or_raise(
     raise error
 
 
+class _TimeoutWorker:
+    """One reusable daemon thread that runs timed remote-IO callables."""
+
+    __slots__ = ("_pool", "_wake", "_task", "_thread")
+
+    def __init__(self, pool: "_TimeoutWorkerPool") -> None:
+        self._pool = pool
+        self._wake = threading.Event()
+        self._task: tuple[Callable[[], Any], _TimedRemoteOperation, str] | None = None
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="remote-io-timeout-idle",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def dispatch(
+        self,
+        fn: Callable[[], Any],
+        operation: _TimedRemoteOperation,
+        description: str,
+    ) -> None:
+        self._task = (fn, operation, description)
+        self._wake.set()
+
+    def _loop(self) -> None:
+        while True:
+            if not self._wake.wait(_TIMEOUT_WORKER_IDLE_SEC):
+                # Retire only if still parked in the idle set; losing that race
+                # means a caller already handed us work.
+                if self._pool.retire(self):
+                    return
+                continue
+            self._wake.clear()
+            task = self._task
+            self._task = None
+            if task is None:
+                continue
+            fn, operation, description = task
+            del task
+            self._thread.name = f"remote-io-timeout:{description[:48]}"
+            try:
+                operation.result_box.append(fn())
+            except BaseException as error:  # noqa: BLE001 - surface to caller
+                operation.error_box.append(error)
+            finally:
+                operation.done.set()
+            # Drop every reference before parking: an idle worker must not pin
+            # the previous call's iterator/record batch until its next task.
+            del fn, operation, description
+            self._thread.name = "remote-io-timeout-idle"
+            if not self._pool.recycle(self):
+                return
+
+
+class _TimeoutWorkerPool:
+    """Reuse daemon threads across ``call_with_timeout`` invocations.
+
+    One thread per call means one thread per Arrow record batch, which at small
+    ``scanner_batch_rows`` multiplies glibc per-thread arenas (and their
+    fragmentation) plus libhdfs JVM attach/detach churn. Hung calls never return
+    to the idle set, so abandonment still costs exactly one thread.
+    """
+
+    def __init__(self, *, max_idle: int = _TIMEOUT_WORKER_MAX_IDLE) -> None:
+        self._idle: list[_TimeoutWorker] = []
+        self._lock = threading.Lock()
+        self._max_idle = max(1, int(max_idle))
+
+    def submit(
+        self,
+        fn: Callable[[], Any],
+        operation: _TimedRemoteOperation,
+        description: str,
+    ) -> None:
+        with self._lock:
+            worker = self._idle.pop() if self._idle else None
+        if worker is None:
+            worker = _TimeoutWorker(self)
+        worker.dispatch(fn, operation, description)
+
+    def recycle(self, worker: _TimeoutWorker) -> bool:
+        with self._lock:
+            if len(self._idle) >= self._max_idle:
+                return False
+            self._idle.append(worker)
+            return True
+
+    def retire(self, worker: _TimeoutWorker) -> bool:
+        with self._lock:
+            try:
+                self._idle.remove(worker)
+            except ValueError:
+                return False
+            return True
+
+    def idle_count(self) -> int:
+        with self._lock:
+            return len(self._idle)
+
+
+_TIMEOUT_WORKERS = _TimeoutWorkerPool()
+
+
 def call_with_timeout(
     fn: Callable[[], T],
     timeout_sec: float,
     *,
     description: str = "remote IO",
 ) -> T:
-    """Run ``fn`` in a daemon thread and raise if it exceeds ``timeout_sec``."""
+    """Run ``fn`` on a pooled daemon thread; raise if it exceeds ``timeout_sec``."""
 
     if timeout_sec <= 0:
         return fn()
 
     operation = _TimedRemoteOperation()
-
-    def runner() -> None:
-        try:
-            operation.result_box.append(fn())
-        except BaseException as error:  # noqa: BLE001 - surface to caller
-            operation.error_box.append(error)
-        finally:
-            operation.done.set()
-
-    thread = threading.Thread(
-        target=runner,
-        name=f"remote-io-timeout:{description[:48]}",
-        daemon=True,
-    )
-    thread.start()
+    _TIMEOUT_WORKERS.submit(fn, operation, description)
     if not operation.done.wait(timeout_sec):
         raise RemoteIoTimeoutError(
             f"{description} timed out after {timeout_sec:.1f}s",
@@ -2678,6 +2899,277 @@ class _ClosableIterator:
 
 
 # ---------------------------------------------------------------------------
+# Scan position: reporting and resuming a rank's deterministic work list
+# ---------------------------------------------------------------------------
+
+# Sharding is deterministic per rank, so "how far did this rank get" is one
+# index into its ordered work list (whole files, or row groups under LPT
+# sharding). Publishing that index lets a checkpoint record where the input
+# stream stopped, and lets a restart re-enter it instead of rereading the shard.
+# The prefix digest travels with the index so a restart can prove that the
+# already-consumed part of the list is unchanged before trusting it.
+
+_SCAN_CURSOR_PAYLOAD_BYTES = 256
+_SCAN_CURSOR_CHANNEL: "ScanCursorChannel | None" = None
+_SCAN_CURSOR_SPLIT_KEY: str | None = None
+_SCAN_RESUME_PLAN: "ScanResumePlan | None" = None
+
+
+@dataclass(frozen=True)
+class ScanPosition:
+    """One rank's place in its ordered scan work list.
+
+    The reader runs ahead of the trainer by whatever sits in the prefetch and
+    IPC queues, so ``position`` alone overstates trained progress. The row
+    counters make that lead measurable: a checkpoint compares ``emitted_rows``
+    against the rows it has actually trained on and walks the position back.
+    """
+
+    work_unit: str
+    position: int
+    prefix_digest: str | None = None
+    # Rows handed downstream by this reader so far, in the same unit the
+    # training loop counts. Zero when nothing reported them.
+    emitted_rows: int = 0
+    # Smallest row count seen for a single work item. Dividing the in-flight row
+    # lead by the smallest item cannot underestimate how many items to redo.
+    min_item_rows: int = 0
+    # Rows that can sit between the scanner and the first emitted batch
+    # (shuffle buffer plus one batch), which the row counters cannot see.
+    lag_rows: int = 0
+
+
+@dataclass(frozen=True)
+class ScanResumePlan:
+    """Where a restarted rank should re-enter its ordered scan work list."""
+
+    work_unit: str
+    position: int
+    prefix_digest: str | None = None
+    # Identifies the split the plan was recorded for, so a held-out evaluation
+    # scan in the same process never inherits the training scan's offset.
+    split_key: str | None = None
+    # Work items to redo before ``position``. Batches already read into the
+    # prefetch queues when the checkpoint was taken were never trained on, so a
+    # small overlap trades duplicate rows for never losing rows.
+    rewind: int = 1
+
+
+def scan_split_key(
+    split: ParquetSplitConfig,
+    *,
+    shard_rank: int,
+    shard_world_size: int,
+) -> str:
+    """Identity of one split's scan for a given rank, stable across restarts."""
+
+    digest = sha256()
+    for item in split.inputs:
+        digest.update(str(item).encode("utf-8"))
+        digest.update(b"\x00")
+    digest.update(f"|{shard_rank}/{shard_world_size}".encode("utf-8"))
+    return digest.hexdigest()
+
+
+def scan_work_item_key(canonical_uri: str, row_group: int | None = None) -> str:
+    """Stable identity of one scan work item, used by the prefix digest."""
+
+    return canonical_uri if row_group is None else f"{canonical_uri}#rg{row_group}"
+
+
+def scan_prefix_digest(keys: Iterable[str]) -> str:
+    """Digest of the work items a rank has already consumed, in scan order."""
+
+    digest = sha256()
+    for key in keys:
+        digest.update(key.encode("utf-8"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+def _incremental_prefix_digests(keys: Sequence[str]) -> list[str]:
+    """Return the digest of every prefix of ``keys``, from empty to complete."""
+
+    running = sha256()
+    digests = [running.hexdigest()]
+    for key in keys:
+        running.update(key.encode("utf-8"))
+        running.update(b"\x00")
+        digests.append(running.hexdigest())
+    return digests
+
+
+class ScanCursorChannel:
+    """Publishes the reader's scan position to whoever drives checkpointing.
+
+    Host-prepare runs the reader in a spawn child, so the channel is backed by a
+    shared ``multiprocessing.Array`` when one is supplied and by a plain
+    attribute otherwise. Writes are single-producer; readers tolerate a torn or
+    absent value by returning None.
+
+    The producer reports two things: which work item the scanner opened
+    (``publish``) and how many rows have been handed downstream
+    (``note_emitted_rows``). Publishing both together is what lets a checkpoint
+    tell the reader's position apart from the trainer's.
+    """
+
+    def __init__(self, storage: Any | None = None, *, lag_rows: int = 0) -> None:
+        self._storage = storage
+        self._local: bytes = b""
+        self._emitted_rows = 0
+        self._lag_rows = max(0, int(lag_rows))
+        self._min_item_rows = 0
+        self._last_item_rows_mark = 0
+        self._published_any = False
+
+    @classmethod
+    def shared(cls, ctx: Any, *, lag_rows: int = 0) -> "ScanCursorChannel":
+        return cls(
+            ctx.Array("c", _SCAN_CURSOR_PAYLOAD_BYTES, lock=True),
+            lag_rows=lag_rows,
+        )
+
+    @property
+    def storage(self) -> Any | None:
+        return self._storage
+
+    def note_emitted_rows(self, rows: int) -> None:
+        """Count rows handed downstream, in the unit the training loop counts."""
+
+        if rows > 0:
+            self._emitted_rows += int(rows)
+
+    def note_lag_rows(self, rows: int) -> None:
+        """Declare the rows that can buffer between the scanner and the output."""
+
+        self._lag_rows = max(self._lag_rows, max(0, int(rows)))
+
+    def publish(self, position: ScanPosition) -> None:
+        emitted = self._emitted_rows
+        # Rows the previous work item contributed. The smallest such span is the
+        # safe divisor when converting an in-flight row lead back into items.
+        if self._published_any:
+            span = emitted - self._last_item_rows_mark
+            if span > 0:
+                self._min_item_rows = (
+                    span if self._min_item_rows == 0 else min(self._min_item_rows, span)
+                )
+        self._last_item_rows_mark = emitted
+        self._published_any = True
+        # An absent digest travels as an empty field so a reader can tell it
+        # apart from a real one; "None" would be compared as a digest value.
+        digest = position.prefix_digest or ""
+        payload = (
+            f"{position.work_unit}|{position.position}|{digest}"
+            f"|{emitted}|{self._min_item_rows}|{self._lag_rows}"
+        ).encode("utf-8")[: _SCAN_CURSOR_PAYLOAD_BYTES - 1]
+        if self._storage is None:
+            self._local = payload
+            return
+        try:
+            self._storage.value = payload
+        except Exception:  # noqa: BLE001 - a lost cursor update must not stop reading
+            pass
+
+    def read(self) -> ScanPosition | None:
+        payload = self._local if self._storage is None else self._read_shared()
+        if not payload:
+            return None
+        try:
+            fields = payload.decode("utf-8").split("|")
+            if len(fields) < 3:
+                return None
+            counters = [int(value) for value in fields[3:6]] + [0, 0, 0]
+            return ScanPosition(
+                fields[0],
+                int(fields[1]),
+                fields[2] or None,
+                emitted_rows=counters[0],
+                min_item_rows=counters[1],
+                lag_rows=counters[2],
+            )
+        except (UnicodeDecodeError, ValueError):
+            return None
+
+    def _read_shared(self) -> bytes:
+        try:
+            return bytes(self._storage.value)
+        except Exception:  # noqa: BLE001 - torn read is reported as "unknown"
+            return b""
+
+
+def set_scan_cursor_channel(
+    channel: ScanCursorChannel | None,
+    *,
+    split_key: str | None = None,
+) -> None:
+    """Install the process-wide channel scanners publish their position to.
+
+    ``split_key`` restricts publication to one split so a periodic held-out
+    evaluation scan cannot overwrite the training scan's cursor.
+    """
+
+    global _SCAN_CURSOR_CHANNEL, _SCAN_CURSOR_SPLIT_KEY
+    _SCAN_CURSOR_CHANNEL = channel
+    _SCAN_CURSOR_SPLIT_KEY = split_key
+
+
+def note_scan_emitted_rows(rows: int, *, split_key: str | None = None) -> None:
+    """Count rows handed downstream from the installed scan cursor's split.
+
+    The training loop counts the same rows, so the difference is exactly the
+    reader's lead: what a checkpoint must walk back over to avoid skipping rows
+    that were read but never trained on.
+    """
+
+    channel = _SCAN_CURSOR_CHANNEL
+    if channel is None or rows <= 0:
+        return
+    if split_key is not None and _SCAN_CURSOR_SPLIT_KEY not in (None, split_key):
+        return
+    channel.note_emitted_rows(rows)
+
+
+def scan_resume_rewind(
+    position: ScanPosition,
+    *,
+    rows_trained: int,
+    extra_items: int = 1,
+) -> int:
+    """Work items to redo before ``position.position`` on the next start.
+
+    The reader publishes the item it opened, which leads the trainer by whatever
+    sits in the prefetch and IPC queues. Converting that row lead back into work
+    items with the *smallest* item seen cannot underestimate the overlap, so the
+    resume repeats rows rather than dropping them.
+    """
+
+    lead = (
+        int(position.emitted_rows) - int(rows_trained) + int(position.lag_rows)
+    )
+    extra = max(0, int(extra_items))
+    if lead <= 0:
+        return extra
+    per_item = int(position.min_item_rows)
+    if per_item <= 0:
+        # One item reported so far: its size is unknown, so redo everything
+        # rather than guess. The consumed prefix is small by definition here.
+        return int(position.position) + extra
+    return -(-lead // per_item) + extra
+
+
+def set_scan_resume_plan(plan: ScanResumePlan | None) -> None:
+    """Install the process-wide resume plan applied by matching scanners."""
+
+    global _SCAN_RESUME_PLAN
+    _SCAN_RESUME_PLAN = plan
+
+
+def get_scan_resume_plan() -> ScanResumePlan | None:
+    return _SCAN_RESUME_PLAN
+
+
+# ---------------------------------------------------------------------------
 # Scanning: sharding, prefetch, and Arrow batch streaming
 # ---------------------------------------------------------------------------
 
@@ -2814,6 +3306,126 @@ class ParquetScanner:
         self._metadata_cache: dict[ParquetInputRef, _FileMetadataCache] | None = None
         self._shard_plan: _ShardPlan | None = None
         self._empty_rank_warning_emitted = False
+        self._resume_offset_cache: dict[str, int] = {}
+        self.split_key = scan_split_key(
+            split,
+            shard_rank=shard_rank,
+            shard_world_size=shard_world_size,
+        )
+
+    def _work_item_keys(self, work_items: Sequence[Any]) -> list[str]:
+        """Stable identities for the rank's ordered work list."""
+
+        keys: list[str] = []
+        for item in work_items:
+            if isinstance(item, ParquetInputRef):
+                keys.append(scan_work_item_key(item.canonical_uri))
+            else:
+                keys.append(
+                    scan_work_item_key(
+                        item.input_ref.canonical_uri,
+                        int(item.local_row_group_index),
+                    )
+                )
+        return keys
+
+    def _resume_offset(self, work_items: Sequence[Any]) -> int:
+        """Return how many leading work items a resumed run should skip.
+
+        The plan is only honoured when the already-consumed prefix of this
+        rank's list is byte-for-byte what the checkpointed run consumed. Adding
+        partitions after the recorded position is therefore safe; rewriting or
+        reordering earlier ones falls back to a full rescan.
+        """
+
+        plan = _SCAN_RESUME_PLAN
+        work_unit = self._effective_shard_unit()
+        if plan is None or plan.position <= 0 or plan.work_unit != work_unit:
+            return 0
+        if plan.split_key is not None and plan.split_key != self.split_key:
+            return 0
+        cached = self._resume_offset_cache.get(work_unit)
+        if cached is not None:
+            return cached
+        offset = 0
+        if plan.position > len(work_items):
+            logger.warning(
+                "scan resume position %d exceeds this rank's %d %s work item(s); "
+                "restarting the scan from the beginning",
+                plan.position,
+                len(work_items),
+                work_unit,
+            )
+        else:
+            digest = scan_prefix_digest(
+                self._work_item_keys(work_items[: plan.position])
+            )
+            if plan.prefix_digest not in (None, digest):
+                logger.warning(
+                    "scan resume rejected: the first %d %s work item(s) changed "
+                    "since the checkpoint; restarting the scan from the beginning",
+                    plan.position,
+                    work_unit,
+                )
+            else:
+                offset = max(0, plan.position - max(0, plan.rewind))
+                logger.info(
+                    "scan resume: rank %d skips %d already-consumed %s work item(s) "
+                    "(checkpoint position %d, rewind %d)",
+                    self.shard_rank,
+                    offset,
+                    work_unit,
+                    plan.position,
+                    plan.rewind,
+                )
+        self._resume_offset_cache[work_unit] = offset
+        return offset
+
+    def _downstream_buffer_rows(self) -> int:
+        """Rows that can sit between this scanner and the first emitted batch.
+
+        Scanned rows pass through the shuffle buffer and are then cut into
+        training batches, so the emitted-row counter lags the scanner by at most
+        this much even with no prefetching at all.
+        """
+
+        reader = self.split.reader
+        rows = int(getattr(reader, "shuffle_buffer_rows", 0) or 0)
+        buckets = getattr(reader, "length_buckets", ()) or ()
+        batch_rows = max(
+            (int(getattr(bucket, "batch_size", 0) or 0) for bucket in buckets),
+            default=0,
+        )
+        return rows + max(batch_rows, int(self._reader_batch_size(default=0) or 0))
+
+    def _scan_position_reporter(
+        self,
+        work_items: Sequence[Any],
+        offset: int,
+    ) -> Callable[[int], None] | None:
+        """Return a callback that publishes the scan position, or None when unused.
+
+        ``work_items`` is the rank's full ordered list and the callback takes an
+        index into the post-resume slice, so a resumed run keeps reporting
+        positions on the original numbering.
+        """
+
+        channel = _SCAN_CURSOR_CHANNEL
+        if channel is None:
+            return None
+        if _SCAN_CURSOR_SPLIT_KEY not in (None, self.split_key):
+            return None
+        channel.note_lag_rows(self._downstream_buffer_rows())
+        digests = _incremental_prefix_digests(self._work_item_keys(work_items))
+        work_unit = self._effective_shard_unit()
+
+        def report(index: int) -> None:
+            absolute = offset + int(index)
+            if absolute >= len(digests):
+                return
+            channel.publish(ScanPosition(work_unit, absolute, digests[absolute]))
+
+        return report
 
     @property
     def shard_plan_fingerprint(self) -> str | None:
@@ -2927,14 +3539,17 @@ class ParquetScanner:
         self,
         work_items: list[_RowGroupWorkItem],
         stop_event: threading.Event,
+        report_position: Callable[[int], None] | None = None,
     ) -> Iterator[Any]:
         """Sequentially read each assigned row group into Arrow record batches."""
         _pa, _pc, _ds, pq = _require_pyarrow()
         batch_size = self._reader_batch_size(default=65536)
         scan_columns = self._scan_columns()
-        for work_item in work_items:
+        for index, work_item in enumerate(work_items):
             if stop_event.is_set():
                 return
+            if report_position is not None:
+                report_position(index)
             ref = work_item.input_ref
             yield from iter_parquet_record_batches(
                 fs_path=ref.fs_path,
@@ -3012,6 +3627,7 @@ class ParquetScanner:
         active_workers: int,
         worker: Callable[[Any, _PrefetchSlot, threading.Event], None],
         thread_name_prefix: str,
+        report_position: Callable[[int], None] | None = None,
     ) -> Iterator[Any]:
         """Stream ordered work through a fixed set of long-lived daemon workers.
 
@@ -3080,6 +3696,8 @@ class ParquetScanner:
             for work_index in range(len(work_items)):
                 if stop_event.is_set():
                     return
+                if report_position is not None:
+                    report_position(work_index)
                 slot = slot_for_item.pop(work_index)
                 while True:
                     if stop_event.is_set() and slot.queue.empty():
@@ -3130,6 +3748,7 @@ class ParquetScanner:
         self,
         work_items: list[_RowGroupWorkItem],
         stop_event: threading.Event,
+        report_position: Callable[[int], None] | None = None,
     ) -> Iterator[Any]:
         """Read row groups concurrently while yielding them in deterministic order.
 
@@ -3142,7 +3761,11 @@ class ParquetScanner:
 
         active_workers = self._prefetch_active_workers(len(work_items))
         if active_workers <= 0:
-            yield from self._iter_row_group_record_batches_sync(work_items, stop_event)
+            yield from self._iter_row_group_record_batches_sync(
+                work_items,
+                stop_event,
+                report_position,
+            )
             return
         yield from self._iter_record_batches_with_persistent_prefetch(
             work_items,
@@ -3150,17 +3773,29 @@ class ParquetScanner:
             active_workers=active_workers,
             worker=self._row_group_worker,
             thread_name_prefix="parquet-prefetch",
+            report_position=report_position,
         )
 
     def _iter_row_group_record_batches(
         self, stop_event: threading.Event
     ) -> Iterator[Any]:
         """Dispatch to sync or prefetch row-group readers based on configuration."""
-        work_items = self._assigned_row_group_work_items()
+        assigned = self._assigned_row_group_work_items()
+        offset = self._resume_offset(assigned)
+        report_position = self._scan_position_reporter(assigned, offset)
+        work_items = assigned[offset:]
         if self.split.reader.prefetch_batches <= 0:
-            yield from self._iter_row_group_record_batches_sync(work_items, stop_event)
+            yield from self._iter_row_group_record_batches_sync(
+                work_items,
+                stop_event,
+                report_position,
+            )
             return
-        yield from self._iter_row_group_record_batches_prefetch(work_items, stop_event)
+        yield from self._iter_row_group_record_batches_prefetch(
+            work_items,
+            stop_event,
+            report_position,
+        )
 
     def _filesystem_is_remote(self) -> bool:
         return self._io_policy.enabled
@@ -3169,14 +3804,17 @@ class ParquetScanner:
         self,
         paths: list[ParquetInputRef],
         stop_event: threading.Event,
+        report_position: Callable[[int], None] | None = None,
     ) -> Iterator[Any]:
         """Sequentially read whole files via eason-style ParquetFile opens."""
         _pa, _pc, _ds, pq = _require_pyarrow()
         batch_size = self._reader_batch_size(default=65536)
         scan_columns = self._scan_columns()
-        for ref in paths:
+        for index, ref in enumerate(paths):
             if stop_event.is_set():
                 return
+            if report_position is not None:
+                report_position(index)
             yield from iter_parquet_record_batches(
                 fs_path=ref.fs_path,
                 filesystem=ref.filesystem,
@@ -3237,6 +3875,7 @@ class ParquetScanner:
         self,
         paths: list[ParquetInputRef],
         stop_event: threading.Event,
+        report_position: Callable[[int], None] | None = None,
     ) -> Iterator[Any]:
         """Read rank-local files concurrently while yielding in deterministic order."""
         if not paths:
@@ -3250,7 +3889,11 @@ class ParquetScanner:
             remote=self._filesystem_is_remote(),
         )
         if active_workers <= 0:
-            yield from self._iter_file_record_batches_sync(paths, stop_event)
+            yield from self._iter_file_record_batches_sync(
+                paths,
+                stop_event,
+                report_position,
+            )
             return
         yield from self._iter_record_batches_with_persistent_prefetch(
             paths,
@@ -3258,6 +3901,7 @@ class ParquetScanner:
             active_workers=active_workers,
             worker=self._file_worker,
             thread_name_prefix="parquet-file-prefetch",
+            report_position=report_position,
         )
 
     def _iter_file_record_batches(self, stop_event: threading.Event) -> Iterator[Any]:
@@ -3273,10 +3917,21 @@ class ParquetScanner:
 
         if not self.paths:
             return
+        offset = self._resume_offset(self.paths)
+        report_position = self._scan_position_reporter(self.paths, offset)
+        paths = self.paths[offset:]
         if self.split.reader.prefetch_batches <= 0:
-            yield from self._iter_file_record_batches_sync(self.paths, stop_event)
+            yield from self._iter_file_record_batches_sync(
+                paths,
+                stop_event,
+                report_position,
+            )
             return
-        yield from self._iter_file_record_batches_prefetch(self.paths, stop_event)
+        yield from self._iter_file_record_batches_prefetch(
+            paths,
+            stop_event,
+            report_position,
+        )
 
     def _iter_dataset_record_batches(
         self, stop_event: threading.Event
@@ -8192,24 +8847,44 @@ def _direct_dense_values(array: Any, dimension: int, field_name: str) -> Tensor:
     return values.view(-1, dimension)
 
 
-_ARANGE_CACHE: dict[int, Tensor] = {}
-_NP_ARANGE_CACHE: dict[int, np.ndarray] = {}
+# One buffer per backend, sliced per request. Keying a dict by length instead
+# made these grow with every distinct window total the shuffle ever produced
+# (``_build_abs_window_gather_plan`` asks for one per unique request) and never
+# release, so the cost was the sum over distinct lengths rather than the max.
+# Callers only read the result, so handing out views is safe.
+_ARANGE_MIN_NUMEL = 1024
+_ARANGE_BUFFER: Tensor | None = None
+_NP_ARANGE_BUFFER: np.ndarray | None = None
+
+
+def _grown_numel(current: int, length: int) -> int:
+    """Double on growth so a slowly rising maximum stays amortized O(n)."""
+
+    return max(length, _ARANGE_MIN_NUMEL, 2 * current)
 
 
 def _cached_arange(length: int) -> Tensor:
-    cached = _ARANGE_CACHE.get(length)
-    if cached is None:
-        cached = torch.arange(length, dtype=torch.long)
-        _ARANGE_CACHE[length] = cached
-    return cached
+    global _ARANGE_BUFFER
+    buffer = _ARANGE_BUFFER
+    if buffer is None or buffer.numel() < length:
+        buffer = torch.arange(
+            _grown_numel(0 if buffer is None else buffer.numel(), length),
+            dtype=torch.long,
+        )
+        _ARANGE_BUFFER = buffer
+    return buffer[:length]
 
 
 def _cached_np_arange(length: int) -> np.ndarray:
-    cached = _NP_ARANGE_CACHE.get(length)
-    if cached is None:
-        cached = np.arange(length, dtype=np.int64)
-        _NP_ARANGE_CACHE[length] = cached
-    return cached
+    global _NP_ARANGE_BUFFER
+    buffer = _NP_ARANGE_BUFFER
+    if buffer is None or buffer.shape[0] < length:
+        buffer = np.arange(
+            _grown_numel(0 if buffer is None else int(buffer.shape[0]), length),
+            dtype=np.int64,
+        )
+        _NP_ARANGE_BUFFER = buffer
+    return buffer[:length]
 
 
 def _build_abs_window_gather_plan(
