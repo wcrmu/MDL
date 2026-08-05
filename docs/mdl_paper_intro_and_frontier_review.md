@@ -48,12 +48,13 @@ MDL 的做法是把特征、场景和任务都表示为 token：Feature token �
 
 过去几类模型不断把 Task 或 Scenario 信息向计算图内部推进，但它们作用的范围并不相同：
 
-| 模型 | 条件如何进入计算 | 仍然受限的部分 |
-|---|---|---|
-| SharedBottom | 共享表示，任务差异留给末端 head | 主干前向不感知任务 |
-| MMoE | 每个任务用独立 gate 组合 shared experts | 条件只覆盖 expert module |
-| STAR / PEPNet | 场景信息改变参数或激活 | 多场景与多任务通常仍由不同模块处理 |
-| RankMixer | 把主要容量放进深层 Feature-interaction blocks | 本身不提供逐层的 Scenario/Task 状态 |
+| 模型               | 差异如何进入前向计算                                                                                                  | 条件未覆盖的计算                                                                                               |
+| ---------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| **SharedBottom** | 所有任务先经过同一个 Shared Bottom，再分别进入各自的 Task Tower                                                                | Shared Bottom 使用同一函数生成共享表示；任务差异只从各自的 Tower 分支开始体现                                                      |
+| **MMoE**         | 每个任务配置独立 Gate；Gate 根据当前输入，对同一组 Shared Experts 的输出进行加权组合，再送入对应的 Task Tower                                   | 任务差异影响 Expert mixture 和后续 Tower，但不改变每个 Shared Expert 内部的前向计算 ([Google Research][1])                    |
+| **STAR**         | Domain 决定专属的归一化统计与参数，并在 FCN 的每一层组合 Shared 与 Domain-specific 参数；辅助网络还直接读取 Domain ID                          | 场景条件覆盖 PN、整个 FCN 和输出旁路，但大规模 Embedding 层仍跨 Domain 共享；原文处理的是多 Domain 下的单一 CTR 任务 ([arXiv][2])            |
+| **PEPNet**       | EPNet依据 Domain-side priors 门控共享 Embedding 的输出；PPNet依据 user/item/author priors，为各 Task Tower 的每一层生成分任务隐藏单元门控 | Embedding Table 本身仍然共享；条件通过门控缩放表示和 Tower hidden units，原文未定义独立且跨层递归更新的 Scenario/Task state ([arXiv][3]) |
+| **RankMixer**    | 输入被组织为 Feature Tokens，经多层 Token Mixing 与 Per-token FFN 迭代，最终 mean pooling 后用于不同任务预测                         | 深层 RankMixer Blocks 迭代的是 Feature Tokens；原文未定义专门的 Scenario/Task token、条件 Gate 或逐层条件状态 ([arXiv][4])      |
 
 RankMixer 通过规则、可堆叠的 Feature blocks，把大量 dense 参数和 FLOPs 放进深层 backbone。主干虽然变大了，但如果 Scenario/Task 仍只出现在末端 gate 或 tower，新增计算在前向中依然不感知场景和任务。问题由此从"共享多少参数"转向更关键的一点：**条件路径能否覆盖模型的主要容量。**
 
