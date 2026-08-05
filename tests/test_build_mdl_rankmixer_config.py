@@ -979,7 +979,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         self.assertEqual(len(mdl_onetrans["features"]), 175)
         self.assertEqual(len(mdl_onetrans["sequences"]), 16)
         self.assertTrue(mdl_onetrans["model"]["experimental_model_acknowledged"])
-        self.assertEqual(mdl_onetrans["model"]["first_domain_sequence_layer"], 4)
+        self.assertEqual(mdl_onetrans["model"]["first_domain_sequence_layer"], 0)
         prior_names = {
             SCENARIO_CONDITIONED_HISTORY_PRIOR,
             "scenario_global_impr_prior",

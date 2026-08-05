@@ -4018,7 +4018,7 @@ def build_config(
         if model_name == "mdl_onetrans":
             model.update(
                 {
-                    "first_domain_sequence_layer": 4,
+                    "first_domain_sequence_layer": 0,
                     "experimental_model_acknowledged": True,
                 }
             )

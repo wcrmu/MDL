@@ -6994,42 +6994,58 @@ def _split_domain_interaction_hat(
     return query, update, domain_state + update
 
 
-def _gated_sequence_interaction_hat(
+def _domain_selected_feature_memory(
+    ns_tokens: Tensor,
+    s_tokens: Tensor,
+    s_mask: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Build the Domain KV set as equal-treatment ``[Q_S; NS]``.
+
+    Matches the RankMixer contract: once tokens are selected to be read, they
+    compete in one attention pool with no extra S-vs-NS residual gate.
+    """
+
+    ns_mask = torch.ones(
+        ns_tokens.size(0),
+        ns_tokens.size(1),
+        dtype=torch.bool,
+        device=ns_tokens.device,
+    )
+    if s_tokens.size(1) == 0:
+        return ns_tokens, ns_mask
+    return (
+        torch.cat([s_tokens, ns_tokens], dim=1),
+        torch.cat([s_mask.to(device=ns_tokens.device, dtype=torch.bool), ns_mask], dim=1),
+    )
+
+
+def _equal_selected_feature_interaction_hat(
     domain_tokens: Tensor,
-    ns_hat: Tensor,
+    ns_tokens: Tensor,
     s_tokens: Tensor,
     s_mask: Tensor,
     attention: VariableLengthDomainAttention | None,
-    gate: nn.Module | None,
 ) -> Tensor:
     if attention is None:
-        return ns_hat
-    if gate is None:
-        raise RuntimeError("domain sequence attention requires a residual gate")
-    s_update = attention(domain_tokens, s_tokens, s_mask)
-    ns_update = ns_hat - domain_tokens
-    sequence_gate = gate(torch.cat([domain_tokens, ns_update, s_update], dim=-1))
-    return ns_hat + sequence_gate * s_update
+        raise RuntimeError("equal selected-feature Domain read requires sequence attention")
+    memory, mask = _domain_selected_feature_memory(ns_tokens, s_tokens, s_mask)
+    return domain_tokens + attention(domain_tokens, memory, mask)
 
 
-def _gated_split_sequence_interaction_hat(
+def _equal_split_selected_feature_interaction_hat(
     query_tokens: Tensor,
-    ns_update: Tensor,
-    state_hat: Tensor,
+    domain_state: Tensor,
+    ns_tokens: Tensor,
     s_tokens: Tensor,
     s_mask: Tensor,
     attention: VariableLengthDomainAttention | None,
-    gate: nn.Module | None,
 ) -> Tensor:
-    """Add OneTrans S evidence without copying a split-mode prompt to state."""
+    """Read ``[Q_S; NS]`` into the split-mode evidence/readout state."""
 
     if attention is None:
-        return state_hat
-    if gate is None:
-        raise RuntimeError("domain sequence attention requires a residual gate")
-    s_update = attention(query_tokens, s_tokens, s_mask)
-    sequence_gate = gate(torch.cat([query_tokens, ns_update, s_update], dim=-1))
-    return state_hat + sequence_gate * s_update
+        raise RuntimeError("equal selected-feature Domain read requires sequence attention")
+    memory, mask = _domain_selected_feature_memory(ns_tokens, s_tokens, s_mask)
+    return domain_state + attention(query_tokens, memory, mask)
 
 
 def _required_split_prompt(
@@ -7924,6 +7940,8 @@ class MDLDomainBlock(nn.Module):
         token_dim = config.model.token_dim
         self.use_sequence_attention = use_sequence_attention
 
+        # When sequence read is enabled, Domain attends one equal-treatment pool
+        # ``[Q_S; NS]`` (RankMixer-style). No separate S residual gate.
         self.scenario_sequence_attention = (
             VariableLengthDomainAttention(
                 token_dim,
@@ -7936,11 +7954,6 @@ class MDLDomainBlock(nn.Module):
                 ),
             )
             if use_sequence_attention and self.use_scenario_tokens
-            else None
-        )
-        self.scenario_sequence_gate = (
-            self._sequence_gate(token_dim)
-            if self.scenario_sequence_attention is not None
             else None
         )
         self.task_sequence_attention = (
@@ -7957,20 +7970,6 @@ class MDLDomainBlock(nn.Module):
             if use_sequence_attention and self.use_task_tokens
             else None
         )
-        self.task_sequence_gate = (
-            self._sequence_gate(token_dim)
-            if self.task_sequence_attention is not None
-            else None
-        )
-
-    @staticmethod
-    def _sequence_gate(token_dim: int) -> nn.Sequential:
-        gate = nn.Sequential(
-            nn.Linear(3 * token_dim, token_dim),
-            nn.Sigmoid(),
-        )
-        nn.init.constant_(gate[0].bias, -2.0)
-        return gate
 
     def forward(
         self,
@@ -7991,23 +7990,25 @@ class MDLDomainBlock(nn.Module):
                     scenario_tokens,
                     "scenario",
                 )
-                scenario_query, scenario_ns_update, scenario_hat = (
-                    _split_domain_interaction_hat(
-                        scenario_prompt,
+                if self.use_sequence_attention:
+                    scenario_query = scenario_prompt + scenario_tokens
+                    scenario_hat = _equal_split_selected_feature_interaction_hat(
+                        scenario_query,
                         scenario_tokens,
                         ns_tokens,
-                        self.scenario_attention,
+                        s_tokens,
+                        s_mask,
+                        self.scenario_sequence_attention,
                     )
-                )
-                scenario_hat = _gated_split_sequence_interaction_hat(
-                    scenario_query,
-                    scenario_ns_update,
-                    scenario_hat,
-                    s_tokens,
-                    s_mask,
-                    self.scenario_sequence_attention,
-                    self.scenario_sequence_gate,
-                )
+                else:
+                    _scenario_query, _scenario_ns_update, scenario_hat = (
+                        _split_domain_interaction_hat(
+                            scenario_prompt,
+                            scenario_tokens,
+                            ns_tokens,
+                            self.scenario_attention,
+                        )
+                    )
                 scenario_tokens = scenario_hat + self.scenario_ffn(scenario_hat)
             elif scenario_tokens.size(1) != 0:
                 raise ValueError(
@@ -8020,23 +8021,25 @@ class MDLDomainBlock(nn.Module):
                     task_tokens,
                     "task",
                 )
-                task_query, task_ns_update, task_hat = (
-                    _split_domain_interaction_hat(
-                        task_prompt,
+                if self.use_sequence_attention:
+                    task_query = task_prompt + task_tokens
+                    task_hat = _equal_split_selected_feature_interaction_hat(
+                        task_query,
                         task_tokens,
                         ns_tokens,
-                        self.task_attention,
+                        s_tokens,
+                        s_mask,
+                        self.task_sequence_attention,
                     )
-                )
-                task_hat = _gated_split_sequence_interaction_hat(
-                    task_query,
-                    task_ns_update,
-                    task_hat,
-                    s_tokens,
-                    s_mask,
-                    self.task_sequence_attention,
-                    self.task_sequence_gate,
-                )
+                else:
+                    _task_query, _task_ns_update, task_hat = (
+                        _split_domain_interaction_hat(
+                            task_prompt,
+                            task_tokens,
+                            ns_tokens,
+                            self.task_attention,
+                        )
+                    )
                 if scenario_hat is not None:
                     task_hat = self.domain_fused(
                         task_hat,
@@ -8053,44 +8056,47 @@ class MDLDomainBlock(nn.Module):
                 f"unsupported model.mdl_token_state: {self.mdl_token_state!r}"
             )
 
-        # Published MDL state propagation, extended here only by the optional
-        # experimental OneTrans S-token read. The initialized prompt remains
-        # the recurrent residual/readout state exactly as before.
+        # Published MDL state propagation. With sequence attention enabled,
+        # selected OneTrans features ``[Q_S; NS]`` are read with equal treatment
+        # in one pool (no S-vs-NS gate). Without it, Domain reads NS only via
+        # DomainAwareAttention, matching the RankMixer Feature-token path.
         scenario_hat: Tensor | None = None
         if self.use_scenario_tokens:
-            scenario_hat = _domain_interaction_hat(
-                scenario_tokens,
-                ns_tokens,
-                self.scenario_attention,
-                self.scenario_rankmixer,
-            )
-            scenario_hat = _gated_sequence_interaction_hat(
-                scenario_tokens,
-                scenario_hat,
-                s_tokens,
-                s_mask,
-                self.scenario_sequence_attention,
-                self.scenario_sequence_gate,
-            )
+            if self.use_sequence_attention:
+                scenario_hat = _equal_selected_feature_interaction_hat(
+                    scenario_tokens,
+                    ns_tokens,
+                    s_tokens,
+                    s_mask,
+                    self.scenario_sequence_attention,
+                )
+            else:
+                scenario_hat = _domain_interaction_hat(
+                    scenario_tokens,
+                    ns_tokens,
+                    self.scenario_attention,
+                    self.scenario_rankmixer,
+                )
             scenario_tokens = scenario_hat + self.scenario_ffn(scenario_hat)
         elif scenario_tokens.size(1) != 0:
             raise ValueError("disabled scenario-token path expects an empty tensor")
 
         if self.use_task_tokens:
-            task_hat = _domain_interaction_hat(
-                task_tokens,
-                ns_tokens,
-                self.task_attention,
-                self.task_rankmixer,
-            )
-            task_hat = _gated_sequence_interaction_hat(
-                task_tokens,
-                task_hat,
-                s_tokens,
-                s_mask,
-                self.task_sequence_attention,
-                self.task_sequence_gate,
-            )
+            if self.use_sequence_attention:
+                task_hat = _equal_selected_feature_interaction_hat(
+                    task_tokens,
+                    ns_tokens,
+                    s_tokens,
+                    s_mask,
+                    self.task_sequence_attention,
+                )
+            else:
+                task_hat = _domain_interaction_hat(
+                    task_tokens,
+                    ns_tokens,
+                    self.task_attention,
+                    self.task_rankmixer,
+                )
             if scenario_hat is not None:
                 task_hat = self.domain_fused(task_hat, scenario_hat, scenario_mask)
             task_tokens = task_hat + self.task_ffn(task_hat)

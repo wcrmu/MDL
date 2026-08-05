@@ -169,7 +169,7 @@ class ModelConfigOverlayTest(unittest.TestCase):
             root / "configs" / "mdl_onetrans.yaml"
         )
         self.assertTrue(production.model.experimental_model_acknowledged)
-        self.assertEqual(production.model.first_domain_sequence_layer, 4)
+        self.assertEqual(production.model.first_domain_sequence_layer, 0)
         s_names = {
             name
             for group in production.resolved.tokenization.sequence_token_groups

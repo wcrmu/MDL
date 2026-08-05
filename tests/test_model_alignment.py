@@ -2340,25 +2340,16 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
                 self.assertEqual(tuple(output.shape), (2, 3, 8))
                 self.assertTrue(bool(torch.isfinite(output).all()))
 
-    def test_zero_sequence_gate_exactly_matches_ns_only_domain_path(self) -> None:
-        class ZeroGate(nn.Module):
-            def forward(self, values: Tensor) -> Tensor:
-                return values[..., : values.size(-1) // 3] * 0.0
-
-        config = _rankmixer_config()
+    def test_sequence_read_has_no_s_gate_and_uses_equal_qs_ns_pool(self) -> None:
         block = MDLDomainBlock(
-            config,
+            _rankmixer_config(),
             ModelMetadata(feature_token_count=2, scenario_count=2, task_count=2),
             use_sequence_attention=True,
         ).eval()
-        self.assertIsNotNone(block.scenario_sequence_gate)
-        self.assertIsNotNone(block.task_sequence_gate)
-        torch.testing.assert_close(
-            block.scenario_sequence_gate[0].bias,
-            torch.full_like(block.scenario_sequence_gate[0].bias, -2.0),
-        )
-        block.scenario_sequence_gate = ZeroGate()
-        block.task_sequence_gate = ZeroGate()
+        self.assertFalse(hasattr(block, "scenario_sequence_gate"))
+        self.assertFalse(hasattr(block, "task_sequence_gate"))
+        self.assertIsNotNone(block.scenario_sequence_attention)
+        self.assertIsNotNone(block.task_sequence_attention)
 
         ns_tokens = torch.randn(2, 2, 4)
         s_tokens = torch.randn(2, 5, 4)
@@ -2369,13 +2360,6 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
         task_tokens = torch.randn(2, 2, 4)
         scenario_mask = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
 
-        expected = _forward_domain_interaction(
-            block,
-            ns_tokens,
-            scenario_tokens,
-            task_tokens,
-            scenario_mask,
-        )
         actual = block(
             ns_tokens,
             s_tokens,
@@ -2384,11 +2368,26 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
             task_tokens,
             scenario_mask,
         )
+        memory = torch.cat([s_tokens, ns_tokens], dim=1)
+        memory_mask = torch.cat([s_mask, torch.ones(2, 2, dtype=torch.bool)], dim=1)
+        scenario_hat = scenario_tokens + block.scenario_sequence_attention(
+            scenario_tokens,
+            memory,
+            memory_mask,
+        )
+        expected_scenario = scenario_hat + block.scenario_ffn(scenario_hat)
+        task_hat = task_tokens + block.task_sequence_attention(
+            task_tokens,
+            memory,
+            memory_mask,
+        )
+        task_hat = block.domain_fused(task_hat, scenario_hat, scenario_mask)
+        expected_task = task_hat + block.task_ffn(task_hat)
 
-        torch.testing.assert_close(actual[0], expected[0])
-        torch.testing.assert_close(actual[1], expected[1])
+        torch.testing.assert_close(actual[0], expected_scenario)
+        torch.testing.assert_close(actual[1], expected_task)
 
-    def test_empty_history_block_output_is_finite_and_matches_ns_only_path(self) -> None:
+    def test_empty_history_block_output_is_finite_and_matches_ns_only_pool(self) -> None:
         block = MDLDomainBlock(
             _rankmixer_config(),
             ModelMetadata(feature_token_count=2, scenario_count=1, task_count=1),
@@ -2398,18 +2397,21 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
         scenario_tokens = torch.randn(2, 2, 4)
         task_tokens = torch.randn(2, 1, 4)
         scenario_mask = torch.ones(2, 1)
-        expected = _forward_domain_interaction(
-            block,
+        s_tokens = torch.randn(2, 5, 4)
+        s_mask = torch.zeros(2, 5, dtype=torch.bool)
+
+        actual = block(
             ns_tokens,
+            s_tokens,
+            s_mask,
             scenario_tokens,
             task_tokens,
             scenario_mask,
         )
-
-        actual = block(
+        expected = block(
             ns_tokens,
-            torch.randn(2, 5, 4),
-            torch.zeros(2, 5, dtype=torch.bool),
+            s_tokens.new_empty(2, 0, 4),
+            s_mask.new_empty(2, 0),
             scenario_tokens,
             task_tokens,
             scenario_mask,
@@ -2494,7 +2496,8 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
             for hook in hooks:
                 hook.remove()
 
-        self.assertEqual(observed_lengths, [4, 3, 2, 4, 3, 2])
+        # Equal-treatment Domain read uses memory ``[Q_S; NS]`` (NS=4 here).
+        self.assertEqual(observed_lengths, [8, 7, 6, 8, 7, 6])
         torch.testing.assert_close(cached, uncached, rtol=1.0e-5, atol=1.0e-6)
 
 
