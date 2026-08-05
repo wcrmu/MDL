@@ -875,6 +875,81 @@ def _build_task_heads(
     )
 
 
+class TaskQueryReadout(nn.Module):
+    """Collapse the final feature stack into one state per task.
+
+    Equal-readout control. A baseline normally decides on every feature token
+    flattened together, while an MDL task token carries a single ``token_dim``
+    state, so an MDL-vs-baseline gap confounds layer-wise Domain propagation
+    with readout width. This reads the same final features through per-task
+    learned queries, matching the MDL readout width without any Domain
+    recurrence.
+
+    Deliberately not parameter-matched: it reuses the published MDL Domain
+    reader so the control is a *strong* narrow readout. If it still loses to
+    the flattening baseline, readout width is the bottleneck rather than an
+    underpowered pooling mechanism.
+    """
+
+    def __init__(
+        self,
+        config: AppConfig,
+        task_count: int,
+        num_feature_tokens: int,
+    ) -> None:
+        super().__init__()
+        token_dim = config.model.token_dim
+        self.queries = nn.Parameter(torch.empty(task_count, token_dim))
+        nn.init.normal_(self.queries, std=config.model.init_std)
+        self.attention = DomainAwareAttention(
+            token_dim,
+            config.model.num_heads,
+            task_count,
+            num_feature_tokens,
+            config.model.hidden_dim,
+            attention_backend=config.runtime.attention_backend,
+            activation=config.model.ffn_activation,
+        )
+        self.ffn = PerTokenFFN(
+            task_count,
+            token_dim,
+            config.model.hidden_dim,
+            activation=config.model.ffn_activation,
+        )
+
+    def forward(self, feature_tokens: Tensor) -> Tensor:
+        queries = self.queries.unsqueeze(0).expand(feature_tokens.size(0), -1, -1)
+        update, _weights = self.attention(queries, feature_tokens)
+        states = queries + update
+        return states + self.ffn(states)
+
+
+def _task_readout_head_input_dim(
+    config: AppConfig,
+    flattened_dim: int,
+) -> int:
+    return (
+        config.model.token_dim
+        if config.model.readout == "task_query"
+        else flattened_dim
+    )
+
+
+def _task_readout_logits(
+    readout: TaskQueryReadout | None,
+    logit_layers: nn.ModuleList,
+    feature_tokens: Tensor,
+) -> Tensor:
+    if readout is None:
+        pooled = feature_tokens.flatten(start_dim=1)
+        return torch.cat([layer(pooled) for layer in logit_layers], dim=1)
+    states = readout(feature_tokens)
+    return torch.cat(
+        [layer(states[:, index, :]) for index, layer in enumerate(logit_layers)],
+        dim=1,
+    )
+
+
 @dataclass(frozen=True)
 class LongerSelfLayerCache:
     cacheable_key: Tensor
@@ -7887,10 +7962,17 @@ class OneTransModel(nn.Module):
             embedding_dim,
             embedding_size_override=embedding_size_override,
         )
-        output_dim = self.backbone.ns_token_count * config.model.token_dim
-        self.logit_layers = _build_task_heads(
-            config, output_dim, len(config.task_names)
+        task_count = len(config.task_names)
+        self.task_query_readout = (
+            TaskQueryReadout(config, task_count, self.backbone.ns_token_count)
+            if config.model.readout == "task_query"
+            else None
         )
+        output_dim = _task_readout_head_input_dim(
+            config,
+            self.backbone.ns_token_count * config.model.token_dim,
+        )
+        self.logit_layers = _build_task_heads(config, output_dim, task_count)
 
     def precompute_request_cache(
         self, features: dict[str, Any]
@@ -7912,8 +7994,11 @@ class OneTransModel(nn.Module):
     ) -> dict[str, Tensor]:
         del scenario_id
         output = self.backbone(features, request_cache=request_cache)
-        pooled = output.feature_tokens.flatten(start_dim=1)
-        logits = torch.cat([layer(pooled) for layer in self.logit_layers], dim=1)
+        logits = _task_readout_logits(
+            self.task_query_readout,
+            self.logit_layers,
+            output.feature_tokens,
+        )
         return {"logits": logits}
 
 
@@ -8405,13 +8490,18 @@ class MixFormerModel(nn.Module):
         )
         self.tokenizer = MixFormerTokenizer(config, self.encoder_bank)
         self.blocks = _build_mixformer_blocks(config, self.feature_head_count)
-        # The paper denotes the stacked head output as a vector in R^(N*D).
-        output_dim = self.feature_head_count * config.model.token_dim
-        self.logit_layers = _build_task_heads(
-            config,
-            output_dim,
-            len(config.task_names),
+        task_count = len(config.task_names)
+        self.task_query_readout = (
+            TaskQueryReadout(config, task_count, self.feature_head_count)
+            if config.model.readout == "task_query"
+            else None
         )
+        # The paper denotes the stacked head output as a vector in R^(N*D).
+        output_dim = _task_readout_head_input_dim(
+            config,
+            self.feature_head_count * config.model.token_dim,
+        )
+        self.logit_layers = _build_task_heads(config, output_dim, task_count)
 
     def precompute_request_cache(
         self,
@@ -8472,10 +8562,10 @@ class MixFormerModel(nn.Module):
         del scenario_id
         tokenized = self.tokenizer(features, request_cache=request_cache)
         feature_heads = self._run_blocks(tokenized)
-        flattened = feature_heads.flatten(start_dim=1)
-        logits = torch.cat(
-            [head(flattened) for head in self.logit_layers],
-            dim=1,
+        logits = _task_readout_logits(
+            self.task_query_readout,
+            self.logit_layers,
+            feature_heads,
         )
         return {"logits": logits}
 

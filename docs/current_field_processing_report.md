@@ -904,14 +904,15 @@ scenario tokens: fixed 时 [B,3,256]
 task tokens:     [B,3,256]
 ```
 
-每个 layer 先执行 OneTrans step，使 S/NS 进行混合因果注意力；随后 MDL domain block 读取当前 NS：
+每个 layer 先执行 OneTrans step，使 S/NS 进行混合因果注意力；随后 MDL domain block 读取当层的统一流：
 
-1. scenario token 对 32 个 NS token 做 domain-aware attention；
-2. task token 对 32 个 NS token 做 domain-aware attention；
-3. 从 0-based layer 4 开始，也就是第 5、6 层，scenario/task token 额外对当前 S token 做 variable-length cross attention；
-4. gate 输入为 `[原 domain state, NS update, S update]`，决定注入多少 S update；
-5. task state 再融合 scenario state；
-6. 最终三个 256 维 task token分别进入 `256 -> 1024 -> 1` 的 head。
+1. 当层 query 侧的 S token 与 32 个 NS token 构成同一个 attention 池 `[Q_S; NS]`，两者同等待遇，没有区分 S/NS 的分支门；
+2. scenario token 对该池做一次 variable-length cross attention；
+3. task token 对同一个池做一次 variable-length cross attention；
+4. task state 再融合 scenario state；
+5. 最终三个 256 维 task token 分别进入 `256 -> 1024 -> 1` 的 head。
+
+该池就是 OneTrans 统一流本身，不额外拷贝；NS 段在 `valid_mask` 中恒为有效。
 
 这里同时存在三种历史使用方式：
 
@@ -2326,13 +2327,12 @@ OneTrans 不把 9 条历史 summary 混入 NS concat；它们作为单独的 S t
 
 MDL-OneTrans 的 domain token：
 
-- 每层可与 NS feature tokens 交互；
-- 当前 `first_domain_sequence_layer=4`；
-- 在 0-based layer 4 和 5，domain token 额外通过 gated sequence interaction 读取 S stream；
+- 当前 `first_domain_sequence_layer=0`，即每层都读；
+- 每层读的是 `[Q_S; NS]` 同一个池：当层 query 侧的 S token 与 32 个 NS feature token 同等参与一次 variable-length cross attention；
 - task 再融合 scenario；
 - 最终 task token 进入 task head。
 
-这比“只把 pooled history 塞进 prior”多一条后层 S-stream interaction。
+这比“只把 pooled history 塞进 prior”多了逐层的 event-level S 交互。
 
 ---
 

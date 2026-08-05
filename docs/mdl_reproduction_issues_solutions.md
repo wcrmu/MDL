@@ -113,20 +113,20 @@ attention residual 之后，两种模式都仍会过各自的 Domain FFN。
 
 ---
 
-## 4. 为什么每层读 NS，但只在后两层读 S？
+## 4. Domain 每层读什么？
 
-> 适用范围：`mdl_onetrans`（Domain sidecar 读 OneTrans）。`mdl_rankmixer` 的 Domain 读的是 32 个 Feature token，没有这条 S/NS 分层合同。
+> 适用范围：`mdl_onetrans`（Domain sidecar 读 OneTrans）。`mdl_rankmixer` 的 Domain 读的是 32 个 Feature token，没有 S/NS 这条区分。
 
 **问题：**
-若 Scenario/Task 对最长约 2048 的 S 做**全层** cross-attention，训练代价与峰值显存都会失控；若完全不读 S，又丢掉长历史直接证据。
+Domain 要同时用上定长的候选相关信号和变长的长历史证据。早期实现按代价把它们拆成两条支路——每层读 NS，只有最后两层读 S，S 支路再加一个残差门——于是"被选中读取的 token"并没有得到同等待遇，长历史支路在训练初期被门压住。
 
 **根因：**
-三类信号职责与代价不同：
+两类信号的工程属性不同，但这不构成给它们不同表决权的理由：
 
 | 信号 | 特点 | 当前处理 |
 |---|---|---|
-| 32 个 NS | 已融合当前候选，长度固定，候选相关性强 | Scenario/Task **每一层**都读 |
-| 最长约 2048 的 S | 请求共享、变长；早层偏原始事件，直接 cross-attn 昂贵 | OneTrans 先做 pyramid 压缩，**最后两层**才允许 Domain 读 |
+| 32 个 NS | 已融合当前候选，长度固定，候选相关性强 | 进入每层的读取池 |
+| 最长约 2048 的 S | 请求共享、变长；OneTrans 逐层 pyramid 压缩 | 当层 query 侧的 \(Q_S\) 进入同一个读取池 |
 | 7 个 Domain prior summary | 面向 scenario/task 的紧凑历史摘要 | **只初始化** Domain prompt，不进原始 S 因果链 |
 
 两点口径需要说清：
@@ -134,13 +134,19 @@ attention residual 之后，两种模式都仍会过各自的 Domain FFN。
 - “2048” 是九条原始行为流 `max_length` 之和，不是单一序列上限；
 - pyramid 不是 pooling 级联，而是线性递减、按 32 取整的 keep-count schedule，配合 causal-suffix attention 逐层保留最新事件：\(2048 \to 1696 \to 1376 \to 1024 \to 704 \to 352 \to 12\)。
 
-逐层计算（记第 \(l\) 层后为 \(S^l,N^l,D^l\)）：先跑原生 OneTrans block 得到 \(S^{l+1},N^{l+1}\)，再让 Domain 读 NS；从 zero-based layer **4** 起（6 层中的最后两层）额外读压缩后的 S，并用残差门控（bias 初始化为 \(-2\)，零输入时 sigmoid \(\approx 0.119\)）避免训练初期长序列支路压过 NS。
+逐层计算（记第 \(l\) 层后为 \(S^l,N^l,D^l\)）：先跑原生 OneTrans block 得到 \(S^{l+1},N^{l+1}\)，再让 Domain 对拼接池做**一次** variable-length cross attention：
+
+\[
+\hat D^l = D^l + \operatorname{VLAttn}\left(Q_l(D^l),\ [\,S^{l+1};N^{l+1}\,],\ [\,M_S^{l+1};\mathbf{1}\,]\right)
+\]
+
+这与 `mdl_rankmixer` 的合同一致：一旦某个 token 被选进读取集合，它就和池子里其他 token 在同一个 softmax 里竞争，没有额外的分支门决定"注入多少"。
 
 **解决方案：**
-配置 `first_domain_sequence_layer=4`：先保证能训、能缓存、能保留 request-sized S cache。算法结论留给消融，而不是把该超参写成论文结论。
+配置 `first_domain_sequence_layer=0` 并移除 S 分支门。该池就是 OneTrans 统一流本身（NS 段在 `valid_mask` 中恒为有效），读取不额外拷贝激活；同时不再构造定宽的 `DomainAwareAttention`，省下每 block 约 70M、6 层共约 422M 从不参与前向的参数。
 
 **边界：**
-至少比较 `null`（不直接读 S）、`4`（最后两层）、`0`（全层读），并同时报告质量、延迟与峰值 HBM。`S-only / prior-only / S+prior` 也要单独做，否则无法区分“复用同一份行为”与“重复计权”。
+这条通路的代价高于早期的"后两层 + 门"方案：Domain 现在每层都对变长 S 做 attention，`benchmark.py` 的解析式 FLOPs 已把这条 sidecar 计入（生产口径约占 dense 的 8%）。要形成算法结论，至少比较 `null`（不直接读 S）与 `0`（全层读），并同时报告质量、延迟与峰值 HBM。`S-only / prior-only / S+prior` 也要单独做，否则无法区分“复用同一份行为”与“重复计权”。
 
 ---
 
@@ -281,7 +287,7 @@ export MDL_PINNED_POOL_MAX_SLOT_BYTES=1073741824  # 1 GiB
 | Task important 统一写“类目层级、价格、……” | 按配置拆开：`fst_cart`（`adj_cartcvr`/`cart_cnt_3d`）、`upid_pay`（`sales`/`adj_cvr`）+ goods/mall/cluster；`cateid_filter` 为 `rel_level`/`rel_score`/`origin_query_hash`，不含 goods/mall/price |
 | Feature token 切分未限定模型范围 | 23+9=32、`Linear→768` 仅 `mdl_rankmixer`/`rankmixer`；`mdl_onetrans` 为 `auto_split`、32 token、dim 256 |
 | `coupled`/`split` 只有公式 | 补硬验证（置零 Value update 后交换 prompt 不得改变 logit）、使用约定与 checkpoint 不混用、`residual_ffn`/`direct_ffn` 说明 |
-| “最长约 2048” 与 pyramid 含糊 | 注明 2048 为九条流上限之和；pyramid 为线性 keep-count schedule（…→352→12）；门控零输入 sigmoid≈0.119；补 `null/4/0` 与 `S-only/prior-only` 消融边界 |
+| “最长约 2048” 与 pyramid 含糊 | 注明 2048 为九条流上限之和；pyramid 为线性 keep-count schedule（…→352→12）；补 `null/0` 与 `S-only/prior-only` 消融边界。S 分支门（bias=−2）后续已随等同待遇单池一并移除 |
 | scene 通道隔离缺边界 | 补 LONGER user-global 仍消费 `scene_id_hn` 的 2×2 归因注意点；fine 自动发现上限 256 |
 | 显存表缺行、个别根因/修复混淆 | 补 token width 512→256、full remat 回退两行；补精确数字 399.49 GiB 与当前 batch 1408/1536；`4861e0e` 第三项是**按长度分块 MixFormer SwiGLU/attention**（非“序列投影”）；补 commit 号 |
 | HDFS / RSS 只有骨架 | 补精确 API（`torch._C._host_emptyCache`）、第一代 free-slot 公式 `max(4, queue_size+2)`、commit 号（`331b6ac`/`64ba075`/`4a3cda0`）与边界 |

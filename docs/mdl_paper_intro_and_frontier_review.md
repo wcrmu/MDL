@@ -295,7 +295,7 @@ Global Scenario token 也不是由所有 specific token 聚合而来，而是一
 | 模型 | 主干 | 说明 |
 |---|---|---|
 | `mdl_rankmixer` | RankMixer | 论文默认机制的复现：32 个 groupwise Feature token（23 个语义组 + 9 个历史组），Domain 逐层读取 Feature |
-| `mdl_onetrans` | OneTrans | MDL 机制的 OneTrans 适配：Domain sidecar 每层读 32 个 NS token，仅最后两层读 pyramid 压缩后的 S |
+| `mdl_onetrans` | OneTrans | MDL 机制的 OneTrans 适配：Domain sidecar 每层把当层 query 侧的 S 与 32 个 NS 拼成同一个池读取 |
 
 复现过程中遇到的 token 构成、状态语义、场景接入与显存/IO/RSS 工程问题，见 [`mdl_reproduction_issues_solutions.md`](./mdl_reproduction_issues_solutions.md)（详版见 [`mdl_key_questions.md`](./mdl_key_questions.md)、[`mdl_onetrans_adaptation_hardships.md`](./mdl_onetrans_adaptation_hardships.md)）。
 

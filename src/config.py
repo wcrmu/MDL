@@ -2442,6 +2442,11 @@ class ModelConfig:
     task_head_hidden_dim: int | None = None
     task_head_dropout: float = 0.0
     task_head_activation: ActivationType = "gelu"
+    # Readout source for the baselines that decide on the whole flattened
+    # feature stack. ``task_query`` narrows them to one token_dim state per
+    # task, matching what an MDL task token carries, so an MDL comparison
+    # isolates layer-wise Domain propagation from readout width.
+    readout: str = "default"
     # MDL token ablations. False removes the corresponding token projectors and
     # block modules, then uses the repository's explicit task/scenario towers.
     use_task_tokens: bool = True
@@ -2625,6 +2630,18 @@ class ModelConfig:
                 raise ValueError(
                     "model.scene_feature_bias requires use_scenario_tokens=true"
                 )
+        if self.readout not in {"default", "task_query"}:
+            raise ValueError("model.readout must be default or task_query")
+        if self.readout == "task_query" and self.name not in {
+            "onetrans",
+            "mixformer",
+        }:
+            raise ValueError(
+                "model.readout=task_query is an equal-readout control for the "
+                "onetrans and mixformer baselines; MDL models already read out "
+                "through per-task Domain tokens, and rankmixer already decides "
+                "on a token_dim pooled state"
+            )
         if self.first_domain_sequence_layer is not None:
             if type(self.first_domain_sequence_layer) is not int:
                 raise ValueError(
@@ -2637,6 +2654,21 @@ class ModelConfig:
             if self.name != "mdl_onetrans":
                 raise ValueError(
                     "model.first_domain_sequence_layer is only valid for mdl_onetrans"
+                )
+            # Sequence-reading blocks read one equal-treatment [Q_S; NS] pool
+            # and have no RankMixer-mixing analogue over variable-length S, so
+            # the interaction switches would be silently ignored there.
+            if self.use_task_tokens and not self.use_task_feature_interaction:
+                raise ValueError(
+                    "model.first_domain_sequence_layer requires "
+                    "use_task_feature_interaction=true; set it to null to ablate "
+                    "task feature interaction"
+                )
+            if self.use_scenario_tokens and not self.use_scenario_feature_interaction:
+                raise ValueError(
+                    "model.first_domain_sequence_layer requires "
+                    "use_scenario_feature_interaction=true; set it to null to "
+                    "ablate scenario feature interaction"
                 )
         if self.pyramid_round_to <= 0:
             raise ValueError("model.pyramid_round_to must be positive")

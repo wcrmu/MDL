@@ -202,6 +202,7 @@ _MODEL_OVERRIDE_FIELDS = (
     "mdl_feature_interaction",
     "mdl_token_state",
     "scene_feature_bias",
+    "readout",
 )
 
 _TOKENIZATION_OVERRIDE_FIELDS = ("omit_scene_features",)
@@ -639,6 +640,19 @@ def _add_model_override_args(parser: argparse.ArgumentParser) -> None:
             "attention (MDL ablation option C); requires mdl_* + scenario tokens"
         ),
     )
+    parser.add_argument(
+        "--readout",
+        choices=["default", "task_query"],
+        default=None,
+        help=(
+            "override model.readout (default: decide on the whole flattened "
+            "feature stack). task_query is the equal-readout control for the "
+            "onetrans / mixformer baselines: per-task learned queries collapse "
+            "the same features to one token_dim state per task, matching MDL "
+            "readout width so a comparison isolates layer-wise Domain "
+            "propagation from readout capacity"
+        ),
+    )
 
 
 def _add_tokenization_override_args(parser: argparse.ArgumentParser) -> None:
@@ -789,6 +803,7 @@ def _cmd_validate_config(args: argparse.Namespace) -> int:
     print(f"mdl_feature_interaction: {config.model.mdl_feature_interaction}")
     print(f"mdl_token_state: {config.model.mdl_token_state}")
     print(f"scene_feature_bias: {config.model.scene_feature_bias}")
+    print(f"readout: {config.model.readout}")
     print(f"omit_scene_features: {config.tokenization.omit_scene_features}")
     if config.tokenization.omit_scene_features:
         resolved = config.resolved.tokenization

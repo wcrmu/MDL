@@ -28,7 +28,7 @@
 | 模型 | 角色 | 主干 | Domain |
 |---|---|---|---|
 | `mdl_rankmixer` | 更接近论文 MDL × RankMixer | 32×768 Feature token，2 层 | Scenario/Task 逐层读 Feature |
-| `mdl_onetrans` | 线上 OneTrans 相似主干上的组合实验 | 9 路 S + 32 NS，6 层 ×256 | sidecar Domain 读 NS，后两层再读 S |
+| `mdl_onetrans` | 线上 OneTrans 相似主干上的组合实验 | 9 路 S + 32 NS，6 层 ×256 | sidecar Domain 每层读 `[Q_S; NS]` |
 
 `mdl_onetrans` **不是** MDL 或 OneTrans 论文的公开模型；上线前必须单独归因。
 
@@ -234,7 +234,7 @@ key/value = clk_long events
 
 ### 4.4 长序列与显存现实
 
-- S 最长 2048；Domain 对 S 的直接 cross-attn 只开在最后两层（`first_domain_sequence_layer=4`），每层仍读 32 NS；
+- S 最长 2048；Domain 每层把当层 `Q_S` 与 32 个 NS 拼成同一个 attention 池读取（`first_domain_sequence_layer=0`），S 与 NS 同等待遇、无分支门；
 - RankMixer 历史走 LONGER 压缩进 Feature token，控制 32×768 宽度；大 batch 下仍需按 token 预算切块 LONGER/序列投影，并把 `device_prefetch_batches` 压到 1；
 - OOM 由 length bucket、packing、cache、checkpoint、allocator、world-size NCCL/emb staging 同相叠加决定，**降 batch / 开 full remat 都不单调更省**；
 - 两族模型已回到各自验证过的 profile：`mdl_rankmixer` 为 batch **1536** + `activation_checkpoint=none` + CUDA graph；`mdl_onetrans` 为 batch **1408** + `activation_checkpoint=none` + fixed packing。现场表见 [`mdl_reproduction_lecture_report.md`](./mdl_reproduction_lecture_report.md) §2.7 与 RankMixer/MDL 显存节。
@@ -252,7 +252,7 @@ key/value = clk_long events
         ▼                       ▼
   mdl_rankmixer            mdl_onetrans
   groupwise 32×768         raw S + DCNv2 NS
-  Domain 读 Feature        Domain 读 NS(/late S)
+  Domain 读 Feature        Domain 读 [Q_S; NS]
   LONGER summaries         event-level causal S
 ```
 

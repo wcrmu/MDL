@@ -109,29 +109,35 @@ hl+1 = hl + Attention(q=ql, K/V=Feature 或 NS/S)
 
 ---
 
-## 问题 4：为什么每层读 NS，但只在后两层读 S？
+## 问题 4：Domain 每层读什么？
 
-> 适用范围：`mdl_onetrans`（Domain sidecar 读 OneTrans）。`mdl_rankmixer` 的 Domain 读的是 32 个 Feature token，没有这条 S/NS 分层合同。
+> 适用范围：`mdl_onetrans`（Domain sidecar 读 OneTrans）。`mdl_rankmixer` 的 Domain 读的是 32 个 Feature token，没有 S/NS 这条区分。
 
 **问题：**  
-若 Scenario/Task 对最长约 2048 的 S 做**全层** cross-attention，训练代价与峰值显存都会失控；若完全不读 S，又丢掉长历史直接证据。
+Domain 要同时用上定长的候选相关信号和变长的长历史证据，但这两类 token 在长度、代价和请求共享性上完全不同。早期实现按代价把它们拆成两条支路（每层读 NS，最后两层才读 S，S 支路再加一个残差门），结果是"被选中读取的 token"并没有得到同等待遇。
 
 **根因：**  
-三类信号职责与代价不同：
+两类信号的工程属性不同，但这不构成给它们不同表决权的理由：
 
 | 信号 | 特点 | 当前处理 |
 |---|---|---|
-| 32 个 NS | 已融合当前候选，长度固定，候选相关性强 | Scenario/Task **每一层**都读 |
-| 最长约 2048 的 S | 请求共享、变长；早层偏原始事件，直接 cross-attn 昂贵 | OneTrans 先做 pyramid 压缩，**最后两层**才允许 Domain 读 |
+| 32 个 NS | 已融合当前候选，长度固定，候选相关性强 | 进入每层的读取池 |
+| 最长约 2048 的 S | 请求共享、变长；OneTrans 逐层 pyramid 压缩 | 当层 query 侧的 \(Q_S\) 进入同一个读取池 |
 | 7 个 Domain prior summary | 面向 scenario/task 的紧凑历史摘要 | **只初始化** Domain prompt，不进原始 S 因果链 |
 
-逐层计算（记第 \(l\) 层后为 \(S^l,N^l,D^l\)）：先跑原生 OneTrans block 得到 \(S^{l+1},N^{l+1}\)，再让 Domain 读 NS；从 zero-based layer **4** 起（6 层中的最后两层）额外读压缩后的 S，并用残差门控（bias 初始化为 \(-2\)）避免训练初期长序列支路压过 NS。
+逐层计算（记第 \(l\) 层后为 \(S^l,N^l,D^l\)）：先跑原生 OneTrans block 得到 \(S^{l+1},N^{l+1}\)，再让 Domain 对拼接池 \([\,S^{l+1};N^{l+1}\,]\) 做**一次** variable-length cross attention：
+
+\[
+\hat D^l = D^l + \operatorname{VLAttn}\left(Q_l(D^l),\ [\,S^{l+1};N^{l+1}\,],\ [\,M_S^{l+1};\mathbf{1}\,]\right)
+\]
+
+这与 `mdl_rankmixer` 的合同一致：一旦某个 token 被选进读取集合，它就和池子里其他 token 在同一个 softmax 里竞争，没有额外的分支门决定"注入多少"。
 
 **解决方案：**  
-配置 `first_domain_sequence_layer=4`：先保证能训、能缓存、能保留 request-sized S cache。算法结论留给消融，而不是把该超参写成论文结论。
+配置 `first_domain_sequence_layer=0`，并移除 S 分支的残差门。该池就是 OneTrans 统一流本身（NS 段在 `valid_mask` 中恒为有效），所以读取不额外拷贝激活。
 
 **边界：**  
-至少比较 `null`（不直接读 S）、`4`（最后两层）、`0`（全层读），并同时报告质量、延迟与峰值 HBM。`S-only / prior-only / S+prior` 也要单独做，否则无法区分“复用同一份行为”与“重复计权”。
+这条通路的代价确实高于早期的"后两层 + 门"方案：Domain 现在每层都对变长 S 做 attention。要形成算法结论，至少比较 `null`（不直接读 S）与 `0`（全层读），并同时报告质量、延迟与峰值 HBM。`S-only / prior-only / S+prior` 也要单独做，否则无法区分"复用同一份行为"与"重复计权"。注意 `first_domain_sequence_layer` 非 `null` 时，`use_task_feature_interaction=false` 这类消融开关会被拒绝而不是被静默忽略——要做该消融必须同时把读 S 关掉。
 
 ---
 
@@ -270,7 +276,7 @@ export MDL_PINNED_POOL_MAX_SLOT_BYTES=1073741824  # 1GiB
 | 任务写成 cart / pay / cate | 统一为 `fst_cart` / `upid_pay` / `cateid_filter` |
 | “不用 RankMixer 默认等宽切片” | 改为：论文要求语义组；**我们早期 tokenizer** 做错了等宽切片 |
 | `coupled`/`split` 方案写到一半 | 补全 `split` 公式、硬验证与 checkpoint 不混用 |
-| “每层读 NS / 后两层读 S”表格挤成一行，且易被当成两模型通用 | 标明仅 `mdl_onetrans`；补门控与消融边界 |
+| “每层读 NS / 后两层读 S”表格挤成一行，且易被当成两模型通用 | 标明仅 `mdl_onetrans`；后续改为 `[Q_S; NS]` 等同待遇单池，去掉 S 分支门 |
 | scene omit 说得过绝对 | 补上 LONGER user-global 仍可能吃 `scene_id` 的边界 |
 | 显存表缺行，且 batch-768 行把修复写进了根因 | 补全 OneTrans 表，并加 RankMixer 对照；当前 batch 写回 1408 / 1536 |
 | HDFS 解决方案表格无表头 | 恢复“手段 / 作用”表 |

@@ -223,6 +223,60 @@ def _mean(values: list[float]) -> float:
     return float(sum(values) / len(values)) if values else 0.0
 
 
+def _mdl_domain_forward_flops(
+    config: AppConfig,
+    *,
+    candidates: float,
+    ns_tokens: float,
+    unified: float,
+) -> float:
+    """Forward FLOPs of the MDL-OneTrans Domain sidecar.
+
+    Domain states are a second, much narrower stream that the plain OneTrans
+    cost model does not see at all. Blocks at or after
+    ``first_domain_sequence_layer`` read the equal-treatment ``[Q_S; NS]`` pool;
+    earlier blocks read the fixed-width NS pool.
+    """
+
+    model = config.model
+    if not (model.use_task_tokens or model.use_scenario_tokens):
+        return 0.0
+    d = float(model.token_dim)
+    h = float(model.hidden_dim)
+    layers = int(model.num_layers)
+    domain_tokens = 0.0
+    if model.use_task_tokens:
+        domain_tokens += float(len(config.task_names))
+    if model.use_scenario_tokens:
+        domain_tokens += float(len(config.scenarios.names)) + float(
+            bool(model.use_global_scenario_token)
+        )
+    if domain_tokens <= 0.0:
+        return 0.0
+
+    first_sequence_layer = model.first_domain_sequence_layer
+    sequence_layers = (
+        0 if first_sequence_layer is None else max(layers - first_sequence_layer, 0)
+    )
+    forward = 0.0
+    for memory_tokens, layer_count in (
+        (unified, float(sequence_layers)),
+        (ns_tokens, float(layers - sequence_layers)),
+    ):
+        if layer_count <= 0.0:
+            continue
+        forward += layer_count * (
+            # Q/O on the Domain states, K/V on the memory pool.
+            4.0 * candidates * domain_tokens * d * d
+            + 4.0 * candidates * memory_tokens * d * d
+            # Scores and the weighted sum over the memory pool.
+            + 4.0 * candidates * domain_tokens * memory_tokens * d
+            # Per-token Domain FFN.
+            + 4.0 * candidates * domain_tokens * d * h
+        )
+    return forward
+
+
 def _analytical_dense_flops_per_step(
     config: AppConfig,
     *,
@@ -274,6 +328,13 @@ def _analytical_dense_flops_per_step(
             + 4.0 * candidates * unified * unified * d
             + 4.0 * candidates * unified * d * h
         )
+        if name == "mdl_onetrans":
+            forward += _mdl_domain_forward_flops(
+                config,
+                candidates=candidates,
+                ns_tokens=ns_tokens,
+                unified=unified,
+            )
         return train_mult * forward
 
     if name in {"mixformer", "mdl_mixformer"}:

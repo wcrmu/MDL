@@ -302,7 +302,7 @@ logits = task head(hL)
 
 prompt 不与 state concat，也不 residual-copy 到 state。Scenario→task 的
 DomainFused 只融合 scenario evidence/readout state，不融合 scenario prompt。
-对实验性的 MDL-OneTrans，prompt 可调制 NS/S attention 与 gate，但只有读取到的
+对实验性的 MDL-OneTrans，prompt 可调制对 `[Q_S; NS]` 池的 attention，但只有读取到的
 Value update 能写入 state。
 
 该模式**不会**把 prior 搬到 32 个 feature K/V 槽，也不会删除 prior。它只改变

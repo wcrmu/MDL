@@ -35,11 +35,15 @@ from src.model import (
     RankMixerSliceTokenizer,
     RMSNorm,
     ScenarioTower,
+    TaskQueryReadout,
+    _build_task_heads,
     _embedding_size,
     _forward_domain_interaction,
     _mdl_logits,
     _project_sequence_in_chunks,
     _scenario_mask_from_ids,
+    _task_readout_head_input_dim,
+    _task_readout_logits,
 )
 from src.modules.attention import (
     DomainFusedModule,
@@ -77,6 +81,11 @@ def _rankmixer_config() -> SimpleNamespace:
             sparse_moe_regularization_initial=1.0e-8,
             sparse_moe_regularization_multiplier=1.2,
             sparse_moe_dtsi_training_output=None,
+            init_std=0.02,
+            readout="default",
+            task_head_hidden_dim=None,
+            task_head_dropout=0.0,
+            task_head_activation="gelu",
         ),
         runtime=SimpleNamespace(
             attention_backend="auto",
@@ -3115,6 +3124,71 @@ class MDLOneTransLayerwiseAlignmentTest(unittest.TestCase):
         self.assertEqual(tuple(output["logits"].shape), (batch_size, 1))
         self.assertEqual(blocks[0].seen, [1.0])
         self.assertEqual(blocks[1].seen, [2.0])
+
+
+class EqualReadoutControlTest(unittest.TestCase):
+    """``readout=task_query`` matches MDL readout width on the baselines."""
+
+    def test_head_input_width_drops_to_one_task_token(self) -> None:
+        config = _rankmixer_config()
+        flattened = 32 * config.model.token_dim
+
+        self.assertEqual(
+            _task_readout_head_input_dim(config, flattened),
+            flattened,
+        )
+        config.model.readout = "task_query"
+        self.assertEqual(
+            _task_readout_head_input_dim(config, flattened),
+            config.model.token_dim,
+        )
+
+    def test_readout_produces_one_state_per_task(self) -> None:
+        config = _rankmixer_config()
+        readout = TaskQueryReadout(config, 3, 5).eval()
+
+        states = readout(torch.randn(2, 5, config.model.token_dim))
+
+        self.assertEqual(tuple(states.shape), (2, 3, config.model.token_dim))
+
+    def test_per_task_queries_read_the_same_features_differently(self) -> None:
+        torch.manual_seed(29)
+        config = _rankmixer_config()
+        readout = TaskQueryReadout(config, 2, 5).eval()
+
+        states = readout(torch.randn(2, 5, config.model.token_dim))
+
+        self.assertFalse(torch.allclose(states[:, 0, :], states[:, 1, :]))
+
+    def test_every_feature_token_reaches_every_task_logit(self) -> None:
+        torch.manual_seed(31)
+        config = _rankmixer_config()
+        config.model.readout = "task_query"
+        readout = TaskQueryReadout(config, 2, 5)
+        heads = _build_task_heads(config, config.model.token_dim, 2)
+        feature_tokens = torch.randn(2, 5, config.model.token_dim, requires_grad=True)
+
+        logits = _task_readout_logits(readout, heads, feature_tokens)
+        self.assertEqual(tuple(logits.shape), (2, 2))
+
+        for task_index in range(2):
+            feature_tokens.grad = None
+            logits[:, task_index].sum().backward(retain_graph=True)
+            assert feature_tokens.grad is not None
+            per_token = feature_tokens.grad.abs().sum(dim=(0, 2))
+            self.assertTrue(bool((per_token > 0).all()))
+
+    def test_default_readout_still_decides_on_the_flattened_stack(self) -> None:
+        torch.manual_seed(37)
+        config = _rankmixer_config()
+        feature_tokens = torch.randn(2, 5, config.model.token_dim)
+        heads = _build_task_heads(config, 5 * config.model.token_dim, 2).eval()
+
+        actual = _task_readout_logits(None, heads, feature_tokens)
+        pooled = feature_tokens.flatten(start_dim=1)
+        expected = torch.cat([head(pooled) for head in heads], dim=1)
+
+        torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":

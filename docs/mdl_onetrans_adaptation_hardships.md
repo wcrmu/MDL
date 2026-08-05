@@ -16,7 +16,7 @@
 |---|---|
 | 主干 | 9 条原始历史 → S；DCNv2 → 32 个 NS |
 | 规模 | `token_dim=256`，6 层、4 heads，`max_position_embeddings=2088` |
-| Domain | sidecar recurrent states，逐层读 NS；从 layer 4 起额外读压缩后的 S |
+| Domain | sidecar recurrent states，逐层读 `[Q_S; NS]` 同一个池（`first_domain_sequence_layer=0`） |
 | 状态语义 | 默认 `mdl_token_state=coupled` |
 | batch | 当前 `batch_size=1408`（多 profile 另有 880/576/432/704） |
 | 边界 | `experimental_model_acknowledged=true` |
@@ -30,7 +30,7 @@
 | # | 难点 | 一句话 |
 |---|---|---|
 | 1 | Domain 往哪放 | 塞进 `[S; NS]` 会破坏 cache 边界或逼出第三种模型 |
-| 2 | 读什么、读哪几层 | NS 便宜且含候选；S 最长 2048，必须受显存约束取舍 |
+| 2 | 读什么、怎么读 | NS 便宜且含候选；S 最长 2048，但被选中读的 token 必须同等待遇 |
 | 3 | coupled 难归因 | 强 prior 可沿 residual 绕过 Attention 到 logit |
 | 4 | cache 按 R 还是按 B | 提前按候选展开会把峰值从 \(O(R)\) 放大到 \(O(B)\) |
 | 5 | 增量 cache 不等于 append 可复用 | pyramid 会让深层旧 token 表示变化 |
@@ -78,18 +78,18 @@ S 是请求级、可缓存；NS 是候选级。Domain prompt 含候选类目、�
 
 ---
 
-### 2.2 每层读 NS，但只在后两层读 S
+### 2.2 Domain 每层读什么
 
 **问题：**  
-Domain 若对最长 2048 的 S 做全层 cross-attention，训练代价与峰值显存都会失控；若完全不读 S，又丢掉长历史直接证据。
+Domain 要同时用上定长的候选相关信号和变长的长历史证据。第一版按代价把它们拆成两条支路：每层读 NS，只有最后两层读 S，S 支路再加一个残差门。代价是可控了，但"被选中读取的 token"没有得到同等待遇——门在训练初期把长历史支路压到约 0.119，等于用超参预设了结论。
 
 **根因：**  
-三类信号职责不同：
+两类信号的工程属性不同，但这不构成给它们不同表决权的理由：
 
 | 信号 | 特点 | 当前处理 |
 |---|---|---|
-| 32 个 NS | 已融合当前候选，长度固定 | Scenario/Task **每一层**都读 |
-| 最长 2048 的 S | 请求共享、变长；早层偏原始事件 | OneTrans 先压缩 4 层，**最后两层**才允许 Domain 读 |
+| 32 个 NS | 已融合当前候选，长度固定 | 进入每层的读取池 |
+| 最长 2048 的 S | 请求共享、变长；OneTrans 逐层 pyramid 压缩 | 当层 query 侧的 \(Q_S\) 进入同一个读取池 |
 | 7 个 Domain prior summary | 面向 scenario/task 的紧凑历史摘要 | 只初始化 Domain prompt，不进原始 S 因果链 |
 
 当前 YAML 有 16 个逻辑 sequence 配置：9 条 raw S stream + 7 条 Scenario/Task prior。它们复用上游物理历史，但消费者、pooling 与 embedding scope 不同。
@@ -100,35 +100,21 @@ Domain 若对最长 2048 的 S 做全层 cross-attention，训练代价与峰值
 (S^{l+1},N^{l+1})=\operatorname{OneTransBlock}_l(S^l,N^l)
 \]
 
-\[
-\Delta^{l}_{D,NS}
-=\operatorname{Attn}
-\left(Q_l(D^l),K_l(N^{l+1}),V_l(N^{l+1})\right)
-\]
-
-从 zero-based layer 4 起（6 层中的最后两层）再读压缩后的 S：
+Domain 对拼接池做**一次** variable-length cross attention，S 与 NS 在同一个 softmax 里竞争：
 
 \[
-\Delta^{l}_{D,S}
-=\operatorname{VLAttn}
-\left(Q_l(D^l),S^{l+1},M_S^{l+1}\right)
+\hat D^l
+=D^l+\operatorname{VLAttn}
+\left(Q_l(D^l),\ [\,S^{l+1};N^{l+1}\,],\ [\,M_S^{l+1};\mathbf{1}\,]\right)
 \]
 
-S 分支由残差门控控制，门控 bias 初始化为 \(-2\)（零输入时 \(g\approx0.119\)），避免训练初期长序列支路直接压过 NS：
-
-\[
-g^l=\sigma\left(W_g[D^l,\Delta^{l}_{D,NS},\Delta^{l}_{D,S}]+b_g\right)
-\]
-
-\[
-\hat D^l=D^l+\Delta^{l}_{D,NS}+g^l\odot\Delta^{l}_{D,S}
-\]
+这与 `mdl_rankmixer` 的合同一致：读取集合由 `first_domain_sequence_layer` 决定，一旦进入集合就一视同仁，没有额外的分支门决定"注入多少"。
 
 **解决方案：**  
-`first_domain_sequence_layer=4`：先保证能训、能缓存；算法结论留给消融。
+`first_domain_sequence_layer=0` + 移除 S 分支门。两项工程收益顺带落地：拼接池就是 OneTrans 统一流本身（NS 段在 `valid_mask` 中恒为有效），读取不额外拷贝激活；定宽的 `DomainAwareAttention` 在这条通路上从不参与前向，因此不再构造，省下每 block 约 70M、6 层共约 422M 参数及其优化器状态。
 
 **验证/边界：**  
-这是有显存约束的工程起点，不是论文结论。至少比较 `null`（不直接读 S）、`4`（最后两层）、`0`（全层读），并同时报告质量、延迟与峰值 HBM。`S-only / prior-only / S+prior` 也要单独做，否则无法区分“复用同一份行为”与“重复计权”。
+代价确实高于"后两层 + 门"：Domain 现在每层都对变长 S 做 attention，`benchmark.py` 的解析式 FLOPs 已把这条 sidecar 计入（生产口径约占 dense 的 8%）。至少比较 `null`（不直接读 S）与 `0`（全层读），并同时报告质量、延迟与峰值 HBM。`S-only / prior-only / S+prior` 也要单独做，否则无法区分“复用同一份行为”与“重复计权”。`first_domain_sequence_layer` 非 `null` 时，`use_task_feature_interaction=false` 这类消融开关会被配置校验拒绝而不是静默忽略。
 
 ---
 
@@ -256,8 +242,8 @@ OneTrans 支持增量更新 S cache，但 pyramid 会让更深层的保留窗口
 | S/NS 合同 | 9 条 S、8 个 SEP、32 个 NS，位置容量 2088 | 历史顺序、截断、separator、padding、causal mask 是否逐项一致 |
 | Domain initializer | 含 request 与 candidate important、7 个历史 prior | 哪些字段能在线稳定供给；是否引入 train/serve 不一致；强 prior 是否绕过 Attention |
 | Cache 粒度 | S 为 request cache；NS/Domain 为 candidate state | 在线 batching 是否保留 `candidate -> request` 映射；更新时是否 full-recompute 等价 |
-| Readout | MDL 用 1 个 256 维 Task state；纯 OneTrans 当前把 `32×256=8192` flatten 后进 task MLP | 直接比较会同时改变 readout 容量；需要 equal-readout control |
-| 成本口径 | 每层 Domain 读 32 NS，最后两层再读 S | 除 samples/s 外还要报 request P99、candidate expansion slope、cache bytes/request、峰值 HBM |
+| Readout | MDL 用 1 个 256 维 Task state；纯 OneTrans 默认把 `32×256=8192` flatten 后进 task MLP | 直接比较会同时改变 readout 容量；用 `model.readout=task_query` 做 equal-readout control |
+| 成本口径 | 每层 Domain 对 `[Q_S; NS]` 各做一次 variable-length attention | 除 samples/s 外还要报 request P99、candidate expansion slope、cache bytes/request、峰值 HBM |
 
 **解决方案：**  
 先锁合同，再开 Domain；用最小可归因实验矩阵推进，而不是一次全开。
@@ -272,9 +258,9 @@ OneTrans 支持增量更新 S cache，但 pyramid 会让更深层的保留窗口
 | 实验 | 唯一变化 | 要回答的问题 |
 |---|---|---|
 | A. OneTrans baseline | 保持线上字段、S/NS、缓存和 readout | 建立可信基线 |
-| B. Equal-readout baseline | baseline 改成与 MDL 相同维度的 task-query/readout，不加 layer-wise Domain | 排除 8192→256 readout 变化 |
+| B. Equal-readout baseline | baseline 加 `--readout task_query`：per-task query 把同一批 feature 收成 1 个 256 维 state，不加 layer-wise Domain | 排除 8192→256 readout 变化 |
 | C. NS-only MDL | Domain 每层只读 NS，`first_domain_sequence_layer=null` | Layer-wise Domain 是否有增益 |
-| D. Late-S MDL | 仅最后两层增加 gated S read | 长历史直接证据是否有额外价值 |
+| D. 全层读 S | `first_domain_sequence_layer=0`（当前生产） | 长历史直接证据是否有额外价值 |
 | E. `coupled` vs `split` | 字段、参数预算和数据完全一致 | 收益来自 initializer bypass 还是动态读取 |
 | F. Scene 2×2 | content-side scene on/off × Domain scene on/off | scene 信号换通道造成了多少收益 |
 | G. Cache on/off | logits/grad 必须一致，只比较性能 | 请求缓存是否真正等价、收益是否随 candidates/request 增长 |
@@ -288,7 +274,7 @@ OneTrans 支持增量更新 S cache，但 pyramid 会让更深层的保留窗口
 建议顺序：**难点 → 错了会怎样 → 我们怎么解 → 还没闭环的验证**。
 
 1. **开场（2 min）：** 为什么要接 OneTrans；当前 `mdl_onetrans` 是组合设计，不是论文公开模型。  
-2. **结构难点（5 min）：** Domain 不能进序列 → sidecar；每层 NS / 后两层 S；coupled vs split。  
+2. **结构难点（5 min）：** Domain 不能进序列 → sidecar；每层读 `[Q_S; NS]` 等同待遇单池；coupled vs split。  
 3. **系统难点（7 min）：** request-sized cache；pyramid 下增量复用；六类 OOM 现场。  
 4. **收尾（4 min）：** 六个线上变量 + 实验矩阵；明确哪些结论现在还不能讲。
 

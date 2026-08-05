@@ -69,8 +69,8 @@
 | Domain | Scenario / Task | 同 coarse：2+global / 3 task |
 | | Token state | `coupled` |
 | | Scene→feature bias | `none` |
-| | 每层读 NS | 是 |
-| | 读 S 起始层 | **`first_domain_sequence_layer=4`**（最后两层 + gate） |
+| | 每层读什么 | 等同待遇的 `[Q_S; NS]` 单一 attention 池，无 S/NS 分支门 |
+| | 读 S 起始层 | **`first_domain_sequence_layer=0`**（全层读 S） |
 | 历史 | 主历史 encoder | **raw S stream**（非 LONGER） |
 | | 主历史 max_length（例） | impr 256；clk/view 512；cart 192；buy 128 等 |
 | | S 总事件上限（工程口径） | 拼接待 SEP 后落在 2088 位置预算内 |
@@ -99,7 +99,7 @@
 |---|---|---|
 | 主干 | 32×768 RankMixer ×2 | S/NS OneTrans ×6，宽 256 |
 | 历史 | LONGER summary → Feature | raw event → causal S |
-| Domain 读什么 | Feature tokens | 每层 NS + 后两层 S |
+| Domain 读什么 | Feature tokens | 每层 `[Q_S; NS]` 同一个池 |
 | 默认 batch | 1536 | 1408 |
 | packing | compact | fixed |
 | cuda graph | on | off |

@@ -321,12 +321,15 @@ def _needs_padded_sdpa_flash(config: AppConfig) -> bool:
     """True when strict flash would also exercise ordinary padded SDPA Flash.
 
     LONGER / OneTrans S-streams use flash-attn varlen. Ordinary padded FlashAttention is
-    only required when MDL constructs ``DomainAwareAttention`` for enabled
-    task/scenario feature interactions. Plain RankMixer token mixing does not
-    use padded Flash, so both capabilities are independent.
+    only required when a model constructs ``DomainAwareAttention``: MDL does so
+    for enabled task/scenario feature interactions, and the equal-readout
+    control does so for its per-task queries. Plain RankMixer token mixing does
+    not use padded Flash, so both capabilities are independent.
     """
 
     model = config.model
+    if getattr(model, "readout", "default") == "task_query":
+        return True
     if model.name not in {
         "mdl_rankmixer",
         "mdl_onetrans",

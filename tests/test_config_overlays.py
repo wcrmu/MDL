@@ -855,6 +855,66 @@ class ModelConfigOverlayTest(unittest.TestCase):
                 )
                 validate_app_config(ablation)
 
+    def test_sequence_reading_rejects_silently_ignored_interaction_ablations(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "mdl_onetrans.yaml")
+        self.assertIsNotNone(config.model.first_domain_sequence_layer)
+
+        for switch in (
+            "use_task_feature_interaction",
+            "use_scenario_feature_interaction",
+        ):
+            with self.subTest(switch=switch):
+                ablation = replace(
+                    config,
+                    model=replace(config.model, **{switch: False}),
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "first_domain_sequence_layer requires",
+                ):
+                    validate_app_config(ablation)
+
+                # The documented way to run that ablation stays available.
+                validate_app_config(
+                    replace(
+                        config,
+                        model=replace(
+                            config.model,
+                            first_domain_sequence_layer=None,
+                            **{switch: False},
+                        ),
+                    )
+                )
+
+    def test_equal_readout_control_is_limited_to_the_flattening_baselines(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        for model_name in ("onetrans", "mixformer"):
+            with self.subTest(model=model_name, allowed=True):
+                config = load_app_config(root / "configs" / f"{model_name}.yaml")
+                self.assertEqual(config.model.readout, "default")
+                validate_app_config(
+                    replace(
+                        config,
+                        model=replace(config.model, readout="task_query"),
+                    )
+                )
+
+        for model_name in ("rankmixer", "mdl_onetrans", "mdl_rankmixer"):
+            with self.subTest(model=model_name, allowed=False):
+                config = load_app_config(root / "configs" / f"{model_name}.yaml")
+                with self.assertRaisesRegex(ValueError, "equal-readout control"):
+                    validate_app_config(
+                        replace(
+                            config,
+                            model=replace(config.model, readout="task_query"),
+                        )
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
