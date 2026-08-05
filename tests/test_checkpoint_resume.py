@@ -947,7 +947,7 @@ class CheckpointStoreProbeCommandTest(unittest.TestCase):
                 temporary,
                 "--checkpoint-run-name",
                 "r",
-                "--resume",
+                "--checkpoint-resume",
                 "30",
             )
         self.assertEqual(passed, 0)

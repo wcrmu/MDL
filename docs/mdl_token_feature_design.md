@@ -131,7 +131,7 @@ recommendation 的进一步差异由 coarse prior、important 组合和 PerToken
 | task | important raw fields | task prior |
 |---|---|---|
 | `fst_cart` | `cat1_id_hn`, `cat2_id_hn`, `price_hn`, `adj_cartcvr_hn`, `cart_cnt_3d_hn`, `cat_id_hn`, `goods_cluster_id_1w_hn`, `mall_id_hn`, `goods_id_hn` | `cart_long` attention pool |
-| `upid_pay` | `cat1_id_hn`, `cat2_id_hn`, `price_hn`, `sales_hn`, `adj_cvr_hn`, `cat_id_hn`, `goods_cluster_id_1w_hn`, `mall_id_hn`, `goods_id_hn` | `buy_long` attention pool |
+| `upid_pay` | `cat1_id_hn`, `cat2_id_hn`, `price_hn`, `adj_cvr_hn`, `idx_c_ordr_cnt_15d_hn`, `nfk_gmv_14d_hn`, `u_fst_ordr_cnt_mix_d_hn`, `cat_id_hn`, `goods_cluster_id_1w_hn` | `buy_long` + `ups_clk_sku` attention pool |
 | `cateid_filter` | `cat1_id_hn`, `cat2_id_hn`, `cat_id_hn`, `rel_level_hn`, `rel_score_hn`, `origin_query_hash_hn` | `srch_q2i` attention pool |
 
 三条 task prior 都以本 task important embeddings 为 query。相比无条件 mean
@@ -140,14 +140,30 @@ pool，它们回答“与当前候选/任务条件相关的历史是什么”。
 购买历史；这是按字段语义做出的推断，必须通过固定 holdout 消融验证。
 
 表中写的是 raw source；YAML 中对应 logical name 带
-`task_important_` 前缀，并使用独立 task-scope embedding。
+`task_{task}_important_` 前缀，并使用独立 task-scope embedding。前缀里带 task
+名是必要的：这些表原本按 source 共用，`fst_cart`（loss 权重 0.5）与两条
+0.01 权重的尾部任务同表，等于 `upid_pay` 的 domain prompt 大部分由加购梯度
+决定。
+
+`upid_pay` 由此做了两处调整：
+
+- important 去掉 `sales_hn` / `mall_id_hn` / `goods_id_hn`，换成
+  `idx_c_ordr_cnt_15d_hn`、`nfk_gmv_14d_hn`、`u_fst_ordr_cnt_mix_d_hn`。前者
+  是这张 token 上最稀疏、且与加购完全重合的三张表，后者是全量覆盖的下单/成交
+  强度锚点（profile 上 distinct 分别为 19 / 22 / 93，无空值）。
+- prior 增加一条 `ups_clk_sku` 流。`buy_long` 在 profile 上有 23.8% 的请求是
+  空 list，这些请求的 pay prior 只能读到 null anchor；`ups_clk_sku` 只有 3.5%
+  为空且 p99 长度 236，恰好落在 cap 内。这条补充流按覆盖率而非商品身份设计，
+  丢掉 `goods_id` / `sku_ids` / `spec` / `mall_id`（主 prior 已经持有这些稀疏
+  表），因此只增加约 13 MiB embedding，anchor 改用 `cat_id_hn`。
 
 task important 不再复制 locale；在保留高支持度类目、价格和任务统计的基础上，
 分两层加入 identity：
 
 - locale 已由 active scenario token 经 DomainFused 注入；
-- `fst_cart` / `upid_pay` 使用叶子类目、商品簇和商家作为低风险 identity，
-  并使用独立的 32M×32 `goods_id` task-extra 表作为论文同型的精确商品身份；
+- `fst_cart` 使用叶子类目、商品簇和商家作为低风险 identity，并使用独立的
+  32M×32 `goods_id` task-extra 表作为论文同型的精确商品身份；`upid_pay` 只保
+  留叶子类目和商品簇，商家/商品身份留在主 feature pack 中；
 - `cateid_filter` 已有叶子 `cat_id`，额外复用物理存在的
   `origin_query_hash_hn` bag 作为可部署 query identity；若上游补充 scalar
   current-query ID，应优先用 scalar 替换该 bag；
@@ -161,13 +177,14 @@ task important 不再复制 locale；在保留高支持度类目、价格和任�
 - 普通 feature、scenario important、task important 是不同物理 embedding 表；
 - 一项 `scenario_important_*` 由 search/recommendation/global 共用，不是
   `3 × scenario` 表；
-- task important 同名字段在使用它的 task tokens 间共用一张 task-scope 表；
+- task important 每个 task 各自持表，同名 raw source 在不同 task 上是不同的
+  物理表，避免尾部任务的 prompt 被主任务梯度主导；
 - task/scenario history prior 保留独立参数与独立 encoder；
 - scenario history 的独立表尺寸跟随 profile 后 backbone 同 raw 字段的
   bucket/dim，独立不再隐含“回退到更大的估计维度”。
 
-当前 coarse MDL 配置约 290 张物理表，规划约 66.24 GiB/GPU
-（BF16 + Row-Wise Adagrad，2 GPU）；fine 配置约 288 张。
+当前 coarse MDL 配置约 306 张物理表，规划约 66.26 GiB/GPU
+（BF16 + Row-Wise Adagrad，2 GPU）；fine 配置约 304 张。
 
 ## 6. RankMixer feature token 边界
 
@@ -311,8 +328,11 @@ additive/FiLM scene bias 会重新引入 prompt→content/readout 路径，配�
 1. 旧 token 字段/mean pool vs 本文方案；
 2. `goods_id` important off vs on（仅在更长窗口下）；
 3. `cateid_filter`: `srch_q2i` vs `buy_long`;
-4. shared conditioned click prior vs 真正由上游产出的 per-scene history；
-5. `scene_feature_bias`: `none` vs `additive` vs `film`，默认仍为 `none`。
+4. `upid_pay`：共用 important 表 vs 每 task 独立表；
+5. `upid_pay`：有/无 `ups_clk_sku` 补充 prior。与上一项分开跑，否则无法归因
+   pay AUC 的变化；
+6. shared conditioned click prior vs 真正由上游产出的 per-scene history；
+7. `scene_feature_bias`: `none` vs `additive` vs `film`，默认仍为 `none`。
 
 所有实验固定数据窗口、seed 和 holdout，按 task × scene 报告：
 

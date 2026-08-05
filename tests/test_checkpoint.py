@@ -97,7 +97,7 @@ class ShardedCheckpointTest(unittest.TestCase):
             self.assertTrue((checkpoint_path / "manifest.json").exists())
             self.assertTrue((checkpoint_path / "dense.pt").exists())
             self.assertEqual(
-                len(list(checkpoint_path.glob("rank-*-of-*.pt"))), 2
+                len(list(checkpoint_path.glob("shard-*-rank-*-of-*.pt"))), 2
             )
 
             config = load_app_config(config_path)

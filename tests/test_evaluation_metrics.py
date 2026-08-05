@@ -16,6 +16,7 @@ from src.train import (
     _StreamingTaskMonitor,
     _binary_auc,
     _group_auc,
+    _production_auc_thresholds,
     _print_fixed_test_eval,
     _reduce_evaluation_histograms,
     _run_fixed_test_eval,
@@ -205,17 +206,72 @@ class EvaluationMetricTest(unittest.TestCase):
         self.assertEqual(_group_auc(scores, labels, groups), 0.5)
 
     def test_streaming_histogram_matches_separated_exact_scores(self) -> None:
-        scores = torch.tensor([0.1, 0.9, 0.8, 0.2])
+        logits = torch.tensor([-2.0, 2.0, 1.5, -1.5])
         labels = torch.tensor([0.0, 1.0, 0.0, 1.0])
         accumulator = _StreamingHistogramAUC(1024)
-        accumulator.update(scores[:2], labels[:2])
-        accumulator.update(scores[2:], labels[2:])
-        self.assertEqual(accumulator.compute(), _binary_auc(scores, labels))
+        accumulator.update(logits[:2], labels[:2])
+        accumulator.update(logits[2:], labels[2:])
+        self.assertEqual(accumulator.compute(), _binary_auc(logits, labels))
         self.assertEqual(accumulator.counts(), (4, 2, 2))
+
+    def test_reported_auc_matches_literal_online_threshold_evaluator(self) -> None:
+        # Reference implementation of the online evaluator: tile every
+        # prediction against the whole threshold grid, accumulate one confusion
+        # matrix per threshold, then integrate the ROC points by trapezoid.
+        generator = torch.Generator().manual_seed(0)
+        num_thresholds = 512
+        for offset in (0.0, -4.0, 4.0):
+            logits = offset + 3.0 * torch.randn(20_000, generator=generator)
+            labels = (
+                torch.rand(logits.shape, generator=generator)
+                < torch.sigmoid(logits)
+            ).float()
+            probabilities = torch.sigmoid(logits.double())
+            thresholds = _production_auc_thresholds(num_thresholds)
+            exceeds = probabilities[:, None] > thresholds[None, :]
+            positive = labels.bool()[:, None]
+            true_positive_rate = (exceeds & positive).sum(0).double() / int(
+                labels.sum()
+            )
+            false_positive_rate = (exceeds & ~positive).sum(0).double() / int(
+                (1.0 - labels).sum()
+            )
+            widths = false_positive_rate[:-1] - false_positive_rate[1:]
+            heights = (true_positive_rate[:-1] + true_positive_rate[1:]) * 0.5
+            reference = float((widths * heights).sum())
+
+            accumulator = _StreamingHistogramAUC(num_thresholds)
+            accumulator.update(logits, labels)
+            self.assertAlmostEqual(accumulator.compute(), reference, places=10)
+
+    def test_logit_grid_diagnostic_flags_a_collapsed_threshold_range(self) -> None:
+        # A 0.1%-rate task that ranks well but predicts inside a narrow band:
+        # the probability grid cannot resolve it, the log-odds grid can, and the
+        # gap is the signal that the reported number is threshold-bound.
+        generator = torch.Generator().manual_seed(0)
+        negatives = torch.randn(199_800, generator=generator)
+        positives = torch.randn(200, generator=generator) + 2.0
+        labels = torch.cat(
+            [torch.zeros(negatives.numel()), torch.ones(positives.numel())]
+        )
+        logits = -6.9 + 0.05 * torch.cat([negatives, positives])
+        self.assertLess(float(torch.sigmoid(logits).max()), 0.002)
+        exact = _binary_auc(logits, labels)
+        assert exact is not None
+        self.assertGreater(exact, 0.85)
+
+        reported = _StreamingHistogramAUC(FixedTestEvalConfig().auc_bins)
+        reported.update(logits, labels)
+        diagnostic = _StreamingHistogramAUC(4096, logit_grid=True)
+        diagnostic.update(logits, labels)
+
+        self.assertLess(reported.occupied_bins(), 10)
+        self.assertLess(reported.compute(), exact - 0.1)
+        self.assertLess(abs(diagnostic.compute() - exact), 0.005)
 
     def test_distributed_histogram_reduction_sums_counts_and_rows(self) -> None:
         accumulator = _StreamingHistogramAUC(16)
-        accumulator.update(torch.tensor([0.1, 0.9]), torch.tensor([0.0, 1.0]))
+        accumulator.update(torch.tensor([-2.0, 2.0]), torch.tensor([0.0, 1.0]))
         context = DistributedContext(
             enabled=True,
             rank=0,
@@ -240,14 +296,14 @@ class EvaluationMetricTest(unittest.TestCase):
             accumulator.add(
                 0,
                 ["a", "b"],
-                torch.tensor([0.1, 0.8]),
+                torch.tensor([-2.0, 1.5]),
                 torch.tensor([0.0, 0.0]),
                 torch.tensor([[True], [True]]),
             )
             accumulator.add(
                 0,
                 ["a", "b", "c"],
-                torch.tensor([0.9, 0.2, 0.7]),
+                torch.tensor([2.0, -1.5, 1.0]),
                 torch.tensor([1.0, 1.0, 1.0]),
                 torch.tensor([[True], [True], [True]]),
             )

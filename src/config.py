@@ -2856,7 +2856,9 @@ class FixedTestEvalConfig:
     # the exact manifest. Keep the held-out pass short so platform GPU-util
     # protect windows are not dominated by evaluation stalls.
     files_per_rank: int = 4
-    # Bounded-memory histogram resolution used by the streaming AUC metric.
+    # Number of fixed probability thresholds in the reported AUC. The estimator
+    # matches the online ranking evaluator; this grid is finer than the 3000 it
+    # uses, which only moves the result toward the exact AUC.
     auc_bins: int = 4096
 
     @classmethod
@@ -2904,8 +2906,17 @@ class CheckpointConfig:
     # Stage locally and upload on a background thread so training does not block
     # on HDFS. Synchronous writes are easier to reason about in tests.
     async_upload: bool = True
-    # Local scratch for staged files; defaults to the system temp directory.
+    # Local scratch for staged files. The system temp directory is the fallback
+    # and is often a small RAM-backed tmpfs, so production runs should name a
+    # filesystem that fits every local rank's shard.
     staging_dir: str | None = None
+    # Embedding tables are packed into staged files of at most this many bytes.
+    # Smaller values lower the host-memory and staging peak; larger values write
+    # fewer, bigger files to the run directory.
+    shard_chunk_bytes: int = 2 * 1024 * 1024 * 1024
+    # Refuse to start when the staging filesystem cannot hold the concurrent
+    # local ranks' checkpoints.
+    preflight_staging: bool = True
     # Rank 0 waits this long for every peer's files before committing a step.
     ready_timeout_sec: float = 1800.0
     # Restart the input scan where the previous run stopped instead of rereading
@@ -2948,6 +2959,12 @@ class CheckpointConfig:
             )
         if float(self.ready_timeout_sec) <= 0.0:
             raise ValueError("training.checkpoint.ready_timeout_sec must be positive")
+        if type(self.shard_chunk_bytes) is not int or self.shard_chunk_bytes <= 0:
+            raise ValueError(
+                "training.checkpoint.shard_chunk_bytes must be a positive integer"
+            )
+        if type(self.preflight_staging) is not bool:
+            raise ValueError("training.checkpoint.preflight_staging must be a boolean")
         if not isinstance(self.resume, str) or not self.resume.strip():
             raise ValueError("training.checkpoint.resume must be a non-empty string")
         if self.every_steps == 0 and self.dir and not self.save_on_exit:

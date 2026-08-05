@@ -117,7 +117,7 @@ over requests (independently for each configured task).
 Production configs can also be generated directly:
 
 ```bash
-python scripts/build_mdl_rankmixer_config.py \
+python scripts/build_production_configs.py \
   --model mdl_rankmixer \
   --sequence-encoder stca \
   --report /path/to/profile.json

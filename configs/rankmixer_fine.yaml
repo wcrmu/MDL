@@ -4424,8 +4424,16 @@ training:
     enabled: true
     every_steps: 5000
     files_per_rank: 4
+    # Online evaluator's fixed-threshold estimator, on a finer grid than its 3000.
     auc_bins: 4096
   save_checkpoint: false
   checkpoint_path: artifacts/checkpoints/rankmixer_2xh100_phase2_shared_dim
+  checkpoint:
+    dir: hdfs://temu-data-ns/apps/nothive/warehouse/searchrec/searchrec_dracarys_cvr_comm_us_8k/intern_train/aiden.fan
+    every_steps: 2000
+    keep_last: 3
+    resume: auto
+    staging_dir: /dev/shm/mdl-checkpoint-staging
+    run_name: rankmixer_fine
   embedding_collect_stats: false
   embedding_validate_indices: false

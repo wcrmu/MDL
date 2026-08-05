@@ -346,7 +346,9 @@ _CHECKPOINT_OVERRIDE_ARGS = (
     ("checkpoint_run_name", "run_name"),
     ("checkpoint_every_steps", "every_steps"),
     ("checkpoint_keep_last", "keep_last"),
-    ("resume", "resume"),
+    # Was bare ``--resume``; platforms often inject that flag for job-level
+    # restart semantics and silently overrode training.checkpoint.resume.
+    ("checkpoint_resume", "resume"),
 )
 
 
@@ -574,7 +576,7 @@ def _add_checkpoint_args(parser: argparse.ArgumentParser) -> None:
         help="override training.checkpoint.keep_last committed steps to retain",
     )
     parser.add_argument(
-        "--resume",
+        "--checkpoint-resume",
         default=None,
         help=(
             "override training.checkpoint.resume: auto (newest committed step), "
@@ -761,7 +763,11 @@ def _cmd_check_checkpoint_store(args: argparse.Namespace) -> int:
         f"latest={'none' if latest is None else latest.directory}",
         flush=True,
     )
-    resume = settings.resume if args.resume is None else args.resume
+    resume = (
+        settings.resume
+        if args.checkpoint_resume is None
+        else args.checkpoint_resume
+    )
     try:
         target = resolve_resume_checkpoint(store, resume)
     except FileNotFoundError as error:
@@ -992,6 +998,13 @@ def _cmd_train(args: argparse.Namespace) -> int:
             "train and fixed test inputs must be disjoint; overlapping partition: "
             + overlap[0]
         )
+    # Print before torchrun re-exec so the parent trainjob log always shows
+    # whether this launch armed HDFS checkpoints, even if a worker later hangs
+    # inside open_run_store.
+    if is_main_process():
+        from src.train import _checkpoint_plan_message
+
+        print(_checkpoint_plan_message(config), flush=True)
     if _effective_distributed_mode(args, config) == "ddp" and not _in_distributed_launcher():
         return _launch_ddp_command(args, config)
     try:
@@ -1281,7 +1294,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     evaluate.add_argument(
         "--group-metric-name", choices=["none", "qauc", "uauc"], default="none"
     )
-    evaluate.add_argument("--auc-bins", type=int, default=65536)
+    evaluate.add_argument("--auc-bins", type=int, default=4096)
     evaluate.add_argument("--distributed", choices=["none", "ddp"], default=None)
     evaluate.add_argument("--nproc-per-node", type=int, default=None)
     evaluate.add_argument("--master-addr", default=None)

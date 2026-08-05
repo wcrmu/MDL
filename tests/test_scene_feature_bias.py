@@ -9,7 +9,7 @@ import torch
 from src.config import ModelConfig, load_app_config
 from src.main import _apply_model_overrides, build_arg_parser
 from src.model import SceneFeatureBias, build_model
-from tests.test_build_mdl_rankmixer_config import (
+from tests.test_build_production_configs import (
     _compact_production_config,
     _synthetic_model_features,
 )

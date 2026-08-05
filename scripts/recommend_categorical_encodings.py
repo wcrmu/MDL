@@ -665,7 +665,7 @@ def scan_for_recommendations(
             "remixed_pre_hashed means SplitMix64(uint64(raw) ^ field_seed) then low bits.",
             "identity/vocab still require an upstream value-domain contract check.",
             "Use profile_prehashed_parquet.py when you only need bucket-size estimates "
-            "compatible with build_mdl_rankmixer_config.py.",
+            "compatible with build_production_configs.py.",
         ],
     }
 

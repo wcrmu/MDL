@@ -33,7 +33,9 @@ training:
 | `save_on_exit` | `true` | Save once more when the loop ends normally, if that step was not just saved. |
 | `resume` | `auto` | `auto` / `latest` take the newest committed step, `none` starts fresh, or name one step (`38000` or `step-000038000`). |
 | `async_upload` | `true` | Stage locally, then upload on a background thread so the step loop is not blocked on HDFS. |
-| `staging_dir` | system temp | Local scratch for staged files. |
+| `staging_dir` | system temp | Local scratch for staged files. Production configs set this explicitly; see [Staging space](#staging-space). |
+| `shard_chunk_bytes` | `2GiB` | Tables are packed into staged files of at most this size. Smaller lowers the host-memory and staging peak. |
+| `preflight_staging` | `true` | Refuse to start when staging cannot hold the local ranks' checkpoints. |
 | `ready_timeout_sec` | `1800` | How long rank 0 waits for every peer's files before giving up on the commit. |
 | `data_resume` | `true` | Skip input files the previous run already consumed. Needs `reader.shard_unit: file` or `row_group`. |
 | `data_resume_rewind` | `1` | Extra work items to re-read on top of the measured in-flight window. |
@@ -90,6 +92,60 @@ python -m src.main check-checkpoint-store \
   --checkpoint-dir hdfs://temu-data-ns/apps/…/aiden.fan --probe-mib 256
 ```
 
+## Staging space
+
+A remote run directory cannot be written by `torch.save`, so every rank first
+writes its files locally and then uploads them. That local scratch is the part
+that is easy to get wrong: at `world_size: 4` one rank's embedding shard for the
+production configs is roughly **30GiB** (BF16 weights plus a Row-Wise Adagrad
+accumulator per row), and all four ranks on a node stage into the same
+filesystem.
+
+Two properties of the trainjob image make the default unusable:
+
+- `/tmp` is a **tmpfs fixed at 48GiB**. It does not grow with the memory the
+  launch requests, so no amount of extra memory makes it fit.
+- `tempfile.gettempdir()` follows `TMPDIR`, and host-prepare repoints `TMPDIR`
+  at `/dev/shm` when its shared-memory IPC starts. Whether staging landed on
+  `/tmp` or in RAM therefore depended on initialization order.
+
+So production configs name the directory explicitly:
+
+```yaml
+training:
+  checkpoint:
+    staging_dir: /dev/shm/mdl-checkpoint-staging
+```
+
+`/dev/shm` is sized by the launch request rather than fixed, which is why it is
+the choice here; it is still RAM, so it counts against the job's memory.
+
+Three things keep the footprint down and make a shortfall legible:
+
+1. **Chunked writes.** Tables are packed into files of at most
+   `shard_chunk_bytes`, and each group's CPU copy is dropped once written, so
+   neither host memory nor staging ever holds a whole shard. A table larger than
+   the budget still gets its own file.
+2. **Publish while staging.** Each file is handed to the uploader as it lands
+   and deleted once it reaches the run directory, so staging holds a chunk or two
+   instead of the whole step. If the run directory stops draining, the sink
+   declines and files simply wait, which degrades to the old behaviour instead of
+   blocking the step loop.
+3. **A preflight and a named error.** Startup compares free space against the
+   estimated need times the local rank count and refuses to run when it does not
+   fit. A write that still fails raises `CheckpointStagingSpaceError`, which
+   names the directory and the shortfall, rather than
+   `PytorchStreamWriter failed writing file data/303`.
+
+Staging failures abort the job on purpose. `save_model_checkpoint` synchronizes
+ranks with a barrier, so a rank that logged the error and carried on would leave
+its peers waiting there forever; a clear crash is better than a hang.
+
+```text
+Checkpointing | ready run_dir=hdfs://…/mdl_rankmixer staging_dir=/dev/shm/mdl-checkpoint-staging staging_default=False …
+Checkpointing | staging staging_dir=/dev/shm/mdl-checkpoint-staging free=598.4GiB needed=27.1GiB (local_ranks=4 total=30.2GiB peak=6.2GiB chunks=16)
+```
+
 ## Layout on disk
 
 ```text
@@ -100,9 +156,10 @@ hdfs://…/aiden.fan/mdl_rankmixer/
     _COMMIT                         written last; only committed steps are resumable
     train_state.pt                  dense + replicated-sparse optimizer state (rank 0)
     model/
-      manifest.json                 embedding shard plan
+      manifest.json                 embedding shard plan and chunk-to-table map
       dense.pt                      all non-sharded weights (rank 0)
-      rank-00000-of-00008.pt        this rank's embedding rows and sparse optimizer accumulator
+      shard-0000-rank-00000-of-00008.pt   some of this rank's tables, with their accumulators
+      shard-0001-rank-00000-of-00008.pt
       …
     progress-rank-00000.json        step, rows, and the input scan cursor for that rank
     …
@@ -137,8 +194,10 @@ a commit marker, so a stale or missing pointer cannot mislead a restart.
 ## What a resume restores
 
 - **Weights.** Replicated modules come from `model/dense.pt`; each rank reads
-  its own embedding rows from `model/rank-<r>-of-<w>.pt`, so an eight-rank
-  restart never materializes the full table on one host.
+  its own embedding rows from its `model/shard-<n>-rank-<r>-of-<w>.pt` files, so
+  an eight-rank restart never materializes the full table on one host. The older
+  one-file-per-rank layout (`rank-<r>-of-<w>.pt`) still loads, so a resume can
+  cross the deploy that introduced chunking.
 - **Optimizer state.** The dense and replicated-sparse `state_dict`s come from
   `train_state.pt`. Sharded embedding optimizers (`ShardedAdagrad`,
   `ShardedRowWiseAdagrad`) keep their accumulator next to the rows it belongs
@@ -229,7 +288,7 @@ there; only the input scan restarts from the beginning of the shard.
   2000 steps the recomputation exposure is bounded by 2000 steps of work,
   while the amortized upload cost stays under a percent of step time for the
   reference 8k-token configs.
-- **Rolling back.** `--resume 36000` re-enters at an older committed step; the
+- **Rolling back.** `--checkpoint-resume 36000` re-enters at an older committed step; the
   newer directories are left alone until retention removes them.
 
 ## Tests

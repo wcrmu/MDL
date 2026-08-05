@@ -85,7 +85,7 @@ class SyntheticAggParquetTest(unittest.TestCase):
         # Independent scenario/task priors have their own encoders and
         # activations, so the sum-based memory bucket must count them rather
         # than only the nine backbone histories.
-        self.assertEqual(bucket["workload_length"], 11476)
+        self.assertEqual(bucket["workload_length"], 11676)
         self.assertIsNone(bucket["max_length"])
         rendered = override["data"]["train"]["reader"]["length_buckets"]
         self.assertEqual(rendered[bucket["bucket_index"]]["batch_size"], 40)

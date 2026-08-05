@@ -292,7 +292,7 @@ key/value = clk_long events
 | 主题 | 位置 |
 |---|---|
 | 配置 | `configs/mdl_rankmixer.yaml`、`configs/mdl_onetrans.yaml`（及 `_fine`） |
-| 配置生成 | `scripts/build_mdl_rankmixer_config.py` |
+| 配置生成 | `scripts/build_production_configs.py` |
 | Adapter / 数据 | `src/dataloader.py` |
 | 训练与 fixed-test | `src/train.py` |
 | 模型 | `src/model.py`、`src/modules/` |

@@ -3025,7 +3025,7 @@ features:
     padding_id: 0
     share_embedding: true
     share_with: scene_id_hn
-- name: task_important_cat1_id_hn
+- name: task_fst_cart_important_cat1_id_hn
   kind: categorical
   source: cat1_id_hn
   embedding_scope: task
@@ -3034,7 +3034,7 @@ features:
     type: pre_hashed
     num_buckets: 256
     padding_id: 0
-- name: task_important_cat2_id_hn
+- name: task_fst_cart_important_cat2_id_hn
   kind: categorical
   source: cat2_id_hn
   embedding_scope: task
@@ -3043,7 +3043,7 @@ features:
     type: pre_hashed
     num_buckets: 1024
     padding_id: 0
-- name: task_important_price_hn
+- name: task_fst_cart_important_price_hn
   kind: categorical
   source: price_hn
   embedding_scope: task
@@ -3052,7 +3052,7 @@ features:
     type: pre_hashed
     num_buckets: 256
     padding_id: 0
-- name: task_important_adj_cartcvr_hn
+- name: task_fst_cart_important_adj_cartcvr_hn
   kind: categorical
   source: adj_cartcvr_hn
   embedding_scope: task
@@ -3061,7 +3061,7 @@ features:
     type: pre_hashed
     num_buckets: 256
     padding_id: 0
-- name: task_important_cart_cnt_3d_hn
+- name: task_fst_cart_important_cart_cnt_3d_hn
   kind: categorical
   source: cart_cnt_3d_hn
   embedding_scope: task
@@ -3074,7 +3074,7 @@ features:
   pooling_null_policy: exclude
   max_length: 1
   truncation: head
-- name: task_important_cat_id_hn
+- name: task_fst_cart_important_cat_id_hn
   kind: categorical
   source: cat_id_hn
   embedding_scope: task
@@ -3083,7 +3083,7 @@ features:
     type: pre_hashed
     num_buckets: 131072
     padding_id: 0
-- name: task_important_goods_cluster_id_1w_hn
+- name: task_fst_cart_important_goods_cluster_id_1w_hn
   kind: categorical
   source: goods_cluster_id_1w_hn
   embedding_scope: task
@@ -3092,7 +3092,7 @@ features:
     type: pre_hashed
     num_buckets: 131072
     padding_id: 0
-- name: task_important_mall_id_hn
+- name: task_fst_cart_important_mall_id_hn
   kind: categorical
   source: mall_id_hn
   embedding_scope: task
@@ -3101,7 +3101,7 @@ features:
     type: pre_hashed
     num_buckets: 4194304
     padding_id: 0
-- name: task_important_goods_id_hn
+- name: task_fst_cart_important_goods_id_hn
   kind: categorical
   source: goods_id_hn
   embedding_scope: task
@@ -3110,16 +3110,34 @@ features:
     type: pre_hashed
     num_buckets: 33554432
     padding_id: 0
-- name: task_important_sales_hn
+- name: task_upid_pay_important_cat1_id_hn
   kind: categorical
-  source: sales_hn
+  source: cat1_id_hn
   embedding_scope: task
   embedding_dim: 16
   encoding:
     type: pre_hashed
     num_buckets: 256
     padding_id: 0
-- name: task_important_adj_cvr_hn
+- name: task_upid_pay_important_cat2_id_hn
+  kind: categorical
+  source: cat2_id_hn
+  embedding_scope: task
+  embedding_dim: 24
+  encoding:
+    type: pre_hashed
+    num_buckets: 1024
+    padding_id: 0
+- name: task_upid_pay_important_price_hn
+  kind: categorical
+  source: price_hn
+  embedding_scope: task
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+- name: task_upid_pay_important_adj_cvr_hn
   kind: categorical
   source: adj_cvr_hn
   embedding_scope: task
@@ -3128,7 +3146,83 @@ features:
     type: pre_hashed
     num_buckets: 256
     padding_id: 0
-- name: task_important_rel_level_hn
+- name: task_upid_pay_important_idx_c_ordr_cnt_15d_hn
+  kind: categorical
+  source: idx_c_ordr_cnt_15d_hn
+  embedding_scope: task
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+- name: task_upid_pay_important_nfk_gmv_14d_hn
+  kind: categorical
+  source: nfk_gmv_14d_hn
+  embedding_scope: task
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+- name: task_upid_pay_important_u_fst_ordr_cnt_mix_d_hn
+  kind: categorical
+  source: u_fst_ordr_cnt_mix_d_hn
+  embedding_scope: task
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 512
+    padding_id: 0
+  pooling: mean
+  pooling_null_policy: exclude
+  max_length: 3
+  truncation: head
+- name: task_upid_pay_important_cat_id_hn
+  kind: categorical
+  source: cat_id_hn
+  embedding_scope: task
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 131072
+    padding_id: 0
+- name: task_upid_pay_important_goods_cluster_id_1w_hn
+  kind: categorical
+  source: goods_cluster_id_1w_hn
+  embedding_scope: task
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 131072
+    padding_id: 0
+- name: task_cateid_filter_important_cat1_id_hn
+  kind: categorical
+  source: cat1_id_hn
+  embedding_scope: task
+  embedding_dim: 16
+  encoding:
+    type: pre_hashed
+    num_buckets: 256
+    padding_id: 0
+- name: task_cateid_filter_important_cat2_id_hn
+  kind: categorical
+  source: cat2_id_hn
+  embedding_scope: task
+  embedding_dim: 24
+  encoding:
+    type: pre_hashed
+    num_buckets: 1024
+    padding_id: 0
+- name: task_cateid_filter_important_cat_id_hn
+  kind: categorical
+  source: cat_id_hn
+  embedding_scope: task
+  embedding_dim: 32
+  encoding:
+    type: pre_hashed
+    num_buckets: 131072
+    padding_id: 0
+- name: task_cateid_filter_important_rel_level_hn
   kind: categorical
   source: rel_level_hn
   embedding_scope: task
@@ -3137,7 +3231,7 @@ features:
     type: pre_hashed
     num_buckets: 256
     padding_id: 0
-- name: task_important_rel_score_hn
+- name: task_cateid_filter_important_rel_score_hn
   kind: categorical
   source: rel_score_hn
   embedding_scope: task
@@ -3146,7 +3240,7 @@ features:
     type: pre_hashed
     num_buckets: 256
     padding_id: 0
-- name: task_important_origin_query_hash_hn
+- name: task_cateid_filter_important_origin_query_hash_hn
   kind: categorical
   source: origin_query_hash_hn
   embedding_scope: task
@@ -4941,15 +5035,15 @@ sequences:
   encoder: attention_pool
   pool_dim: 32
   target_inputs:
-  - task_important_cat1_id_hn
-  - task_important_cat2_id_hn
-  - task_important_price_hn
-  - task_important_adj_cartcvr_hn
-  - task_important_cart_cnt_3d_hn
-  - task_important_cat_id_hn
-  - task_important_goods_cluster_id_1w_hn
-  - task_important_mall_id_hn
-  - task_important_goods_id_hn
+  - task_fst_cart_important_cat1_id_hn
+  - task_fst_cart_important_cat2_id_hn
+  - task_fst_cart_important_price_hn
+  - task_fst_cart_important_adj_cartcvr_hn
+  - task_fst_cart_important_cart_cnt_3d_hn
+  - task_fst_cart_important_cat_id_hn
+  - task_fst_cart_important_goods_cluster_id_1w_hn
+  - task_fst_cart_important_mall_id_hn
+  - task_fst_cart_important_goods_id_hn
   time_delta_field: time_delta_log1p_seconds
   null_anchor_field: goods_id_hn
   fields:
@@ -5053,15 +5147,15 @@ sequences:
   encoder: attention_pool
   pool_dim: 32
   target_inputs:
-  - task_important_cat1_id_hn
-  - task_important_cat2_id_hn
-  - task_important_price_hn
-  - task_important_sales_hn
-  - task_important_adj_cvr_hn
-  - task_important_cat_id_hn
-  - task_important_goods_cluster_id_1w_hn
-  - task_important_mall_id_hn
-  - task_important_goods_id_hn
+  - task_upid_pay_important_cat1_id_hn
+  - task_upid_pay_important_cat2_id_hn
+  - task_upid_pay_important_price_hn
+  - task_upid_pay_important_adj_cvr_hn
+  - task_upid_pay_important_idx_c_ordr_cnt_15d_hn
+  - task_upid_pay_important_nfk_gmv_14d_hn
+  - task_upid_pay_important_u_fst_ordr_cnt_mix_d_hn
+  - task_upid_pay_important_cat_id_hn
+  - task_upid_pay_important_goods_cluster_id_1w_hn
   time_delta_field: time_delta_log1p_seconds
   null_anchor_field: goods_id_hn
   fields:
@@ -5173,12 +5267,12 @@ sequences:
   encoder: attention_pool
   pool_dim: 32
   target_inputs:
-  - task_important_cat1_id_hn
-  - task_important_cat2_id_hn
-  - task_important_cat_id_hn
-  - task_important_rel_level_hn
-  - task_important_rel_score_hn
-  - task_important_origin_query_hash_hn
+  - task_cateid_filter_important_cat1_id_hn
+  - task_cateid_filter_important_cat2_id_hn
+  - task_cateid_filter_important_cat_id_hn
+  - task_cateid_filter_important_rel_level_hn
+  - task_cateid_filter_important_rel_score_hn
+  - task_cateid_filter_important_origin_query_hash_hn
   time_delta_field: time_delta_log1p_seconds
   null_anchor_field: goods_id_hn
   fields:
@@ -5245,6 +5339,78 @@ sequences:
   - name: timegap_hn
     kind: categorical
     source: srch_q2i_x_timegap_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 256
+      padding_id: 0
+- name: task_upid_pay_ups_clk_sku_prior
+  embedding_scope: task
+  max_length: 200
+  truncation: head
+  sequence_order: newest_to_oldest
+  encoder: attention_pool
+  pool_dim: 32
+  target_inputs:
+  - task_upid_pay_important_cat1_id_hn
+  - task_upid_pay_important_cat2_id_hn
+  - task_upid_pay_important_price_hn
+  - task_upid_pay_important_adj_cvr_hn
+  - task_upid_pay_important_idx_c_ordr_cnt_15d_hn
+  - task_upid_pay_important_nfk_gmv_14d_hn
+  - task_upid_pay_important_u_fst_ordr_cnt_mix_d_hn
+  - task_upid_pay_important_cat_id_hn
+  - task_upid_pay_important_goods_cluster_id_1w_hn
+  time_delta_field: time_delta_log1p_seconds
+  null_anchor_field: cat_id_hn
+  fields:
+  - name: time_delta_log1p_seconds
+    kind: dense
+    source: ups_clk_sku_x_time_delta_log1p_seconds
+    dimension: 1
+  - name: cat1_id_hn
+    kind: categorical
+    source: ups_clk_sku_x_cat1_id_hn
+    embedding_dim: 16
+    encoding:
+      type: pre_hashed
+      num_buckets: 256
+      padding_id: 0
+  - name: cat2_id_hn
+    kind: categorical
+    source: ups_clk_sku_x_cat2_id_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 1024
+      padding_id: 0
+  - name: cat3_id_hn
+    kind: categorical
+    source: ups_clk_sku_x_cat3_id_hn
+    embedding_dim: 24
+    encoding:
+      type: pre_hashed
+      num_buckets: 8192
+      padding_id: 0
+  - name: cat4_id_hn
+    kind: categorical
+    source: ups_clk_sku_x_cat4_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 32768
+      padding_id: 0
+  - name: cat_id_hn
+    kind: categorical
+    source: ups_clk_sku_x_cat_id_hn
+    embedding_dim: 32
+    encoding:
+      type: pre_hashed
+      num_buckets: 65536
+      padding_id: 0
+  - name: timegap_hn
+    kind: categorical
+    source: ups_clk_sku_x_timegap_hn
     embedding_dim: 16
     encoding:
       type: pre_hashed
@@ -5484,38 +5650,39 @@ tokenization:
   task_tokens:
   - name: fst_cart
     important_inputs:
-    - task_important_cat1_id_hn
-    - task_important_cat2_id_hn
-    - task_important_price_hn
-    - task_important_adj_cartcvr_hn
-    - task_important_cart_cnt_3d_hn
-    - task_important_cat_id_hn
-    - task_important_goods_cluster_id_1w_hn
-    - task_important_mall_id_hn
-    - task_important_goods_id_hn
+    - task_fst_cart_important_cat1_id_hn
+    - task_fst_cart_important_cat2_id_hn
+    - task_fst_cart_important_price_hn
+    - task_fst_cart_important_adj_cartcvr_hn
+    - task_fst_cart_important_cart_cnt_3d_hn
+    - task_fst_cart_important_cat_id_hn
+    - task_fst_cart_important_goods_cluster_id_1w_hn
+    - task_fst_cart_important_mall_id_hn
+    - task_fst_cart_important_goods_id_hn
     prior_inputs:
     - task_fst_cart_prior
   - name: upid_pay
     important_inputs:
-    - task_important_cat1_id_hn
-    - task_important_cat2_id_hn
-    - task_important_price_hn
-    - task_important_sales_hn
-    - task_important_adj_cvr_hn
-    - task_important_cat_id_hn
-    - task_important_goods_cluster_id_1w_hn
-    - task_important_mall_id_hn
-    - task_important_goods_id_hn
+    - task_upid_pay_important_cat1_id_hn
+    - task_upid_pay_important_cat2_id_hn
+    - task_upid_pay_important_price_hn
+    - task_upid_pay_important_adj_cvr_hn
+    - task_upid_pay_important_idx_c_ordr_cnt_15d_hn
+    - task_upid_pay_important_nfk_gmv_14d_hn
+    - task_upid_pay_important_u_fst_ordr_cnt_mix_d_hn
+    - task_upid_pay_important_cat_id_hn
+    - task_upid_pay_important_goods_cluster_id_1w_hn
     prior_inputs:
     - task_upid_pay_prior
+    - task_upid_pay_ups_clk_sku_prior
   - name: cateid_filter
     important_inputs:
-    - task_important_cat1_id_hn
-    - task_important_cat2_id_hn
-    - task_important_cat_id_hn
-    - task_important_rel_level_hn
-    - task_important_rel_score_hn
-    - task_important_origin_query_hash_hn
+    - task_cateid_filter_important_cat1_id_hn
+    - task_cateid_filter_important_cat2_id_hn
+    - task_cateid_filter_important_cat_id_hn
+    - task_cateid_filter_important_rel_level_hn
+    - task_cateid_filter_important_rel_score_hn
+    - task_cateid_filter_important_origin_query_hash_hn
     prior_inputs:
     - task_cateid_filter_prior
   scenario_tokens:
@@ -5627,6 +5794,7 @@ training:
     enabled: true
     every_steps: 5000
     files_per_rank: 4
+    # Online evaluator's fixed-threshold estimator, on a finer grid than its 3000.
     auc_bins: 4096
   save_checkpoint: false
   checkpoint_path: artifacts/checkpoints/mdl_rankmixer_2xh100_phase2_shared_dim
@@ -5635,6 +5803,7 @@ training:
     every_steps: 2000
     keep_last: 3
     resume: auto
+    staging_dir: /dev/shm/mdl-checkpoint-staging
     run_name: mdl_rankmixer_fine
   embedding_collect_stats: true
   embedding_validate_indices: false

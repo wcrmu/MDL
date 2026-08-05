@@ -44,8 +44,11 @@ from .config import (
     ReaderConfig,
 )
 from .checkpoint import (
+    check_staging_space,
     CheckpointUploader,
     DataCursor,
+    DEFAULT_SHARD_CHUNK_BYTES,
+    estimate_staging_space,
     fetch_checkpoint_for_rank,
     load_model_checkpoint,
     load_training_checkpoint,
@@ -53,6 +56,7 @@ from .checkpoint import (
     resolve_resume_checkpoint,
     save_model_checkpoint,
     stage_training_checkpoint,
+    StagingSpaceEstimate,
     step_directory_name,
 )
 from .dataloader import (
@@ -6019,6 +6023,26 @@ def _aggregate_train_result(
     )
 
 
+def _checkpoint_plan_message(config: AppConfig) -> str:
+    """One-line summary of whether periodic HDFS checkpoints will run."""
+
+    settings = getattr(config.training, "checkpoint", None)
+    if settings is None or not settings.enabled:
+        return (
+            "Checkpointing | disabled "
+            "(training.checkpoint.dir is unset; periodic HDFS saves and "
+            "resume are off)"
+        )
+    run_name = settings.run_name or config.model.name
+    return (
+        "Checkpointing | enabled "
+        f"dir={settings.dir} run_name={run_name} "
+        f"every_steps={settings.every_steps} keep_last={settings.keep_last} "
+        f"save_on_exit={settings.save_on_exit} resume={settings.resume} "
+        f"async_upload={settings.async_upload} data_resume={settings.data_resume}"
+    )
+
+
 class _CheckpointCoordinator:
     """Periodic resumable checkpoints for one rank of a training run.
 
@@ -6047,6 +6071,10 @@ class _CheckpointCoordinator:
         self._staging_root = staging_root
         self._run_name = run_name
         self._log = log_steps and context.rank == 0
+        self._chunk_bytes = int(
+            getattr(settings, "shard_chunk_bytes", DEFAULT_SHARD_CHUNK_BYTES)
+        )
+        self._estimate: StagingSpaceEstimate | None = None
         self.scan_cursor = scan_cursor
         self.scan_resume_plan: ScanResumePlan | None = None
         self._last_saved_step = -1
@@ -6063,10 +6091,28 @@ class _CheckpointCoordinator:
         log_steps: bool,
     ) -> "_CheckpointCoordinator | None":
         settings = getattr(config.training, "checkpoint", None)
+        # Rank-0 always announces the plan *before* touching HDFS. A missing
+        # banner used to mean either "dir unset" (silent return) or "open_run_store
+        # hung/threw before the success print" — both looked like "checkpoint
+        # code never ran" in trainjob logs that only keep the training tail.
+        if context.rank == 0:
+            print(_checkpoint_plan_message(config), flush=True)
         if settings is None or not settings.enabled:
             return None
         run_name = settings.run_name or config.model.name
-        store = open_run_store(str(settings.dir), run_name)
+        try:
+            store = open_run_store(str(settings.dir), run_name)
+        except Exception as error:
+            if context.rank == 0:
+                print(
+                    "Checkpointing | FAILED to open run directory "
+                    f"dir={settings.dir!r} run_name={run_name!r}: {error}",
+                    flush=True,
+                )
+            raise
+        # An explicit staging_dir also pins the path: ``gettempdir()`` follows
+        # TMPDIR, which host-prepare repoints at /dev/shm once its shared-memory
+        # IPC comes up.
         staging_root = Path(
             settings.staging_dir or tempfile.gettempdir()
         ) / "mdl-checkpoint-staging"
@@ -6078,10 +6124,12 @@ class _CheckpointCoordinator:
             ready_timeout_sec=settings.ready_timeout_sec,
             asynchronous=settings.async_upload,
         )
-        if log_steps and context.rank == 0:
+        if context.rank == 0:
             print(
-                "Checkpointing | "
+                "Checkpointing | ready "
                 f"run_dir={store.root_uri} "
+                f"staging_dir={staging_root} "
+                f"staging_default={settings.staging_dir is None} "
                 f"every_steps={settings.every_steps} "
                 f"keep_last={settings.keep_last} "
                 f"async_upload={settings.async_upload} "
@@ -6236,6 +6284,44 @@ class _CheckpointCoordinator:
         self._staging_root.mkdir(parents=True, exist_ok=True)
         return self._staging_root
 
+    def preflight(
+        self,
+        model: nn.Module,
+        context: DistributedContext,
+        *,
+        dense_optimizer: torch.optim.Optimizer | None = None,
+        replicated_sparse_optimizer: torch.optim.Optimizer | None = None,
+        sharded_optimizer: ShardedAdagrad | ShardedRowWiseAdagrad | None = None,
+    ) -> None:
+        """Fail at startup when staging cannot hold this node's checkpoints.
+
+        Without this the first ``every_steps`` save is where a too-small staging
+        filesystem shows up, thousands of steps into a run, as a zip writer error
+        that names neither the directory nor the space it wanted.
+        """
+
+        if not self._store.is_remote:
+            return
+        estimate = estimate_staging_space(
+            model,
+            rank=context.rank,
+            world_size=context.world_size,
+            dense_optimizer=dense_optimizer,
+            replicated_sparse_optimizer=replicated_sparse_optimizer,
+            sharded_optimizer=sharded_optimizer,
+            chunk_bytes=self._chunk_bytes,
+            upload_window=self._uploader.stream_window,
+        )
+        self._estimate = estimate
+        summary = check_staging_space(
+            self._staging_root_ready(),
+            estimate,
+            local_ranks=_local_world_size(),
+            enforce=bool(getattr(self._settings, "preflight_staging", True)),
+        )
+        if self._log:
+            print(f"Checkpointing | staging {summary}", flush=True)
+
     def _data_cursor(
         self,
         config: AppConfig,
@@ -6302,7 +6388,25 @@ class _CheckpointCoordinator:
             # turns the "upload" into marker writes instead of a second copy.
             staging_dir = Path(self._store.uri(directory))
             cleanup_staging = False
+        if cleanup_staging and self._estimate is not None:
+            # Cheap statvfs each time: staging is shared with everything else on
+            # the node, so passing the startup check does not keep it roomy.
+            check_staging_space(
+                self._staging_root,
+                self._estimate,
+                local_ranks=_local_world_size(),
+                enforce=bool(getattr(self._settings, "preflight_staging", True)),
+            )
         cursor = self._data_cursor(config, context, rows)
+
+        def _beat() -> None:
+            _step_watchdog_beat(
+                watchdog,
+                "checkpoint_stage_upload_wait",
+                detail=f"steps={step}",
+                device=context.device,
+            )
+
         staged = stage_training_checkpoint(
             config,
             model,
@@ -6318,6 +6422,15 @@ class _CheckpointCoordinator:
             elapsed_seconds=elapsed_seconds,
             run_name=self._run_name,
             cleanup_staging=cleanup_staging,
+            chunk_bytes=self._chunk_bytes,
+            # Hand each file over as it lands so staging holds a chunk or two
+            # rather than every rank's whole shard.
+            publish=self._uploader.stream_publisher(
+                staging_dir,
+                step,
+                enabled=cleanup_staging,
+                heartbeat=_beat,
+            ),
         )
         self._last_saved_step = step
         self._uploader.submit(staged)
@@ -6495,6 +6608,14 @@ def train_mdl(
             for optimizer in optimizers
         ]
         checkpointing = _CheckpointCoordinator.create(config, context, log_steps)
+        if checkpointing is not None:
+            checkpointing.preflight(
+                base_model,
+                context,
+                dense_optimizer=dense_optimizer,
+                replicated_sparse_optimizer=embedding_optimizer,
+                sharded_optimizer=sharded_embedding_optimizer,
+            )
         resumed = (
             None
             if checkpointing is None
@@ -7096,6 +7217,14 @@ def train_mdl(
                     # Otherwise a reader degrading into repeated zero-loss
                     # replays is invisible until it trips the idle ceiling.
                     + (f" starved_steps={starved_steps}" if starved_steps else "")
+                    # Keep checkpoint arming visible on the same cadence as
+                    # Train step: early banners are easy to miss in truncated
+                    # trainjob tails, and a silent disable looks like a code bug.
+                    + (
+                        f" checkpoint=on(every={config.training.checkpoint.every_steps})"
+                        if checkpointing is not None
+                        else " checkpoint=off"
+                    )
                 )
                 memory_report = _host_memory_report(host_batch_iterator)
                 if memory_report:
@@ -7236,6 +7365,87 @@ def train_mdl(
             _cleanup_distributed(context)
 
 
+# Reported AUC uses the online ranking evaluator's estimator: a fixed grid of
+# `[-eps, 1/(N-1), ..., 1, 1+eps]` probability thresholds, per-threshold
+# TP/FP/TN/FN, and trapezoidal integration of the resulting ROC points. N comes
+# from config and is 4096 rather than the 3000 used online; the estimator is
+# monotone in resolution, so a finer grid only moves the result toward exact.
+_AUC_THRESHOLD_EPSILON = 1e-7
+
+# Secondary diagnostic grid, uniform in log-odds instead of in probability. A
+# fixed probability grid resolves a task only as finely as the span its scores
+# occupy, not as finely as its base rate: predictions inside one threshold step
+# read as tied pairs, each counted half, pulling the value toward 0.5 even when
+# the ranking is perfect. A 0.3%-rate task with a normal logit spread loses
+# ~2e-4 at N=4096, but ~0.04 once its predictions compress into a narrow band.
+# The gap between the two numbers separates "ranks worse" from "predicts flat".
+_AUC_LOGIT_LIMIT = 20.0
+_AUC_DIAGNOSTIC_BINS = 4096
+
+
+def _production_auc_thresholds(num_thresholds: int) -> Tensor:
+    """The online evaluator's threshold grid; kept for reference and tests."""
+
+    interior = torch.arange(1, num_thresholds, dtype=torch.float64) / (
+        num_thresholds - 1
+    )
+    return torch.cat(
+        [
+            torch.tensor([-_AUC_THRESHOLD_EPSILON], dtype=torch.float64),
+            interior,
+            torch.tensor([1.0 + _AUC_THRESHOLD_EPSILON], dtype=torch.float64),
+        ]
+    )
+
+
+def _auc_logit_bins(logits: Tensor, bins: int) -> Tensor:
+    """Map logits onto ``bins`` uniform log-odds buckets over the clamp range."""
+
+    normalized = (
+        logits.clamp(-_AUC_LOGIT_LIMIT, _AUC_LOGIT_LIMIT) + _AUC_LOGIT_LIMIT
+    ) / (2.0 * _AUC_LOGIT_LIMIT)
+    return torch.clamp(torch.floor(normalized * bins).long(), min=0, max=bins - 1)
+
+
+def _auc_probability_bins(logits: Tensor, num_thresholds: int) -> Tensor:
+    """Bucket by the highest online threshold each prediction exceeds.
+
+    The evaluator this mirrors compares every prediction against all `N + 1`
+    thresholds to build one confusion matrix per threshold. Bucketing by
+    `ceil(p * (N - 1)) - 1` reproduces those counts exactly under the same
+    `pred > threshold` rule while staying O(batch) instead of O(batch * N).
+    """
+
+    probabilities = torch.sigmoid(logits.double())
+    buckets = torch.ceil(probabilities * (num_thresholds - 1)).long() - 1
+    return torch.clamp(buckets, min=0, max=num_thresholds - 1)
+
+
+def _trapezoidal_roc_auc(positives: Tensor, negatives: Tensor) -> float:
+    """Integrate the ROC points implied by per-threshold confusion counts."""
+
+    positive_total = float(positives.sum().item())
+    negative_total = float(negatives.sum().item())
+    # tp/fp at threshold j count everything in bucket j and above, so the
+    # per-threshold confusion matrix is a reversed cumulative sum. Both series
+    # start at (1, 1) for the -eps threshold and end at (0, 0) for 1 + eps.
+    true_positive_rate = torch.cat(
+        [
+            torch.flip(torch.cumsum(torch.flip(positives, (0,)), 0), (0,)),
+            torch.zeros(1, dtype=positives.dtype),
+        ]
+    ) / positive_total
+    false_positive_rate = torch.cat(
+        [
+            torch.flip(torch.cumsum(torch.flip(negatives, (0,)), 0), (0,)),
+            torch.zeros(1, dtype=negatives.dtype),
+        ]
+    ) / negative_total
+    widths = false_positive_rate[:-1] - false_positive_rate[1:]
+    heights = (true_positive_rate[:-1] + true_positive_rate[1:]) * 0.5
+    return float((widths * heights).sum().item())
+
+
 def _binary_auc(scores: Tensor, labels: Tensor) -> float | None:
     """Exact rank-based binary AUC with average ranks for tied scores."""
 
@@ -7292,30 +7502,39 @@ def _group_auc(scores: Tensor, labels: Tensor, group_ids: list[str]) -> float | 
 
 
 class _StreamingHistogramAUC:
-    """Bounded-memory AUC using deterministic score bins."""
+    """Online-evaluator AUC: fixed probability thresholds plus trapezoid.
 
-    def __init__(self, bins: int) -> None:
+    Holds per-bucket positive/negative counts rather than the evaluator's
+    ``(4, num_thresholds)`` confusion matrix; the two carry the same
+    information, since TP/FP at a threshold are reversed cumulative sums of
+    these counts and TN/FN are their complements. Reducing counts across ranks
+    is a plain sum either way.
+    """
+
+    def __init__(self, bins: int, *, logit_grid: bool = False) -> None:
         if bins < 2:
             raise ValueError("AUC histogram requires at least two bins")
         self.bins = bins
+        self.logit_grid = logit_grid
         self.histogram = torch.zeros(2, bins, dtype=torch.float64)
         self.positives = self.histogram[0]
         self.negatives = self.histogram[1]
 
-    def update(self, scores: Tensor, labels: Tensor) -> None:
-        scores = scores.detach().float().flatten().cpu()
+    def update(self, logits: Tensor, labels: Tensor) -> None:
+        logits = logits.detach().float().flatten().cpu()
         labels = labels.detach().float().flatten().cpu()
-        if scores.numel() != labels.numel():
-            raise ValueError("AUC scores and labels must have the same length")
-        if not scores.numel():
+        if logits.numel() != labels.numel():
+            raise ValueError("AUC logits and labels must have the same length")
+        if not logits.numel():
             return
-        if not bool(torch.isfinite(scores).all()):
-            raise ValueError("AUC scores must be finite")
+        if not bool(torch.isfinite(logits).all()):
+            raise ValueError("AUC logits must be finite")
         if not bool(((labels == 0.0) | (labels == 1.0)).all()):
             raise ValueError("AUC labels must be binary")
-        indices = torch.clamp(
-            torch.floor(scores.clamp(0.0, 1.0) * self.bins).long(),
-            max=self.bins - 1,
+        indices = (
+            _auc_logit_bins(logits, self.bins)
+            if self.logit_grid
+            else _auc_probability_bins(logits, self.bins)
         )
         self.positives += torch.bincount(
             indices[labels == 1.0], minlength=self.bins
@@ -7325,21 +7544,26 @@ class _StreamingHistogramAUC:
         ).to(torch.float64)
 
     def compute(self) -> float | None:
-        positive_count = float(self.positives.sum().item())
-        negative_count = float(self.negatives.sum().item())
-        if positive_count == 0.0 or negative_count == 0.0:
+        if not float(self.positives.sum().item()) or not float(
+            self.negatives.sum().item()
+        ):
             return None
-        negatives_below = torch.cumsum(self.negatives, dim=0) - self.negatives
-        concordant = (
-            self.positives * (negatives_below + 0.5 * self.negatives)
-        ).sum()
-        return float((concordant / (positive_count * negative_count)).item())
+        return _trapezoidal_roc_auc(self.positives, self.negatives)
+
+    def occupied_bins(self) -> int:
+        """Buckets holding at least one sample; low values mean a coarse grid."""
+
+        return int(((self.positives + self.negatives) > 0).sum().item())
 
     def counts(self) -> tuple[int, int, int]:
         positives = int(self.positives.sum().item())
         negatives = int(self.negatives.sum().item())
         return positives + negatives, positives, negatives
 
+
+# Reported AUC and the log-odds diagnostic agree to well under this on any task
+# whose predictions actually spread across the threshold grid.
+_AUC_GRID_DRIFT_WARN = 0.005
 
 # Collapse / miscalibration heuristics for train and quick-eval monitors.
 _MONITOR_PROB_MEAN_WARN = 0.9
@@ -7504,8 +7728,13 @@ def _run_fixed_test_eval(
     if split is None:
         raise ValueError("fixed-test evaluation requires data.test")
 
+    # Second accumulator per task is the log-odds diagnostic grid; it shares the
+    # reduce path and only costs one more bincount per batch.
     accumulators = [
-        [_StreamingHistogramAUC(evaluation.auc_bins)]
+        [
+            _StreamingHistogramAUC(evaluation.auc_bins),
+            _StreamingHistogramAUC(_AUC_DIAGNOSTIC_BINS, logit_grid=True),
+        ]
         for _ in config.task_names
     ]
     task_monitors = [_StreamingTaskMonitor() for _ in config.task_names]
@@ -7604,7 +7833,6 @@ def _run_fixed_test_eval(
                 if batch.labels is None:
                     raise RuntimeError("fixed-test batch did not contain labels")
                 logits_cpu = logits.float().cpu()
-                probabilities = torch.sigmoid(logits_cpu)
                 labels = batch.labels.float().cpu()
                 label_mask = (
                     None
@@ -7615,17 +7843,13 @@ def _run_fixed_test_eval(
                 for task_index in range(len(config.task_names)):
                     if label_mask is None:
                         task_logits = logits_cpu[:, task_index]
-                        task_scores = probabilities[:, task_index]
                         task_labels = labels[:, task_index]
                     else:
                         valid = label_mask[:, task_index]
                         task_logits = logits_cpu[valid, task_index]
-                        task_scores = probabilities[valid, task_index]
                         task_labels = labels[valid, task_index]
-                    accumulators[task_index][0].update(
-                        task_scores,
-                        task_labels,
-                    )
+                    for accumulator in accumulators[task_index]:
+                        accumulator.update(task_logits, task_labels)
                     task_monitors[task_index].update(task_logits, task_labels)
 
         _step_watchdog_beat(
@@ -7638,11 +7862,13 @@ def _run_fixed_test_eval(
         _reduce_evaluation_task_monitors(context, task_monitors)
         metrics: dict[str, dict[str, float | int | None]] = {}
         for task_index, task_name in enumerate(config.task_names):
-            accumulator = accumulators[task_index][0]
+            accumulator, diagnostic = accumulators[task_index]
             examples, positives, negatives = accumulator.counts()
             monitor = task_monitors[task_index].compute()
             metrics[task_name] = {
                 "auc": accumulator.compute(),
+                "auc_logit_grid": diagnostic.compute(),
+                "auc_occupied_thresholds": accumulator.occupied_bins(),
                 "loss": monitor["loss"],
                 "prob_mean": monitor["prob_mean"],
                 "logit_mean": monitor["logit_mean"],
@@ -7699,6 +7925,21 @@ def _print_fixed_test_eval(
             f"examples={metrics['examples']} positives={metrics['positives']} "
             f"negatives={metrics['negatives']}"
         )
+        diagnostic = metrics.get("auc_logit_grid")
+        if auc_value is not None and diagnostic is not None:
+            drift = float(diagnostic) - auc_value
+            # The two grids only diverge when this task's predictions sit inside
+            # a handful of threshold steps, so the reported AUC is measuring
+            # threshold resolution rather than ranking.
+            if abs(drift) > _AUC_GRID_DRIFT_WARN:
+                print(
+                    f"Fixed test eval warning | step={step} task={task_name} "
+                    f"auc_grid_drift={drift:+.6f} "
+                    f"auc_logit_grid={float(diagnostic):.8f} "
+                    "occupied_thresholds="
+                    f"{metrics.get('auc_occupied_thresholds')} "
+                    "(predictions span too few thresholds to rank on)"
+                )
         warning_parts = _task_monitor_warning_parts(
             prob_mean=prob_mean_value,
             auc=auc_value,
@@ -7738,23 +7979,20 @@ class _DiskBackedGroupAUC:
         self,
         task_index: int,
         group_ids: list[str],
-        scores: Tensor,
+        logits: Tensor,
         labels: Tensor,
         scenario_membership: Tensor,
     ) -> None:
-        score_values = scores.detach().float().flatten().cpu()
+        logit_values = logits.detach().float().flatten().cpu()
         label_values = labels.detach().long().flatten().cpu()
         memberships = scenario_membership.detach().bool().cpu()
         if (
-            len(group_ids) != score_values.numel()
-            or label_values.numel() != score_values.numel()
-            or memberships.size(0) != score_values.numel()
+            len(group_ids) != logit_values.numel()
+            or label_values.numel() != logit_values.numel()
+            or memberships.size(0) != logit_values.numel()
         ):
             raise ValueError("group AUC batch inputs must have matching rows")
-        score_bins = torch.clamp(
-            torch.floor(score_values.clamp(0.0, 1.0) * self.bins).long(),
-            max=self.bins - 1,
-        ).tolist()
+        score_bins = _auc_probability_bins(logit_values, self.bins).tolist()
         records: list[tuple[int, int, str, int, int, int]] = []
         membership_rows = memberships.tolist()
         for group_id, score_bin, label, member_row in zip(
@@ -7868,7 +8106,7 @@ def evaluate_mdl(
     max_batches: int | None = None,
     allow_random_init: bool = False,
     group_metric_name: str | None = None,
-    auc_bins: int = 65536,
+    auc_bins: int = 4096,
 ) -> EvaluateResult:
     context = _setup_distributed(config)
     _apply_local_rank_cpu_affinity("train")
@@ -7975,7 +8213,7 @@ def evaluate_mdl(
                 continue
             if batch.labels is None:
                 raise RuntimeError("evaluation batch did not contain labels")
-            probabilities = torch.sigmoid(logits.float()).cpu()
+            logits_cpu = logits.float().cpu()
             labels = batch.labels.float().cpu()
             label_mask = (
                 None
@@ -7993,13 +8231,13 @@ def evaluate_mdl(
             rows += int(labels.size(0))
             for task_index in range(len(config.task_names)):
                 if label_mask is None:
-                    task_scores = probabilities[:, task_index]
+                    task_logits = logits_cpu[:, task_index]
                     task_labels = labels[:, task_index]
                     task_scenarios = scenario_membership
                     task_groups = batch.group_id
                 else:
                     valid = label_mask[:, task_index]
-                    task_scores = probabilities[valid, task_index]
+                    task_logits = logits_cpu[valid, task_index]
                     task_labels = labels[valid, task_index]
                     task_scenarios = scenario_membership[valid]
                     task_groups = [
@@ -8008,18 +8246,18 @@ def evaluate_mdl(
                         if keep
                     ]
                 auc_accumulators[task_index][0].update(
-                    task_scores, task_labels
+                    task_logits, task_labels
                 )
                 for scenario in range(scenario_count):
                     selected = task_scenarios[:, scenario]
                     auc_accumulators[task_index][scenario + 1].update(
-                        task_scores[selected], task_labels[selected]
+                        task_logits[selected], task_labels[selected]
                     )
                 if grouped_auc is not None:
                     grouped_auc.add(
                         task_index,
                         task_groups,
-                        task_scores,
+                        task_logits,
                         task_labels,
                         task_scenarios,
                     )

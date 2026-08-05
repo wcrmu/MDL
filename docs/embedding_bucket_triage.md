@@ -116,7 +116,7 @@
 - `configs/onetrans.yaml`
 - `configs/onetrans_fine.yaml`
 
-并同步收紧 `scripts/build_mdl_rankmixer_config.py` 的 `_estimated_bucket` 启发式，避免下次无 profile 重建时再胀回去。
+并同步收紧 `scripts/build_production_configs.py` 的 `_estimated_bucket` 启发式，避免下次无 profile 重建时再胀回去。
 
 | 物理表 | 原 shape | 新 shape |
 |--------|----------|----------|

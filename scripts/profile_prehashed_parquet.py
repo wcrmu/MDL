@@ -36,7 +36,7 @@ MASK64 = (1 << 64) - 1
 # have to be repeated merely to diagnose that a strict collision target is
 # incompatible with the available embedding-memory budget.
 DEFAULT_BUCKETS = tuple(1 << exponent for exponent in range(10, 37))
-# Must match scripts/build_mdl_rankmixer_config.CONTEXT_FEATURE_COUNT (47/100 split).
+# Must match scripts/build_production_configs.CONTEXT_FEATURE_COUNT (47/100 split).
 DEFAULT_CONTEXT_FEATURE_COUNT = 47
 DEFAULT_SKU_FIELDS = (
     "sku_id_hn",
@@ -544,10 +544,15 @@ def profile_spec_from_mapping(
     }
 
     train = payload.get("data", {}).get("train", {})
+    # Production MDL configs keep labels at data.train.labels. Older fixtures /
+    # sample YAMLs still nest them under data.train.agg_layout.labels. Accept
+    # either so scene_label_distribution is not silently empty on prod configs.
     agg_layout = train.get("agg_layout", {}) if isinstance(train, dict) else {}
-    label_sources = agg_layout.get("labels", {}) if isinstance(agg_layout, dict) else {}
-    if not isinstance(label_sources, dict):
-        label_sources = {}
+    label_sources = {}
+    if isinstance(train, dict) and isinstance(train.get("labels"), dict):
+        label_sources = train["labels"]
+    elif isinstance(agg_layout, dict) and isinstance(agg_layout.get("labels"), dict):
+        label_sources = agg_layout["labels"]
     feature_sources = tuple(feature_logical_sources.values())
     categorical_sources = tuple(
         dict.fromkeys(

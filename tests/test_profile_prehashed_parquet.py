@@ -8,7 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 
-from scripts.build_mdl_rankmixer_config import CONTEXT_FEATURE_COUNT
+from scripts.build_production_configs import CONTEXT_FEATURE_COUNT
 from scripts.profile_prehashed_parquet import (
     DEFAULT_CONTEXT_FEATURE_COUNT,
     _bucket_report,
@@ -18,10 +18,41 @@ from scripts.profile_prehashed_parquet import (
     detect_scalar_multi_conflicts,
     load_profile_spec,
     profile_paths,
+    profile_spec_from_mapping,
 )
 
 
 class PreHashedParquetProfileTest(unittest.TestCase):
+    def test_prefers_train_labels_over_agg_layout_labels(self) -> None:
+        # Production MDL YAMLs put labels at data.train.labels; older fixtures
+        # nest them under agg_layout. Prefer the production path when both exist.
+        payload = {
+            "data": {
+                "train": {
+                    "labels": {"pay": "upid_pay_col"},
+                    "agg_layout": {"labels": {"cart": "label_fst_cart"}},
+                }
+            },
+            "features": [{"name": "ctx_hn", "source": "ctx_hn"}],
+            "sequences": [],
+            "vocab_strategy": {"features": {"ctx_hn": {"encoding": "pre_hashed"}}},
+        }
+        spec = profile_spec_from_mapping(payload, context_feature_count=1)
+        self.assertEqual(spec.label_sources, {"pay": "upid_pay_col"})
+
+        legacy = {
+            "data": {
+                "train": {
+                    "agg_layout": {"labels": {"cart": "label_fst_cart"}},
+                }
+            },
+            "features": [{"name": "ctx_hn", "source": "ctx_hn"}],
+            "sequences": [],
+            "vocab_strategy": {"features": {"ctx_hn": {"encoding": "pre_hashed"}}},
+        }
+        legacy_spec = profile_spec_from_mapping(legacy, context_feature_count=1)
+        self.assertEqual(legacy_spec.label_sources, {"cart": "label_fst_cart"})
+
     def test_bucket_recommendation_projects_full_cardinality_collisions(self) -> None:
         report, recommendation = _bucket_report(
             100_000,

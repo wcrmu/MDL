@@ -12,9 +12,12 @@ can never be mistaken for a resumable step.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields as dataclass_fields
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields
+import errno
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import queue
@@ -36,6 +39,12 @@ from .optim import ShardedAdagrad, ShardedRowWiseAdagrad
 logger = logging.getLogger(__name__)
 
 SHARDED_CHECKPOINT_FORMAT = "mdl_sharded_embedding_v1"
+# v2 splits one rank's tables across several bounded-size files so neither the
+# CPU copy nor the staging directory ever holds a whole shard at once.
+SHARDED_CHECKPOINT_CHUNK_FORMAT = "mdl_sharded_embedding_v2"
+_SHARDED_CHECKPOINT_READABLE = frozenset(
+    {SHARDED_CHECKPOINT_FORMAT, SHARDED_CHECKPOINT_CHUNK_FORMAT}
+)
 TRAINING_CHECKPOINT_FORMAT = "mdl_training_checkpoint_v1"
 
 # Layout of one committed step directory inside a run directory.
@@ -47,6 +56,11 @@ TRAIN_STATE_FILE = "train_state.pt"
 CHECKPOINT_MANIFEST = "checkpoint.json"
 COMMIT_MARKER = "_COMMIT"
 LATEST_POINTER = "_latest.json"
+
+# Tables are packed into files up to this many bytes. A single table larger than
+# the budget still gets its own file: splitting one table across files would put
+# a row-range dimension into the reshard path for very little extra headroom.
+DEFAULT_SHARD_CHUNK_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def _checkpoint_metadata(config: AppConfig) -> dict[str, Any]:
@@ -70,18 +84,88 @@ def _validate_checkpoint_metadata(
         raise ValueError("checkpoint vocab_strategy_hash does not match current config")
 
 
+class CheckpointStagingSpaceError(RuntimeError):
+    """The local staging directory could not hold this rank's checkpoint.
+
+    Raised instead of the zip writer's ``unexpected pos`` / ``file write
+    failed`` pair, which names neither the directory that filled up nor how much
+    room the save actually needed.
+    """
+
+
+def _free_bytes(path: Path) -> int | None:
+    """Bytes writable at ``path`` (or its nearest existing parent)."""
+
+    for candidate in (path, *path.parents):
+        try:
+            stat = os.statvfs(candidate)
+        except OSError:
+            continue
+        return int(stat.f_bavail) * int(stat.f_frsize)
+    return None
+
+
+def _format_bytes(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    return f"{value / (1024 ** 3):.1f}GiB"
+
+
+def _is_out_of_space(error: BaseException) -> bool:
+    """Whether a failed write looks like the filesystem running out of room.
+
+    ``torch.save`` reports a short write through the zip writer, which discards
+    the underlying errno, so the message has to be matched as well.
+    """
+
+    if isinstance(error, OSError) and error.errno in {errno.ENOSPC, errno.EDQUOT}:
+        return True
+    text = str(error).lower()
+    return "no space left" in text or "file write failed" in text
+
+
+def _discard_partial_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        logger.debug("could not remove partial checkpoint file %s", path)
+
+
 def _atomic_torch_save(payload: Any, path: Path) -> None:
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    torch.save(payload, temporary)
+    try:
+        torch.save(payload, temporary)
+    except BaseException as error:
+        # A half-written archive is pure overhead: nothing can read it, and on
+        # the filesystem that just filled up it keeps the next attempt from
+        # succeeding.
+        _discard_partial_file(temporary)
+        if _is_out_of_space(error):
+            raise CheckpointStagingSpaceError(
+                f"ran out of space writing {path.name} under {path.parent}: "
+                f"{_format_bytes(_free_bytes(path.parent))} free. Point "
+                "training.checkpoint.staging_dir at a filesystem with room for "
+                "every local rank's shard."
+            ) from error
+        raise
     os.replace(temporary, path)
 
 
 def _atomic_json_save(payload: dict[str, Any], path: Path) -> None:
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except BaseException as error:
+        _discard_partial_file(temporary)
+        if _is_out_of_space(error):
+            raise CheckpointStagingSpaceError(
+                f"ran out of space writing {path.name} under {path.parent}: "
+                f"{_format_bytes(_free_bytes(path.parent))} free"
+            ) from error
+        raise
     os.replace(temporary, path)
 
 
@@ -105,6 +189,280 @@ def _sharded_state_keys(model: nn.Module) -> set[str]:
     return keys
 
 
+def _tensor_bytes(value: Any) -> int:
+    if isinstance(value, Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, dict):
+        return sum(_tensor_bytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_tensor_bytes(item) for item in value)
+    return 0
+
+
+def _sharded_optimizer_row_bytes(
+    module: ShardedEmbedding,
+    sharded_optimizer: "ShardedAdagrad | ShardedRowWiseAdagrad | None",
+) -> int:
+    """Accumulator bytes per embedding row, ``0`` when nothing is saved.
+
+    Row-Wise Adagrad keeps one FP32 scalar per row; plain Adagrad keeps a full
+    row. Both are derived from tensors this rank already owns, so the number is
+    the same on every rank.
+    """
+
+    if sharded_optimizer is None:
+        return 0
+    state = sharded_optimizer.state.get(module.weight)
+    if not state:
+        return 0
+    rows = max(1, int(module.weight.size(0)))
+    return max(0, _tensor_bytes(state) // rows)
+
+
+def _table_plan_bytes(
+    module: ShardedEmbedding,
+    *,
+    world_size: int,
+    row_bytes: int,
+) -> int:
+    """Bytes one rank writes for a table, computed from global table shape.
+
+    Chunk boundaries must be identical on every rank, so the plan is derived
+    from ``num_embeddings`` (global, replicated) rather than the local row count
+    (which differs by a row or two depending on the owner mapping).
+    """
+
+    per_row = module.embedding_dim * module.weight.element_size() + row_bytes
+    rows = math.ceil(int(module.num_embeddings) / max(1, int(world_size)))
+    return rows * per_row
+
+
+def plan_shard_chunks(
+    modules: Sequence[ShardedEmbedding],
+    *,
+    world_size: int,
+    chunk_bytes: int = DEFAULT_SHARD_CHUNK_BYTES,
+    sharded_optimizer: "ShardedAdagrad | ShardedRowWiseAdagrad | None" = None,
+) -> list[list[ShardedEmbedding]]:
+    """Pack tables into files of at most ``chunk_bytes``, in a stable order."""
+
+    budget = max(1, int(chunk_bytes))
+    chunks: list[list[ShardedEmbedding]] = []
+    current: list[ShardedEmbedding] = []
+    current_bytes = 0
+    for module in sorted(modules, key=lambda item: item.table_name):
+        size = _table_plan_bytes(
+            module,
+            world_size=world_size,
+            row_bytes=_sharded_optimizer_row_bytes(module, sharded_optimizer),
+        )
+        if current and current_bytes + size > budget:
+            chunks.append(current)
+            current = []
+            current_bytes = 0
+        current.append(module)
+        current_bytes += size
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+@dataclass(frozen=True)
+class StagingSpaceEstimate:
+    """How much local scratch one rank needs to stage a checkpoint."""
+
+    total_bytes: int
+    peak_bytes: int
+    chunk_count: int
+    largest_chunk_bytes: int
+
+    def describe(self) -> str:
+        return (
+            f"total={_format_bytes(self.total_bytes)} "
+            f"peak={_format_bytes(self.peak_bytes)} "
+            f"chunks={self.chunk_count}"
+        )
+
+
+def estimate_staging_space(
+    model: nn.Module,
+    *,
+    rank: int = 0,
+    world_size: int = 1,
+    dense_optimizer: torch.optim.Optimizer | None = None,
+    replicated_sparse_optimizer: torch.optim.Optimizer | None = None,
+    sharded_optimizer: "ShardedAdagrad | ShardedRowWiseAdagrad | None" = None,
+    chunk_bytes: int = DEFAULT_SHARD_CHUNK_BYTES,
+    upload_window: int = 1,
+) -> StagingSpaceEstimate:
+    """Predict this rank's staging footprint before anything is written.
+
+    ``peak_bytes`` assumes published files are deleted as the upload drains, so
+    it is what a healthy save actually needs. ``total_bytes`` is the fallback
+    when uploads cannot keep up and every file stays until the step finishes.
+    """
+
+    modules = sharded_embedding_modules(model)
+    chunk_sizes: list[int] = []
+    if modules:
+        for chunk in plan_shard_chunks(
+            modules,
+            world_size=world_size,
+            chunk_bytes=chunk_bytes,
+            sharded_optimizer=sharded_optimizer,
+        ):
+            chunk_sizes.append(
+                sum(
+                    _table_plan_bytes(
+                        module,
+                        world_size=world_size,
+                        row_bytes=_sharded_optimizer_row_bytes(
+                            module, sharded_optimizer
+                        ),
+                    )
+                    for module in chunk
+                )
+            )
+        sharded_keys = _sharded_state_keys(model)
+        replicated = sum(
+            _tensor_bytes(value)
+            for key, value in model.state_dict().items()
+            if key not in sharded_keys
+        )
+    else:
+        replicated = _tensor_bytes(model.state_dict())
+    extras = 0
+    if rank == 0:
+        extras += replicated
+        for optimizer in (dense_optimizer, replicated_sparse_optimizer):
+            if optimizer is not None:
+                extras += _tensor_bytes(optimizer.state)
+    total = sum(chunk_sizes) + extras
+    largest = max(chunk_sizes, default=0)
+    # One chunk is being written while ``upload_window`` earlier ones may still
+    # be waiting for the store to accept them.
+    peak = min(total, largest * (max(0, int(upload_window)) + 1) + extras)
+    return StagingSpaceEstimate(
+        total_bytes=total,
+        peak_bytes=peak,
+        chunk_count=len(chunk_sizes),
+        largest_chunk_bytes=largest,
+    )
+
+
+def check_staging_space(
+    staging_dir: str | Path,
+    estimate: StagingSpaceEstimate,
+    *,
+    local_ranks: int = 1,
+    headroom: float = 1.1,
+    enforce: bool = True,
+) -> str:
+    """Raise when ``staging_dir`` cannot hold the concurrent local ranks.
+
+    Every rank on a node stages into the same filesystem, so the requirement is
+    the per-rank figure times the local rank count, not one checkpoint.
+    """
+
+    path = Path(staging_dir)
+    free = _free_bytes(path)
+    ranks = max(1, int(local_ranks))
+    required = int(estimate.peak_bytes * ranks * max(1.0, headroom))
+    comfortable = int(estimate.total_bytes * ranks * max(1.0, headroom))
+    summary = (
+        f"staging_dir={path} free={_format_bytes(free)} "
+        f"needed={_format_bytes(required)} "
+        f"(local_ranks={ranks} {estimate.describe()})"
+    )
+    if free is None:
+        return summary
+    if free < required:
+        message = (
+            "training.checkpoint staging has too little room: "
+            f"{summary}. Set training.checkpoint.staging_dir to a filesystem "
+            "with more space (the system temp directory is often a small "
+            "RAM-backed tmpfs)."
+        )
+        if enforce:
+            raise CheckpointStagingSpaceError(message)
+        logger.error("%s", message)
+        return summary
+    if free < comfortable:
+        logger.warning(
+            "checkpoint staging has room for the streamed peak but not for a "
+            "whole step (%s); a slow run directory will make saves block. %s",
+            _format_bytes(comfortable),
+            summary,
+        )
+    return summary
+
+
+def shard_chunk_file(index: int, rank: int, world_size: int) -> str:
+    """Name of one packed group of tables belonging to one rank."""
+
+    return f"shard-{int(index):04d}-rank-{int(rank):05d}-of-{int(world_size):05d}.pt"
+
+
+def legacy_rank_file(rank: int, world_size: int) -> str:
+    """Name of the single-file-per-rank layout written before chunking."""
+
+    return f"rank-{int(rank):05d}-of-{int(world_size):05d}.pt"
+
+
+def shard_file_names(
+    manifest: dict[str, Any],
+    *,
+    rank: int,
+    world_size: int,
+) -> list[str]:
+    """Embedding shard files one rank must read, newest and legacy layouts.
+
+    A restart at the saved world size only touches its own files. Resharding
+    reads every saved owner, because the rows this rank now owns were spread
+    across all of them.
+    """
+
+    saved_world_size = int(manifest["world_size"])
+    resharding = saved_world_size != world_size
+
+    def _pick(files: Sequence[str]) -> list[str]:
+        if resharding:
+            return list(files)
+        if not 0 <= rank < len(files):
+            raise ValueError(
+                f"checkpoint has {len(files)} shard files per group but this run "
+                f"is rank {rank} of {world_size}"
+            )
+        return [files[rank]]
+
+    chunks = manifest.get("chunks")
+    if chunks:
+        names: list[str] = []
+        for chunk in chunks:
+            names.extend(_pick(chunk["rank_files"]))
+        return names
+    return _pick(manifest["rank_files"])
+
+
+def _table_payload(
+    module: ShardedEmbedding,
+    sharded_optimizer: ShardedAdagrad | ShardedRowWiseAdagrad | None,
+) -> dict[str, Any]:
+    optimizer_state = None
+    if sharded_optimizer is not None:
+        state = sharded_optimizer.state.get(module.weight)
+        if state:
+            optimizer_state = _state_to_cpu(state)
+    return {
+        "weight": module.weight.detach().cpu(),
+        "num_embeddings": module.num_embeddings,
+        "embedding_dim": module.embedding_dim,
+        "padding_idx": module.padding_idx,
+        "shard_spec": asdict(module.shard_spec),
+        "optimizer_state": optimizer_state,
+    }
+
+
 def save_model_checkpoint(
     config: AppConfig,
     model: nn.Module,
@@ -114,11 +472,27 @@ def save_model_checkpoint(
     world_size: int = 1,
     process_group: torch_dist.ProcessGroup | None = None,
     sharded_optimizer: ShardedAdagrad | ShardedRowWiseAdagrad | None = None,
-) -> None:
-    """Save one replicated file or an atomic manifest plus local shard files."""
+    chunk_bytes: int = DEFAULT_SHARD_CHUNK_BYTES,
+    publish: Callable[[str], None] | None = None,
+) -> list[str]:
+    """Save one replicated file or a manifest plus this rank's shard files.
+
+    Returns the files written, relative to ``path``. ``publish`` is called with
+    each name as soon as it lands, so a caller that copies files to a run
+    directory can drain (and delete) them while the next chunk is still being
+    built — that is what keeps staging bounded by one chunk instead of a whole
+    shard.
+    """
 
     checkpoint_path = Path(path)
     sharded_modules = sharded_embedding_modules(model)
+    written: list[str] = []
+
+    def _record(name: str) -> None:
+        written.append(name)
+        if publish is not None:
+            publish(name)
+
     if not sharded_modules:
         if rank == 0:
             checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,7 +503,10 @@ def save_model_checkpoint(
                 },
                 checkpoint_path,
             )
-        return
+            # A replicated model is one file next to the checkpoint, so names are
+            # relative to its parent; sharded names are relative to the directory.
+            _record(checkpoint_path.name)
+        return written
 
     if world_size <= 0 or not 0 <= rank < world_size:
         raise ValueError("invalid rank/world_size for sharded checkpoint")
@@ -142,31 +519,32 @@ def save_model_checkpoint(
         )
     checkpoint_path.mkdir(parents=True, exist_ok=True)
 
-    tables: dict[str, dict[str, Any]] = {}
-    for module in sharded_modules:
-        optimizer_state = None
-        if sharded_optimizer is not None:
-            state = sharded_optimizer.state.get(module.weight)
-            if state:
-                optimizer_state = _state_to_cpu(state)
-        tables[module.table_name] = {
-            "weight": module.weight.detach().cpu(),
-            "num_embeddings": module.num_embeddings,
-            "embedding_dim": module.embedding_dim,
-            "padding_idx": module.padding_idx,
-            "shard_spec": asdict(module.shard_spec),
-            "optimizer_state": optimizer_state,
-        }
-    rank_file = f"rank-{rank:05d}-of-{world_size:05d}.pt"
-    _atomic_torch_save(
-        {
-            "format": SHARDED_CHECKPOINT_FORMAT,
+    chunks = plan_shard_chunks(
+        sharded_modules,
+        world_size=world_size,
+        chunk_bytes=chunk_bytes,
+        sharded_optimizer=sharded_optimizer,
+    )
+    for index, chunk in enumerate(chunks):
+        # Build, write, and drop one group at a time. Materializing every table
+        # first would put a second copy of the whole shard in host memory before
+        # a single byte reached the disk.
+        payload = {
+            "format": SHARDED_CHECKPOINT_CHUNK_FORMAT,
             "rank": rank,
             "world_size": world_size,
-            "tables": tables,
-        },
-        checkpoint_path / rank_file,
-    )
+            "chunk": index,
+            "tables": {
+                module.table_name: _table_payload(module, sharded_optimizer)
+                for module in chunk
+            },
+        }
+        chunk_file = shard_chunk_file(index, rank, world_size)
+        try:
+            _atomic_torch_save(payload, checkpoint_path / chunk_file)
+        finally:
+            del payload
+        _record(chunk_file)
 
     dense_file = "dense.pt"
     if rank == 0:
@@ -180,6 +558,8 @@ def save_model_checkpoint(
             {"model_state_dict": dense_state, **_checkpoint_metadata(config)},
             checkpoint_path / dense_file,
         )
+        del dense_state
+        _record(dense_file)
     if world_size > 1:
         torch_dist.barrier(group=process_group)
     if rank == 0:
@@ -193,13 +573,20 @@ def save_model_checkpoint(
         }
         _atomic_json_save(
             {
-                "format": SHARDED_CHECKPOINT_FORMAT,
-                "version": 1,
+                "format": SHARDED_CHECKPOINT_CHUNK_FORMAT,
+                "version": 2,
                 "world_size": world_size,
                 "dense_file": dense_file,
-                "rank_files": [
-                    f"rank-{item:05d}-of-{world_size:05d}.pt"
-                    for item in range(world_size)
+                "chunks": [
+                    {
+                        "index": index,
+                        "tables": [module.table_name for module in chunk],
+                        "rank_files": [
+                            shard_chunk_file(index, item, world_size)
+                            for item in range(world_size)
+                        ],
+                    }
+                    for index, chunk in enumerate(chunks)
                 ],
                 "tables": table_metadata,
                 "training_metadata": {
@@ -209,8 +596,10 @@ def save_model_checkpoint(
             },
             checkpoint_path / "manifest.json",
         )
+        _record("manifest.json")
     if world_size > 1:
         torch_dist.barrier(group=process_group)
+    return written
 
 
 def _sharded_optimizer_state(
@@ -279,7 +668,7 @@ def _load_sharded_checkpoint(
     if not manifest_path.exists():
         raise ValueError(f"sharded checkpoint is missing {manifest_path.name}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("format") != SHARDED_CHECKPOINT_FORMAT:
+    if manifest.get("format") not in _SHARDED_CHECKPOINT_READABLE:
         raise ValueError("unsupported sharded checkpoint format")
     _validate_checkpoint_metadata(config, manifest)
     dense_path = checkpoint_path / str(manifest["dense_file"])
@@ -323,30 +712,38 @@ def _load_sharded_checkpoint(
         rank = torch_dist.get_rank(process_group)
         world_size = torch_dist.get_world_size(process_group)
     saved_world_size = int(manifest["world_size"])
-    rank_files = [checkpoint_path / name for name in manifest["rank_files"]]
-
-    # Same-size restarts need only the local file. Different-size loads stream
+    # Same-size restarts need only this rank's files. Different-size loads stream
     # every saved owner and write directly into the new local rows; no full-table
     # reconstruction is allocated.
-    if saved_world_size == world_size:
-        payloads = [torch.load(rank_files[rank], map_location=device)]
-    else:
-        payloads = [torch.load(path, map_location="cpu") for path in rank_files]
+    shard_files = [
+        checkpoint_path / name
+        for name in shard_file_names(
+            manifest,
+            rank=rank,
+            world_size=world_size,
+        )
+    ]
+    map_location = device if saved_world_size == world_size else "cpu"
     filled = {
         name: torch.zeros(module.weight.size(0), dtype=torch.bool)
         for name, module in modules.items()
     }
     with torch.no_grad():
-        for payload in payloads:
-            if payload.get("format") != SHARDED_CHECKPOINT_FORMAT:
+        for shard_file in shard_files:
+            # One file at a time: a resharding load would otherwise hold every
+            # saved rank's tables in host memory simultaneously.
+            payload = torch.load(shard_file, map_location=map_location)
+            if payload.get("format") not in _SHARDED_CHECKPOINT_READABLE:
                 raise ValueError("invalid embedding rank shard format")
             saved_rank = int(payload["rank"])
             if int(payload["world_size"]) != saved_world_size:
                 raise ValueError("inconsistent world size across embedding shard files")
-            for table_name, module in modules.items():
-                table = payload["tables"].get(table_name)
-                if table is None:
-                    raise ValueError(f"rank shard is missing table {table_name!r}")
+            for table_name, table in payload["tables"].items():
+                module = modules.get(table_name)
+                if module is None:
+                    raise ValueError(
+                        f"checkpoint shard holds unknown table {table_name!r}"
+                    )
                 if (
                     int(table["num_embeddings"]) != module.num_embeddings
                     or int(table["embedding_dim"]) != module.embedding_dim
@@ -386,6 +783,7 @@ def _load_sharded_checkpoint(
                         table_name=table_name,
                     )
                 filled[table_name].index_fill_(0, target_rows.cpu(), True)
+            del payload
     incomplete = [name for name, mask in filled.items() if not bool(mask.all())]
     if incomplete:
         raise ValueError(
@@ -643,14 +1041,32 @@ def stage_training_checkpoint(
     elapsed_seconds: float = 0.0,
     run_name: str | None = None,
     cleanup_staging: bool = True,
+    chunk_bytes: int = DEFAULT_SHARD_CHUNK_BYTES,
+    publish: Callable[[str], bool] | None = None,
 ) -> StagedCheckpoint:
-    """Write this rank's share of a resumable checkpoint to a local directory."""
+    """Write this rank's share of a resumable checkpoint to a local directory.
+
+    ``publish`` is offered each file as it lands and returns whether it took
+    ownership (uploaded and removed it). Files it declines stay for the caller's
+    normal publish pass, so a stalled run directory degrades to the old
+    "everything waits in staging" behaviour instead of blocking the step loop.
+    """
 
     staging_path = Path(staging_dir)
     staging_path.mkdir(parents=True, exist_ok=True)
     sharded = bool(sharded_embedding_modules(model))
     model_relpath = MODEL_SUBDIR if sharded else MODEL_FILE
-    save_model_checkpoint(
+    model_prefix = f"{MODEL_SUBDIR}/" if sharded else ""
+
+    relative_files: list[str] = []
+    published: set[str] = set()
+
+    def _offer(relative: str) -> None:
+        relative_files.append(relative)
+        if publish is not None and publish(relative):
+            published.add(relative)
+
+    model_files = save_model_checkpoint(
         config,
         model,
         staging_path / model_relpath,
@@ -658,19 +1074,15 @@ def stage_training_checkpoint(
         world_size=world_size,
         process_group=process_group,
         sharded_optimizer=sharded_optimizer,
+        chunk_bytes=chunk_bytes,
+        publish=(
+            None
+            if publish is None
+            else (lambda name: _offer(f"{model_prefix}{name}"))
+        ),
     )
-
-    relative_files: list[str] = []
-    if sharded:
-        relative_files.append(
-            f"{MODEL_SUBDIR}/rank-{rank:05d}-of-{world_size:05d}.pt"
-        )
-        if rank == 0:
-            relative_files.extend(
-                [f"{MODEL_SUBDIR}/dense.pt", f"{MODEL_SUBDIR}/manifest.json"]
-            )
-    elif rank == 0:
-        relative_files.append(MODEL_FILE)
+    if publish is None:
+        relative_files.extend(f"{model_prefix}{name}" for name in model_files)
 
     progress_name = rank_progress_file(rank)
     _atomic_json_save(
@@ -686,7 +1098,7 @@ def stage_training_checkpoint(
         },
         staging_path / progress_name,
     )
-    relative_files.append(progress_name)
+    _offer(progress_name)
 
     if rank == 0:
         _atomic_torch_save(
@@ -708,7 +1120,7 @@ def stage_training_checkpoint(
             },
             staging_path / TRAIN_STATE_FILE,
         )
-        relative_files.append(TRAIN_STATE_FILE)
+        _offer(TRAIN_STATE_FILE)
         _atomic_json_save(
             {
                 "format": TRAINING_CHECKPOINT_FORMAT,
@@ -733,8 +1145,15 @@ def stage_training_checkpoint(
             },
             staging_path / CHECKPOINT_MANIFEST,
         )
-        relative_files.append(CHECKPOINT_MANIFEST)
+        _offer(CHECKPOINT_MANIFEST)
 
+    if published:
+        logger.debug(
+            "checkpoint step %d streamed %d/%d files while staging",
+            int(step),
+            len(published),
+            len(relative_files),
+        )
     return StagedCheckpoint(
         step=int(step),
         staging_dir=staging_path,
@@ -746,6 +1165,16 @@ def stage_training_checkpoint(
 # --- Publishing staged steps to the run directory ---
 
 
+@dataclass(frozen=True)
+class _StagedFile:
+    """One staged file handed to the uploader before its step finished."""
+
+    step: int
+    directory: str
+    relative: str
+    source: Path
+
+
 class CheckpointUploader:
     """Publishes staged steps to the run directory without stalling training.
 
@@ -753,6 +1182,10 @@ class CheckpointUploader:
     for the full set before writing ``_COMMIT``; readers treat a step without
     that marker as non-existent, so a crash mid-upload leaves nothing that can
     be resumed from by mistake.
+
+    Files can also be handed over while the step is still being written (see
+    :meth:`stream_publisher`). They travel on the same queue as the step that
+    owns them, so the ready marker is still written after the last byte lands.
     """
 
     def __init__(
@@ -766,6 +1199,8 @@ class CheckpointUploader:
         poll_interval_sec: float = 2.0,
         asynchronous: bool = True,
         max_pending: int = 1,
+        stream_window: int = 2,
+        stream_timeout_sec: float = 300.0,
     ) -> None:
         self._store = store
         self._rank = int(rank)
@@ -774,9 +1209,19 @@ class CheckpointUploader:
         self._ready_timeout_sec = float(ready_timeout_sec)
         self._poll_interval_sec = float(poll_interval_sec)
         self._asynchronous = bool(asynchronous)
-        self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(max_pending)))
+        self._stream_window = max(0, int(stream_window))
+        self._stream_timeout_sec = max(0.0, float(stream_timeout_sec))
+        self._queue: queue.Queue = queue.Queue(
+            maxsize=max(1, int(max_pending)) + self._stream_window
+        )
         self._thread: threading.Thread | None = None
         self._stopping = threading.Event()
+        # Names that already reached the run directory, so the publish pass can
+        # skip them. Ordering on the queue guarantees this is complete before the
+        # owning step is finalized; the lock only covers synchronous uploads and
+        # dropped steps, which run on the caller's thread.
+        self._streamed: dict[int, set[str]] = {}
+        self._streamed_lock = threading.Lock()
         self.published_steps: list[int] = []
         self.failed_steps: list[int] = []
         self.dropped_steps: list[int] = []
@@ -792,6 +1237,68 @@ class CheckpointUploader:
     def store(self) -> CheckpointStore:
         return self._store
 
+    @property
+    def stream_window(self) -> int:
+        """Staged files that may be awaiting upload while the next one is built."""
+
+        return self._stream_window
+
+    def stream_publisher(
+        self,
+        staging_dir: Path,
+        step: int,
+        *,
+        enabled: bool = True,
+        heartbeat: Callable[[], None] | None = None,
+    ) -> Callable[[str], bool]:
+        """Sink that uploads staged files as they are written, then deletes them.
+
+        Local run directories stage straight into their destination, so there is
+        nothing to copy and nothing that may be deleted; those pass
+        ``enabled=False`` and keep every file. When the queue stays full past
+        ``stream_timeout_sec`` the sink declines, which leaves the file for the
+        normal publish pass rather than blocking the step loop forever.
+        """
+
+        directory = step_directory_name(step)
+        with self._streamed_lock:
+            # A step that failed while staging never reaches ``_publish``, which
+            # is what normally clears its names. Reaching a later step means no
+            # earlier one can still be finalized.
+            for earlier in [key for key in self._streamed if key < int(step)]:
+                del self._streamed[earlier]
+
+        def _publish_file(relative: str) -> bool:
+            if not enabled:
+                return False
+            item = _StagedFile(
+                step=int(step),
+                directory=directory,
+                relative=relative,
+                source=Path(staging_dir) / relative,
+            )
+            if not self._asynchronous:
+                return self._upload_staged_file(item)
+            deadline = time.monotonic() + self._stream_timeout_sec
+            while True:
+                try:
+                    self._queue.put(item, timeout=0.5)
+                    return True
+                except queue.Full:
+                    if heartbeat is not None:
+                        heartbeat()
+                    if time.monotonic() >= deadline:
+                        logger.warning(
+                            "checkpoint step %d kept %s in staging: the run "
+                            "directory is not draining within %.0fs",
+                            step,
+                            relative,
+                            self._stream_timeout_sec,
+                        )
+                        return False
+
+        return _publish_file
+
     def submit(self, staged: StagedCheckpoint) -> bool:
         """Queue a staged step. Returns False when it was dropped for backpressure."""
 
@@ -799,7 +1306,9 @@ class CheckpointUploader:
             self._publish(staged)
             return True
         try:
-            self._queue.put_nowait(staged)
+            # Streamed files share the queue, so a momentarily full queue is
+            # normal; only a genuinely stuck uploader should drop a step.
+            self._queue.put(staged, timeout=self._stream_timeout_sec)
         except queue.Full:
             # Dropping is safer than blocking the training loop: the next
             # cadence writes a fresh step, and the stale staging dir is removed.
@@ -847,24 +1356,57 @@ class CheckpointUploader:
     def _run(self) -> None:
         while not self._stopping.is_set():
             try:
-                staged = self._queue.get(timeout=0.2)
+                item = self._queue.get(timeout=0.2)
             except queue.Empty:
                 continue
             try:
-                self._publish(staged)
+                if isinstance(item, _StagedFile):
+                    self._upload_staged_file(item)
+                else:
+                    self._publish(item)
             finally:
                 self._queue.task_done()
 
+    def _upload_staged_file(self, item: _StagedFile) -> bool:
+        """Copy one staged file to the run directory and free the local copy."""
+
+        try:
+            self._store.upload_file(
+                item.source,
+                item.directory,
+                *item.relative.split("/"),
+            )
+        except Exception as error:  # noqa: BLE001 - the publish pass retries
+            logger.warning(
+                "checkpoint step %d could not stream %s: %s",
+                item.step,
+                item.relative,
+                error,
+            )
+            return False
+        with self._streamed_lock:
+            self._streamed.setdefault(item.step, set()).add(item.relative)
+        _discard_partial_file(item.source)
+        return True
+
     def _publish(self, staged: StagedCheckpoint) -> None:
         directory = step_directory_name(staged.step)
+        with self._streamed_lock:
+            already = self._streamed.pop(staged.step, set())
         try:
             self._store.makedirs(directory)
             for relative in staged.relative_files:
+                if relative in already:
+                    continue
                 self._store.upload_file(
                     staged.staging_dir / relative,
                     directory,
                     *relative.split("/"),
                 )
+                if staged.cleanup_staging:
+                    # Freeing each file as it lands keeps a large multi-rank step
+                    # from holding its whole footprint until the very end.
+                    _discard_partial_file(staged.staging_dir / relative)
             self._store.write_json(
                 {
                     "rank": self._rank,
@@ -936,6 +1478,8 @@ class CheckpointUploader:
             time.sleep(self._poll_interval_sec)
 
     def _cleanup(self, staged: StagedCheckpoint) -> None:
+        with self._streamed_lock:
+            self._streamed.pop(staged.step, None)
         if not staged.cleanup_staging:
             return
         shutil.rmtree(staged.staging_dir, ignore_errors=True)
@@ -983,13 +1527,29 @@ def fetch_checkpoint_for_rank(
         rank_progress_file(rank),
         f"{MODEL_SUBDIR}/manifest.json",
         f"{MODEL_SUBDIR}/dense.pt",
-        f"{MODEL_SUBDIR}/rank-{rank:05d}-of-{saved_world_size:05d}.pt",
     ]
     for relative in wanted:
         parts = relative.split("/")
         if not store.exists(checkpoint.directory, *parts):
             continue
         store.download_file(local_dir / Path(*parts), checkpoint.directory, *parts)
+
+    # Which embedding files belong to this rank depends on the layout the save
+    # used, so the model manifest decides rather than a name built here.
+    model_manifest_path = local_dir / MODEL_SUBDIR / "manifest.json"
+    if model_manifest_path.exists():
+        model_manifest = json.loads(model_manifest_path.read_text(encoding="utf-8"))
+        for name in shard_file_names(
+            model_manifest,
+            rank=rank,
+            world_size=world_size,
+        ):
+            store.download_file(
+                local_dir / MODEL_SUBDIR / name,
+                checkpoint.directory,
+                MODEL_SUBDIR,
+                name,
+            )
     return local_dir
 
 

@@ -10,7 +10,7 @@ from scripts.recommend_embedding_shapes import (
     estimate_growth,
     load_json_report,
 )
-from scripts.build_mdl_rankmixer_config import (
+from scripts.build_production_configs import (
     PROFILE_DRIVEN_EMBEDDING_SHAPES,
     _BOOTSTRAP_PROFILE_DRIVEN_EMBEDDING_SHAPES,
 )

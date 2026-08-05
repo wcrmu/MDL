@@ -3,7 +3,7 @@
 > **状态：历史快照，不是当前生产契约。** 本报告记录的是 2026-07-27
 > 11:22 UTC 的 168-field/旧 prior 配置。当前恢复后的权威来源是
 > `configs/{rankmixer,mdl_rankmixer,onetrans,mdl_onetrans}{,_fine}.yaml`、
-> `scripts/build_mdl_rankmixer_config.py` 与
+> `scripts/build_production_configs.py` 与
 > `docs/mdl_token_feature_design.md`：147 个主字段（47 request + 100
 > candidate），RankMixer 为固定 32×768 语义 token，scenario/task prior
 > 组成也已更新。请勿据本报告中的旧字段数或旧 prior 名称重新生成配置。
@@ -34,7 +34,7 @@
 
 1. 当前可被 `load_app_config` 和 `resolve_app_config` 成功解析的 8 份配置；
 2. 当前 `src/dataloader.py`、`src/config.py`、`src/model.py`、`src/modules/stca.py` 的实际代码路径；
-3. 当前 `scripts/build_mdl_rankmixer_config.py` 的生成规则；
+3. 当前 `scripts/build_production_configs.py` 的生成规则；
 4. `DATA_FORMAT.md` 中的上游数据观测与物理格式说明；
 5. `docs/stca_sequence_encoder.md` 与 `paper/STCA/main.tex` 的 STCA 对齐说明。
 
@@ -89,7 +89,7 @@ kind: categorical
 
 它们不是直接进入网络的浮点标量，而是先按预哈希类别 ID 映射到 embedding row，再使用 embedding 向量。字段名称表达业务含义，不表达模型 dtype。
 
-`scripts/build_mdl_rankmixer_config.py::_main_features` 会把 168 个主字段统一生成为 categorical。当前 8 份配置中：
+`scripts/build_production_configs.py::_main_features` 会把 168 个主字段统一生成为 categorical。当前 8 份配置中：
 
 - top-level dense feature：**0**
 - top-level categorical feature：**168**
@@ -2555,7 +2555,7 @@ tests/test_mdl_rankmixer_adapter.py
 第二组：
 
 ```text
-tests/test_build_mdl_rankmixer_config.py
+tests/test_build_production_configs.py
 tests/test_config_overlays.py
 ```
 
@@ -2762,7 +2762,7 @@ evaluation-only
 | embedding 与分布式 lookup | `src/embeddings.py` |
 | scalar/bag/sequence 编码与模型 | `src/model.py` |
 | STCA encoder | `src/modules/stca.py` |
-| 配置生成规则 | `scripts/build_mdl_rankmixer_config.py` |
+| 配置生成规则 | `scripts/build_production_configs.py` |
 | STCA 对齐说明 | `docs/stca_sequence_encoder.md` |
 | STCA 原文 | `paper/STCA/main.tex` |
 

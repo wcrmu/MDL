@@ -1318,7 +1318,7 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         self.assertEqual(actual["ctx_scalar_hn"], [101, 101, 102])
 
     def test_all_request_context_scalars_expand(self) -> None:
-        from scripts.build_mdl_rankmixer_config import REQUEST_CONTEXT_SCALAR_FIELDS
+        from scripts.build_production_configs import REQUEST_CONTEXT_SCALAR_FIELDS
 
         for field in sorted(REQUEST_CONTEXT_SCALAR_FIELDS):
             with self.subTest(field=field):
@@ -1353,7 +1353,7 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
                 self.assertEqual(actual[field], [7, 7, None])
 
     def test_all_request_context_bags_expand(self) -> None:
-        from scripts.build_mdl_rankmixer_config import REQUEST_CONTEXT_BAG_FIELDS
+        from scripts.build_production_configs import REQUEST_CONTEXT_BAG_FIELDS
 
         for field in sorted(REQUEST_CONTEXT_BAG_FIELDS):
             with self.subTest(field=field):
