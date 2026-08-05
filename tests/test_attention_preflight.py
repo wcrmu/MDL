@@ -156,7 +156,11 @@ class AttentionCapabilityHelperTest(unittest.TestCase):
                     "use_scenario_feature_interaction": False,
                 },
             ),
-            ("mdl_onetrans", True, True, None),
+            # Domain reads the varlen [Q_S; NS] pool in every layer, so no
+            # fixed-width DomainAwareAttention is built.
+            ("mdl_onetrans", True, False, None),
+            ("mdl_onetrans", True, True, {"first_domain_sequence_layer": 4}),
+            ("mdl_onetrans", True, True, {"first_domain_sequence_layer": None}),
             ("mixformer", False, False, None),
             ("mdl_mixformer", False, True, None),
             (

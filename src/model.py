@@ -6857,7 +6857,15 @@ def _init_domain_interaction_modules(
     block: nn.Module,
     config: AppConfig,
     metadata: ModelMetadata,
+    build_feature_interaction: bool = True,
 ) -> None:
+    """Register Domain state modules.
+
+    ``build_feature_interaction=False`` skips the fixed-width NS reader for
+    blocks that instead read the variable-length ``[Q_S; NS]`` pool, so those
+    projections do not sit in the checkpoint and DDP parameter set unused.
+    """
+
     token_dim = config.model.token_dim
     hidden_dim = config.model.hidden_dim
     block.use_task_tokens = config.model.use_task_tokens
@@ -6886,17 +6894,17 @@ def _init_domain_interaction_modules(
                 attention_backend=config.runtime.attention_backend,
                 activation=config.model.ffn_activation,
             )
-            if block.use_scenario_feature_interaction
+            if build_feature_interaction and block.use_scenario_feature_interaction
             else None
         )
         block.scenario_rankmixer = (
-            None
-            if block.use_scenario_feature_interaction
-            else RankMixerDomainInteraction(
+            RankMixerDomainInteraction(
                 token_dim,
                 scenario_token_count,
                 metadata.feature_token_count,
             )
+            if build_feature_interaction and not block.use_scenario_feature_interaction
+            else None
         )
         # Keep this FFN in every block, including the final block, to match the
         # published MDL propagation equation exactly.
@@ -6922,17 +6930,17 @@ def _init_domain_interaction_modules(
                 attention_backend=config.runtime.attention_backend,
                 activation=config.model.ffn_activation,
             )
-            if block.use_task_feature_interaction
+            if build_feature_interaction and block.use_task_feature_interaction
             else None
         )
         block.task_rankmixer = (
-            None
-            if block.use_task_feature_interaction
-            else RankMixerDomainInteraction(
+            RankMixerDomainInteraction(
                 token_dim,
                 metadata.task_count,
                 metadata.feature_token_count,
             )
+            if build_feature_interaction and not block.use_task_feature_interaction
+            else None
         )
         block.task_ffn = PerTokenFFN(
             metadata.task_count,
@@ -6994,58 +7002,39 @@ def _split_domain_interaction_hat(
     return query, update, domain_state + update
 
 
-def _domain_selected_feature_memory(
-    ns_tokens: Tensor,
-    s_tokens: Tensor,
-    s_mask: Tensor,
-) -> tuple[Tensor, Tensor]:
-    """Build the Domain KV set as equal-treatment ``[Q_S; NS]``.
+def _equal_selected_feature_interaction_hat(
+    domain_tokens: Tensor,
+    memory: Tensor,
+    memory_mask: Tensor,
+    attention: VariableLengthDomainAttention | None,
+) -> Tensor:
+    """Read the equal-treatment ``[Q_S; NS]`` pool into the Domain state.
 
     Matches the RankMixer contract: once tokens are selected to be read, they
     compete in one attention pool with no extra S-vs-NS residual gate.
     """
 
-    ns_mask = torch.ones(
-        ns_tokens.size(0),
-        ns_tokens.size(1),
-        dtype=torch.bool,
-        device=ns_tokens.device,
-    )
-    if s_tokens.size(1) == 0:
-        return ns_tokens, ns_mask
-    return (
-        torch.cat([s_tokens, ns_tokens], dim=1),
-        torch.cat([s_mask.to(device=ns_tokens.device, dtype=torch.bool), ns_mask], dim=1),
-    )
-
-
-def _equal_selected_feature_interaction_hat(
-    domain_tokens: Tensor,
-    ns_tokens: Tensor,
-    s_tokens: Tensor,
-    s_mask: Tensor,
-    attention: VariableLengthDomainAttention | None,
-) -> Tensor:
     if attention is None:
-        raise RuntimeError("equal selected-feature Domain read requires sequence attention")
-    memory, mask = _domain_selected_feature_memory(ns_tokens, s_tokens, s_mask)
-    return domain_tokens + attention(domain_tokens, memory, mask)
+        raise RuntimeError(
+            "equal selected-feature Domain read requires sequence attention"
+        )
+    return domain_tokens + attention(domain_tokens, memory, memory_mask)
 
 
 def _equal_split_selected_feature_interaction_hat(
     query_tokens: Tensor,
     domain_state: Tensor,
-    ns_tokens: Tensor,
-    s_tokens: Tensor,
-    s_mask: Tensor,
+    memory: Tensor,
+    memory_mask: Tensor,
     attention: VariableLengthDomainAttention | None,
 ) -> Tensor:
     """Read ``[Q_S; NS]`` into the split-mode evidence/readout state."""
 
     if attention is None:
-        raise RuntimeError("equal selected-feature Domain read requires sequence attention")
-    memory, mask = _domain_selected_feature_memory(ns_tokens, s_tokens, s_mask)
-    return domain_state + attention(query_tokens, memory, mask)
+        raise RuntimeError(
+            "equal selected-feature Domain read requires sequence attention"
+        )
+    return domain_state + attention(query_tokens, memory, memory_mask)
 
 
 def _required_split_prompt(
@@ -7936,7 +7925,15 @@ class MDLDomainBlock(nn.Module):
         use_sequence_attention: bool = False,
     ) -> None:
         super().__init__()
-        _init_domain_interaction_modules(self, config, metadata)
+        # A sequence-reading block never calls the fixed-width NS reader, so
+        # skip building it instead of parking ~70M unused parameters per block
+        # in the checkpoint, the optimizer state, and the DDP bucket set.
+        _init_domain_interaction_modules(
+            self,
+            config,
+            metadata,
+            build_feature_interaction=not use_sequence_attention,
+        )
         token_dim = config.model.token_dim
         self.use_sequence_attention = use_sequence_attention
 
@@ -7973,15 +7970,21 @@ class MDLDomainBlock(nn.Module):
 
     def forward(
         self,
-        ns_tokens: Tensor,
-        s_tokens: Tensor,
-        s_mask: Tensor,
+        tokens: Tensor,
+        valid_mask: Tensor,
+        s_count: int,
         scenario_tokens: Tensor,
         task_tokens: Tensor,
         scenario_mask: Tensor,
         scenario_prompts: Tensor | None = None,
         task_prompts: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
+        # ``tokens``/``valid_mask`` are the OneTrans unified stream, which is
+        # already laid out as ``[Q_S; NS]`` with an all-valid NS tail. Read it
+        # as-is so the equal-treatment pool costs no extra activation copy.
+        ns_tokens = tokens[:, s_count:, :]
+        memory = tokens if self.use_sequence_attention else ns_tokens
+        memory_mask = valid_mask
         if self.mdl_token_state == "split":
             scenario_hat: Tensor | None = None
             if self.use_scenario_tokens:
@@ -7995,9 +7998,8 @@ class MDLDomainBlock(nn.Module):
                     scenario_hat = _equal_split_selected_feature_interaction_hat(
                         scenario_query,
                         scenario_tokens,
-                        ns_tokens,
-                        s_tokens,
-                        s_mask,
+                        memory,
+                        memory_mask,
                         self.scenario_sequence_attention,
                     )
                 else:
@@ -8026,9 +8028,8 @@ class MDLDomainBlock(nn.Module):
                     task_hat = _equal_split_selected_feature_interaction_hat(
                         task_query,
                         task_tokens,
-                        ns_tokens,
-                        s_tokens,
-                        s_mask,
+                        memory,
+                        memory_mask,
                         self.task_sequence_attention,
                     )
                 else:
@@ -8065,9 +8066,8 @@ class MDLDomainBlock(nn.Module):
             if self.use_sequence_attention:
                 scenario_hat = _equal_selected_feature_interaction_hat(
                     scenario_tokens,
-                    ns_tokens,
-                    s_tokens,
-                    s_mask,
+                    memory,
+                    memory_mask,
                     self.scenario_sequence_attention,
                 )
             else:
@@ -8085,9 +8085,8 @@ class MDLDomainBlock(nn.Module):
             if self.use_sequence_attention:
                 task_hat = _equal_selected_feature_interaction_hat(
                     task_tokens,
-                    ns_tokens,
-                    s_tokens,
-                    s_mask,
+                    memory,
+                    memory_mask,
                     self.task_sequence_attention,
                 )
             else:
@@ -8299,8 +8298,6 @@ class MDLOneTransModel(nn.Module):
             zip(self.blocks, layer_caches)
         ):
             state = self.backbone.step(state, layer_index, layer_cache)
-            s_tokens = state.tokens[:, : state.s_count, :]
-            s_mask = state.valid_mask[:, : state.s_count]
             feature_tokens = state.tokens[:, state.s_count :, :]
             if (
                 _activation_checkpoint_enabled(
@@ -8309,9 +8306,9 @@ class MDLOneTransModel(nn.Module):
                 and self.training
             ):
                 block_args = (
-                    feature_tokens,
-                    s_tokens,
-                    s_mask,
+                    state.tokens,
+                    state.valid_mask,
+                    state.s_count,
                     scenario_tokens,
                     task_tokens,
                     scenario_mask,
@@ -8325,9 +8322,9 @@ class MDLOneTransModel(nn.Module):
                 )
             else:
                 block_args = (
-                    feature_tokens,
-                    s_tokens,
-                    s_mask,
+                    state.tokens,
+                    state.valid_mask,
+                    state.s_count,
                     scenario_tokens,
                     task_tokens,
                     scenario_mask,

@@ -429,9 +429,9 @@ class MDLTokenStateAlignmentTest(unittest.TestCase):
         scenario_state = torch.randn(2, 2, 4)
         task_state = torch.randn(2, 1, 4)
         common_args = (
-            torch.randn(2, 2, 4),
-            torch.randn(2, 3, 4),
-            torch.ones(2, 3, dtype=torch.bool),
+            torch.randn(2, 5, 4),
+            torch.ones(2, 5, dtype=torch.bool),
+            3,
             scenario_state,
             task_state,
             torch.ones(2, 1),
@@ -2350,6 +2350,12 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
         self.assertFalse(hasattr(block, "task_sequence_gate"))
         self.assertIsNotNone(block.scenario_sequence_attention)
         self.assertIsNotNone(block.task_sequence_attention)
+        # The fixed-width NS reader is never called on this path, so it must
+        # not be allocated as unused parameters.
+        self.assertIsNone(block.scenario_attention)
+        self.assertIsNone(block.task_attention)
+        self.assertIsNone(block.scenario_rankmixer)
+        self.assertIsNone(block.task_rankmixer)
 
         ns_tokens = torch.randn(2, 2, 4)
         s_tokens = torch.randn(2, 5, 4)
@@ -2359,17 +2365,17 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
         scenario_tokens = torch.randn(2, 3, 4)
         task_tokens = torch.randn(2, 2, 4)
         scenario_mask = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        memory = torch.cat([s_tokens, ns_tokens], dim=1)
+        memory_mask = torch.cat([s_mask, torch.ones(2, 2, dtype=torch.bool)], dim=1)
 
         actual = block(
-            ns_tokens,
-            s_tokens,
-            s_mask,
+            memory,
+            memory_mask,
+            5,
             scenario_tokens,
             task_tokens,
             scenario_mask,
         )
-        memory = torch.cat([s_tokens, ns_tokens], dim=1)
-        memory_mask = torch.cat([s_mask, torch.ones(2, 2, dtype=torch.bool)], dim=1)
         scenario_hat = scenario_tokens + block.scenario_sequence_attention(
             scenario_tokens,
             memory,
@@ -2400,18 +2406,19 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
         s_tokens = torch.randn(2, 5, 4)
         s_mask = torch.zeros(2, 5, dtype=torch.bool)
 
+        ns_mask = torch.ones(2, 2, dtype=torch.bool)
         actual = block(
-            ns_tokens,
-            s_tokens,
-            s_mask,
+            torch.cat([s_tokens, ns_tokens], dim=1),
+            torch.cat([s_mask, ns_mask], dim=1),
+            5,
             scenario_tokens,
             task_tokens,
             scenario_mask,
         )
         expected = block(
             ns_tokens,
-            s_tokens.new_empty(2, 0, 4),
-            s_mask.new_empty(2, 0),
+            ns_mask,
+            0,
             scenario_tokens,
             task_tokens,
             scenario_mask,
@@ -2431,11 +2438,14 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
         )
         s_tokens = torch.randn(2, 5, 4, requires_grad=True)
         _scenario_tokens, task_tokens = block(
-            torch.randn(2, 2, 4),
-            s_tokens,
+            torch.cat([s_tokens, torch.randn(2, 2, 4)], dim=1),
             torch.tensor(
-                [[False, True, True, True, True], [True, True, True, True, True]]
+                [
+                    [False, True, True, True, True, True, True],
+                    [True, True, True, True, True, True, True],
+                ]
             ),
+            5,
             torch.randn(2, 2, 4),
             torch.randn(2, 1, 4),
             torch.ones(2, 1),
