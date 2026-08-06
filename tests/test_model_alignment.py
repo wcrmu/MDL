@@ -47,6 +47,7 @@ from src.model import (
 )
 from src.modules.attention import (
     DomainFusedModule,
+    DomainSequenceMemory,
     RankMixerDomainInteraction,
     VariableLengthDomainAttention,
     _VarlenPacking,
@@ -342,8 +343,8 @@ class MDLTokenStateAlignmentTest(unittest.TestCase):
         def forward(
             self,
             domain_tokens: Tensor,
-            sequence_tokens: Tensor,
-            sequence_mask: Tensor,
+            sequence_tokens: Tensor | DomainSequenceMemory,
+            sequence_mask: Tensor | None = None,
         ) -> Tensor:
             del sequence_tokens, sequence_mask
             return torch.zeros_like(domain_tokens)
@@ -2470,6 +2471,55 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
         self.assertGreater(float(s_tokens.grad.abs().sum().item()), 0.0)
         self.assertTrue(bool(torch.isfinite(s_tokens.grad).all()))
 
+    def test_domain_readers_pack_compactly_without_moving_the_backbone(self) -> None:
+        metadata = ModelMetadata(feature_token_count=2, scenario_count=1, task_count=1)
+        inherited = MDLDomainBlock(
+            _rankmixer_config(), metadata, use_sequence_attention=True
+        )
+        config = _rankmixer_config()
+        config.runtime.varlen_packing = "fixed"
+        config.runtime.domain_varlen_packing = "compact"
+        overridden = MDLDomainBlock(config, metadata, use_sequence_attention=True)
+
+        for block, expected in ((inherited, "fixed"), (overridden, "compact")):
+            assert block.scenario_sequence_attention is not None
+            assert block.task_sequence_attention is not None
+            self.assertEqual(
+                block.scenario_sequence_attention.varlen_packing, expected
+            )
+            self.assertEqual(block.task_sequence_attention.varlen_packing, expected)
+
+    def test_domain_only_recompute_matches_stored_activations(self) -> None:
+        model, features = self._small_model_and_features(batch_size=2)
+        model.train()
+        scenario_id = torch.zeros(2, dtype=torch.long)
+        self.assertEqual(model.config.runtime.activation_checkpoint, "none")
+
+        def run(recompute_domain: bool) -> tuple[Tensor, Tensor]:
+            torch.manual_seed(53)
+            model.config = replace(
+                model.config,
+                runtime=replace(
+                    model.config.runtime,
+                    checkpoint_domain_blocks=recompute_domain,
+                ),
+            )
+            model.zero_grad(set_to_none=True)
+            model(features, scenario_id)["logits"].square().sum().backward()
+            block = model.blocks[0]
+            assert block.task_sequence_attention is not None
+            logits_grad = block.task_sequence_attention.key_projection.weight.grad
+            backbone_grad = model.backbone.blocks[0].attention.s_query.weight.grad
+            assert logits_grad is not None and backbone_grad is not None
+            return logits_grad.detach().clone(), backbone_grad.detach().clone()
+
+        stored_domain, stored_backbone = run(False)
+        recomputed_domain, recomputed_backbone = run(True)
+
+        torch.testing.assert_close(recomputed_domain, stored_domain)
+        torch.testing.assert_close(recomputed_backbone, stored_backbone)
+        self.assertGreater(float(stored_domain.abs().sum().item()), 0.0)
+
     def test_cached_candidate_fanout_matches_full_recompute_across_pyramid(self) -> None:
         torch.manual_seed(47)
         model, single_features = self._small_model_and_features(batch_size=1)
@@ -2498,7 +2548,9 @@ class MDLOneTransSequenceAttentionTest(unittest.TestCase):
             assert block.task_sequence_attention is not None
             hooks.append(
                 block.task_sequence_attention.register_forward_pre_hook(
-                    lambda _module, args: observed_lengths.append(args[1].size(1))
+                    lambda _module, args: observed_lengths.append(
+                        args[1].tokens.size(1)
+                    )
                 )
             )
 

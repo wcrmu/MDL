@@ -237,7 +237,7 @@ key/value = clk_long events
 - S 最长 2048；Domain 每层把当层 `Q_S` 与 32 个 NS 拼成同一个 attention 池读取（`first_domain_sequence_layer=0`），S 与 NS 同等待遇、无分支门；
 - RankMixer 历史走 LONGER 压缩进 Feature token，控制 32×768 宽度；大 batch 下仍需按 token 预算切块 LONGER/序列投影，并把 `device_prefetch_batches` 压到 1；
 - OOM 由 length bucket、packing、cache、checkpoint、allocator、world-size NCCL/emb staging 同相叠加决定，**降 batch / 开 full remat 都不单调更省**；
-- 两族模型已回到各自验证过的 profile：`mdl_rankmixer` 为 batch **1536** + `activation_checkpoint=none` + CUDA graph；`mdl_onetrans` 为 batch **1408** + `activation_checkpoint=none` + fixed packing。现场表见 [`mdl_reproduction_lecture_report.md`](./mdl_reproduction_lecture_report.md) §2.7 与 RankMixer/MDL 显存节。
+- 两族模型已回到各自验证过的 profile：`mdl_rankmixer` 为 batch **1536** + `activation_checkpoint=none` + CUDA graph；`mdl_onetrans` 为 batch **1408** + `activation_checkpoint=none` + 主干 fixed packing，Domain sidecar 单独走 `domain_varlen_packing=compact` + `checkpoint_domain_blocks=true`。现场表见 [`mdl_reproduction_lecture_report.md`](./mdl_reproduction_lecture_report.md) §2.7 与 RankMixer/MDL 显存节。
 
 ### 4.5 分布式稀疏表
 

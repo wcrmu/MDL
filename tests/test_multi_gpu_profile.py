@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from src.config import load_app_config
@@ -127,6 +128,39 @@ class MultiGpuProfileTest(unittest.TestCase):
         )
         self.assertGreaterEqual(updated.data.train.reader.prefetch_batches, 6)
         self.assertLessEqual(updated.data.train.reader.hdfs_op_timeout, 15.0)
+
+    def test_mdl_onetrans_full_remat_applies_hbm_rescue_profile(self) -> None:
+        os.environ.pop("MDL_LOCAL_BATCH_SCALE", None)
+        os.environ.pop("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", None)
+        config = load_app_config("configs/mdl_onetrans.yaml")
+        # Force full remat plus a non-rescued baseline so the auto-profile path
+        # is exercised even if production YAML is mid-edit.
+        config = replace(
+            config,
+            runtime=replace(
+                config.runtime,
+                activation_checkpoint="full",
+                varlen_packing="fixed",
+                sequence_projection_chunk_tokens=81920,
+            ),
+            model=replace(config.model, use_request_cache=True),
+            data=replace(
+                config.data,
+                train=replace(
+                    config.data.train,
+                    reader=replace(
+                        config.data.train.reader,
+                        device_prefetch_batches=1,
+                    ),
+                ),
+            ),
+        )
+        updated = _apply_world_size_training_profile(config, world_size=4)
+        self.assertEqual(updated.runtime.varlen_packing, "compact")
+        self.assertEqual(updated.runtime.sequence_projection_chunk_tokens, 32768)
+        self.assertFalse(updated.model.use_request_cache)
+        self.assertEqual(updated.data.train.reader.device_prefetch_batches, 0)
+        self.assertEqual(os.environ.get("MDL_GROUPED_EMB_MAX_OUTPUT_MIB"), "256")
 
     def test_nccl_env_sets_buffer_caps(self) -> None:
         env: dict[str, str] = {"WORLD_SIZE": "8"}

@@ -715,6 +715,7 @@ def _configure_nccl_runtime_env(
     environ: MutableMapping[str, str] | None = None,
     *,
     prefer_collective_bw: bool = False,
+    hbm_caps_min_world_size: int = 6,
 ) -> None:
     """Use CUDA P2P when healthy; otherwise tell NCCL to fall back safely.
 
@@ -730,7 +731,9 @@ def _configure_nccl_runtime_env(
 
     ``prefer_collective_bw`` (RankMixer-family): keep larger NCCL buffers /
     full channel count so emb A2A is not BW-starved on 6–8 GPU. OneTrans-style
-    models keep the tighter HBM caps.
+    models keep the tighter HBM caps. ``hbm_caps_min_world_size`` is 4 for
+    OneTrans (long-S remat fights NCCL scratch for the same 80 GiB) and 6 for
+    other non-RankMixer models.
 
     ``environ`` defaults to ``os.environ``; the DDP launcher may pass a copied
     dict so child processes inherit the decision.
@@ -746,13 +749,13 @@ def _configure_nccl_runtime_env(
         world_size = int(env.get("WORLD_SIZE", "1") or "1")
     except ValueError:
         world_size = 1
-    # Emb-bound RankMixer needs larger scratch from 2-GPU up. Other models keep
-    # tighter 6–8 GPU HBM caps (applying those on 2–4 GPU cut A2A BW).
+    # Emb-bound RankMixer needs larger scratch from 2-GPU up. OneTrans applies
+    # tighter HBM caps from 4-GPU up; other models keep the historical ≥6 gate.
     if prefer_collective_bw and world_size >= 2:
         env.setdefault("NCCL_CUMEM_ENABLE", "0")
         env.setdefault("NCCL_BUFFSIZE", str(8 * 1024 * 1024))
         env.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "8")
-    elif world_size >= 6:
+    elif world_size >= max(2, int(hbm_caps_min_world_size)):
         env.setdefault("NCCL_CUMEM_ENABLE", "0")
         env.setdefault("NCCL_BUFFSIZE", str(2 * 1024 * 1024))
         env.setdefault("NCCL_MAX_NCHANNELS", "4")
@@ -789,6 +792,10 @@ def _configure_nccl_runtime_env(
 
 def _is_rankmixer_family(config: AppConfig) -> bool:
     return str(getattr(config.model, "name", "")) in {"rankmixer", "mdl_rankmixer"}
+
+
+def _is_onetrans_family(config: AppConfig) -> bool:
+    return str(getattr(config.model, "name", "")) in {"onetrans", "mdl_onetrans"}
 
 
 def _local_world_size() -> int:
@@ -949,6 +956,9 @@ def _apply_world_size_training_profile(
     training = config.training
     data = config.data
     runtime = config.runtime
+    model = config.model
+    onetrans_family = _is_onetrans_family(config)
+    full_remat = str(getattr(runtime, "activation_checkpoint", "none")) == "full"
     if abs(scale - 1.0) >= 1.0e-9:
         old_bs = int(training.batch_size)
         new_bs = _scale_int_batch(old_bs, scale)
@@ -974,9 +984,31 @@ def _apply_world_size_training_profile(
         elif rankmixer_family:
             # No-P2P / 24GB: medium chunks — 768+ regressed sps on 4×4090.
             emb_cap = "512"
+        elif onetrans_family and full_remat:
+            # Full remat already fights activations for HBM; keep emb scratch
+            # smaller than the default 512 MiB OneTrans staging buffer.
+            emb_cap = "256" if world_size >= 4 else "384"
         else:
             emb_cap = "384" if world_size >= 8 else "512"
         os.environ.setdefault("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", emb_cap)
+
+    # OneTrans full-remat HBM rescue (infra only; numerics unchanged):
+    # compact backbone packing, drop the extra device FeatureBatch, drop the
+    # request-cache layer ``s_input`` tape that full remat otherwise retains,
+    # and tighten projector chunking.
+    if onetrans_family and full_remat:
+        runtime_updates: dict[str, object] = {}
+        if getattr(runtime, "varlen_packing", "fixed") != "compact":
+            runtime_updates["varlen_packing"] = "compact"
+        chunk_tokens = int(
+            getattr(runtime, "sequence_projection_chunk_tokens", 0) or 0
+        )
+        if chunk_tokens <= 0 or chunk_tokens > 32768:
+            runtime_updates["sequence_projection_chunk_tokens"] = 32768
+        if runtime_updates:
+            runtime = replace(runtime, **runtime_updates)
+        if bool(getattr(model, "use_request_cache", False)):
+            model = replace(model, use_request_cache=False)
 
     # MDL-RankMixer CUDA-graph pools are huge on ≤32 GiB; disable graph.
     if (
@@ -1000,6 +1032,16 @@ def _apply_world_size_training_profile(
             world_size >= 8
             and reader.device_prefetch_batches > 0
             and not rankmixer_family
+        ):
+            reader = replace(reader, device_prefetch_batches=0)
+            reader_changed = True
+        # OneTrans full remat: even one prefetched FeatureBatch of long S is a
+        # second live copy beside the remat working set. Drop it from 2-GPU up.
+        if (
+            onetrans_family
+            and full_remat
+            and multi_gpu
+            and reader.device_prefetch_batches > 0
         ):
             reader = replace(reader, device_prefetch_batches=0)
             reader_changed = True
@@ -1079,6 +1121,7 @@ def _apply_world_size_training_profile(
         training is config.training
         and data is config.data
         and runtime is config.runtime
+        and model is config.model
     ):
         if is_main_process() and multi_gpu:
             print(
@@ -1093,11 +1136,16 @@ def _apply_world_size_training_profile(
                 f"emb_max_output_mib="
                 f"{os.environ.get('MDL_GROUPED_EMB_MAX_OUTPUT_MIB', '')} "
                 f"p2p={int(p2p_ok)} small_hbm={int(small_hbm)} "
-                f"cuda_graph={int(bool(runtime.cuda_graph_backbone))}",
+                f"cuda_graph={int(bool(runtime.cuda_graph_backbone))} "
+                f"activation_checkpoint={runtime.activation_checkpoint} "
+                f"varlen_packing={runtime.varlen_packing} "
+                f"request_cache={int(bool(model.use_request_cache))}",
                 flush=True,
             )
         return config
-    updated = replace(config, training=training, data=data, runtime=runtime)
+    updated = replace(
+        config, training=training, data=data, runtime=runtime, model=model
+    )
     if is_main_process():
         train_reader = updated.data.train.reader if updated.data.train else None
         print(
@@ -1112,7 +1160,10 @@ def _apply_world_size_training_profile(
             f"emb_max_output_mib="
             f"{os.environ.get('MDL_GROUPED_EMB_MAX_OUTPUT_MIB', '')} "
             f"p2p={int(p2p_ok)} small_hbm={int(small_hbm)} "
-            f"cuda_graph={int(bool(updated.runtime.cuda_graph_backbone))}",
+            f"cuda_graph={int(bool(updated.runtime.cuda_graph_backbone))} "
+            f"activation_checkpoint={updated.runtime.activation_checkpoint} "
+            f"varlen_packing={updated.runtime.varlen_packing} "
+            f"request_cache={int(bool(updated.model.use_request_cache))}",
             flush=True,
         )
     return updated
@@ -1160,6 +1211,9 @@ def _setup_distributed(config: AppConfig) -> DistributedContext:
             # knobs before ProcessGroupNCCL allocates channel/scratch buffers.
             _configure_nccl_runtime_env(
                 prefer_collective_bw=_is_rankmixer_family(config),
+                hbm_caps_min_world_size=(
+                    4 if _is_onetrans_family(config) else 6
+                ),
             )
         backend = _resolve_process_group_backend(device)
         torch_dist.init_process_group(

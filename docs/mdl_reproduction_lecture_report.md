@@ -413,7 +413,7 @@ F^{l+1}=\operatorname{LN}
 |---|---|---|
 | 静态大头 | embedding + Row-Wise state（MDL 因 Domain scope 更高） | 同左，另加长 S 的激活/cache |
 | 动态大头 | LONGER 与序列投影、device prefetch、emb A2A scratch | varlen pack、多层 S cache、Domain×S cross-attn |
-| 默认省激活旋钮 | **不要** full remat；用 none + CUDA graph | **不要**盲开 full remat；用 none + fixed packing 基线 |
+| 默认省激活旋钮 | **不要** full remat；用 none + CUDA graph | **不要**盲开 full remat；主干守住 none + fixed packing 基线，只把 Domain sidecar 交给 `domain_varlen_packing` / `checkpoint_domain_blocks` |
 | 当前生产 batch | 1536（`rankmixer` 1280） | 1408 |
 | 不能外推的点 | 短跑 peak ≠ 长跑；world size 改变 NCCL/emb 占用 | 同左，且 candidates/request 会放大 cache |
 
@@ -516,7 +516,7 @@ F^{l+1}=\operatorname{LN}
 2. 三轴错位为何不 crash；
 3. sparse DDP 静默分叉；
 4. OneTrans sidecar 与 request-sized cache；
-5. 399.49 GiB 的 24h Embedding 预算，以及 RankMixer「none + CUDA graph」与 OneTrans「none + fixed packing」两条不同的 HBM 剖面；
+5. 399.49 GiB 的 24h Embedding 预算，以及 RankMixer「none + CUDA graph」与 OneTrans「主干 none + fixed packing，Domain sidecar compact + 重算」两条不同的 HBM 剖面；
 6. fixed holdout 之前不能讲 AUC 坍缩。
 
 ## 6. 当前结论与下一步

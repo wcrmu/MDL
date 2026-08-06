@@ -2301,6 +2301,15 @@ class RuntimeConfig:
     # fixed avoids dynamic-shape synchronization; compact removes padded Q/K/V
     # tokens and is the low-HBM production mode for variable-length workloads.
     varlen_packing: Literal["fixed", "compact"] = "fixed"
+    # The MDL Domain sidecar reads the padded [Q_S; NS] pool, so fixed-capacity
+    # packing copies every padded slot into K and V once per reader per layer.
+    # Packing that path compactly is worth far more HBM than it is on the
+    # backbone. Null inherits varlen_packing.
+    domain_varlen_packing: Literal["fixed", "compact"] | None = None
+    # Recompute only the MDL Domain sidecar. It reads the widest pools but is a
+    # small share of dense FLOPs, so this buys back its activations for much
+    # less throughput than the global activation_checkpoint ladder costs.
+    checkpoint_domain_blocks: bool = False
     # Full-checkpoint mode flattens long event axes and projects at most this
     # many tokens at once. Zero keeps the unchunked projection.
     sequence_projection_chunk_tokens: int = 0
@@ -2334,6 +2343,12 @@ class RuntimeConfig:
             values["activation_checkpoint"] = "full" if legacy_checkpoint else "none"
         return cls(**values)
 
+    @property
+    def resolved_domain_varlen_packing(self) -> str:
+        """Packing the MDL Domain readers use, falling back to the global mode."""
+
+        return self.domain_varlen_packing or self.varlen_packing
+
     def validate(self) -> None:
         for field_name in (
             "device",
@@ -2355,6 +2370,7 @@ class RuntimeConfig:
             "trim_all_invalid_sequence_prefix",
             "validate_scenario_ids",
             "onetrans_batched_ns",
+            "checkpoint_domain_blocks",
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise ValueError(f"runtime.{field_name} must be a boolean")
@@ -2366,6 +2382,12 @@ class RuntimeConfig:
             raise ValueError(
                 "runtime.cuda_graph_backbone requires runtime.activation_checkpoint=none "
                 "(selective/full recompute is incompatible with CUDA Graph capture)"
+            )
+        if self.cuda_graph_backbone and self.checkpoint_domain_blocks:
+            raise ValueError(
+                "runtime.cuda_graph_backbone requires "
+                "runtime.checkpoint_domain_blocks=false "
+                "(recompute is incompatible with CUDA Graph capture)"
             )
         if self.nproc_per_node is not None and type(self.nproc_per_node) is not int:
             raise ValueError("runtime.nproc_per_node must be an integer or null")
@@ -2400,6 +2422,10 @@ class RuntimeConfig:
             raise ValueError("runtime.attention_backend must be auto, sdpa, or flash")
         if self.varlen_packing not in {"fixed", "compact"}:
             raise ValueError("runtime.varlen_packing must be fixed or compact")
+        if self.domain_varlen_packing not in {None, "fixed", "compact"}:
+            raise ValueError(
+                "runtime.domain_varlen_packing must be fixed, compact, or null"
+            )
         if self.activation_checkpoint not in {"none", "selective", "full"}:
             raise ValueError(
                 "runtime.activation_checkpoint must be none, selective, or full"

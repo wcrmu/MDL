@@ -219,9 +219,18 @@ OneTrans 支持增量更新 S cache，但 pyramid 会让更深层的保留窗口
 | batch 768 在约 step 1300 仍 OOM | 除 live tensor 外约有 12 GiB reserved fragmentation；短 smoke 未覆盖高水位 | allocator 配置必须在 import torch 前生效，并联动 length bucket、projection chunk 与 packing（`304c1d0`） |
 | 打开 full activation checkpoint 后仍 mid-run OOM | checkpoint、固定/变长 packing、cache K/V 与 batch profile 耦合；单一“省激活”旋钮非单调 | 回退到验证过的 `activation_checkpoint=none + fixed packing` 基线后重新调参（`f6fdb68`） |
 | Flash/FFN 峰值叠加 | 冗余 contiguous、重复 mask metadata、长序列投影同时存活 | 复用 packing metadata、跳过冗余拷贝、按长度分块序列投影（`4861e0e`） |
+| Domain 每层读 `[Q_S; NS]` 后 sidecar 激活翻数倍 | scenario 与 task 各自把整个池子清零、归一、投影 K/V，且 fixed packing 按满 padding 容量再拷一份 | 一层只准备一次共享 memory；padding 不再清零（LayerNorm 逐 token，mask 已排除 padded key，只要求其有限）；`domain_varlen_packing` 与 `checkpoint_domain_blocks` 单独控制这条路径 |
 
 **解决方案的结论：**  
 当前已重新调到 `batch_size=1408`。历史上的“降到 512”不是终局答案。OneTrans 的安全 batch 必须在**真实长度分布、缓存策略、allocator、packing 与完整长跑**下联合验证，不能由短跑峰值或单一 batch 数字外推。
+
+Domain sidecar 的显存有三个与全局 ladder 正交的旋钮，因为 `activation_checkpoint=selective/full` 会把主干和序列编码器一起拖进重算，而 2.6 记录的正是那种耦合导致的 mid-run OOM：
+
+- `runtime.domain_varlen_packing`（默认继承 `varlen_packing`）：`compact` 只打包有效 token，不为 padded slot 付 K/V 拷贝。触发过 OOM 的 boolean indexing 已在 `cc92f47` 换成 `index_select`，重算路径下同样安全。
+- `runtime.checkpoint_domain_blocks`：只重算 Domain block，主干激活照常保留。sidecar 按解析式 FLOPs 只占 dense 的约 8%，用它换回整条 sidecar 的激活是笔划算买卖。
+- 共享 memory 与去掉 `masked_fill` 无需配置，恒定生效。
+
+生产 `mdl_onetrans` 的 4×H100 救援剖面是 `activation_checkpoint=full` + 主干/Domain 都 `compact` packing + `checkpoint_domain_blocks=true` + `device_prefetch_batches=0` + `use_request_cache=false`（full remat 下 cache 会把每层 `s_input` 钉在 tape 上，反而更费）。数值与 `none+fixed` 一致，只是用重算换激活。多卡启动时 `_apply_world_size_training_profile` 还会把 emb A2A 帽到 256 MiB，并给 OneTrans 从 4 卡起套 NCCL buffer/channel 帽。若真机峰值有余量，可逐个关掉换吞吐。
 
 **验证/边界：**  
 任何新 packing / checkpoint / width / cache 组合，都要跑到足以暴露 reserved fragmentation 的步数，并报告峰值 HBM、cache bytes/request、candidates/request 扩展斜率。

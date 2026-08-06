@@ -915,6 +915,44 @@ class ModelConfigOverlayTest(unittest.TestCase):
                         )
                     )
 
+    def test_domain_sidecar_hbm_controls_are_independent_of_the_global_ladder(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = load_app_config(root / "configs" / "mdl_onetrans.yaml")
+        # Exercise the RuntimeConfig knobs directly; production YAML may still
+        # be mid-flight on unrelated embedding-size edits.
+        runtime = replace(
+            config.runtime,
+            activation_checkpoint="full",
+            domain_varlen_packing="compact",
+            checkpoint_domain_blocks=True,
+        )
+
+        self.assertEqual(
+            runtime.resolved_domain_varlen_packing,
+            runtime.domain_varlen_packing or runtime.varlen_packing,
+        )
+
+        inherited = replace(runtime, domain_varlen_packing=None)
+        self.assertEqual(
+            inherited.resolved_domain_varlen_packing, inherited.varlen_packing
+        )
+        overridden = replace(
+            runtime, varlen_packing="fixed", domain_varlen_packing="compact"
+        )
+        self.assertEqual(overridden.resolved_domain_varlen_packing, "compact")
+
+        with self.assertRaisesRegex(ValueError, "domain_varlen_packing"):
+            replace(runtime, domain_varlen_packing="packed").validate()
+        with self.assertRaisesRegex(ValueError, "checkpoint_domain_blocks"):
+            replace(
+                runtime,
+                activation_checkpoint="none",
+                cuda_graph_backbone=True,
+                checkpoint_domain_blocks=True,
+            ).validate()
+
 
 if __name__ == "__main__":
     unittest.main()

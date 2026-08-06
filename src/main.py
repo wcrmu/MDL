@@ -196,7 +196,12 @@ _TRAINING_OVERRIDE_FIELDS = (
     "checkpoint_path",
 )
 
-_RUNTIME_OVERRIDE_FIELDS = ("activation_checkpoint", "cuda_graph_backbone")
+_RUNTIME_OVERRIDE_FIELDS = (
+    "activation_checkpoint",
+    "cuda_graph_backbone",
+    "domain_varlen_packing",
+    "checkpoint_domain_blocks",
+)
 
 _MODEL_OVERRIDE_FIELDS = (
     "mdl_feature_interaction",
@@ -605,6 +610,24 @@ def _add_runtime_override_args(parser: argparse.ArgumentParser) -> None:
             "stack after embeddings (requires activation_checkpoint=none)"
         ),
     )
+    parser.add_argument(
+        "--domain-varlen-packing",
+        choices=["fixed", "compact"],
+        default=None,
+        help=(
+            "override runtime.domain_varlen_packing; compact drops padded keys "
+            "from the MDL Domain reads instead of packing at full capacity"
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-domain-blocks",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "override runtime.checkpoint_domain_blocks; recomputes only the MDL "
+            "Domain sidecar, leaving the backbone activations stored"
+        ),
+    )
 
 
 def _add_model_override_args(parser: argparse.ArgumentParser) -> None:
@@ -838,6 +861,11 @@ def _cmd_validate_config(args: argparse.Namespace) -> int:
     print(f"lr_sparse: {config.training.lr_sparse}")
     print(f"activation_checkpoint: {config.runtime.activation_checkpoint}")
     print(f"cuda_graph_backbone: {config.runtime.cuda_graph_backbone}")
+    print(
+        "domain_varlen_packing: "
+        f"{config.runtime.resolved_domain_varlen_packing}"
+    )
+    print(f"checkpoint_domain_blocks: {config.runtime.checkpoint_domain_blocks}")
     buckets = config.data.train.reader.length_buckets
     if buckets:
         rendered = ",".join(

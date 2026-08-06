@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 import math
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from torch import Tensor, nn
@@ -512,6 +512,59 @@ class DomainAwareAttention(nn.Module):
         return self._merge_heads(attended), weights if need_weights else None
 
 
+class DomainSequenceMemory(NamedTuple):
+    """Sequence memory shared by the Domain readers of one block.
+
+    The attention masks depend only on the sequence side, so a block that runs
+    several readers over the same memory derives them once instead of once per
+    reader.  ``tokens`` aliases the caller's stream rather than a padding-zeroed
+    copy, which keeps the widest activation in the sidecar off the tape.
+    """
+
+    tokens: Tensor
+    safe_mask: Tensor
+    has_valid_sequence: Tensor
+
+
+def prepare_domain_sequence_memory(
+    sequence_tokens: Tensor,
+    sequence_mask: Tensor,
+) -> DomainSequenceMemory:
+    """Derive the attention masks a block's Domain readers share.
+
+    Padded positions are left untouched: LayerNorm normalizes every token on
+    its own, the attention mask drops padded keys, and fixed-capacity packing
+    zeroes them again before Flash sees them, so a padded value can never reach
+    a valid query.  Callers must keep those positions finite, because the
+    zero attention weight would otherwise turn an inf or NaN into a NaN.
+    """
+
+    if sequence_tokens.ndim != 3:
+        raise ValueError("sequence_tokens must have shape [batch, length, token_dim]")
+    if sequence_mask.shape != sequence_tokens.shape[:2]:
+        raise ValueError(
+            "sequence_mask must match the sequence token batch and length"
+        )
+    sequence_mask = sequence_mask.to(
+        device=sequence_tokens.device,
+        dtype=torch.bool,
+    )
+    if sequence_tokens.size(1) == 0:
+        return DomainSequenceMemory(
+            sequence_tokens,
+            sequence_mask,
+            sequence_mask.new_zeros(sequence_tokens.size(0)),
+        )
+    has_valid_sequence = sequence_mask.any(dim=1)
+
+    # SDPA backends need at least one allowed key per row.  Empty-history rows
+    # temporarily expose position 0 and are explicitly zeroed again after
+    # projection, so neither padding values nor projection biases leak.
+    safe_mask = sequence_mask.clone()
+    safe_mask[:, 0] |= ~has_valid_sequence
+    return DomainSequenceMemory(sequence_tokens, safe_mask, has_valid_sequence)
+
+
 class VariableLengthDomainAttention(nn.Module):
     """Cross-attention from fixed domain tokens to masked sequence states.
 
@@ -605,38 +658,35 @@ class VariableLengthDomainAttention(nn.Module):
     def forward(
         self,
         domain_tokens: Tensor,
-        sequence_tokens: Tensor,
-        sequence_mask: Tensor,
+        sequence_tokens: Tensor | DomainSequenceMemory,
+        sequence_mask: Tensor | None = None,
     ) -> Tensor:
         if domain_tokens.ndim != 3 or domain_tokens.size(-1) != self.token_dim:
             raise ValueError(
                 f"domain_tokens must have shape [batch, tokens, {self.token_dim}]"
             )
-        if sequence_tokens.ndim != 3 or sequence_tokens.size(-1) != self.token_dim:
+        if isinstance(sequence_tokens, DomainSequenceMemory):
+            memory = sequence_tokens
+        elif sequence_mask is None:
+            raise ValueError("sequence_mask is required with raw sequence tokens")
+        else:
+            memory = prepare_domain_sequence_memory(sequence_tokens, sequence_mask)
+        if memory.tokens.size(-1) != self.token_dim:
             raise ValueError(
                 f"sequence_tokens must have shape [batch, length, {self.token_dim}]"
             )
-        if sequence_mask.shape != sequence_tokens.shape[:2]:
-            raise ValueError("sequence_mask must match the sequence token batch and length")
-        if domain_tokens.size(0) != sequence_tokens.size(0):
+        if domain_tokens.size(0) != memory.tokens.size(0):
             raise ValueError("domain and sequence token batches must match")
-        if sequence_tokens.size(1) == 0:
+        if memory.tokens.size(1) == 0:
             return torch.zeros_like(domain_tokens)
 
-        sequence_mask = sequence_mask.to(device=sequence_tokens.device, dtype=torch.bool)
-        has_valid_sequence = sequence_mask.any(dim=1)
-
-        # SDPA backends need at least one allowed key per row.  Empty-history
-        # rows temporarily expose one zeroed key and are explicitly zeroed again
-        # after projection, so neither padding values nor projection biases leak.
-        safe_mask = sequence_mask.clone()
-        safe_mask[:, 0] |= ~has_valid_sequence
-        memory = sequence_tokens.masked_fill(~sequence_mask.unsqueeze(-1), 0.0)
+        safe_mask = memory.safe_mask
+        has_valid_sequence = memory.has_valid_sequence
 
         query = self._split_heads(
             self.query_projection(self.query_norm(domain_tokens))
         )
-        normalized_memory = self.memory_norm(memory)
+        normalized_memory = self.memory_norm(memory.tokens)
         key = self._split_heads(self.key_projection(normalized_memory))
         value = self._split_heads(self.value_projection(normalized_memory))
         if self.attention_backend == "flash":
