@@ -4113,7 +4113,9 @@ def build_config(
             "use_scenario_feature_interaction": mdl_family,
             "mdl_feature_interaction": "residual_ffn",
             "scene_feature_bias": "none",
-            "use_request_cache": True,
+            # Under full remat the cache keeps per-layer ``s_input`` on the
+            # tape; disable it so HBM tracks the live token stream only.
+            "use_request_cache": False,
         }
         if model_name == "mdl_onetrans":
             model.update(
@@ -4135,16 +4137,36 @@ def build_config(
             "compile_mode": "default",
             "require_compact_sequence_batches": False,
             "allow_tf32": True,
-            "activation_checkpoint": "none",
+            # OneTrans / MDL-OneTrans use full remat + compact packing as the
+            # large-batch HBM rescue profile (same numerics as none+fixed).
+            "activation_checkpoint": (
+                "full" if onetrans_family else "none"
+            ),
             # RankMixer dense-stack CUDA graphs exist (opt-in). Keep default
             # false until DDP+graph soak is clean on PCIe fabrics.
             "cuda_graph_backbone": False,
             "attention_backend": "flash",
+            "varlen_packing": "compact" if onetrans_family else "fixed",
+            # The Domain sidecar reads the padded [Q_S; NS] pool once per
+            # reader per layer, so fixed-capacity packing pays for every padded
+            # slot twice over. Pack that path compactly and recompute it rather
+            # than storing the widest activations in the model.
+            **(
+                {
+                    "domain_varlen_packing": "compact",
+                    "checkpoint_domain_blocks": True,
+                }
+                if model_name == "mdl_onetrans"
+                else {}
+            ),
             # The STCA SwiGLU is token-wise; bounded chunks preserve the exact
             # equation while avoiding an r*d activation over every 10k token at
             # once. Other encoders retain their established unchunked default.
+            # OneTrans full remat chunks the S projectors to bound peak HBM.
             "sequence_projection_chunk_tokens": (
-                65536 if rankmixer_family and sequence_encoder == "stca" else 0
+                32768
+                if onetrans_family
+                else (65536 if rankmixer_family and sequence_encoder == "stca" else 0)
             ),
             "distributed": "ddp",
             "nproc_per_node": gpu_count,

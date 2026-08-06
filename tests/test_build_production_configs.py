@@ -1386,10 +1386,10 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             "mdl_onetrans": (
                 "flash",
                 False,
-                2,
-                "none",
+                4,
+                "full",
                 False,
-                "fixed",
+                "compact",
                 False,
             ),
             "mdl_rankmixer": (
@@ -1480,13 +1480,13 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertEqual(config.training.lr_warmup_steps, 5000)
                 if memory_optimized:
                     expected_proj_chunk = (
-                        131072 if model_name == "mdl_rankmixer" else 81920
+                        131072 if model_name == "mdl_rankmixer" else 32768
                     )
-                    expected_batch = 1536 if model_name == "mdl_rankmixer" else 1408
+                    expected_batch = 1536 if model_name == "mdl_rankmixer" else 1024
                     expected_buckets = (
                         [1536, 960, 640, 480, 768]
                         if model_name == "mdl_rankmixer"
-                        else [1408, 880, 576, 432, 704]
+                        else [1024, 640, 416, 320, 512]
                     )
                     self.assertEqual(
                         config.runtime.sequence_projection_chunk_tokens,
@@ -1548,7 +1548,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertEqual(config.data.train.reader.scanner_batch_rows, 128)
                 self.assertEqual(
                     config.data.train.reader.device_prefetch_batches,
-                    1,
+                    0 if model_name == "mdl_onetrans" else 1,
                 )
                 self.assertEqual(config.data.train.reader.length_bucket_metric, "sum")
                 self.assertEqual(

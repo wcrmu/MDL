@@ -11,15 +11,17 @@ runtime:
   compile_mode: default
   require_compact_sequence_batches: false
   allow_tf32: true
-  activation_checkpoint: none
+  activation_checkpoint: full
   attention_backend: flash
-  varlen_packing: fixed
-  sequence_projection_chunk_tokens: 81920
+  varlen_packing: compact
+  domain_varlen_packing: compact
+  checkpoint_domain_blocks: true
+  sequence_projection_chunk_tokens: 32768
   sequence_encoder_chunk_rows: 0
   sequence_encoder_chunk_tokens: 163840
   onetrans_batched_ns: true
   distributed: ddp
-  nproc_per_node: 2
+  nproc_per_node: 4
   master_addr: 127.0.0.1
   master_port: 29500
   trim_all_invalid_sequence_prefix: false
@@ -48,7 +50,7 @@ data:
       schema_validation_samples: 1
       cardinality_audit_raw_rows: 0
       coalesce_pinned_tensors: true
-      device_prefetch_batches: 1
+      device_prefetch_batches: 0
       deduplicate_request_features: true
       agg_direct_mode: direct
       host_prepare_prefetch: 3
@@ -68,15 +70,15 @@ data:
       length_bucket_metric: sum
       length_buckets:
       - max_length: 2048
-        batch_size: 1408
+        batch_size: 1024
       - max_length: 4096
-        batch_size: 880
+        batch_size: 640
       - max_length: 6144
-        batch_size: 576
+        batch_size: 416
       - max_length: 8192
-        batch_size: 432
+        batch_size: 320
       - max_length: null
-        batch_size: 704
+        batch_size: 512
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
       input_columns:
@@ -5548,13 +5550,13 @@ model:
   use_scenario_feature_interaction: true
   mdl_feature_interaction: residual_ffn
   scene_feature_bias: none
-  use_request_cache: true
+  use_request_cache: false
   first_domain_sequence_layer: 0
   experimental_model_acknowledged: true
   mdl_token_state: coupled
 training:
   step_watchdog_sec: 600.0
-  batch_size: 1408
+  batch_size: 1024
   gradient_accumulation_steps: 1
   embedding_distribution: sharded
   dense_distribution: ddp
