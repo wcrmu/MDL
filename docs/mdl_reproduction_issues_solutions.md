@@ -4,7 +4,7 @@
 > 本文与 [`mdl_key_questions.md`](./mdl_key_questions.md) 同源，为独立成文的压缩重写版。
 > 完整字段见 [`mdl_token_feature_design.md`](./mdl_token_feature_design.md)；OneTrans 适配见 [`mdl_onetrans_adaptation_hardships.md`](./mdl_onetrans_adaptation_hardships.md)；串讲底稿见 [`mdl_reproduction_lecture_report.md`](./mdl_reproduction_lecture_report.md)。
 
-本文记录 MDL 复现过程中最关键的八类问题：token 构成与切分（§1–2）、Domain 状态语义与 S/NS 分层（§3–4）、多场景接入（§5），以及显存、HDFS IO、Host RSS 三类系统工程问题（§6–8）。统一体例为 **问题 → 根因 → 解决方案**；必要时补 **边界**，说明哪些结论还不能下定论。
+本文记录 MDL 复现过程中最关键的八类问题：token 构成与切分（§1–2）、Domain 状态语义与 S/NS 分层（§3–4）、多场景接入（§5），以及显存、HDFS IO、CPU 内存占用 三类系统工程问题（§6–8）。统一体例为 **问题 → 根因 → 解决方案**；必要时补 **边界**，说明哪些结论还不能下定论。
 
 ---
 
@@ -227,21 +227,24 @@ OOM 很少由单一张量决定，而是 **embedding 静态占用、激活、pac
 
 ---
 
-## 8. 为什么 RSS 会不断增长？
+## 8. 为什么训练进程占用的 CPU 内存会越来越高？
 
-训练使用 pinned memory 缓存 CPU 到 GPU 的数据。旧版 buffer pool 只会扩容，不会缩容。
+训练会提前申请一批 pinned memory，用来加速 CPU 到 GPU 的数据传输。为了避免反复申请，程序会把用过的内存保留下来，给后续 batch 复用。
 
-例如平时 batch 只需要 200 MB，偶尔一个超长 batch 需要 2 GB，pool 就会把 2 GB buffer 永久保留。之后即使 batch 恢复正常，实际只使用其中一小部分，整块 pinned memory 仍占着 RSS。
+问题是旧版内存池只会变大，不会变小。
 
-因此这不是普通的 Python 对象泄漏，而是 **pinned memory pool 被历史峰值撑大后没有回收**。
+例如平时一个 batch 只需要 200 MB，偶尔出现一个超长 batch，需要 2 GB。内存池扩到 2 GB 后，即使后面的 batch 又恢复到 200 MB，这块 2 GB 内存仍然会一直保留。
 
-解决方式是让 pool 根据最近一段时间的 batch 大小动态缩容：
+因此，内存占用会被历史上最大的 batch 不断抬高，最终可能触发平台的内存保护。
 
-- 过大的空闲 buffer 直接丢弃；
-- 降低扩容预留比例；
-- 限制空闲 buffer 数量和单个 buffer 的保留上限。
+解决方式是：
 
-核心变化是：**超长 batch 可以临时申请大内存，但处理完成后不再永久保留。** 可选硬上限示例：`MDL_PINNED_POOL_MAX_SLOT_BYTES=1073741824`（1 GiB）。长跑验收看尖峰后 RSS 是否回落；这不替代 memfd IPC 等更早一层的修复。
+- 只根据最近一段时间的 batch 大小决定保留多少内存；
+- 过大的空闲 buffer 及时释放；
+- 减少扩容时多申请的余量；
+- 限制空闲 buffer 的数量和大小。
+
+核心变化是：**大 batch 可以临时使用大内存，但用完后不再长期保留。**
 
 ---
 
@@ -257,7 +260,7 @@ OOM 很少由单一张量决定，而是 **embedding 静态占用、激活、pac
 | “最长约 2048” 与 pyramid 含糊 | 注明 2048 为九条流上限之和；pyramid 为线性 keep-count schedule（…→352→12）；补 `null/0` 与 `S-only/prior-only` 消融边界。S 分支门（bias=−2）后续已随等同待遇单池一并移除 |
 | scene 通道隔离缺边界 | 补 LONGER user-global 仍消费 `scene_id_hn` 的 2×2 归因注意点；fine 自动发现上限 256 |
 | 显存表缺行、个别根因/修复混淆 | 补 token width 512→256、full remat 回退两行；补精确数字 399.49 GiB 与当前 batch 1408/1536；`4861e0e` 第三项是**按长度分块 MixFormer SwiGLU/attention**（非“序列投影”）；补 commit 号 |
-| HDFS / RSS 过密、难讲 | 改成因果叙事：collective 等待链 + session 废弃/杀进程组；pinned pool 尖峰棘轮 + 滑动缩容；细节仍指向串讲底稿 |
+| HDFS / 内存表述过密 | 改成因果叙事：collective 等待链 + session 废弃/杀进程组；CPU 内存被历史最大 batch 抬高 + 滑动缩容；细节仍指向串讲底稿 |
 
 ## 相关文档
 
