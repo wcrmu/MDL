@@ -12,6 +12,16 @@ Bucket count and embedding width answer different questions:
   deployable shape for the two-H100 budget.  The deployable shape retains the
   one-hour load-0.5 table as a floor and limits the 24-hour projection to load
   1.75.
+
+  Load is a poor proxy for retained signal: a table at load 0.5 still loses
+  about 20% of its distinct values to hash collisions.  That is ruinous for the
+  medium-cardinality conversion features (scene-crossed CVR, price, cart and
+  order counts) that carry most of the payment signal, while the low-cardinality
+  relevance anchors sit near load 0.03 and are unaffected.  Tables projected
+  below ``SMALL_TABLE_DISTINCT_CEILING`` therefore take an additional floor that
+  bounds collision directly at ``SMALL_TABLE_MAX_COLLISION``.  These tables are
+  the cheapest in the pack, so the floor costs a few MiB against a 68 GiB
+  budget.
 * ``embedding_dim`` reports the usual bounded cardinality tier as the ideal,
   but caps production widths at 32 once projected cardinality exceeds one
   million.  This trades width for hash capacity under the fixed GPU budget.
@@ -51,6 +61,8 @@ MAX_PRODUCTION_BUCKETS = 1 << 30
 MAX_GROWTH_ALPHA = 0.95
 IDEAL_MAX_LOAD = 0.5
 PRODUCTION_MAX_LOAD = 1.75
+SMALL_TABLE_DISTINCT_CEILING = 1_000
+SMALL_TABLE_MAX_COLLISION = 0.02
 RETENTION_HOURS = 1.0
 HIGH_CARDINALITY_THRESHOLD = 1_000_000
 HIGH_CARDINALITY_PRODUCTION_DIM = 32
@@ -332,6 +344,18 @@ def _projected_uniform_collision(distinct: int, buckets: int) -> float:
     return max(0.0, 1.0 - occupied / distinct)
 
 
+def _collision_bounded_buckets(distinct: int, max_collision: float) -> int:
+    """Smallest power-of-two table whose uniform collision stays under a bound."""
+
+    buckets = MIN_BUCKETS
+    while (
+        buckets < MAX_PRODUCTION_BUCKETS
+        and _projected_uniform_collision(distinct, buckets) > max_collision
+    ):
+        buckets <<= 1
+    return buckets
+
+
 def _recommend_one(
     name: str,
     small_stats: Mapping[str, Any],
@@ -410,9 +434,17 @@ def _recommend_one(
     production_load_buckets = _next_power_of_two(
         int(math.ceil(growth.projected_distinct / PRODUCTION_MAX_LOAD))
     )
+    collision_floor_buckets = MIN_BUCKETS
+    if growth.projected_distinct <= SMALL_TABLE_DISTINCT_CEILING:
+        collision_floor_buckets = _collision_bounded_buckets(
+            growth.projected_distinct,
+            SMALL_TABLE_MAX_COLLISION,
+        )
+        ideal_buckets = max(ideal_buckets, collision_floor_buckets)
     uncapped_production_buckets = max(
         one_hour_floor_buckets,
         production_load_buckets,
+        collision_floor_buckets,
     )
     buckets = min(uncapped_production_buckets, MAX_PRODUCTION_BUCKETS)
     ideal_dimension = _suggest_embedding_dim(growth.projected_distinct)
@@ -676,10 +708,13 @@ def build_recommendations(
             "bucket_policy": {
                 "ideal_target_max_load": IDEAL_MAX_LOAD,
                 "production_target_max_load": PRODUCTION_MAX_LOAD,
+                "small_table_distinct_ceiling": SMALL_TABLE_DISTINCT_CEILING,
+                "small_table_max_collision": SMALL_TABLE_MAX_COLLISION,
                 "rounding": "next power of two, minimum 256",
                 "production_formula": (
                     "max(one_hour_load_0.5_buckets, "
-                    "primary_load_1.75_buckets)"
+                    "primary_load_1.75_buckets, "
+                    "small_table_collision_floor_buckets)"
                 ),
                 "hard_bucket_cap": MAX_PRODUCTION_BUCKETS,
                 "planned_embedding_memory_gib_per_gpu": (
@@ -688,7 +723,11 @@ def build_recommendations(
                 "note": (
                     "The collision estimate assumes uniformly distributed "
                     "pre-hashed low bits. The memory ceiling is validated on "
-                    "the generated two-GPU bf16/row-wise-Adagrad configs."
+                    "the generated two-GPU bf16/row-wise-Adagrad configs. "
+                    "Tables projected at or below the small-table ceiling are "
+                    "sized by collision rather than load: load 0.5 discards "
+                    "roughly a fifth of their distinct values, which strips the "
+                    "resolution from the medium-cardinality conversion features."
                 ),
             },
             "embedding_dim_policy": {

@@ -22,9 +22,17 @@
 
 ```text
 尺度：24h × ~500 files/hour ≈ 12,000 文件
-deploy_bucket ≈ max(1h@load0.5, 24h@load1.75)，≤ 2^30
+deploy_bucket ≈ max(1h@load0.5, 24h@load1.75, 小表碰撞下限)，≤ 2^30
+小表（projected distinct ≤ 1,000）：直接按碰撞率 ≤ 2% 定桶
 高基数（distinct > 1e6）：dim 封顶 32（理想 64 常放不下）
 ```
+
+load 不等于保住的信息量：load 0.5 的表仍有约 20% 的取值会和别的取值撞进同一行。
+这一刀几乎全落在 pay 上——它的转化信号（scene 交叉 CVR、价格、加购/下单数）
+全是中等基数的上游量化数值列，`scene_adj_cvr_15d_hn` 这类在 256 桶下碰撞率
+13–21%；而撑起 cate 的相关性锚点 `rel_level_hn` 只有 5 个取值，load 0.03，
+怎么压都不掉。所以小表改用碰撞率定桶。这批表本来就是全库最便宜的，
+124 张表整体只增加约 **19 MiB**。
 
 例子（生产 shape，BF16）：
 

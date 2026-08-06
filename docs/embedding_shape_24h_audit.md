@@ -12,6 +12,7 @@ coarse MDL embedding 推到约 **399.49 GiB/GPU（2 卡）**，即使使用 4 �
 
 - 24 小时 projected hash load 上限取 1.75，并向上取 2 次幂；
 - 同时保留 1 小时 / 500 文件、load 0.5 的 bucket 作为下限；
+- projected distinct ≤ 1,000 的小表额外要求碰撞率 ≤ 2%（见下节）；
 - projected distinct 超过 100 万时，生产 dim 上限从理想档位 64 调为 32，
   用表示宽度换 hash 容量；
 - shared root 必须使用 `shared_embedding_groups` 的来源并集，不使用 root 单列；
@@ -59,12 +60,40 @@ ideal_bucket  = next_pow2(d12000 / 0.5)
 deploy_bucket = max(
     next_pow2(d500 / 0.5),
     next_pow2(d12000 / 1.75),
+    collision_floor(d12000),          # 仅 d12000 <= 1,000
 )
 ```
 
 低基数饱和字段保留 25% headroom；增长很慢但基数较高的字段至少保留 50%
 headroom。报告中的 `ideal_num_buckets` / `ideal_embedding_dim` 是不考虑两卡
 显存时的参考，`num_buckets` / `embedding_dim` 才是当前生产配置。
+
+### 小表按碰撞率定桶
+
+load 是个坏的代理量：load 0.5 的表仍有约 20% 的取值和别的取值撞进同一行，
+报告里的 `projected_uniform_collision` 一直记录着这个数，但早先并不参与定桶。
+
+这一刀的落点极不对称。cate 的决定性锚点 `rel_level_hn` 只有 5 个取值，
+load 0.027、碰撞率 1.2%，任何桶数下都无损。pay 没有这样的低基数锚点——
+它的转化信号全是中等基数的上游量化数值列，恰好都顶在 load 0.5 的天花板上：
+
+| source | projected distinct | 旧桶 | 旧碰撞率 | 新桶 | 新碰撞率 |
+|---|---:|---:|---:|---:|---:|
+| `sku_price_v2_hn` | 127 | 256 | 21.0% | **4,096** | 1.5% |
+| `scene_cart_cnt_15d_hn` | 127 | 256 | 21.0% | **4,096** | 1.5% |
+| `scene_adj_cvr_15d_hn` | 118 | 256 | 19.8% | **4,096** | 1.4% |
+| `sku_ordr_cnt_1m_hn` | 104 | 256 | 17.7% | **4,096** | 1.2% |
+| `goods_scene_clk_cnt_15d_hn` | 163 | 512 | 14.3% | **4,096** | 2.0% |
+| `scene_adj_cartcvr_15d_hn` | 150 | 512 | 13.2% | **4,096** | 1.8% |
+| `adj_cvr_hn` | 27 | 256 | 4.9% | **1,024** | 1.3% |
+
+上游已经把这些列量化到约 20 档，桶配置再把幸存的分辨率打碎一次；cate 两次都躲过了。
+因此 `projected distinct <= 1,000` 的表改为直接按碰撞率 ≤ 2% 定桶
+（`SMALL_TABLE_DISTINCT_CEILING` / `SMALL_TABLE_MAX_COLLISION`）。
+
+超过该基数上限的表不受影响，仍走 load 预算——`goods_id_hn` 这类多 GiB 身份表
+的碰撞率本来就无法靠增桶解决，动它才是真吃显存。共 124 张表调整，
+合计 **+19.17 MiB**，占 68 GiB/GPU 规划线的 0.028%。
 
 ## 关键字段
 

@@ -6,6 +6,8 @@ import tempfile
 import unittest
 
 from scripts.recommend_embedding_shapes import (
+    SMALL_TABLE_DISTINCT_CEILING,
+    SMALL_TABLE_MAX_COLLISION,
     build_recommendations,
     estimate_growth,
     load_json_report,
@@ -101,6 +103,41 @@ class RecommendEmbeddingShapesTest(unittest.TestCase):
             shapes["cart_long_x_sku_ids_hn"]["embedding_dim"],
             32,
         )
+        # Sizing small tables at load 0.5 loses about a fifth of their distinct
+        # values to collisions. That falls almost entirely on the payment
+        # signals -- scene-crossed CVR, price, cart and order counts -- because
+        # every one of them is a medium-cardinality quantised numeric, while the
+        # relevance anchors that carry the category task are small enough to be
+        # unaffected either way. Size these by collision instead.
+        for source in (
+            "scene_adj_cvr_15d_hn",
+            "scene_adj_cartcvr_15d_hn",
+            "scene_cart_cnt_15d_hn",
+            "sku_price_v2_hn",
+            "sku_ordr_cnt_1m_hn",
+            "goods_scene_clk_cnt_15d_hn",
+            "adj_cvr_hn",
+            "price_hn",
+        ):
+            with self.subTest(source=source):
+                shape = shapes[source]
+                self.assertLessEqual(
+                    shape["projected_distinct"],
+                    SMALL_TABLE_DISTINCT_CEILING,
+                )
+                self.assertLessEqual(
+                    shape["projected_uniform_collision"],
+                    SMALL_TABLE_MAX_COLLISION,
+                )
+
+        # The floor is a small-table rule only. Tables above the ceiling stay on
+        # the budgeted load policy, so the multi-GiB identity tables keep their
+        # shapes and the fix stays affordable.
+        self.assertGreater(
+            shapes["goods_id_hn"]["projected_uniform_collision"],
+            SMALL_TABLE_MAX_COLLISION,
+        )
+
         self.assertEqual(
             report["summary"]["configured_sources_excluded"],
             [

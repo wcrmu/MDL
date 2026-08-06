@@ -9,7 +9,7 @@ from unittest.mock import patch
 import torch
 import yaml
 
-from scripts.build_mdl_rankmixer_config import (
+from scripts.build_production_configs import (
     AUTO_SCENARIO_NAME,
     CANDIDATE_ITEM_BAG_FIELDS,
     CANDIDATE_ITEM_SCALAR_FIELDS,
@@ -894,9 +894,12 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             by_name["goods_id_hn"]["encoding"]["num_buckets"],
             1 << 28,
         )
+        # A 22-value counter still gets a small table, but the small-table
+        # collision floor keeps it off the 256-bucket minimum, where roughly one
+        # value in twenty-five would share a row with another.
         self.assertEqual(
             by_name["ups_clkv2_i2i_goods_ids_hit_size"]["encoding"]["num_buckets"],
-            256,
+            1024,
         )
         self.assertEqual(summary["profile"]["settings"]["mode"], "name_heuristic")
         self.assertLess(
