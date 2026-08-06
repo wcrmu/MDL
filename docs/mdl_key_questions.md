@@ -13,7 +13,7 @@
 论文只说 Domain 由 important raw features + related prior 初始化，没有给出工业字段清单。直接抄论文示例字段会对不上我们的搜推混部数据。
 
 **根因：**  
-论文给结构、不给字段。线上 Scenario 要同时覆盖搜索/推荐，Task 要对齐三个监督目标；important 与 prior 的职责不同——前者是语义锚，后者是行为摘要。若把极稀疏 identity 和长历史摘要混进同一条路径，既难训也难归因。
+论文给结构、不给字段。线上 Scenario 要同时覆盖搜索/推荐，Task 要对齐三个监督目标；important 是语义锚，prior 挂与该 Domain 相关的行为历史，一起初始化 Domain prompt。主干如何编码历史是另一条合同（RankMixer 主 UPS 走 LONGER，OneTrans 主 UPS 走 raw），不回答「Domain 由什么字段构成」。
 
 **解决方案：**  
 
@@ -22,24 +22,23 @@
 | 组成 | 内容 |
 |---|---|
 | important | locale、页面/入口、`scene_id`（**global 不用**）、类目/价格等强锚；search 另含 `search_method_hn`，recommendation 去掉 |
-| prior | coarse scene prior、scene 曝光统计、scene-conditioned click 历史摘要；global 另用 impr / clk / view 摘要 |
+| prior | coarse scene prior、scene 曝光统计；search/recommendation 挂 conditioned click 历史；global 挂 impr / clk / view 历史 |
 
 **Task（`fst_cart` / `upid_pay` / `cateid_filter`）**
 
-| 任务 | important（示意） | prior |
+| 任务 | important（示意） | prior（相关行为历史） |
 |---|---|---|
-| `fst_cart` | 类目层级、价格、加购相关统计，以及可控 identity（goods/mall 等） | `cart_long` 的 **task-important 条件 attention pool** |
-| `upid_pay` | 类目层级、价格、支付/转化相关统计，以及可控 identity | `buy_long` 的条件 attention pool |
-| `cateid_filter` | 类目、相关性、query 等 | `srch_q2i` 的条件 attention pool（按标签语义选，不是买历史） |
+| `fst_cart` | 类目/价格、加购统计，可控 identity（mall/goods 等） | `cart_long` |
+| `upid_pay` | 类目/价格、转化/订单/GMV 锚与用户购买倾向；**不含** mall/goods | 主 `buy_long` + 辅 `ups_clk_sku`（补 buy_long 空窗） |
+| `cateid_filter` | 类目、相关性、query；**不含** goods/mall/price | `srch_q2i` |
 
 取舍原则：
 
-- **高频、可学习、语义锚** → important；
-- **行为统计 / 历史摘要** → prior；
-- 单 epoch 下极稀疏的主 `goods_id` **默认不进** scenario important；task 侧用**独立小 dim extra 表**补精确身份，禁止再复制 268M 主表。
+- **高频、可学习、语义锚** → important；**相关行为历史** → prior；
+- 单 epoch 下极稀疏的主 `goods_id` **默认不进** scenario important；task 侧需要 identity 时用独立低基数 extra 表，禁止再复制 268M 主表。
 
 **边界：**  
-完整字段表与消融清单见 [`mdl_token_feature_design.md`](./mdl_token_feature_design.md)。prior 用哪条历史（尤其 `cateid_filter`）是当前默认解释，需 holdout 消融，不是论文规定。
+完整字段表见 [`mdl_token_feature_design.md`](./mdl_token_feature_design.md)。prior 选哪条历史需 holdout 消融，不是论文规定。
 
 ---
 

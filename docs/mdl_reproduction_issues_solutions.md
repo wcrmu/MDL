@@ -14,34 +14,34 @@
 论文只说 Domain token 由 important raw features + related prior 初始化，没有给出工业字段清单。直接照抄论文示例字段，对不上我们的搜推混部数据。
 
 **根因：**
-论文给结构、不给字段。线上 Scenario 要同时覆盖搜索与推荐，Task 要对齐三个监督目标；important 与 prior 的职责不同——前者是语义锚，后者是行为摘要。若把极稀疏 identity 和长历史摘要混进同一条路径，既难训、也难归因。
+论文给结构、不给字段。线上 Scenario 要同时覆盖搜索与推荐，Task 要对齐三个监督目标；important 与 prior 的职责不同——前者是语义锚，后者挂上与该 Domain 相关的行为历史。二者一起初始化 Domain prompt，再由 Domain Attention 去读主干 Feature（RankMixer）或 S/NS（OneTrans）。主干怎么编码历史，是另一条合同：`mdl_rankmixer` 主 UPS 走 LONGER，`mdl_onetrans` 主 UPS 走 raw 事件流——都和「Domain 由什么字段构成」无关。
 
 **解决方案：**
 
 **Scenario（coarse：`search` / `recommendation` / `global`）**
 
-routing 只有 `search` / `recommendation` 两类；`global` 是每个样本都使用的常驻 Domain token，不参与 routing。
+routing 只有 `search` / `recommendation`；`global` 是每样本常驻 Domain token，不参与 routing。
 
 | 组成 | 内容 |
 |---|---|
 | important | locale（`currency` / `plat` / `region` / `hash_language_site`）、页面/入口（`page_elsn` / `page_sn`）、`scene_id`（**global 不用**）、`cat1_id`、`price` 等强锚；`search` 另含 `search_method_hn`，`recommendation` 去掉 |
-| prior | coarse scene prior、scene 曝光统计（`impr_cnt_15d`）、scene-conditioned click 历史摘要（`scenario_conditioned_clk_long_prior`，attention pool 的 query 取 scenario important 的 `scene_id` + `page_sn`）；global 另用全局 impr / clk / view 摘要 |
+| prior | coarse scene prior、scene 曝光统计（`impr_cnt_15d`）；search/recommendation 挂 scene-conditioned click 历史（`scenario_conditioned_clk_long_prior`）；global 挂全局 impr / clk / view 历史 |
 
 **Task（`fst_cart` / `upid_pay` / `cateid_filter`）**
 
-| 任务 | important | prior |
+| 任务 | important | prior（相关行为历史） |
 |---|---|---|
-| `fst_cart` | 加购相关统计（`adj_cartcvr`、`cart_cnt_3d`），加可控 identity（goods / mall / cluster） | `cart_long` 的 **task-important 条件 attention pool** |
-| `upid_pay` | 支付/转化相关统计（`sales`、`adj_cvr`），加可控 identity（goods / mall / cluster） | `buy_long` 的条件 attention pool |
-| `cateid_filter` | 相关性与 query（`rel_level` / `rel_score` / `origin_query_hash`），**不含** goods / mall / price | `srch_q2i` 的条件 attention pool（按标签语义选，不是买历史） |
+| `fst_cart` | 类目/价格、加购统计（`adj_cartcvr`、`cart_cnt_3d`），加可控 identity（`cat_id` / cluster / mall / goods） | `cart_long`（`task_fst_cart_prior`） |
+| `upid_pay` | 类目/价格、转化统计（`adj_cvr`、`idx_c_ordr_cnt_15d`、`nfk_gmv_14d`、`u_fst_ordr_cnt_mix_d`），taxonomy 到 cluster；**不含** mall/goods（避免与 cart 共享稀疏身份、把 pay prompt 做成 cart 副本） | 主：`buy_long`；辅：`ups_clk_sku`（buy_long 约 24% 请求为空时的补流） |
+| `cateid_filter` | 类目、相关性与 query（`rel_level` / `rel_score` / `origin_query_hash`），**不含** goods / mall / price | `srch_q2i`（按标签语义选检索历史，不是买历史） |
 
 取舍原则：
 
-- **高频、可学习、语义锚** → important；**行为统计 / 历史摘要** → prior；
-- 单 epoch 下极稀疏的主 `goods_id`（\(2^{28}\approx\) 268M buckets）**默认不进** scenario important；task 侧用独立的**低基数** extra 表（\(2^{25}\approx\) 32M buckets，dim 与主表同为 32）补精确身份——缩小的是行数而不是维度，关键是**不再复制一张 268M 主表**。
+- **高频、可学习、语义锚** → important；**与该 Domain 相关的行为历史** → prior；
+- 单 epoch 下极稀疏的主 `goods_id`（\(2^{28}\approx\) 268M buckets）**默认不进** scenario important；task 侧需要 identity 时用独立**低基数** extra 表（如 cart 的 \(2^{25}\) goods），禁止再复制一张 268M 主表。
 
 **边界：**
-完整字段表与消融清单见 [`mdl_token_feature_design.md`](./mdl_token_feature_design.md)。prior 用哪条历史（尤其 `cateid_filter`）是当前默认解释，需 holdout 消融，不是论文规定。
+完整字段表与消融清单见 [`mdl_token_feature_design.md`](./mdl_token_feature_design.md)。prior 选哪条历史（尤其 `cateid_filter`、pay 的双 prior）是当前默认解释，需 holdout 消融，不是论文规定。
 
 ---
 
