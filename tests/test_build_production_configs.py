@@ -23,6 +23,7 @@ from scripts.build_production_configs import (
     OBSERVED_MULTIVALUE_MAX_LENGTHS,
     ONETRANS_SEQUENCE_LENGTH_CAPS,
     PACK_MULTIVALUE_MAX_LENGTHS,
+    PHASE2_TASK_PRIOR_SEQUENCES,
     PRODUCTION_COARSE_CONFIG_NAMES,
     RANKMIXER_SEMANTIC_FEATURE_GROUPS,
     REQUEST_CONTEXT_BAG_FIELDS,
@@ -45,6 +46,8 @@ from scripts.build_production_configs import (
     _categorical_entries_by_name,
     merge_production_contract,
     render_config,
+    task_important_name,
+    task_prior_inputs,
     write_fine_siblings,
 )
 from scripts.profile_prehashed_parquet import profile_spec_from_mapping
@@ -479,15 +482,20 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 "goods_id_hn",
             ),
         )
+        # Pay keeps taxonomy identity but drops the two sparsest tables; the
+        # order/GMV anchors replace them.
         self.assertEqual(
-            TASK_IMPORTANT_FIELDS_BY_TASK["upid_pay"][-4:],
+            TASK_IMPORTANT_FIELDS_BY_TASK["upid_pay"][-5:],
             (
+                "idx_c_ordr_cnt_15d_hn",
+                "nfk_gmv_14d_hn",
+                "u_fst_ordr_cnt_mix_d_hn",
                 "cat_id_hn",
                 "goods_cluster_id_1w_hn",
-                "mall_id_hn",
-                "goods_id_hn",
             ),
         )
+        self.assertNotIn("goods_id_hn", TASK_IMPORTANT_FIELDS_BY_TASK["upid_pay"])
+        self.assertNotIn("mall_id_hn", TASK_IMPORTANT_FIELDS_BY_TASK["upid_pay"])
         self.assertEqual(
             TASK_IMPORTANT_FIELDS_BY_TASK["cateid_filter"][-1],
             "origin_query_hash_hn",
@@ -497,25 +505,28 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             self.assertEqual(
                 prior["target_inputs"],
                 [
-                    f"task_important_{source}"
+                    task_important_name(task_name, source)
                     for source in TASK_IMPORTANT_FIELDS_BY_TASK[task_name]
                 ],
             )
-        for source, (num_buckets, embedding_dim) in (
-            TASK_IMPORTANT_IDENTITY_SHAPES.items()
-        ):
-            important = by_name[f"task_important_{source}"]
-            self.assertEqual(important["source"], source)
-            self.assertEqual(important["embedding_scope"], "task")
-            self.assertEqual(important["embedding_dim"], embedding_dim)
-            self.assertEqual(
-                important["encoding"]["num_buckets"], num_buckets
-            )
-            self.assertFalse(
-                important["encoding"].get("share_embedding", False)
-            )
-            self.assertNotIn("share_with", important["encoding"])
-        query_identity = by_name["task_important_origin_query_hash_hn"]
+        # Each task owns its important tables, so a source listed by several
+        # tasks is no longer one table optimised mostly by the largest weight.
+        for task, sources in TASK_IMPORTANT_FIELDS_BY_TASK.items():
+            for source in sources:
+                shape = TASK_IMPORTANT_IDENTITY_SHAPES.get(source)
+                if shape is None:
+                    continue
+                num_buckets, embedding_dim = shape
+                important = by_name[task_important_name(task, source)]
+                self.assertEqual(important["source"], source)
+                self.assertEqual(important["embedding_scope"], "task")
+                self.assertEqual(important["embedding_dim"], embedding_dim)
+                self.assertEqual(important["encoding"]["num_buckets"], num_buckets)
+                self.assertFalse(important["encoding"].get("share_embedding", False))
+                self.assertNotIn("share_with", important["encoding"])
+        query_identity = by_name[
+            task_important_name("cateid_filter", "origin_query_hash_hn")
+        ]
         self.assertEqual(query_identity["pooling"], "mean")
         self.assertEqual(query_identity["max_length"], 46)
         self.assertTrue(
@@ -979,8 +990,8 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         self.assertEqual(onetrans["model"]["num_ns_tokens"], 32)
 
         mdl_onetrans = payloads["mdl_onetrans"]
-        self.assertEqual(len(mdl_onetrans["features"]), 175)
-        self.assertEqual(len(mdl_onetrans["sequences"]), 16)
+        self.assertEqual(len(mdl_onetrans["features"]), 185)
+        self.assertEqual(len(mdl_onetrans["sequences"]), 17)
         self.assertTrue(mdl_onetrans["model"]["experimental_model_acknowledged"])
         self.assertEqual(mdl_onetrans["model"]["first_domain_sequence_layer"], 0)
         prior_names = {
@@ -988,9 +999,8 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             "scenario_global_impr_prior",
             "scenario_global_clk_long_prior",
             "scenario_global_view_long_prior",
-            "task_fst_cart_prior",
-            "task_upid_pay_prior",
-            "task_cateid_filter_prior",
+            *PHASE2_TASK_PRIOR_SEQUENCES,
+            "task_upid_pay_ups_clk_sku_prior",
         }
         self.assertEqual(
             {sequence["name"] for sequence in mdl_onetrans["sequences"][9:]},
@@ -1012,7 +1022,12 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             task_priors,
             {
                 "fst_cart": ("task_fst_cart_prior",),
-                "upid_pay": ("task_upid_pay_prior",),
+                # Pay carries a second, denser stream: buy_long is an empty
+                # list on ~24% of requests.
+                "upid_pay": (
+                    "task_upid_pay_prior",
+                    "task_upid_pay_ups_clk_sku_prior",
+                ),
                 "cateid_filter": ("task_cateid_filter_prior",),
             },
         )
@@ -1040,7 +1055,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             self.assertEqual(
                 token["important_inputs"],
                 [
-                    f"task_important_{source}"
+                    task_important_name(token["name"], source)
                     for source in TASK_IMPORTANT_FIELDS_BY_TASK[token["name"]]
                 ],
             )
@@ -1181,7 +1196,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertEqual(len(model.encoder_bank.sequence_stca_encoders), 1)
                 self.assertEqual(
                     len(model.encoder_bank.sequence_query_projectors),
-                    5 if model_name == "mdl_rankmixer" else 1,
+                    6 if model_name == "mdl_rankmixer" else 1,
                 )
                 output = model(
                     _synthetic_model_features(compact),
@@ -1585,10 +1600,15 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         if not getattr(item.encoding, "share_embedding", False)
                     )
                     # Phase-2 keeps task/scenario-history priors independent;
-                    # this now includes four candidate/query identity tables.
-                    self.assertEqual(physical, 290)
+                    # this now includes four candidate/query identity tables
+                    # and one important table per task rather than per source.
+                    self.assertEqual(physical, 306)
                     if model_name == "mdl_onetrans":
-                        self.assertEqual(len(config.sequences), 16)
+                        self.assertEqual(len(config.sequences), 17)
+                        # Every prior a task token reads must exist as a loaded
+                        # sequence, which is more than one per task: pay carries
+                        # a supplemental stream for the requests where buy_long
+                        # is empty.
                         self.assertEqual(
                             {
                                 sequence.name
@@ -1596,9 +1616,9 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                                 if sequence.name.startswith("task_")
                             },
                             {
-                                "task_fst_cart_prior",
-                                "task_upid_pay_prior",
-                                "task_cateid_filter_prior",
+                                name
+                                for task in EXPECTED_LABELS
+                                for name in task_prior_inputs(task)
                             },
                         )
                         self.assertGreaterEqual(
@@ -1677,14 +1697,15 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             # Growth-aware PROFILE_DRIVEN_EMBEDDING_SHAPES win after every Phase-2
             # tier, so shared/query/aggressive bucket profiles collapse to the same
             # planned memory once those overrides apply.
-            # Counts include independent global scenario priors plus the
-            # cluster/mall/goods/query task-identity tables; dead
-            # near-constants are removed.
-            "baseline": (289, 66.242),
-            "shared": (288, 66.242),
-            "shared_dim": (288, 66.242),
-            "shared_dim_query_bucket": (288, 66.242),
-            "shared_dim_aggressive_bucket": (288, 66.242),
+            # Counts include independent global scenario priors, the per-task
+            # important tables, and the pay coverage prior; dead near-constants
+            # are removed. Small-table collision floors nudge planned GiB slightly
+            # above the pre-floor 66.257 baseline.
+            "baseline": (305, 66.268),
+            "shared": (304, 66.268),
+            "shared_dim": (304, 66.268),
+            "shared_dim_query_bucket": (304, 66.268),
+            "shared_dim_aggressive_bucket": (304, 66.268),
         }
         for profile, (tables, gib) in expected.items():
             with self.subTest(profile=profile):
