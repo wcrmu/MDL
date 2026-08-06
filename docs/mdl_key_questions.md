@@ -110,33 +110,31 @@ hl+1 = hl + Attention(q=ql, K/V=Feature 或 NS/S)
 
 ## 问题 4：Domain 每层读什么？
 
-> 适用范围：`mdl_onetrans`（Domain sidecar 读 OneTrans）。`mdl_rankmixer` 的 Domain 读的是 32 个 Feature token，没有 S/NS 这条区分。
+> 适用范围：`mdl_onetrans`。`mdl_rankmixer` 的 Domain 读的是 32 个 Feature token，没有 S/NS 拆分。
 
 **问题：**  
-Domain 要同时用上定长的候选相关信号和变长的长历史证据，但这两类 token 在长度、代价和请求共享性上完全不同。早期实现按代价把它们拆成两条支路（每层读 NS，最后两层才读 S，S 支路再加一个残差门），结果是"被选中读取的 token"并没有得到同等待遇。
+接到 OneTrans 后，定长 NS 与变长 S 代价差很大。早期「每层读 NS、后两层读 S + S 残差门」给被选中 token 不同表决权，长历史支路会被门压住。
 
 **根因：**  
-两类信号的工程属性不同，但这不构成给它们不同表决权的理由：
+进入读取集合的 token 应同等竞争。OneTrans 统一流已是 `[Q_S; NS]`，Domain 应直接读这个池。
 
-| 信号 | 特点 | 当前处理 |
-|---|---|---|
-| 32 个 NS | 已融合当前候选，长度固定，候选相关性强 | 进入每层的读取池 |
-| 最长约 2048 的 S | 请求共享、变长；OneTrans 逐层 pyramid 压缩 | 当层 query 侧的 \(Q_S\) 进入同一个读取池 |
-| 7 个 Domain prior summary | 面向 scenario/task 的紧凑历史摘要 | **只初始化** Domain prompt，不进原始 S 因果链 |
+**当前生产合同（`mdl_onetrans`）：**
 
-逐层计算（记第 \(l\) 层后为 \(S^l,N^l,D^l\)）：先跑原生 OneTrans block 得到 \(S^{l+1},N^{l+1}\)，再让 Domain 对拼接池 \([\,S^{l+1};N^{l+1}\,]\) 做**一次** variable-length cross attention：
+| 信号 | 角色 |
+|---|---|
+| 当层 `[Q_S; NS]` | Domain **每层**唯一读取池（`first_domain_sequence_layer=0`） |
+| Domain important + 相关行为 prior | **只初始化** prompt，不进 S 链、也不进该读取池 |
+
+S 容量为九条 raw 流之和约 2048；Domain 读当层 pyramid 压缩后的 \(Q_S\)。prior 现为 8 条 Domain 专用序列（含 pay 的 `ups_clk_sku` 辅 prior）。
 
 \[
-\hat D^l = D^l + \operatorname{VLAttn}\left(Q_l(D^l),\ [\,S^{l+1};N^{l+1}\,],\ [\,M_S^{l+1};\mathbf{1}\,]\right)
+\hat D^l = D^l + \operatorname{VLAttn}\left(Q_l(D^l),\ [\,Q_S^{l+1};N^{l+1}\,],\ [\,M_S^{l+1};\mathbf{1}\,]\right)
 \]
 
-这与 `mdl_rankmixer` 的合同一致：一旦某个 token 被选进读取集合，它就和池子里其他 token 在同一个 softmax 里竞争，没有额外的分支门决定"注入多少"。
-
-**解决方案：**  
-配置 `first_domain_sequence_layer=0`，并移除 S 分支的残差门。该池就是 OneTrans 统一流本身（NS 段在 `valid_mask` 中恒为有效），所以读取不额外拷贝激活。
+无 S 分支门；读统一流、共享一次 memory 准备；定宽 `DomainAwareAttention` 不再构造。
 
 **边界：**  
-这条通路的代价确实高于早期的"后两层 + 门"方案：Domain 现在每层都对变长 S 做 attention。要形成算法结论，至少比较 `null`（不直接读 S）与 `0`（全层读），并同时报告质量、延迟与峰值 HBM。`S-only / prior-only / S+prior` 也要单独做，否则无法区分"复用同一份行为"与"重复计权"。注意 `first_domain_sequence_layer` 非 `null` 时，`use_task_feature_interaction=false` 这类消融开关会被拒绝而不是被静默忽略——要做该消融必须同时把读 S 关掉。
+至少对比 `null` vs `0`，并报质量 / 延迟 / HBM；`S-only / prior-only / S+prior` 分开做。非 `null` 时关掉 `use_task_feature_interaction` 会被校验拒绝。
 
 ---
 
@@ -203,68 +201,36 @@ OOM 很少由单一张量决定，而是 **embedding 静态占用、激活、pac
 
 ---
 
-## 问题 7：一个 HDFS `pread` 卡死，为什么最后表现成所有 GPU 一起不动？
+## 问题 7：为什么一个 HDFS `pread` 卡住，会让所有 GPU 停住？
 
-**问题：**  
-多卡 HDFS 流式训练中，某个 reader 的 native `pread` 偶发永久不返回；该 rank 不再产生 batch，其它 rank 随后卡在 collective，日志只剩 GPU 空转或 NCCL timeout。任务结束时还可能卡在 reader / queue / process-group teardown。
+多卡训练要求所有 rank 每一步都一起做梯度同步。只要其中一个 rank 卡在 HDFS 读取、拿不到下一个 batch，其他 rank 即使已经算完，也只能停在 collective 等它，因此最终表现为所有 GPU 一起不动，甚至触发 NCCL timeout。
 
-**根因：**
+问题不只是 HDFS 偶发卡顿，而是超时后的处理方式：
 
-1. 并发 worker 复用 `HadoopFileSystem` / Parquet session，native handle 可能损坏；
-2. timeout thread 仍持有 generator 时，再次 `next()` 会报 `generator already executing`；
-3. 对仍有挂起 `pread` 的 poisoned session 调 native `close`，close 本身也可能永久挂起；
-4. 训练前 scene discovery 在冷 HDFS 上耗时很长，若直接走 NCCL 广播，会把 IO 冷启动与 GPU collective 绑死。
+- 多个 worker 复用同一个 HDFS session，可能相互影响；
+- 已经超时的 generator 不能继续重试；
+- 对仍有挂起读取的 session 调 `close()`，也可能卡住；
+- 启动阶段的 HDFS 扫描若走 NCCL，会把冷 IO 和 GPU 通信绑在一起。
 
-这里不能简单套用“fork 继承 libhdfs JVM”的常见故事；仓库证据指向的是 **session 复用、超时重试与 teardown 合同** 的问题。
-
-**解决方案：**
-
-| 手段 | 作用 |
-|---|---|
-| thread-local HDFS client | 不在长期 prefetch workers 间共享 native client |
-| timed open/start/batch + controlled row-group concurrency | 给每个远程阶段独立预算，限制同时悬挂的 native 调用 |
-| poisoned session quarantine | timeout 后不在原 generator 上重试，也不 native-close；新建 session；从未产出 batch 时才安全重开 |
-| `spawn` host-prepare child + process-group kill | startup/idle 超时后杀整个子进程树，避免 D-state 子进程拖住父 rank |
-| `REMOTE_IO_STALL -> exit 70` | 让平台按可重启 IO 故障处理，而不是无限等 NCCL |
-| Gloo control group | scene discovery 用 Arrow unique 扫描后经 CPU control group 广播，避免冷 HDFS 阻塞 NCCL |
-| bounded teardown | 先关 IPC pipe，再 join CUDA prefetch；删除无界 queue join，并限制 `destroy_process_group` 等待 |
-
-**边界：**  
-目标不是“永远不遇到坏 HDFS”，而是把不可观测的永久挂起转换成**有阶段、有 HBM 快照、有退出码、可自动重启**的失败。相关提交见串讲底稿附录（`705878d`、`48f243a`、`fd5edb6`、`457d2e6`、`8c31ae3` 等）。
+因此处理原则是：**超时后直接废弃旧 session，不重试、不强行关闭；在独立子进程中执行远程读取，超时后杀掉整个进程组，并以明确退出码结束，让平台自动重启。** 启动期 scene discovery 走 CPU control group（Gloo）广播，避免冷 HDFS 绑死 NCCL。细节与提交见 [`mdl_reproduction_lecture_report.md`](./mdl_reproduction_lecture_report.md)。
 
 ---
 
-## 问题 8：开了 recycled pinned pool，为什么 host RSS 仍可能跟历史尖峰一起爬？
+## 问题 8：为什么 RSS 会不断增长？
 
-**问题：**  
-`331b6ac` / `64ba075` 之后，host-prepare 已用 memfd + recycled pinned pool，不再每个变长 shape 都 `pin_memory()` 新 slab。但长跑里偶发超长 pack（尖峰 batch）仍可能把 container RSS 顶上去，之后即使多数 batch 变短，**idle pinned 页也不回落**，RSS 继续贴着历史峰值斜着爬，最终可能先被平台 host-mem protect 杀掉。
+训练使用 pinned memory 缓存 CPU 到 GPU 的数据。旧版 buffer pool 只会扩容，不会缩容。
 
-**根因：**  
-第一代 pool 是 **grow-only 复用**：lease 归还后按历史最大 `numel` 留着 buffer，以便下次免分配。这对“稳定长度分布”很省，但对“偶发长尾 pack”是单向下棘轮——一次尖峰把 slot 撑大，后续小 batch 只 `narrow` 使用前缀，**整块 pinned storage 仍被 CUDA host caching allocator 握着**。再叠加：
+例如平时 batch 只需要 200 MB，偶尔一个超长 batch 需要 2 GB，pool 就会把 2 GB buffer 永久保留。之后即使 batch 恢复正常，实际只使用其中一小部分，整块 pinned memory 仍占着 RSS。
 
-- 扩容余量原先偏大（约 25%），每次 grow 多锁一截；
-- free slot 数若跟 `queue_size+2` 走，深 prefetch 会同时留住多份峰值级 idle slab。
+因此这不是普通的 Python 对象泄漏，而是 **pinned memory pool 被历史峰值撑大后没有回收**。
 
-Python 对象都释放了也看不见：泄漏在 allocator / pinned page，不在 `gc.get_objects()`。
+解决方式是让 pool 根据最近一段时间的 batch 大小动态缩容：
 
-**解决方案：**  
-`_PinnedHostBufferPool` 改为**可缩的滑动高水位**，不再按全局历史峰值永久长大：
+- 过大的空闲 buffer 直接丢弃；
+- 降低扩容预留比例；
+- 限制空闲 buffer 数量和单个 buffer 的保留上限。
 
-| 手段 | 作用 |
-|---|---|
-| 滑动窗口（默认 256）记近期请求 `numel` | lease 归还时若 `buf > 2× recent_hwm`，丢掉过大 idle slab，并 `_host_emptyCache` |
-| 扩容余量 `25% → 12.5%` | 降低每次 grow 的锁页幅度 |
-| `max_free_slots = min(4, max(2, queue_size))` | 深 queue 不再成倍堆峰值级 idle slot |
-| 可选 `MDL_PINNED_POOL_MAX_SLOT_BYTES` | idle 保留硬上限；**live batch 仍保证能装下**（超 cap 时跳过 headroom，归还后再 trim） |
-
-默认即可靠滑动缩容；更狠的 idle 上限示例：
-
-```bash
-export MDL_PINNED_POOL_MAX_SLOT_BYTES=1073741824  # 1GiB
-```
-
-**边界：**  
-回归覆盖复用、尖峰后缩容、byte cap 与 env 解析（见 `tests/test_pinned_host_pool.py`）。仓库仍没有可引用的完整“修复前后 24h RSS 曲线”，长跑验收应看**偶发尖峰后 RSS 是否回落/平台**，而不是只看短 smoke 的峰值。这是对串讲 §3.5「recycled pinned pool」的增强，不替代 memfd / 私有化 / H2D 后放 ref 那几条。
+核心变化是：**超长 batch 可以临时申请大内存，但处理完成后不再永久保留。** 可选硬上限示例：`MDL_PINNED_POOL_MAX_SLOT_BYTES=1073741824`（1 GiB）。长跑验收看尖峰后 RSS 是否回落；这不替代 memfd IPC 等更早一层的修复。
 
 ---
 
