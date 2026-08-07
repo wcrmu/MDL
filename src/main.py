@@ -210,7 +210,30 @@ _MODEL_OVERRIDE_FIELDS = (
     "readout",
 )
 
+# argparse default meaning "flag omitted"; distinct from an explicit null override.
+_CLI_UNSET = object()
+
 _TOKENIZATION_OVERRIDE_FIELDS = ("omit_scene_features",)
+
+
+def _parse_first_domain_sequence_layer(text: str) -> int | None:
+    """Parse ``null``/``none``/``ns`` or a non-negative layer index."""
+
+    lowered = str(text).strip().lower()
+    if lowered in {"null", "none", "ns"}:
+        return None
+    try:
+        layer = int(lowered)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected null/none/ns or a non-negative integer layer index; "
+            f"received {text!r}"
+        ) from error
+    if layer < 0:
+        raise argparse.ArgumentTypeError(
+            f"first_domain_sequence_layer must be non-negative; received {layer}"
+        )
+    return layer
 
 
 def _scale_length_buckets(buckets: tuple, old_batch_size: int, new_batch_size: int) -> tuple:
@@ -326,6 +349,20 @@ def _apply_model_overrides(config, args: argparse.Namespace):
         value = getattr(args, field_name, None)
         if value is not None:
             updates[field_name] = value
+
+    domain_read = getattr(args, "mdl_domain_read", None)
+    layer_override = getattr(args, "first_domain_sequence_layer", _CLI_UNSET)
+    if domain_read is not None and layer_override is not _CLI_UNSET:
+        raise ValueError(
+            "pass only one of --mdl-domain-read and --first-domain-sequence-layer"
+        )
+    if domain_read == "ns":
+        updates["first_domain_sequence_layer"] = None
+    elif domain_read == "equal":
+        updates["first_domain_sequence_layer"] = 0
+    elif layer_override is not _CLI_UNSET:
+        updates["first_domain_sequence_layer"] = layer_override
+
     if not updates:
         return config
     model = replace(config.model, **updates)
@@ -405,7 +442,11 @@ def _load_config(args: argparse.Namespace):
         config = _apply_checkpoint_overrides(config, args)
     if any(getattr(args, name, None) is not None for name in _RUNTIME_OVERRIDE_FIELDS):
         config = _apply_runtime_overrides(config, args)
-    if any(getattr(args, name, None) is not None for name in _MODEL_OVERRIDE_FIELDS):
+    if (
+        any(getattr(args, name, None) is not None for name in _MODEL_OVERRIDE_FIELDS)
+        or getattr(args, "mdl_domain_read", None) is not None
+        or getattr(args, "first_domain_sequence_layer", _CLI_UNSET) is not _CLI_UNSET
+    ):
         config = _apply_model_overrides(config, args)
     if any(
         getattr(args, name, None) is not None for name in _TOKENIZATION_OVERRIDE_FIELDS
@@ -676,6 +717,29 @@ def _add_model_override_args(parser: argparse.ArgumentParser) -> None:
             "propagation from readout capacity"
         ),
     )
+    parser.add_argument(
+        "--mdl-domain-read",
+        choices=["ns", "equal"],
+        default=None,
+        help=(
+            "mdl_onetrans Domain read set. equal: every layer reads the "
+            "equal-treatment [Q_S; NS] pool (sets first_domain_sequence_layer=0). "
+            "ns: conservative NS-only DomainAwareAttention path (sets "
+            "first_domain_sequence_layer=null). Do not combine with "
+            "--first-domain-sequence-layer"
+        ),
+    )
+    parser.add_argument(
+        "--first-domain-sequence-layer",
+        type=_parse_first_domain_sequence_layer,
+        default=_CLI_UNSET,
+        help=(
+            "override model.first_domain_sequence_layer for mdl_onetrans: "
+            "null/none/ns for NS-only Domain reads, or a layer index from which "
+            "Domain reads [Q_S; NS] (0 = every layer). Prefer --mdl-domain-read "
+            "ns|equal for the common ablations"
+        ),
+    )
 
 
 def _add_tokenization_override_args(parser: argparse.ArgumentParser) -> None:
@@ -827,6 +891,10 @@ def _cmd_validate_config(args: argparse.Namespace) -> int:
     print(f"mdl_token_state: {config.model.mdl_token_state}")
     print(f"scene_feature_bias: {config.model.scene_feature_bias}")
     print(f"readout: {config.model.readout}")
+    print(
+        "first_domain_sequence_layer: "
+        f"{config.model.first_domain_sequence_layer}"
+    )
     print(f"omit_scene_features: {config.tokenization.omit_scene_features}")
     if config.tokenization.omit_scene_features:
         resolved = config.resolved.tokenization

@@ -336,9 +336,14 @@ def _needs_padded_sdpa_flash(config: AppConfig) -> bool:
         "mdl_mixformer",
     }:
         return False
-    if model.name == "mdl_onetrans" and model.first_domain_sequence_layer == 0:
+    if (
+        model.name == "mdl_onetrans"
+        and model.first_domain_sequence_layer is not None
+        and model.first_domain_sequence_layer == 0
+    ):
         # Every Domain block reads the variable-length ``[Q_S; NS]`` pool, so
-        # no fixed-width ``DomainAwareAttention`` is built at all.
+        # no fixed-width ``DomainAwareAttention`` is built at all. NS-only
+        # (first_domain_sequence_layer=null) still constructs that path.
         return False
     task_attention_enabled = (
         model.use_task_tokens and model.use_task_feature_interaction
