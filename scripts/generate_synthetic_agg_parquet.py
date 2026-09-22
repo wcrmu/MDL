@@ -5,7 +5,7 @@ The generated files follow the production adapter contract: one raw row holds
 multiple requests, candidates are routed by ``target_indices``, and every UPS
 token carries a list of visible request IDs. The physical schema can be padded
 to 630 columns so projection/footer behavior resembles production while model
-input values remain limited to the YAML-declared 47 Context, 122 Item, and nine
+input values remain limited to the YAML-declared 47 Context, 122 Item, and seven
 UPS groups.
 """
 
@@ -35,7 +35,7 @@ OBSERVED_MEDIAN_SEQUENCE_LENGTHS: dict[str, int] = {
     "buy_long": 22,
     "semi_clk": 4,
     "srch_q2i": 71,
-    "ups_clk_sku": 200,
+    "ups_clk_sku": 100,
     "flatten_query_hash": 78,
 }
 

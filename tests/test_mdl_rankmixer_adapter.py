@@ -12,6 +12,7 @@ from src.dataloader import (
     COARSE_SCENE_INDEX_COLUMN,
     COARSE_SCENE_PRIOR_ID_COLUMN,
     FeatureCardinalityAuditor,
+    _accumulate_agg_memberships,
     _adapter_table_to_python,
     _arrow_array_to_pylist,
     _column_array,
@@ -73,6 +74,14 @@ REQUIRED = [
 
 
 class MDLRankMixerParquetAdapterTest(unittest.TestCase):
+    def test_accumulate_agg_memberships_unions_prefix_requests(self) -> None:
+        accumulated = _accumulate_agg_memberships(
+            {"impr": {0: [0, 1], 1: [1, 2]}},
+            {0: 0, 1: 1},
+        )
+        self.assertEqual(accumulated[0]["impr"], [0, 1])
+        self.assertEqual(accumulated[1]["impr"], [0, 1, 2])
+
     def test_global_recent_selection_excludes_events_without_timestamps(self) -> None:
         selected = _select_global_recent_sequence_positions(
             {
@@ -1850,6 +1859,50 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
                 adapt(pa.table(payload), context=axis_context())
             with self.assertRaisesRegex(ValueError, pattern):
                 adapt(pa.table(payload), context=axis_context(trusted_input=True))
+
+    def test_accumulate_agg_history_adds_earlier_request_ups_only(self) -> None:
+        table = pa.table(
+            {
+                "context_indices": [[0, 1]],
+                "target_indices": [[0, 1]],
+                "ctx_scalar_hn": [[[101], [102]]],
+                "ctx_bag_hn": [[[1], [2]]],
+                "item_scalar_hn": [[[201], [202]]],
+                "sku_a_hn": [[[11], [12]]],
+                "sku_b_hn": [[[21], [22]]],
+                "impr_x_goods_id_hn": [[10, 20, 30]],
+                "impr_x_time": [[4900, 4000, 3000]],
+                "impr_x_indices": [[[0], [0, 1], [1]]],
+                "scene_id": [[7, 8]],
+                "search_id": [["r0", "r1"]],
+                "impr_time": [[5000, 6000]],
+                "label_a": [[0, 1]],
+                "label_b": [[1, 0]],
+                "label_c": [[0, 1]],
+            }
+        )
+
+        def axis_context(*, accumulate: bool) -> SimpleNamespace:
+            context = _context(REQUIRED)
+            context.trusted_input = False
+            context.options["accumulate_agg_history"] = accumulate
+            context._runtime_cache = {
+                "axis_separated": True,
+                "axis_request_id_column": "search_id",
+            }
+            return context
+
+        def goods(bundle: Any, slot: int) -> list[int]:
+            row = bundle.sequence_features["impr_x_goods_id_hn"][slot]
+            return [int(value) for value in row]
+
+        baseline = adapt(table, context=axis_context(accumulate=False))
+        self.assertEqual(goods(baseline, 0), [10, 20])
+        self.assertEqual(goods(baseline, 1), [20, 30])
+
+        accumulated = adapt(table, context=axis_context(accumulate=True))
+        self.assertEqual(goods(accumulated, 0), [10, 20])
+        self.assertEqual(goods(accumulated, 1), [10, 20, 30])
 
 
 if __name__ == "__main__":

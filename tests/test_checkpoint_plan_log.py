@@ -20,7 +20,10 @@ class CheckpointPlanMessageTest(unittest.TestCase):
         config = load_app_config("configs/mdl_onetrans.yaml")
         message = _checkpoint_plan_message(config)
         self.assertTrue(message.startswith("Checkpointing | enabled "))
-        self.assertIn("every_steps=2000", message)
+        self.assertIn("every_steps=0", message)
+        self.assertIn("data_window_hours=8", message)
+        self.assertIn("sparse_delta=true", message)
+        self.assertIn("upload_stall_timeout_sec=300", message)
         self.assertIn(str(config.training.checkpoint.dir), message)
 
     def test_missing_dir_announces_disabled(self) -> None:
@@ -58,6 +61,10 @@ class CheckpointCreateBannerTest(unittest.TestCase):
         self.assertTrue(order[0].startswith("Checkpointing | enabled "))
         self.assertEqual(order[1], "open_run_store")
         self.assertTrue(order[2].startswith("Checkpointing | ready "))
+        self.assertIn(
+            f"staging_dir={config.training.checkpoint.staging_dir}",
+            order[2],
+        )
 
     def test_disabled_banner_skips_store_open(self) -> None:
         config = load_app_config("configs/mdl_onetrans.yaml")

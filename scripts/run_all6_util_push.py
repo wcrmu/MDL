@@ -23,8 +23,13 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 # File-sharded DDP needs ≥ nproc parquet files. The x24 tile is the local
 # util-protect fixture (plain mock_parquet_full only has 2 files).
+# MixFormer YAML grew 4 physical columns after the 2026-07-24 fixture;
+# mf297 clones that schema plus the missing request/item fields.
 MOCK_INPUTS = [
     str(ROOT / "artifacts" / "mock_parquet_full_2x2500_zstd_x24"),
+]
+MIXFORMER_MOCK_INPUTS = [
+    str(ROOT / "artifacts" / "mock_parquet_full_2x2500_zstd_mf297_x24"),
 ]
 
 
@@ -60,13 +65,14 @@ UTIL_BATCH_SCALE = {
     "rankmixer": 2.00,  # 1280 → 2560
     "mdl_rankmixer": 1.0,
     # Plain OneTrans: selective + large batch (prod act=none OOMs at util scale).
-    "onetrans": 2.00,  # 1408 → ~2816 with selective
-    # MDL-OneTrans: act=full + ~2957 (l: util~82 / sps↑ vs post 87.5/1693).
-    "mdl_onetrans": 2.10,  # 1408 → ~2957
-    # MixFormer: build_current_e2e_overlays already applies 0.90→~460.
-    # Extra derate + oversized steps collapse sps (~15×); stay at overlay size.
-    "mixformer": 1.0,  # keep ~460 (post_opt control util~95)
-    "mdl_mixformer": 1.0,  # keep ~512 + selective
+    "onetrans": 2.00,  # 1408 → ~2816 with selective; prod batch may drift
+    # MDL-OneTrans: act=full. Prod batch drifted 1408→1024; 2.10× only reaches
+    # ~2150 and leaves ~12GiB/24GiB HBM — under-fills vs post_opt ~2957/17GiB.
+    # 2.9× → ~2960 to restore that compute fill on 2×24GB no-P2P.
+    "mdl_onetrans": 2.90,
+    # MixFormer production packs 64 agg rows; overlay 0.90 then this scale.
+    "mixformer": 4.00,
+    "mdl_mixformer": 1.0,  # keep candidate-packed ~512 + selective
 }
 
 
@@ -128,6 +134,9 @@ def _prepare_yaml(
     *,
     nproc: int,
     bucket_map: dict[str, int],
+    num_workers: int | None = None,
+    adapter_workers: int | None = None,
+    agg_direct_mode: str | None = None,
 ) -> Path:
     # Start from capped production overlay.
     overlay = build_overlay(
@@ -157,12 +166,13 @@ def _prepare_yaml(
         runtime["cuda_graph_backbone"] = False
     if model == "mdl_mixformer":
         runtime["activation_checkpoint"] = "selective"
-    if model in {"mixformer", "mdl_mixformer"}:
-        # Prod used to ship 512; that starves SMs (~6× SPS regression vs 8192).
-        runtime["sequence_projection_chunk_tokens"] = max(
-            int(runtime.get("sequence_projection_chunk_tokens") or 0),
-            8192,
-        )
+    if model == "mixformer":
+        # Production YAML is reduce-overhead. MixFormer dense compile maps that
+        # to static-shape inductor fusion without CUDAGraph replay (grad-accum
+        # overwrites MixFormer residuals). Keep the production compile_mode so
+        # the overlay matches configs/mixformer.yaml. GSET stays on (Kraken
+        # one-table); MixFormer compiles dense blocks only.
+        runtime["compile_mode"] = "reduce-overhead"
     payload["runtime"] = runtime
 
     rankmixer_family = model in {"rankmixer", "mdl_rankmixer"}
@@ -171,6 +181,12 @@ def _prepare_yaml(
     if model == "rankmixer":
         host, prefetch = 6, 4
     elif rankmixer_family:
+        host, prefetch = 10, 6
+    elif model in {"onetrans", "mdl_onetrans"}:
+        # Local baseline 20260807: wait~0.07 with host=6; deepen runway.
+        host, prefetch = 10, 6
+    elif model in {"mixformer", "mdl_mixformer"}:
+        # Compiled MixFormer at util-scale batches outruns host=6 (wait~0.07).
         host, prefetch = 10, 6
     else:
         host, prefetch = 6, 4
@@ -185,7 +201,11 @@ def _prepare_yaml(
         if not isinstance(split, dict):
             continue
         split = dict(split)
-        split["inputs"] = list(MOCK_INPUTS)
+        split["inputs"] = list(
+            MIXFORMER_MOCK_INPUTS
+            if model in {"mixformer", "mdl_mixformer"}
+            else MOCK_INPUTS
+        )
         reader = _deepen_reader(
             dict(split.get("reader") or {}),
             host=host,
@@ -196,11 +216,25 @@ def _prepare_yaml(
         # and under-feeds the GPU (rankmixer wait 0.13 → util ~69).
         if model in {
             "rankmixer",
+            "mdl_rankmixer",
+            "onetrans",
             "mdl_onetrans",
             "mixformer",
             "mdl_mixformer",
         }:
+            # Local 20260807a winner: workers=4 / adapter=6. workers=8 raised
+            # wait again (CPU oversubscribe with other tenants).
             reader["num_workers"] = max(int(reader.get("num_workers") or 0), 4)
+            reader["adapter_workers"] = max(int(reader.get("adapter_workers") or 0), 6)
+        if model in {"mixformer", "mdl_mixformer"}:
+            reader["num_workers"] = max(int(reader.get("num_workers") or 0), 6)
+            reader["adapter_workers"] = max(int(reader.get("adapter_workers") or 0), 8)
+        if num_workers is not None:
+            reader["num_workers"] = int(num_workers)
+        if adapter_workers is not None:
+            reader["adapter_workers"] = int(adapter_workers)
+        if agg_direct_mode is not None:
+            reader["agg_direct_mode"] = str(agg_direct_mode)
         split["reader"] = reader
         payload.setdefault("data", {})[split_name] = split
 
@@ -209,6 +243,14 @@ def _prepare_yaml(
     fixed_test["enabled"] = False
     training["fixed_test_eval"] = fixed_test
     training["log_every_steps"] = 10
+    training["save_checkpoint"] = False
+    # Prod YAMLs may point training.checkpoint.dir at HDFS; opening that store
+    # needs libjvm and is irrelevant for local mock util/sps measurement.
+    # Drop the production data-window policy as one unit.  Keeping
+    # data_window_hours/sparse_delta while only clearing ``dir`` creates an
+    # invalid benchmark config and, more importantly, makes a perf harness
+    # depend on an HDFS checkpoint service it never exercises.
+    training["checkpoint"] = {"dir": None}
     payload["training"] = training
 
     out_path = out_dir / f"{model}.yaml"
@@ -260,6 +302,9 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=36)
     parser.add_argument("--profile-steps", type=int, default=1)
     parser.add_argument("--models", default=",".join(MODELS))
+    parser.add_argument("--num-workers", type=int)
+    parser.add_argument("--adapter-workers", type=int)
+    parser.add_argument("--agg-direct-mode", choices=("direct", "direct_arrow"))
     args = parser.parse_args()
 
     out = Path(args.out_dir)
@@ -277,7 +322,13 @@ def main() -> int:
 
     for model in models:
         cfg = _prepare_yaml(
-            model, out, nproc=args.nproc, bucket_map=bucket_map
+            model,
+            out,
+            nproc=args.nproc,
+            bucket_map=bucket_map,
+            num_workers=args.num_workers,
+            adapter_workers=args.adapter_workers,
+            agg_direct_mode=args.agg_direct_mode,
         )
         log_path = out / f"{model}.log"
         json_path = out / f"{model}.json"

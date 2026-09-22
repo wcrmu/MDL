@@ -123,7 +123,14 @@ class CheckpointStore:
     def read_bytes(self, *parts: str) -> bytes:
         raise NotImplementedError
 
-    def upload_file(self, source: Path, *parts: str) -> None:
+    def upload_file(
+        self,
+        source: Path,
+        *parts: str,
+        progress: Callable[[int], None] | None = None,
+    ) -> None:
+        """Upload ``source`` and optionally report each durable byte increment."""
+
         raise NotImplementedError
 
     def download_file(self, destination: Path, *parts: str) -> None:
@@ -197,14 +204,23 @@ class LocalCheckpointStore(CheckpointStore):
     def read_bytes(self, *parts: str) -> bytes:
         return self._resolve(parts).read_bytes()
 
-    def upload_file(self, source: Path, *parts: str) -> None:
+    def upload_file(
+        self,
+        source: Path,
+        *parts: str,
+        progress: Callable[[int], None] | None = None,
+    ) -> None:
         target = self._resolve(parts)
         if Path(source).resolve() == target.resolve():
+            if progress is not None:
+                progress(Path(source).stat().st_size)
             return
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
         shutil.copyfile(source, temporary)
         os.replace(temporary, target)
+        if progress is not None:
+            progress(Path(source).stat().st_size)
 
     def download_file(self, destination: Path, *parts: str) -> None:
         source = self._resolve(parts)
@@ -321,7 +337,12 @@ class HadoopCheckpointStore(CheckpointStore):
 
         return _retry(read, description=f"read {path}")
 
-    def upload_file(self, source: Path, *parts: str) -> None:
+    def upload_file(
+        self,
+        source: Path,
+        *parts: str,
+        progress: Callable[[int], None] | None = None,
+    ) -> None:
         path = self._resolve(parts)
         parent = posixpath.dirname(path)
 
@@ -335,6 +356,11 @@ class HadoopCheckpointStore(CheckpointStore):
                     if not chunk:
                         break
                     remote.write(chunk)
+                    # Queue backpressure must distinguish a slow multi-GiB
+                    # upload from a wedged DFSClient. Report only after the
+                    # remote write returns, never after the local read.
+                    if progress is not None:
+                        progress(len(chunk))
 
         _retry(upload, description=f"upload {source} -> {path}")
 

@@ -201,6 +201,7 @@ _RUNTIME_OVERRIDE_FIELDS = (
     "cuda_graph_backbone",
     "domain_varlen_packing",
     "checkpoint_domain_blocks",
+    "mfalcon_microbatch_size",
 )
 
 _MODEL_OVERRIDE_FIELDS = (
@@ -388,6 +389,10 @@ _CHECKPOINT_OVERRIDE_ARGS = (
     ("checkpoint_dir", "dir"),
     ("checkpoint_run_name", "run_name"),
     ("checkpoint_every_steps", "every_steps"),
+    ("checkpoint_every_data_hours", "data_window_hours"),
+    ("checkpoint_sparse_delta", "sparse_delta"),
+    ("checkpoint_sparse_full_every", "sparse_full_every"),
+    ("checkpoint_lineage_id", "lineage_id"),
     ("checkpoint_keep_last", "keep_last"),
     # Was bare ``--resume``; platforms often inject that flag for job-level
     # restart semantics and silently overrode training.checkpoint.resume.
@@ -617,6 +622,35 @@ def _add_checkpoint_args(parser: argparse.ArgumentParser) -> None:
         help="override training.checkpoint.every_steps (0 disables periodic saves)",
     )
     parser.add_argument(
+        "--checkpoint-every-data-hours",
+        type=int,
+        default=None,
+        help=(
+            "commit after this many contiguous hourly training partitions; "
+            "0 disables data-window checkpoints"
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-sparse-delta",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "store only rank-owned sparse rows updated since the previous "
+            "committed data window"
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-sparse-full-every",
+        type=int,
+        default=None,
+        help="write a new full sparse base after this many generations",
+    )
+    parser.add_argument(
+        "--checkpoint-lineage-id",
+        default=None,
+        help="override the stable checkpoint history identity used by auto resume",
+    )
+    parser.add_argument(
         "--checkpoint-keep-last",
         type=int,
         default=None,
@@ -667,6 +701,15 @@ def _add_runtime_override_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "override runtime.checkpoint_domain_blocks; recomputes only the MDL "
             "Domain sidecar, leaving the backbone activations stored"
+        ),
+    )
+    parser.add_argument(
+        "--mfalcon-microbatch-size",
+        type=int,
+        default=None,
+        help=(
+            "override runtime.mfalcon_microbatch_size; positive values reuse "
+            "one request cache while scoring candidates in bounded microbatches"
         ),
     )
 
@@ -911,6 +954,7 @@ def _cmd_validate_config(args: argparse.Namespace) -> int:
     if config.data.test is not None:
         print(f"test_inputs: {len(config.data.test.inputs)}")
     print(f"batch_size_per_rank: {config.training.batch_size}")
+    print(f"pack_unit: {config.data.train.reader.pack_unit}")
     print(
         "gradient_accumulation_steps: "
         f"{config.training.gradient_accumulation_steps}"
@@ -1043,9 +1087,13 @@ def _launch_ddp_command(args: argparse.Namespace, config) -> int:
     env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     # Emb A2A chunk caps + RankMixer-vs-OneTrans NCCL BW/HBM tradeoffs are
     # applied in train._configure_nccl_runtime_env / world-size profile.
-    prefer_collective_bw = str(getattr(config.model, "name", "")) in {
+    model_name = str(getattr(config.model, "name", ""))
+    # Match train._setup_distributed: RankMixer + plain OneTrans prefer larger
+    # NCCL scratch; mdl_onetrans full remat keeps tighter HBM caps.
+    prefer_collective_bw = model_name in {
         "rankmixer",
         "mdl_rankmixer",
+        "onetrans",
     }
     # Probe local CUDA P2P: keep NVLink/P2P when healthy, otherwise fall back
     # via NCCL_IGNORE_DISABLED_P2P / NCCL_P2P_DISABLE (see train.py).

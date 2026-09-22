@@ -700,6 +700,68 @@ class CheckpointCoordinatorTest(unittest.TestCase):
             scan_split_key(config.data.train, shard_rank=0, shard_world_size=1),
         )
 
+    def test_exit_save_surfaces_a_publish_failure(self) -> None:
+        """A normal-looking train result must not hide a missing final checkpoint."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self._config(temporary)
+            context = self._context()
+            model = _DenseToyModel()
+            optimizer = torch.optim.RMSprop(model.parameters(), lr=0.1)
+            writer = _CheckpointCoordinator.create(config, context, False)
+            try:
+                with patch.object(
+                    writer._store,
+                    "upload_file",
+                    side_effect=OSError("destination unavailable"),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "final checkpoint step 4 failed to commit"
+                    ):
+                        writer.save(
+                            config,
+                            model,
+                            context,
+                            step=4,
+                            rows=1024,
+                            elapsed_seconds=12.5,
+                            dense_optimizer=optimizer,
+                            replicated_sparse_optimizer=None,
+                            sharded_optimizer=None,
+                            on_exit=True,
+                        )
+            finally:
+                writer.close()
+
+    def test_periodic_save_skips_before_staging_when_previous_is_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self._config(temporary)
+            context = self._context()
+            writer = _CheckpointCoordinator.create(config, context, False)
+            self.assertTrue(writer._uploader.reserve_step(2))
+            try:
+                with patch("src.train.stage_training_checkpoint") as stage:
+                    saved = writer.save(
+                        config,
+                        _DenseToyModel(),
+                        context,
+                        step=4,
+                        rows=1024,
+                        elapsed_seconds=12.5,
+                        dense_optimizer=None,
+                        replicated_sparse_optimizer=None,
+                        sharded_optimizer=None,
+                    )
+                self.assertFalse(saved)
+                stage.assert_not_called()
+            finally:
+                writer._uploader.abort_step(
+                    2,
+                    Path(temporary) / "unused",
+                    cleanup_staging=False,
+                )
+                writer.close()
+
     def test_resume_none_starts_a_fresh_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = self._config(temporary)
@@ -979,12 +1041,14 @@ class CheckpointConfigTest(unittest.TestCase):
                     "every_steps": 2000,
                     "keep_last": 3,
                     "resume": "auto",
+                    "upload_stall_timeout_sec": 123,
                 }
             }
         )
         training.validate()
         self.assertTrue(training.checkpoint.enabled)
         self.assertEqual(training.checkpoint.every_steps, 2000)
+        self.assertEqual(training.checkpoint.upload_stall_timeout_sec, 123)
 
     def test_production_configs_never_share_a_run_directory(self) -> None:
         """Coarse and fine siblings share ``model.name`` but not their vocabulary.
@@ -1012,6 +1076,8 @@ class CheckpointConfigTest(unittest.TestCase):
             CheckpointConfig(every_steps=-1).validate()
         with self.assertRaises(ValueError):
             CheckpointConfig(keep_last=-1).validate()
+        with self.assertRaises(ValueError):
+            CheckpointConfig(upload_stall_timeout_sec=0).validate()
         with self.assertRaises(ValueError):
             CheckpointConfig(resume="").validate()
         with self.assertRaises(ValueError):

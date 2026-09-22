@@ -28,7 +28,7 @@ MODELS = (
     "mdl_mixformer",
 )
 MOCK_INPUTS = [
-    str(ROOT / "artifacts" / "mock_parquet_full_2x2500_zstd"),
+    str(ROOT / "artifacts" / "mock_parquet_full_2x2500_zstd_mf297"),
 ]
 BUCKET_SOURCE = ROOT / "artifacts" / "bench_b512_direct.yaml"
 # Absolute ceiling for fixture embeddings on 24GB cards when a name is absent
@@ -42,20 +42,39 @@ MASTER_PORTS = {
     "mixformer": 29615,
     "mdl_mixformer": 29616,
 }
-# 24GB mock E2E: production MixFormer batches under-fill the GPU after embedding
-# caps. Scale request batches (and length-bucket sizes) for util measurement only.
-# Production MixFormer defaults are 512 (paper ≈1500). Mock 24GB E2E still needs
-# a down-scale so capped-emb runs fit; keep absolute sizes near the previous
-# ~450–530 candidate regime that filled the 4090s.
+# 24GB mock E2E: production MixFormer packs 64 agg rows per microbatch.
+# Scale those request/agg batches (and length-bucket sizes) for util
+# measurement only. Keep MixFormer math unchanged.
 MIXFORMER_E2E_BATCH_SCALE = {
-    "mixformer": 0.90,  # 512 → ~460
-    "mdl_mixformer": 1.0,  # 512 → ~512
+    "mixformer": 0.90,  # 64 agg rows → ~58
+    "mdl_mixformer": 1.0,  # still candidate-packed 512
 }
 
 
 def _feature_bucket_map(path: Path) -> dict[str, int]:
-    config = load_app_config(path)
+    """Read embedding hash-bucket ceilings from a fixture YAML.
+
+    Prefer raw YAML walk over ``load_app_config``: the capped bench fixture may
+    still carry retired training keys (e.g. ``quick_eval``) that block schema
+    load, while we only need ``features[*].encoding.num_buckets``.
+    """
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     out: dict[str, int] = {}
+    for feature in payload.get("features") or []:
+        if not isinstance(feature, dict):
+            continue
+        name = feature.get("name")
+        encoding = feature.get("encoding")
+        if not isinstance(name, str) or not isinstance(encoding, dict):
+            continue
+        num_buckets = encoding.get("num_buckets")
+        if num_buckets is None:
+            continue
+        out[name] = int(num_buckets)
+    if out:
+        return out
+    # Fallback for fixtures that only validate through the current schema.
+    config = load_app_config(path)
     for feature in config.features:
         encoding = feature.encoding
         if encoding is None or encoding.num_buckets is None:
@@ -173,7 +192,7 @@ def build_overlay(
     bucket_map: dict[str, int],
 ) -> Path:
     src = ROOT / "configs" / f"{model_name}.yaml"
-    # Resolve ``extends`` so MixFormer overlays inherit the full parent contract.
+    # Resolve ``extends`` so inherited siblings expand to a full payload.
     payload = _load_config_mapping(src)
 
     payload["features"] = _cap_feature_payload(list(payload["features"]), bucket_map)
@@ -189,8 +208,10 @@ def build_overlay(
     runtime["master_port"] = MASTER_PORTS.get(
         model_name, 29500 + hash(model_name) % 1000
     )
-    # MixFormer cross-attention is a packed einsum path, not FlashAttention.
-    # Keep the flash SLO for models that actually emit Flash kernels.
+    # MixFormer leftover False is padding only. Dao varlen Flash is the
+    # production mixed-length path, but this overlay still forces SDPA so the
+    # gpt (no flash_attn) flash-kernel SLO does not fail. mdl-cu128 benches
+    # restore runtime.attention_backend=flash after prepare.
     if model_name in {"mixformer", "mdl_mixformer"}:
         runtime["attention_backend"] = "sdpa"
     # MDL-MixFormer at full ckpt tops out ~87% on 24GB mock cards; selective
@@ -206,6 +227,13 @@ def build_overlay(
         training = dict(payload.get("training") or {})
         training["lr_dense"] = 1.0e-4
         payload["training"] = training
+
+    # Keep production Kraken GSET (one namespace table, compress_dim=16,
+    # rAdaGrad, id % world_size). Mock still caps hash buckets so the ID
+    # stream fits local parquet; the physical table is GSET, not per-feature
+    # shards. Checkpoint HDFS is dropped below so local benches do not open
+    # libjvm.
+
 
     for split_name in ("train", "test"):
         split = (payload.get("data") or {}).get(split_name)

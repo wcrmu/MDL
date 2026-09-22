@@ -1495,6 +1495,9 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
             self.output_dims = output_dims
             self.sequence_event_input_dims = sequence_dims
 
+        def prepare_gset_batch(self, _features: dict[str, object]) -> None:
+            """Match the production encoder's tokenizer-facing no-op contract."""
+
         def encode_sequence_event_inputs(
             self,
             sequence_name: str,
@@ -1783,6 +1786,38 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
         torch.testing.assert_close(
             cache.s_tokens[0, :, 0],
             torch.tensor([1.0, 2.0, 3.0, 4.0]),
+        )
+
+    def test_equal_request_and_candidate_counts_still_apply_row_indices(self) -> None:
+        tokenizer = self._fusion_tokenizer("timestamp_aware")
+        row_indices = torch.tensor([0, 0])
+        features = self._fusion_features()
+        for value in features.values():
+            value["row_indices"] = row_indices
+        request_tokens = torch.tensor(
+            [
+                [[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0]],
+                [[9.0, 0.0, 0.0, 0.0], [8.0, 0.0, 0.0, 0.0]],
+            ]
+        )
+        request_cache = OneTransRequestCache(
+            s_tokens=request_tokens,
+            s_valid_mask=torch.ones(2, 2, dtype=torch.bool),
+        )
+        encoded = {
+            name: torch.zeros(2, width)
+            for name, width in tokenizer.encoder_bank.output_dims.items()
+        }
+
+        output = tokenizer(
+            features,
+            request_cache=request_cache,
+            encoded_features=encoded,
+        )
+
+        torch.testing.assert_close(
+            output.feature_tokens[:, :2, :],
+            request_tokens.index_select(0, row_indices),
         )
 
     def test_timestamp_aware_global_window_keeps_newest_events(self) -> None:
@@ -2769,18 +2804,49 @@ class OneTransCacheAlignmentTest(unittest.TestCase):
             torch.testing.assert_close(incremental_layer.s_key, full_layer.s_key)
             torch.testing.assert_close(incremental_layer.s_output, full_layer.s_output)
 
-    def test_cross_request_cache_rejects_non_append_mutation(self) -> None:
+    def test_cross_request_cache_rebuilds_non_append_mutation(self) -> None:
         backbone = self._backbone(use_pyramid=False)
         old_tokens = torch.randn(1, 4, 8)
         old_cache = backbone.precompute_request_cache({"s_tokens": old_tokens})
         changed = old_tokens.clone()
         changed[:, 1, :] += 1.0
+        new_tokens = torch.cat([changed, torch.randn(1, 1, 8)], dim=1)
 
-        with self.assertRaisesRegex(ValueError, "exact prefix"):
-            backbone.update_request_cache(
-                {"s_tokens": torch.cat([changed, torch.randn(1, 1, 8)], dim=1)},
+        with torch.no_grad():
+            rebuilt = backbone.update_request_cache(
+                {"s_tokens": new_tokens},
                 old_cache,
             )
+            full = backbone.precompute_request_cache({"s_tokens": new_tokens})
+
+        for rebuilt_layer, full_layer in zip(rebuilt.layers, full.layers):
+            self.assertEqual(rebuilt_layer.s_reused_kv_tokens, 0)
+            torch.testing.assert_close(rebuilt_layer.s_key, full_layer.s_key)
+            torch.testing.assert_close(rebuilt_layer.s_value, full_layer.s_value)
+            torch.testing.assert_close(rebuilt_layer.s_output, full_layer.s_output)
+
+    def test_cross_request_cache_rebuilds_sliding_recent_window(self) -> None:
+        backbone = self._backbone(use_pyramid=True)
+        old_tokens = torch.randn(1, 5, 8)
+        new_tokens = torch.cat(
+            [old_tokens[:, 1:, :], torch.randn(1, 1, 8)],
+            dim=1,
+        )
+
+        with torch.no_grad():
+            old_cache = backbone.precompute_request_cache({"s_tokens": old_tokens})
+            rebuilt = backbone.update_request_cache(
+                {"s_tokens": new_tokens},
+                old_cache,
+            )
+            full = backbone.precompute_request_cache({"s_tokens": new_tokens})
+
+        torch.testing.assert_close(rebuilt.s_tokens, new_tokens)
+        for rebuilt_layer, full_layer in zip(rebuilt.layers, full.layers):
+            self.assertEqual(rebuilt_layer.s_reused_kv_tokens, 0)
+            torch.testing.assert_close(rebuilt_layer.s_key, full_layer.s_key)
+            torch.testing.assert_close(rebuilt_layer.s_value, full_layer.s_value)
+            torch.testing.assert_close(rebuilt_layer.s_output, full_layer.s_output)
 
     def test_cache_for_candidate_rows_keeps_request_sized_layers(self) -> None:
         backbone = self._backbone(use_pyramid=True).train()
@@ -2837,6 +2903,46 @@ class OneTransCacheAlignmentTest(unittest.TestCase):
         lazy.square().mean().backward()
         self.assertTrue(torch.isfinite(s_input.grad).all())
         self.assertTrue(torch.isfinite(ns_tokens.grad).all())
+
+    def test_forward_cached_ns_honors_equal_size_duplicate_row_map(self) -> None:
+        config = SimpleNamespace(
+            model=SimpleNamespace(token_dim=8, num_heads=2, hidden_dim=16),
+            runtime=SimpleNamespace(attention_backend="auto"),
+        )
+        torch.manual_seed(53)
+        block = OneTransBlock(config, ns_token_count=3).eval()
+        s_input = torch.randn(2, 5, 8)
+        ns_tokens = torch.randn(2, 3, 8)
+        s_mask = torch.ones(2, 5, dtype=torch.bool)
+        row_indices = torch.tensor([0, 0])
+        empty = s_input.new_empty(
+            2,
+            block.attention.num_heads,
+            0,
+            block.attention.head_dim,
+        )
+
+        with torch.no_grad():
+            lazy = block.forward_cached_ns_tensors(
+                ns_tokens,
+                s_input,
+                empty,
+                empty,
+                s_mask,
+                row_indices,
+            )
+            eager_s = s_input.index_select(0, row_indices)
+            eager_mask = s_mask.index_select(0, row_indices)
+            eager = block.forward_cached_ns_tensors(
+                ns_tokens,
+                eager_s,
+                empty,
+                empty,
+                eager_mask,
+                None,
+            )
+
+        torch.testing.assert_close(lazy, eager, rtol=1e-5, atol=1e-6)
 
 
 class OneTransPositionEmbeddingAlignmentTest(unittest.TestCase):

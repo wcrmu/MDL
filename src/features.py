@@ -344,6 +344,35 @@ def vocab_strategy_fingerprint(strategy_or_config: VocabStrategy | AppConfig) ->
     return sha256(encoded.encode("utf-8")).hexdigest()
 
 
+# Missing / rectangular-pad sentinel. Not a table row.
+# Production pre_hashed/identity follow the dracarys contract: id=0 is a normal
+# learnable embedding row. Nulls and tensor pads use this negative id and are
+# skipped at lookup, not mapped onto row 0.
+CATEGORICAL_MISSING_ID = -1
+
+
+def reserves_padding_row(encoding: Any) -> bool:
+    """True when the encoder synthesizes row 0 as OOV/pad (vocab/hash)."""
+
+    return getattr(encoding, "encoding", None) not in {"pre_hashed", "identity"}
+
+
+def tensor_padding_id(encoding: Any) -> int:
+    """Integer used to fill missing slots and rectangular sequence pads."""
+
+    if reserves_padding_row(encoding):
+        return int(getattr(encoding, "padding_id", 0))
+    return CATEGORICAL_MISSING_ID
+
+
+def embedding_padding_idx(encoding: Any) -> int | None:
+    """``nn.Embedding`` padding_idx, or None when row 0 is a real id."""
+
+    if reserves_padding_row(encoding):
+        return 0
+    return None
+
+
 def stable_hash_bucket(value: Any, num_buckets: int, salt: str | None = None) -> int:
     if num_buckets <= 0:
         raise ValueError("num_buckets must be positive")
@@ -361,8 +390,9 @@ def pre_hashed_bucket(value: Any, num_buckets: int) -> int:
     """Map one signed int64 hash by its unchanged uint64 low bits.
 
     The power-of-two requirement makes signed and unsigned modulo identical
-    without ``abs`` and avoids the ``INT64_MIN`` overflow corner case.  Zero is
-    an upstream-contract violation; true null is handled separately as padding.
+    without ``abs`` and avoids the ``INT64_MIN`` overflow corner case.  ``0`` is
+    a normal bucket (dracarys / gigantic contract). True null is
+    ``CATEGORICAL_MISSING_ID``, not row 0.
     """
 
     if num_buckets <= 0 or num_buckets & (num_buckets - 1):
@@ -371,9 +401,7 @@ def pre_hashed_bucket(value: Any, num_buckets: int) -> int:
         raise TypeError(f"pre_hashed value must be an int64, got {type(value).__name__}")
     if value < -(1 << 63) or value > (1 << 63) - 1:
         raise ValueError(f"pre_hashed value {value!r} is outside signed int64 range")
-    if value == 0:
-        raise ValueError("pre_hashed non-null value must not be zero")
-    return (value & (num_buckets - 1)) + 1
+    return value & (num_buckets - 1)
 
 
 def _unseen_value_error(feature_name: str, value: Any) -> ValueError:
@@ -387,7 +415,7 @@ def encode_categorical_value(
     unseen_policy: str = "oov",
 ) -> int:
     if value is None:
-        return 0
+        return tensor_padding_id(categorical_input.encoding)
     encoding = categorical_input.encoding
     if encoding.encoding in {"vocab", "shared_vocab"}:
         if vocab_map is None:
@@ -407,7 +435,7 @@ def encode_categorical_value(
         if encoded < 0 or encoded >= encoding.num_buckets:
             if encoding.out_of_range == "error":
                 raise _unseen_value_error(categorical_input.name, value)
-            return encoding.padding_id
+            return tensor_padding_id(encoding)
         return encoded
     raise ValueError(f"unsupported encoding {encoding.encoding!r}")
 

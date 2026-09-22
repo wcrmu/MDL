@@ -19,11 +19,18 @@ import torch
 from src.dataloader import FeatureBatch, pin_feature_batch, privatize_shared_feature_batch
 from src.train import (
     _HOST_PREPARE_SHARE_SHM_BYTES,
+    _compact_share_ipc_enabled,
+    _host_prepare_direct_shared_enabled,
     _host_prepare_ipc_mode,
+    _host_prepare_pipeline_depth,
+    _host_prepare_torch_threads,
+    _iter_host_prepared_batches,
     _load_feature_batch_from_ipc,
+    _load_shared_feature_batch_from_ipc,
     _memfd_handle_channel,
     _publish_memfd_payload,
     _share_feature_batch_for_ipc,
+    _share_feature_batch_payload_for_ipc,
     _spill_feature_batch_for_ipc,
     _wait_for_host_prepare_terminal_ack,
 )
@@ -114,6 +121,79 @@ def _share_memory_child(queue: object, terminal_ack: object) -> None:
 
 
 class HostPrepareIpcModeTest(unittest.TestCase):
+    def test_compact_share_defaults_on_and_has_rollback_switch(self) -> None:
+        self.assertTrue(_compact_share_ipc_enabled({}))
+        self.assertTrue(
+            _compact_share_ipc_enabled({"MDL_HOST_PREPARE_COMPACT_SHARE": "yes"})
+        )
+        self.assertFalse(
+            _compact_share_ipc_enabled({"MDL_HOST_PREPARE_COMPACT_SHARE": "0"})
+        )
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            _compact_share_ipc_enabled(
+                {"MDL_HOST_PREPARE_COMPACT_SHARE": "sometimes"}
+            )
+
+    def test_direct_shared_defaults_on_and_has_rollback_switch(self) -> None:
+        self.assertTrue(_host_prepare_direct_shared_enabled({}))
+        self.assertFalse(
+            _host_prepare_direct_shared_enabled(
+                {"MDL_HOST_PREPARE_DIRECT_SHARED": "off"}
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            _host_prepare_direct_shared_enabled(
+                {"MDL_HOST_PREPARE_DIRECT_SHARED": "sometimes"}
+            )
+
+    def test_host_prepare_pipeline_depth_is_bounded(self) -> None:
+        self.assertEqual(_host_prepare_pipeline_depth({}), 1)
+        self.assertEqual(
+            _host_prepare_pipeline_depth({"MDL_HOST_PREPARE_PIPELINE_DEPTH": "1"}),
+            1,
+        )
+        with self.assertRaisesRegex(ValueError, r"\[1, 2\]"):
+            _host_prepare_pipeline_depth(
+                {"MDL_HOST_PREPARE_PIPELINE_DEPTH": "3"}
+            )
+
+    def test_host_prepare_torch_threads_default_and_override(self) -> None:
+        self.assertEqual(_host_prepare_torch_threads({}), 1)
+        self.assertEqual(
+            _host_prepare_torch_threads({}, model_name="mdl_rankmixer"),
+            2,
+        )
+        self.assertEqual(
+            _host_prepare_torch_threads(
+                {"MDL_HOST_PREPARE_TORCH_THREADS": "4"}
+            ),
+            4,
+        )
+        with self.assertRaisesRegex(ValueError, r"\[1, 64\]"):
+            _host_prepare_torch_threads(
+                {"MDL_HOST_PREPARE_TORCH_THREADS": "0"}
+            )
+
+    def test_host_prepare_pipeline_preserves_order(self) -> None:
+        beats: list[str] = []
+
+        def prepare(value: object) -> FeatureBatch:
+            return _packed_test_batch(int(value))
+
+        batches = list(
+            _iter_host_prepared_batches(
+                iter([0, 1, 2]),
+                prepare,
+                pipeline_depth=2,
+                progress_beat=beats.append,
+            )
+        )
+        self.assertEqual(
+            [int(batch.features["x"][0, 0]) for batch in batches],
+            [0, 20, 40],
+        )
+        self.assertEqual(beats, ["table", "table", "table"])
+
     def test_explicit_override(self) -> None:
         self.assertEqual(_host_prepare_ipc_mode({"MDL_HOST_PREPARE_IPC": "memfd"}), "memfd")
         self.assertEqual(_host_prepare_ipc_mode({"MDL_HOST_PREPARE_IPC": "share"}), "share")
@@ -145,6 +225,28 @@ class HostPrepareIpcModeTest(unittest.TestCase):
         shared = _share_feature_batch_for_ipc(batch)
         self.assertTrue(shared._packed_buffers[0].is_shared())
         self.assertTrue(shared.scenario_id.is_shared())
+
+    def test_compact_share_payload_roundtrip_rebuilds_views(self) -> None:
+        batch = _packed_test_batch()
+        payload = _share_feature_batch_payload_for_ipc(batch)
+        self.assertEqual(payload["_host_prepare_transport"], "share")
+        self.assertEqual(len(payload["buffers"]), 1)
+        self.assertTrue(payload["buffers"][0].is_shared())
+        # Tensor views are metadata tuples; only the packed base crosses IPC.
+        self.assertIsInstance(payload["features"]["x"], tuple)
+        restored = _load_shared_feature_batch_from_ipc(
+            payload,
+            pin_memory=False,
+        )
+        self.assertFalse(restored._packed_buffers[0].is_shared())
+        torch.testing.assert_close(
+            restored.features["x"],
+            torch.arange(16, dtype=torch.int64).view(4, 4),
+        )
+        torch.testing.assert_close(
+            restored.scenario_id,
+            torch.arange(16, 20, dtype=torch.int64),
+        )
 
     @unittest.skipUnless(
         PINNED_MEMORY_AVAILABLE,

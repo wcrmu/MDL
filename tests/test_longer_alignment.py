@@ -15,6 +15,7 @@ from src.model import (
     LongerSequenceAttentionBlock,
     LongerSequenceEncoder,
     LongerTokenMerger,
+    UnifiedLongerReadout,
     _resolve_longer_chunk_rows,
 )
 
@@ -376,6 +377,34 @@ class LongerSequenceEncoderAlignmentTest(unittest.TestCase):
         expected = torch.cat([global_tokens, tokens[:, -2:, :]], dim=1).flatten(start_dim=1)
         actual = _compressed_tensor(output)
         self.assertEqual(tuple(actual.shape), tuple(expected.shape))
+        torch.testing.assert_close(actual, expected)
+
+    def test_compressed_valid_mask_tracks_merged_recent_suffix(self) -> None:
+        encoder = LongerSequenceEncoder(
+            token_dim=4,
+            num_heads=2,
+            hidden_dim=8,
+            query_token_count=3,
+            self_layers=1,
+            summary_tokens=2,
+            token_merge=2,
+            inner_layers=0,
+        )
+        history_mask = torch.tensor(
+            [
+                [False, False, True, True, True, True, True, True],
+                [False, False, False, False, False, False, False, True],
+            ]
+        )
+
+        actual = encoder.compressed_valid_mask(history_mask)
+
+        expected = torch.tensor(
+            [
+                [True, True, True, True, True],
+                [True, True, False, False, True],
+            ]
+        )
         torch.testing.assert_close(actual, expected)
 
     def test_precomputed_cache_is_numerically_equivalent_and_candidate_reusable(self) -> None:
@@ -780,6 +809,71 @@ class LongerSequenceEncoderAlignmentTest(unittest.TestCase):
         )
 
 
+class UnifiedLongerReadoutTest(unittest.TestCase):
+    def _readout(self) -> UnifiedLongerReadout:
+        return UnifiedLongerReadout(
+            input_dim=4,
+            output_dim=8,
+            num_queries=2,
+            num_heads=2,
+            hidden_dim=16,
+            global_tokens=2,
+            recent_tokens=3,
+            user_global_tokens=1,
+            candidate_global_tokens=1,
+            attention_backend="sdpa",
+        )
+
+    def test_all_full_longer_states_feed_fixed_width_readout_slots(self) -> None:
+        torch.manual_seed(53)
+        readout = self._readout()
+        hidden = torch.randn(2, 5, 4, requires_grad=True)
+        valid_mask = torch.tensor(
+            [[True, True, True, True, True], [True, True, False, True, True]]
+        )
+
+        output = readout(hidden, valid_mask)
+
+        self.assertEqual(tuple(output.shape), (2, 2, 8))
+        output.square().mean().backward()
+        self.assertIsNotNone(hidden.grad)
+        self.assertGreater(float(hidden.grad[:, 2:, :].abs().sum()), 0.0)
+        unused = [
+            name
+            for name, parameter in readout.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        self.assertEqual(unused, [])
+
+    def test_masked_recent_states_cannot_change_readout(self) -> None:
+        torch.manual_seed(59)
+        readout = self._readout().eval()
+        hidden = torch.randn(1, 5, 4)
+        valid_mask = torch.tensor([[True, True, False, True, True]])
+        perturbed = hidden.clone()
+        perturbed[:, 2, :] = 1.0e6
+
+        with torch.no_grad():
+            baseline = readout(hidden, valid_mask)
+            actual = readout(perturbed, valid_mask)
+
+        torch.testing.assert_close(actual, baseline)
+
+    def test_valid_recent_state_changes_readout(self) -> None:
+        torch.manual_seed(61)
+        readout = self._readout().eval()
+        hidden = torch.randn(1, 5, 4)
+        valid_mask = torch.ones(1, 5, dtype=torch.bool)
+        perturbed = hidden.clone()
+        perturbed[:, -1, :] += torch.tensor([5.0, -3.0, 2.0, 0.5])
+
+        with torch.no_grad():
+            baseline = readout(hidden, valid_mask)
+            actual = readout(perturbed, valid_mask)
+
+        self.assertFalse(torch.allclose(actual, baseline))
+
+
 class LongerInputGenerationAlignmentTest(unittest.TestCase):
     def _sequence(self, order: str) -> SequenceConfig:
         return SequenceConfig(
@@ -869,6 +963,97 @@ class LongerInputGenerationAlignmentTest(unittest.TestCase):
 
         self.assertEqual(_sequence_bounds(5, oldest), (3, 5))
         self.assertEqual(_sequence_bounds(5, newest), (0, 2))
+
+    def test_unified_history_interleaves_streams_and_keeps_global_recent_window(self) -> None:
+        def sequence(name: str) -> SequenceConfig:
+            return SequenceConfig(
+                name=name,
+                fields=[
+                    SequenceFieldConfig(
+                        name="value",
+                        kind="dense",
+                        source=f"{name}_value",
+                    ),
+                    SequenceFieldConfig(
+                        name="time_delta",
+                        kind="dense",
+                        source=f"{name}_time_delta",
+                    ),
+                ],
+                max_length=3,
+                sequence_order="oldest_to_newest",
+                encoder="longer",
+                time_delta_field="time_delta",
+                longer_history_group="history",
+                longer_output="full",
+            )
+
+        first = sequence("first")
+        second = sequence("second")
+        bank = FeatureEncoderBank.__new__(FeatureEncoderBank)
+        nn.Module.__init__(bank)
+        bank.config = SimpleNamespace(
+            model=SimpleNamespace(global_sequence_max_length=4),
+            runtime=SimpleNamespace(activation_checkpoint="none"),
+        )
+        bank.embedding_weight_dtype = torch.float32
+        bank.sequences_by_name = {item.name: item for item in (first, second)}
+        bank.sequence_field_embedding_keys = {}
+        bank.embeddings = nn.ModuleDict()
+        bank.sequence_step_projectors = nn.ModuleDict(
+            {
+                "first": nn.Linear(2, 2, bias=False),
+                "second": nn.Linear(2, 2, bias=False),
+            }
+        )
+        with torch.no_grad():
+            bank.sequence_step_projectors["first"].weight.copy_(torch.eye(2))
+            bank.sequence_step_projectors["second"].weight.copy_(torch.eye(2))
+        bank.sequence_longer_history_members_by_owner = {"first": ("first", "second")}
+        bank.sequence_longer_history_owner_by_name = {
+            "first": "first",
+            "second": "first",
+        }
+        bank.sequence_longer_history_type_keys = {"first": "history_type"}
+        bank.sequence_longer_type_embeddings = nn.ModuleDict(
+            {"history_type": nn.Embedding(2, 2)}
+        )
+        bank.sequence_longer_history_position_keys = {"first": "history_position"}
+        bank.sequence_position_embeddings = nn.ModuleDict(
+            {"history_position": nn.Embedding(4, 2)}
+        )
+        with torch.no_grad():
+            bank.sequence_longer_type_embeddings["history_type"].weight.zero_()
+            bank.sequence_position_embeddings["history_position"].weight.zero_()
+        features = {
+            "first": {
+                "fields": {
+                    "value": torch.tensor([[10.0, 30.0, 50.0]]),
+                    "time_delta": torch.tensor([[9.0, 5.0, 1.0]]),
+                },
+                "lengths": torch.tensor([3]),
+            },
+            "second": {
+                "fields": {
+                    "value": torch.tensor([[20.0, 40.0]]),
+                    "time_delta": torch.tensor([[7.0, 3.0]]),
+                },
+                "lengths": torch.tensor([2]),
+            },
+        }
+
+        tokens, mask, row_indices = bank._longer_history_group_tokens(
+            "first",
+            features,
+            None,
+        )
+
+        self.assertIsNone(row_indices)
+        torch.testing.assert_close(
+            tokens[0, :, 0], torch.tensor([20.0, 30.0, 40.0, 50.0])
+        )
+        torch.testing.assert_close(tokens[0, :, 1], torch.tensor([7.0, 5.0, 3.0, 1.0]))
+        torch.testing.assert_close(mask, torch.ones(1, 4, dtype=torch.bool))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: mdl-paper-alignment
+Version: 0.1.0
+Summary: Paper-aligned RankMixer, MDL, OneTrans, and LONGER implementations
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.2
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: pyarrow>=14.0

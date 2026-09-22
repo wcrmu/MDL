@@ -13,6 +13,8 @@ import errno
 import json
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -26,6 +28,7 @@ from src.checkpoint import (
     MODEL_SUBDIR,
     SHARDED_CHECKPOINT_CHUNK_FORMAT,
     SHARDED_CHECKPOINT_FORMAT,
+    StagedCheckpoint,
     _checkpoint_metadata,
     check_staging_space,
     estimate_staging_space,
@@ -479,6 +482,124 @@ class StreamingPublishTest(unittest.TestCase):
             uploader.close()
             for relative in staged.relative_files:
                 self.assertTrue((staging / relative).exists(), relative)
+
+    def test_slow_upload_progress_resets_the_backpressure_deadline(self) -> None:
+        """A large file may exceed the timeout while still writing every chunk."""
+
+        class ProgressingStore(LocalCheckpointStore):
+            def __init__(self, root: str) -> None:
+                super().__init__(root)
+                self.started = threading.Event()
+
+            def upload_file(self, source, *parts, progress=None) -> None:
+                self.started.set()
+                for _ in range(6):
+                    time.sleep(0.02)
+                    if progress is not None:
+                        progress(8 * 1024 * 1024)
+                super().upload_file(source, *parts)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ProgressingStore(str(Path(temporary) / "run"))
+            store.makedirs()
+            staging = Path(temporary) / "staging"
+            staging.mkdir()
+            names = ("a.pt", "b.pt", "c.pt")
+            for name in names:
+                (staging / name).write_bytes(name.encode())
+            uploader = CheckpointUploader(
+                store,
+                asynchronous=True,
+                max_pending=1,
+                stream_window=2,
+                stream_timeout_sec=0.05,
+            )
+            publish = uploader.stream_publisher(staging, 21)
+            self.assertTrue(publish(names[0]))
+            self.assertTrue(store.started.wait(timeout=1.0))
+            self.assertTrue(publish(names[1]))
+
+            started = time.monotonic()
+            self.assertTrue(publish(names[2]))
+            # Queue capacity stayed unavailable for longer than the nominal
+            # timeout, but byte callbacks proved that the store was healthy.
+            self.assertGreater(time.monotonic() - started, 0.05)
+            uploader.submit(
+                StagedCheckpoint(
+                    step=21,
+                    staging_dir=staging,
+                    relative_files=names,
+                )
+            )
+            uploader.close(timeout_sec=5.0)
+
+            directory = step_directory_name(21)
+            self.assertTrue(store.exists(directory, "_COMMIT"))
+            for name in names:
+                self.assertTrue(store.exists(directory, name), name)
+
+    def test_stalled_stream_opens_once_but_never_drops_the_finalizer(self) -> None:
+        """Backpressure may decline files, but cannot delete queued sources."""
+
+        class BlockingStore(LocalCheckpointStore):
+            def __init__(self, root: str) -> None:
+                super().__init__(root)
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def upload_file(self, source, *parts, progress=None) -> None:
+                if not self.release.is_set():
+                    self.started.set()
+                    self.release.wait(timeout=2.0)
+                super().upload_file(source, *parts, progress=progress)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = BlockingStore(str(Path(temporary) / "run"))
+            store.makedirs()
+            staging = Path(temporary) / "staging"
+            staging.mkdir()
+            names = ("a.pt", "b.pt", "c.pt", "d.pt")
+            for name in names:
+                (staging / name).write_bytes(name.encode())
+            uploader = CheckpointUploader(
+                store,
+                asynchronous=True,
+                max_pending=1,
+                stream_window=2,
+                stream_timeout_sec=0.05,
+            )
+            publish = uploader.stream_publisher(staging, 22)
+            self.assertTrue(publish(names[0]))
+            self.assertTrue(store.started.wait(timeout=1.0))
+            self.assertTrue(publish(names[1]))
+            self.assertFalse(publish(names[2]))
+
+            # Once the no-progress circuit opens, later files are declined
+            # immediately instead of each spending another full timeout.
+            started = time.monotonic()
+            self.assertFalse(publish(names[3]))
+            self.assertLess(time.monotonic() - started, 0.03)
+
+            staged = StagedCheckpoint(
+                step=22,
+                staging_dir=staging,
+                relative_files=names,
+            )
+            started = time.monotonic()
+            self.assertTrue(uploader.submit(staged))
+            self.assertLess(time.monotonic() - started, 0.03)
+            # The old queue.Full path rmtree'd this directory while a.pt/b.pt
+            # still pointed into it, guaranteeing that the checkpoint failed.
+            self.assertTrue((staging / names[1]).exists())
+            self.assertTrue((staging / names[2]).exists())
+
+            store.release.set()
+            uploader.close(timeout_sec=5.0)
+            directory = step_directory_name(22)
+            self.assertTrue(store.exists(directory, "_COMMIT"))
+            for name in names:
+                self.assertTrue(store.exists(directory, name), name)
+            self.assertFalse(staging.exists())
 
 
 if __name__ == "__main__":

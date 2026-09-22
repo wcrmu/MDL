@@ -14,8 +14,18 @@ from .mixformer import (
     MixFormerRequestLayout,
     MixFormerRMSNorm,
     StackedPerHeadSwiGLUFFN,
+    assemble_mixformer_heads,
 )
 from .mlp import PerTokenFFN, StackedPerTokenFFN
+from .gset import (
+    clear_gset_batch_outcomes,
+    GSETEmbeddingView,
+    GSETNamespacePolicy,
+    GSETStats,
+    GlobalSharedEmbeddingTable,
+    gset_batch_outcomes,
+    set_gset_batch_outcomes,
+)
 from .stca import (
     STCAInputLayer,
     STCASequenceCache,
@@ -28,6 +38,12 @@ __all__ = [
     "DomainAwareAttention",
     "DomainFusedModule",
     "DenseSwiGLUFFN",
+    "GSETEmbeddingView",
+    "GSETNamespacePolicy",
+    "GSETStats",
+    "GlobalSharedEmbeddingTable",
+    "clear_gset_batch_outcomes",
+    "gset_batch_outcomes",
     "MixFormerBlock",
     "MixFormerCrossAttention",
     "MixFormerHeadMixing",
@@ -38,6 +54,7 @@ __all__ = [
     "PerTokenFFN",
     "StackedPerTokenFFN",
     "StackedPerHeadSwiGLUFFN",
+    "assemble_mixformer_heads",
     "RankMixerDomainInteraction",
     "RankMixerTokenMixing",
     "STCAInputLayer",
@@ -45,4 +62,5 @@ __all__ = [
     "STCASequenceEncoder",
     "SingleQueryTargetAttention",
     "SwiGLUFFN",
+    "set_gset_batch_outcomes",
 ]

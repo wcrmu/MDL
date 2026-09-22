@@ -21,6 +21,8 @@ import torch.distributed as torch_dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .features import CATEGORICAL_MISSING_ID
+
 
 _DEFAULT_GROUPED_EMB_MAX_OUTPUT_BYTES = 1024**3
 _STATS_HOST_SYNC = threading.local()
@@ -435,12 +437,39 @@ def _all_to_all_variable(
     return output
 
 
+def _invalid_id_mask(indices: Tensor, num_embeddings: int) -> Tensor:
+    return (indices >= num_embeddings) | (
+        (indices < 0) & (indices != CATEGORICAL_MISSING_ID)
+    )
+
+
+def _active_id_mask(indices: Tensor, padding_idx: int | None) -> Tensor:
+    active = indices >= 0
+    if padding_idx is not None:
+        active = active & (indices != padding_idx)
+    return active
+
+
+def lookup_id_embedding(module: nn.Module, indices: Tensor) -> Tensor:
+    """Lookup ids, skipping ``CATEGORICAL_MISSING_ID`` without using row 0 as pad."""
+
+    if isinstance(module, ShardedEmbedding):
+        return module(indices)
+    padding_idx = getattr(module, "padding_idx", None)
+    active = _active_id_mask(indices, padding_idx)
+    if padding_idx is None:
+        output = module(indices.clamp(min=0))
+        return output * active.unsqueeze(-1).to(dtype=output.dtype)
+    safe = torch.where(active, indices, torch.full_like(indices, int(padding_idx)))
+    return module(safe)
+
+
 def _single_rank_embedding(
     weight: Tensor,
     indices: Tensor,
     *,
     num_embeddings: int,
-    padding_idx: int,
+    padding_idx: int | None,
     table_name: str,
     validate_indices: bool,
 ) -> Tensor:
@@ -455,7 +484,7 @@ def _single_rank_embedding(
         raise TypeError("sharded embedding indices must be torch.long")
     if validate_indices:
         flat = indices.reshape(-1)
-        invalid = (flat < 0) | (flat >= num_embeddings)
+        invalid = _invalid_id_mask(flat, num_embeddings)
         if _invalid_any(
             invalid,
             f"embedding {table_name!r} received an out-of-range ID",
@@ -465,12 +494,13 @@ def _single_rank_embedding(
                 f"embedding {table_name!r} received IDs outside "
                 f"[0, {num_embeddings}): {examples}"
             )
-    return F.embedding(
-        indices,
-        weight,
-        padding_idx=padding_idx,
-        sparse=True,
-    )
+    active = _active_id_mask(indices, padding_idx)
+    if padding_idx is None:
+        safe = indices.clamp(min=0)
+        output = F.embedding(safe, weight, padding_idx=-1, sparse=True)
+        return output * active.unsqueeze(-1).to(dtype=output.dtype)
+    safe = torch.where(active, indices, torch.full_like(indices, padding_idx))
+    return F.embedding(safe, weight, padding_idx=padding_idx, sparse=True)
 
 
 class _ShardedEmbeddingLookup(torch.autograd.Function):
@@ -480,7 +510,7 @@ class _ShardedEmbeddingLookup(torch.autograd.Function):
         local_weight: Tensor,
         indices: Tensor,
         num_embeddings: int,
-        padding_idx: int,
+        padding_idx: int | None,
         shard_spec: EmbeddingShardSpec,
         local_dedup: bool,
         process_group: torch_dist.ProcessGroup | None,
@@ -498,7 +528,7 @@ class _ShardedEmbeddingLookup(torch.autograd.Function):
             )
         flat = indices.reshape(-1)
         if validate_indices:
-            invalid = (flat < 0) | (flat >= num_embeddings)
+            invalid = _invalid_id_mask(flat, num_embeddings)
             if _invalid_any(
                 invalid,
                 f"embedding {table_name!r} received an out-of-range ID",
@@ -508,7 +538,7 @@ class _ShardedEmbeddingLookup(torch.autograd.Function):
                     f"embedding {table_name!r} received IDs outside [0, {num_embeddings}): "
                     f"{examples}"
                 )
-        active_mask = flat != padding_idx
+        active_mask = _active_id_mask(flat, padding_idx)
         active_positions = torch.nonzero(active_mask, as_tuple=False).flatten()
         active_ids = flat.index_select(0, active_positions)
         if local_dedup:
@@ -684,7 +714,7 @@ class ShardedEmbedding(nn.Module):
         *,
         table_name: str,
         shard_spec: EmbeddingShardSpec,
-        padding_idx: int = 0,
+        padding_idx: int | None = None,
         local_dedup: bool = True,
         init_std: float = 0.02,
         process_group: torch_dist.ProcessGroup | None = None,
@@ -695,7 +725,7 @@ class ShardedEmbedding(nn.Module):
         super().__init__()
         if num_embeddings <= 0 or embedding_dim <= 0:
             raise ValueError("num_embeddings and embedding_dim must be positive")
-        if not 0 <= padding_idx < num_embeddings:
+        if padding_idx is not None and not 0 <= padding_idx < num_embeddings:
             raise ValueError("padding_idx must be inside the embedding table")
         rank, world_size = _distributed_rank_world(process_group)
         if world_size != shard_spec.world_size:
@@ -736,17 +766,18 @@ class ShardedEmbedding(nn.Module):
         # Model construction now happens directly on the destination GPU.
         # Resolve this scalar ownership arithmetically so initializing hundreds
         # of embedding tables does not perform two CUDA -> host reads per table.
-        if self.shard_spec.strategy == "table_wise":
-            padding_owner = self.shard_spec.table_owner
-            local_padding = self.padding_idx
-        else:
-            padding_owner = (
-                self.padding_idx + self.shard_spec.cyclic_offset
-            ) % self.world_size
-            local_padding = self.padding_idx // self.world_size
-        if padding_owner == self.rank:
-            with torch.no_grad():
-                self.weight[local_padding].zero_()
+        if self.padding_idx is not None:
+            if self.shard_spec.strategy == "table_wise":
+                padding_owner = self.shard_spec.table_owner
+                local_padding = self.padding_idx
+            else:
+                padding_owner = (
+                    self.padding_idx + self.shard_spec.cyclic_offset
+                ) % self.world_size
+                local_padding = self.padding_idx // self.world_size
+            if padding_owner == self.rank:
+                with torch.no_grad():
+                    self.weight[local_padding].zero_()
 
     def forward(self, indices: Tensor) -> Tensor:
         if self.world_size == 1:
@@ -1162,7 +1193,7 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
             request = packed_indices.narrow(0, request_offset, request_numel)
             request_offset += request_numel
             if metadata.validate_indices:
-                invalid = (request < 0) | (request >= module.num_embeddings)
+                invalid = _invalid_id_mask(request, module.num_embeddings)
                 if _invalid_any(
                     invalid,
                     f"embedding {module.table_name!r} received an out-of-range ID",
@@ -1172,7 +1203,7 @@ class _GroupedShardedEmbeddingLookup(torch.autograd.Function):
                         f"embedding {module.table_name!r} received IDs outside "
                         f"[0, {module.num_embeddings}): {examples}"
                     )
-            active_mask = request != module.padding_idx
+            active_mask = _active_id_mask(request, module.padding_idx)
             positions = torch.nonzero(active_mask, as_tuple=False).flatten()
             active_ids = request.index_select(0, positions)
             active_positions_parts.append(positions + raw_offset)

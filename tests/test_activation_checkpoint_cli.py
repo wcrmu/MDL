@@ -27,7 +27,7 @@ class ActivationCheckpointCliOverrideTest(unittest.TestCase):
     def test_runtime_override_replaces_yaml_value(self) -> None:
         config = load_app_config(ROOT / "configs" / "rankmixer.yaml")
         self.assertEqual(config.runtime.activation_checkpoint, "none")
-        self.assertTrue(config.runtime.cuda_graph_backbone)
+        self.assertFalse(config.runtime.cuda_graph_backbone)
         args = build_arg_parser().parse_args(
             [
                 "train",
@@ -41,7 +41,7 @@ class ActivationCheckpointCliOverrideTest(unittest.TestCase):
         self.assertEqual(overridden.runtime.activation_checkpoint, "full")
         self.assertFalse(overridden.runtime.cuda_graph_backbone)
         self.assertEqual(config.runtime.activation_checkpoint, "none")
-        self.assertTrue(config.runtime.cuda_graph_backbone)
+        self.assertFalse(config.runtime.cuda_graph_backbone)
 
     def test_load_config_applies_activation_checkpoint_override(self) -> None:
         args = build_arg_parser().parse_args(

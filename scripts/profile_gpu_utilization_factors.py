@@ -125,7 +125,7 @@ def _truncate_ordinary_bags(
 ) -> FeatureBatch:
     features = dict(batch.features)
     for feature in config.features:
-        if feature.kind != "categorical" or feature.pooling != "mean":
+        if not feature.is_bag:
             continue
         payload = features[feature.name]
         if not isinstance(payload, dict):

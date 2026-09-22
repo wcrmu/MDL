@@ -812,6 +812,51 @@ class CoalescedBatchTest(unittest.TestCase):
         self.assertEqual(moved.labels.tolist(), [[1.0], [0.0], [1.0]])
         self.assertEqual(moved.scenario_id.tolist(), [0, 1, 0])
 
+    def test_can_pack_directly_into_shared_ipc_storage(self) -> None:
+        batch = FeatureBatch(
+            features={"x": torch.arange(12, dtype=torch.int64).view(3, 4)},
+            labels=torch.tensor([[1.0], [0.0], [1.0]]),
+            label_mask=None,
+            scenario_id=torch.tensor([0, 1, 0]),
+            group_id=[],
+        )
+
+        packed = _coalesce_feature_batch(
+            batch,
+            pin_memory=False,
+            shared_memory=True,
+        )
+
+        self.assertTrue(all(buffer.is_shared() for buffer in packed._packed_buffers))
+        torch.testing.assert_close(packed.features["x"], batch.features["x"])
+        torch.testing.assert_close(packed.labels, batch.labels)
+        with self.assertRaisesRegex(ValueError, "both pinned and shared"):
+            _coalesce_feature_batch(
+                batch,
+                pin_memory=True,
+                shared_memory=True,
+            )
+
+    def test_shared_ipc_storage_falls_back_on_older_torch(self) -> None:
+        batch = FeatureBatch(
+            features={"x": torch.arange(6, dtype=torch.int64).view(2, 3)},
+            labels=torch.tensor([[1.0], [0.0]]),
+            label_mask=None,
+            scenario_id=torch.tensor([0, 1]),
+            group_id=[],
+        )
+
+        with patch.object(torch.UntypedStorage, "_new_shared", None):
+            packed = _coalesce_feature_batch(
+                batch,
+                pin_memory=False,
+                shared_memory=True,
+            )
+
+        self.assertTrue(all(buffer.is_shared() for buffer in packed._packed_buffers))
+        torch.testing.assert_close(packed.features["x"], batch.features["x"])
+        torch.testing.assert_close(packed.labels, batch.labels)
+
 
 class DevicePrefetchTest(unittest.TestCase):
     def test_resolves_implicit_cuda_device_before_starting_worker(self) -> None:
@@ -917,7 +962,7 @@ class ByteBudgetTest(unittest.TestCase):
         feature = next(
             item
             for item in config.features
-            if item.kind == "categorical" and item.pooling == "mean"
+            if item.is_bag
         )
         dictionary = pa.array([[1, 2, 3], [4]], type=pa.list_(pa.int64()))
         encoded = pa.DictionaryArray.from_arrays(
@@ -941,7 +986,7 @@ class ByteBudgetTest(unittest.TestCase):
         feature = next(
             item
             for item in config.features
-            if item.kind == "categorical" and item.pooling == "mean"
+            if item.is_bag
         )
         dictionary_a = pa.array([[1, 2], [3]], type=pa.list_(pa.int64()))
         dictionary_b = pa.array([[4], [5, 6, 7]], type=pa.list_(pa.int64()))

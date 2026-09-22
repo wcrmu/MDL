@@ -125,11 +125,12 @@ SequenceOrderType = Literal[
 ]
 CategoricalPoolingType = Literal[
     "none",  # One categorical value per flattened training row.
-    "mean",  # A ragged bag of categorical values pooled after embedding lookup.
+    "mean",  # A ragged bag of categorical values mean-pooled after embedding lookup.
+    "sum",  # A ragged bag of categorical values sum-pooled after embedding lookup.
 ]
 PoolingNullPolicy = Literal[
-    "exclude",  # Inner null/padding elements do not contribute to the denominator.
-    "include_as_padding",  # Preserve aligned slots; padding contributes a zero vector.
+    "exclude",  # Inner missing ids (<0) do not contribute to the denominator.
+    "include_as_padding",  # Preserve aligned slots; missing contributes a zero vector.
 ]
 
 # Sequence encoder choices; individual values target different model paths.
@@ -480,7 +481,11 @@ class ParquetAdapterConfig(_DeeplyImmutableConfig):
 
 @dataclass(frozen=True)
 class LengthBucketConfig:
-    """One upper-bounded sequence-length bucket and its per-rank batch size."""
+    """One upper-bounded sequence-length bucket and its per-rank batch size.
+
+    ``batch_size`` uses the same unit as ``reader.pack_unit`` (candidate rows
+    or complete agg parquet rows).
+    """
 
     max_length: int | None
     batch_size: int
@@ -597,6 +602,13 @@ class ReaderConfig(_DeeplyImmutableConfig):
     length_buckets: tuple[LengthBucketConfig, ...] = ()
     # max is backward compatible; sum tracks total work across heterogeneous UPS.
     length_bucket_metric: Literal["max", "sum"] = "max"
+    # What ``training.batch_size`` and ``length_buckets.batch_size`` count.
+    # ``candidates`` (default): one FeatureBatch has that many candidate rows;
+    # a request group may be sliced if it exceeds the bucket capacity.
+    # ``agg_rows``: one FeatureBatch contains that many complete physical agg
+    # parquet rows. Every request and candidate of a row stays together and is
+    # never sliced. Requires ``agg_direct_mode`` other than ``legacy``.
+    pack_unit: Literal["candidates", "agg_rows"] = "candidates"
     # Bounded streaming shuffle. With request-feature deduplication enabled,
     # request groups are shuffled atomically and bucketed from one shared
     # sequence-length calculation. Zero preserves physical request order.
@@ -732,6 +744,13 @@ class ReaderConfig(_DeeplyImmutableConfig):
             )
         if self.length_bucket_metric not in {"max", "sum"}:
             raise ValueError("reader.length_bucket_metric must be max or sum")
+        if self.pack_unit not in {"candidates", "agg_rows"}:
+            raise ValueError("reader.pack_unit must be candidates or agg_rows")
+        if self.pack_unit == "agg_rows" and self.agg_direct_mode == "legacy":
+            raise ValueError(
+                "reader.pack_unit='agg_rows' requires reader.agg_direct_mode "
+                "direct, direct_arrow, or compare"
+            )
         if self.agg_direct_mode not in {"legacy", "direct", "direct_arrow", "compare"}:
             raise ValueError(
                 "reader.agg_direct_mode must be legacy, direct, direct_arrow, or compare"
@@ -1065,12 +1084,13 @@ class FeatureConfig:
     encoding: CategoricalEncodingConfig | None = None
     # A categorical bag remains one model input but pools a ragged list after
     # embedding lookup. max_length/truncation define its deterministic window.
+    # Production non-UPS multi-value fields use sum; mean remains supported.
     pooling: CategoricalPoolingType = "none"
     pooling_null_policy: PoolingNullPolicy = "exclude"
     max_length: int | None = None
     truncation: Literal["head", "tail"] = "tail"
     # Dense features append a presence bit so null→0 is distinct from a real 0.
-    # Ignored for categorical features (null still maps to padding ID 0).
+    # Categorical nulls use CATEGORICAL_MISSING_ID (-1), not table row 0.
     presence: bool = True
 
     @classmethod
@@ -1117,8 +1137,10 @@ class FeatureConfig:
             raise ValueError(f"feature {self.name!r} max_length must be positive")
         if self.truncation not in {"head", "tail"}:
             raise ValueError(f"feature {self.name!r} truncation must be head or tail")
-        if self.pooling not in {"none", "mean"}:
-            raise ValueError(f"feature {self.name!r} pooling must be none or mean")
+        if self.pooling not in {"none", "mean", "sum"}:
+            raise ValueError(
+                f"feature {self.name!r} pooling must be none, mean, or sum"
+            )
         if self.pooling_null_policy not in {"exclude", "include_as_padding"}:
             raise ValueError(
                 f"feature {self.name!r} pooling_null_policy must be exclude or include_as_padding"
@@ -1129,13 +1151,19 @@ class FeatureConfig:
             )
         if self.pooling == "none" and self.pooling_null_policy != "exclude":
             raise ValueError(
-                f"feature {self.name!r} pooling_null_policy requires pooling=mean"
+                f"feature {self.name!r} pooling_null_policy requires bag pooling"
             )
         if self.pooling == "none" and self.max_length is not None:
             raise ValueError(
-                f"feature {self.name!r} max_length requires categorical pooling=mean; "
+                f"feature {self.name!r} max_length requires categorical bag pooling; "
                 "use top-level sequences for temporal inputs"
             )
+
+    @property
+    def is_bag(self) -> bool:
+        """True when this categorical feature is a ragged multi-value bag."""
+
+        return self.kind == "categorical" and self.pooling in {"mean", "sum"}
 
 
 @dataclass(frozen=True)
@@ -1258,6 +1286,12 @@ class SequenceConfig(_DeeplyImmutableConfig):
     # time_delta, and encoded as the paper's one (video, action-type) history.
     # The first member in config order owns the single downstream z token.
     stca_history_group: str | None = None
+    # Optional chronological LONGER merge group for schemas that expose one
+    # heterogeneous user history as several physical action-family streams.
+    # Members are time-interleaved before the single shared LONGER encoder. The
+    # full [global; recent] output is then resampled back to one fixed-width
+    # RankMixer token per member, preserving the existing feature-token layout.
+    longer_history_group: str | None = None
     # LONGER-specific query/self-attention parameters. Ignored by simpler encoders.
     # Working width inside LONGER (paper d≈32). Independent of RankMixer token_dim;
     # summary outputs are packed at this width and projected by the feature tokenizer.
@@ -1327,6 +1361,7 @@ class SequenceConfig(_DeeplyImmutableConfig):
             stca_expansion_ratio=payload.get("stca_expansion_ratio", 4),
             stca_parameter_group=payload.get("stca_parameter_group"),
             stca_history_group=payload.get("stca_history_group"),
+            longer_history_group=payload.get("longer_history_group"),
             longer_dim=payload.get("longer_dim", 32),
             longer_num_heads=payload.get("longer_num_heads"),
             longer_hidden_dim=payload.get("longer_hidden_dim"),
@@ -1360,6 +1395,28 @@ class SequenceConfig(_DeeplyImmutableConfig):
         if self._transport_max_length is not None:
             return self._transport_max_length
         return self.max_length
+
+    def is_timestamp_field(self, field_name: str) -> bool:
+        return (
+            self.timestamp_field is not None and field_name == self.timestamp_field
+        )
+
+    def event_fields(self) -> tuple["SequenceFieldConfig", ...]:
+        """Fields concatenated into the per-event vector.
+
+        ``timestamp_field`` is the timestamp-aware sort key. When the sequence
+        also has item/side fields, the raw timestamp is excluded so unix-ms
+        values do not dominate the projection. A timestamp-only sequence still
+        uses that field as the event representation.
+        """
+
+        timestamp_field = self.timestamp_field
+        if timestamp_field is None:
+            return self.fields
+        remaining = tuple(
+            field for field in self.fields if field.name != timestamp_field
+        )
+        return remaining if remaining else self.fields
 
     def resolved_longer_candidate_global_tokens(self) -> int:
         if self.longer_candidate_global_tokens is not None:
@@ -1501,6 +1558,30 @@ class SequenceConfig(_DeeplyImmutableConfig):
                 raise ValueError(
                     f"sequence {self.name!r} stca_history_group requires "
                     "encoder=stca"
+                )
+        if self.longer_history_group is not None:
+            if (
+                not isinstance(self.longer_history_group, str)
+                or not self.longer_history_group
+            ):
+                raise ValueError(
+                    f"sequence {self.name!r} longer_history_group must be a "
+                    "non-empty string or null"
+                )
+            if "." in self.longer_history_group:
+                raise ValueError(
+                    f"sequence {self.name!r} longer_history_group must not "
+                    "contain '.'"
+                )
+            if self.encoder != "longer":
+                raise ValueError(
+                    f"sequence {self.name!r} longer_history_group requires "
+                    "encoder=longer"
+                )
+            if self.longer_output != "full":
+                raise ValueError(
+                    f"sequence {self.name!r} longer_history_group requires "
+                    "longer_output=full so recent-query states reach the readout"
                 )
         if self.encoder in {"stca", "attention_pool"} and not self.target_inputs:
             raise ValueError(
@@ -1832,8 +1913,6 @@ REQUEST_SCENE_FEATURE_NAMES = frozenset(
 # and from encoder inclusion; prefer removing them from configs entirely.
 DEAD_CONSTANT_FEATURE_NAMES = frozenset(
     {
-        "scene_clk_cnt_15d_hit_hn",
-        "clk_7d_page_elsns_hn",
         "c_adj_cart_cvr_15d_hn",
         "c_adj_ctr_15d_hn",
         "c_adj_ordr_cvr_15d_hn",
@@ -1853,7 +1932,6 @@ DEAD_CONSTANT_FEATURE_NAMES = frozenset(
         "idx_c_simi_impr_cnt_15d_hn",
         # distinct≈2 near-constants: zero FE value, still occupied pack slots
         "ad_id_bin_hn",
-        "ups_in_cart_2h_sku_cur_prices_hn",
     }
 )
 
@@ -2326,6 +2404,10 @@ class RuntimeConfig:
     # projections as batched GEMMs removes thousands of tiny CUDA launches for
     # production-sized token sets while preserving the historical state_dict.
     onetrans_batched_ns: bool = True
+    # M-FALCON serving: zero keeps the ordinary one-forward prediction path;
+    # a positive value evaluates that many candidate rows per forward while
+    # reusing one request-level sequence cache across all microbatches.
+    mfalcon_microbatch_size: int = 0
     # DDP launch options. none means single process.
     distributed: Literal["none", "ddp"] = "none"
     nproc_per_node: int | None = None
@@ -2413,6 +2495,13 @@ class RuntimeConfig:
         ):
             raise ValueError(
                 "runtime.sequence_encoder_chunk_tokens must be a non-negative integer"
+            )
+        if (
+            type(self.mfalcon_microbatch_size) is not int
+            or self.mfalcon_microbatch_size < 0
+        ):
+            raise ValueError(
+                "runtime.mfalcon_microbatch_size must be a non-negative integer"
             )
         if self.precision not in {"fp32", "bf16", "fp16"}:
             raise ValueError("runtime.precision must be fp32, bf16, or fp16")
@@ -2532,8 +2621,11 @@ class ModelConfig:
     # newest-event window of this size. None preserves per-stream truncation.
     global_sequence_max_length: int | None = None
     # MixFormer uses feature-token count as N and token_dim as the per-head D.
-    # null is the original MixFormer. Setting a strict interior split enables
-    # the paper's optional UI-MixFormer one-way user-to-item HeadMixing mask.
+    # UI-MixFormer partitions request-axis (user) vs candidate-axis (item)
+    # features, applies the one-way HeadMixing mask, and shares user-side
+    # Query Mixer / user-head attention across candidates in a request.
+    mixformer_user_item_decouple: bool = False
+    # null auto-selects N_U (paper formula, then the published 1:1 split).
     mixformer_user_head_count: int | None = None
     # MDL-MixFormer innovation: route the active scenario state into the
     # high-order queries before every sequence cross-attention operation.
@@ -2757,15 +2849,27 @@ class ModelConfig:
                 "model.global_sequence_max_length must be a positive integer or null"
             )
         if self.global_sequence_max_length is not None:
-            if self.name not in {"mixformer", "mdl_mixformer"}:
+            if self.name not in {
+                "rankmixer",
+                "mdl_rankmixer",
+                "mixformer",
+                "mdl_mixformer",
+                "onetrans",
+                "mdl_onetrans",
+            }:
                 raise ValueError(
-                    "model.global_sequence_max_length requires mixformer or mdl_mixformer"
+                    "model.global_sequence_max_length requires timestamp-aware "
+                    "OneTrans, MixFormer, or unified-LONGER RankMixer"
                 )
             if self.sequence_fusion != "timestamp_aware":
                 raise ValueError(
                     "model.global_sequence_max_length requires "
                     "model.sequence_fusion=timestamp_aware"
                 )
+        if type(self.mixformer_user_item_decouple) is not bool:
+            raise ValueError(
+                "model.mixformer_user_item_decouple must be a boolean"
+            )
         if (
             self.mixformer_user_head_count is not None
             and (
@@ -2781,11 +2885,11 @@ class ModelConfig:
                 "model.mdl_mixformer_query_conditioning must be a boolean"
             )
         if (
-            self.mixformer_user_head_count is not None
-            and self.name not in {"mixformer", "mdl_mixformer"}
-        ):
+            self.mixformer_user_item_decouple
+            or self.mixformer_user_head_count is not None
+        ) and self.name not in {"mixformer", "mdl_mixformer"}:
             raise ValueError(
-                "model.mixformer_user_head_count requires mixformer or mdl_mixformer"
+                "UI-MixFormer requires mixformer or mdl_mixformer"
             )
         if self.rankmixer_ffn_type not in {"dense", "sparse_moe"}:
             raise ValueError("model.rankmixer_ffn_type must be dense or sparse_moe")
@@ -2947,7 +3051,7 @@ class FixedTestEvalConfig:
 
 @dataclass(frozen=True)
 class CheckpointConfig:
-    """Periodic resumable checkpoints written to a local or HDFS run directory."""
+    """Resumable checkpoints written to a local or HDFS run directory."""
 
     # Run directory root. Local paths and hdfs:// / viewfs:// URIs are both
     # accepted; ``run_name`` is appended so several jobs can share one root.
@@ -2955,14 +3059,20 @@ class CheckpointConfig:
     run_name: str | None = None
     # Steps between saves. Zero disables periodic saving entirely.
     every_steps: int = 0
+    # Data-time checkpoint cadence.  A positive value partitions hourly
+    # ``pt=YYYY-MM-DD/hr=HH`` training inputs into contiguous windows and
+    # commits only after every rank finishes one window.  This is intentionally
+    # separate from wall-clock time: eight hours means eight hours of data, not
+    # eight hours spent running.
+    data_window_hours: int = 0
     # Committed steps to retain; older ones are deleted after each new commit.
     keep_last: int = 3
     # Save once more when the training loop ends normally.
     save_on_exit: bool = True
     # auto | latest | none | <step number> | step-000012000
     resume: str = "auto"
-    # Stage locally and upload on a background thread so training does not block
-    # on HDFS. Synchronous writes are easier to reason about in tests.
+    # Stage locally and upload on a background thread. Data-window boundaries
+    # still wait for the durable global commit before training continues.
     async_upload: bool = True
     # Local scratch for staged files. The system temp directory is the fallback
     # and is often a small RAM-backed tmpfs, so production runs should name a
@@ -2972,11 +3082,24 @@ class CheckpointConfig:
     # Smaller values lower the host-memory and staging peak; larger values write
     # fewer, bigger files to the run directory.
     shard_chunk_bytes: int = 2 * 1024 * 1024 * 1024
+    # Store sharded embeddings as a full sparse base followed by dirty-row
+    # deltas.  This mode is restricted to synchronous data-window commits so a
+    # dirty bit is never cleared before its remote _COMMIT is durable.
+    sparse_delta: bool = False
+    # Bound restore-chain length by writing a fresh sparse base after this many
+    # delta generations.  One means every checkpoint is a full base.
+    sparse_full_every: int = 8
+    # Stable model-history identity used when auto-selecting checkpoints from a
+    # shared run directory.  The run name/model name is used when unset.
+    lineage_id: str | None = None
     # Refuse to start when the staging filesystem cannot hold the concurrent
     # local ranks' checkpoints.
     preflight_staging: bool = True
     # Rank 0 waits this long for every peer's files before committing a step.
     ready_timeout_sec: float = 1800.0
+    # File streaming falls back to local staging only after this long without a
+    # completed remote write chunk. Slow uploads that keep moving reset it.
+    upload_stall_timeout_sec: float = 300.0
     # Restart the input scan where the previous run stopped instead of rereading
     # the whole shard. Requires reader.shard_unit file or row_group.
     data_resume: bool = True
@@ -3001,6 +3124,19 @@ class CheckpointConfig:
             raise ValueError(
                 "training.checkpoint.every_steps must be a non-negative integer"
             )
+        if type(self.data_window_hours) is not int or self.data_window_hours < 0:
+            raise ValueError(
+                "training.checkpoint.data_window_hours must be a non-negative integer"
+            )
+        if self.data_window_hours > 0 and self.every_steps > 0:
+            raise ValueError(
+                "training.checkpoint.data_window_hours and every_steps cannot both "
+                "be positive; choose a data-window or step cadence"
+            )
+        if self.data_window_hours > 0 and not self.dir:
+            raise ValueError(
+                "training.checkpoint.data_window_hours>0 requires checkpoint.dir"
+            )
         if type(self.keep_last) is not int or self.keep_last < 0:
             raise ValueError(
                 "training.checkpoint.keep_last must be a non-negative integer"
@@ -3009,6 +3145,24 @@ class CheckpointConfig:
             raise ValueError("training.checkpoint.save_on_exit must be a boolean")
         if type(self.async_upload) is not bool:
             raise ValueError("training.checkpoint.async_upload must be a boolean")
+        if type(self.sparse_delta) is not bool:
+            raise ValueError("training.checkpoint.sparse_delta must be a boolean")
+        if type(self.sparse_full_every) is not int or self.sparse_full_every <= 0:
+            raise ValueError(
+                "training.checkpoint.sparse_full_every must be a positive integer"
+            )
+        if self.sparse_delta and self.data_window_hours <= 0:
+            raise ValueError(
+                "training.checkpoint.sparse_delta=true requires "
+                "data_window_hours>0 so dirty rows are cleared only after a "
+                "synchronous window commit"
+            )
+        if self.lineage_id is not None and (
+            not isinstance(self.lineage_id, str) or not self.lineage_id.strip()
+        ):
+            raise ValueError(
+                "training.checkpoint.lineage_id must be null or a non-empty string"
+            )
         if type(self.data_resume) is not bool:
             raise ValueError("training.checkpoint.data_resume must be a boolean")
         if type(self.data_resume_rewind) is not int or self.data_resume_rewind < 0:
@@ -3017,6 +3171,10 @@ class CheckpointConfig:
             )
         if float(self.ready_timeout_sec) <= 0.0:
             raise ValueError("training.checkpoint.ready_timeout_sec must be positive")
+        if float(self.upload_stall_timeout_sec) <= 0.0:
+            raise ValueError(
+                "training.checkpoint.upload_stall_timeout_sec must be positive"
+            )
         if type(self.shard_chunk_bytes) is not int or self.shard_chunk_bytes <= 0:
             raise ValueError(
                 "training.checkpoint.shard_chunk_bytes must be a positive integer"
@@ -3025,7 +3183,12 @@ class CheckpointConfig:
             raise ValueError("training.checkpoint.preflight_staging must be a boolean")
         if not isinstance(self.resume, str) or not self.resume.strip():
             raise ValueError("training.checkpoint.resume must be a non-empty string")
-        if self.every_steps == 0 and self.dir and not self.save_on_exit:
+        if (
+            self.every_steps == 0
+            and self.data_window_hours == 0
+            and self.dir
+            and not self.save_on_exit
+        ):
             raise ValueError(
                 "training.checkpoint.dir is set but neither every_steps nor "
                 "save_on_exit would ever write a checkpoint"
@@ -3033,11 +3196,189 @@ class CheckpointConfig:
 
 
 @dataclass(frozen=True)
+class GSETConfig(_DeeplyImmutableConfig):
+    """Kraken Global Shared Embedding Table and replacement policies.
+
+    ``capacity`` is the number of physical, trainable rows on each rank
+    (the implementation reserves one additional zero fallback row).  With
+    ``training.embedding_distribution=sharded`` those rows store only IDs
+    satisfying the online rule ``id % world_size == rank``.  Per-feature maps
+    use fully qualified categorical names, e.g. ``user_id`` or
+    ``history.item_id``.
+    """
+
+    enabled: bool = False
+    capacity: int = 0
+    # Shared physical table width. Enabling GSET overrides every categorical
+    # embedding_dim with this value. Dracarys feature_xor_raw64 additionally
+    # requires compress_dim=16.
+    compress_dim: int = 16
+    key_mode: Literal["namespace", "feature_xor_raw64"] = "namespace"
+    missing_raw_id: int = 0
+    eviction_policy: Literal["score", "lru"] = "score"
+    admission_probability: float = 1.0
+    feature_admission_probabilities: Mapping[str, float] = field(
+        default_factory=dict
+    )
+    # Kraken score: S(t+1)=(1-beta)S(t)+beta*(r*c+ + c-).
+    score_decay: float = 0.1
+    positive_weight: float = 1.0
+    # Binary task whose labels define c+/c-. Null selects the first task.
+    score_task: str | None = None
+    score_update_interval: int = 1
+    default_ttl_steps: int | None = None
+    feature_ttl_steps: Mapping[str, int] = field(default_factory=dict)
+    high_priority_features: tuple[str, ...] = ()
+    eviction_enabled: bool = True
+    seed: int = 2025
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any] | None) -> "GSETConfig":
+        if payload is None:
+            return cls()
+        if not isinstance(payload, dict):
+            raise ValueError("training.gset must be an object")
+        return cls(**payload)
+
+    def validate(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ValueError("training.gset.enabled must be a boolean")
+        if type(self.capacity) is not int or self.capacity < 0:
+            raise ValueError(
+                "training.gset.capacity must be a non-negative integer"
+            )
+        if self.enabled and self.capacity <= 0:
+            raise ValueError(
+                "training.gset.capacity must be positive when GSET is enabled"
+            )
+        if type(self.compress_dim) is not int or self.compress_dim <= 0:
+            raise ValueError("training.gset.compress_dim must be positive")
+        if self.key_mode not in {"namespace", "feature_xor_raw64"}:
+            raise ValueError(
+                "training.gset.key_mode must be namespace or feature_xor_raw64"
+            )
+        if type(self.missing_raw_id) is not int or not (
+            -(1 << 63) <= self.missing_raw_id < (1 << 63)
+        ):
+            raise ValueError(
+                "training.gset.missing_raw_id must be a signed int64"
+            )
+        if self.eviction_policy not in {"score", "lru"}:
+            raise ValueError(
+                "training.gset.eviction_policy must be score or lru"
+            )
+        if self.key_mode == "feature_xor_raw64":
+            if self.compress_dim != 16:
+                raise ValueError(
+                    "Dracarys feature_xor_raw64 requires training.gset.compress_dim=16"
+                )
+            if self.eviction_policy != "lru":
+                raise ValueError(
+                    "Dracarys feature_xor_raw64 requires training.gset.eviction_policy=lru"
+                )
+            if float(self.admission_probability) != 1.0:
+                raise ValueError(
+                    "Dracarys feature_xor_raw64 inserts every new ID and requires "
+                    "training.gset.admission_probability=1"
+                )
+            if (
+                self.feature_admission_probabilities
+                or self.feature_ttl_steps
+                or self.high_priority_features
+                or self.default_ttl_steps is not None
+            ):
+                raise ValueError(
+                    "Dracarys feature_xor_raw64 uses one global cold-ID shrinker; "
+                    "per-feature admission, TTL, and priority policies must be empty"
+                )
+        if not 0.0 <= float(self.admission_probability) <= 1.0:
+            raise ValueError(
+                "training.gset.admission_probability must be in [0, 1]"
+            )
+        for name, probability in self.feature_admission_probabilities.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    "training.gset.feature_admission_probabilities keys must be non-empty strings"
+                )
+            if (
+                type(probability) not in {int, float}
+                or not math.isfinite(float(probability))
+                or not 0.0 <= float(probability) <= 1.0
+            ):
+                raise ValueError(
+                    "training.gset.feature_admission_probabilities values must be in [0, 1]"
+                )
+        if (
+            type(self.score_decay) not in {int, float}
+            or not math.isfinite(float(self.score_decay))
+            or not 0.0 <= float(self.score_decay) <= 1.0
+        ):
+            raise ValueError("training.gset.score_decay must be in [0, 1]")
+        if (
+            type(self.positive_weight) not in {int, float}
+            or not math.isfinite(float(self.positive_weight))
+            or float(self.positive_weight) < 0.0
+        ):
+            raise ValueError(
+                "training.gset.positive_weight must be finite and non-negative"
+            )
+        if self.score_task is not None and (
+            not isinstance(self.score_task, str) or not self.score_task
+        ):
+            raise ValueError(
+                "training.gset.score_task must be a non-empty task name or null"
+            )
+        if (
+            type(self.score_update_interval) is not int
+            or self.score_update_interval <= 0
+        ):
+            raise ValueError(
+                "training.gset.score_update_interval must be a positive integer"
+            )
+        if self.default_ttl_steps is not None and (
+            type(self.default_ttl_steps) is not int
+            or self.default_ttl_steps <= 0
+        ):
+            raise ValueError(
+                "training.gset.default_ttl_steps must be a positive integer or null"
+            )
+        for name, ttl in self.feature_ttl_steps.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    "training.gset.feature_ttl_steps keys must be non-empty strings"
+                )
+            if type(ttl) is not int or ttl <= 0:
+                raise ValueError(
+                    "training.gset.feature_ttl_steps values must be positive integers"
+                )
+        if len(set(self.high_priority_features)) != len(
+            self.high_priority_features
+        ):
+            raise ValueError(
+                "training.gset.high_priority_features must not contain duplicates"
+            )
+        if any(
+            not isinstance(name, str) or not name
+            for name in self.high_priority_features
+        ):
+            raise ValueError(
+                "training.gset.high_priority_features must contain non-empty strings"
+            )
+        if type(self.eviction_enabled) is not bool:
+            raise ValueError(
+                "training.gset.eviction_enabled must be a boolean"
+            )
+        if type(self.seed) is not int:
+            raise ValueError("training.gset.seed must be an integer")
+
+
+@dataclass(frozen=True)
 class TrainingConfig(_DeeplyImmutableConfig):
     """Optimizer, batch, schedule, and checkpoint settings."""
 
     # Physical samples per forward on each rank/GPU. This value is never divided
-    # by world size. The effective global batch is
+    # by world size. The unit follows ``reader.pack_unit`` (candidate rows, or
+    # complete agg parquet rows). The effective global batch is
     # batch_size * runtime_world_size * gradient_accumulation_steps.
     batch_size: int = 2048
     gradient_accumulation_steps: int = 1
@@ -3066,12 +3407,17 @@ class TrainingConfig(_DeeplyImmutableConfig):
     adagrad_initial_accumulator_value: float = 0.1
     adagrad_eps: float = 1.0e-10
     # Replicated is the small-table correctness baseline. Sharded stores only
-    # the locally owned rows and optimizer state on each rank.
+    # the locally owned rows and optimizer state on each rank. GSET + sharded
+    # uses the online rule id % world_size == rank.
     embedding_distribution: Literal["replicated", "sharded"] = "replicated"
     dense_distribution: Literal["ddp"] = "ddp"
     embedding_sharding: EmbeddingShardingConfig = field(
         default_factory=EmbeddingShardingConfig
     )
+    # Kraken GSET defaults off in the dataclass so paper/reference configs stay
+    # on fixed tables. Production YAMLs enable it and shard the pool by
+    # id % world_size.
+    gset: GSETConfig = field(default_factory=GSETConfig)
     ddp: DDPConfig = field(default_factory=DDPConfig)
     # Both built-in embedding distributions use sparse gradients. Replicated
     # exchanges touched rows; sharded routes IDs/gradients only to row owners.
@@ -3126,6 +3472,7 @@ class TrainingConfig(_DeeplyImmutableConfig):
         values["embedding_sharding"] = EmbeddingShardingConfig.from_mapping(
             values.get("embedding_sharding")
         )
+        values["gset"] = GSETConfig.from_mapping(values.get("gset"))
         values["ddp"] = DDPConfig.from_mapping(values.get("ddp"))
         values["fixed_test_eval"] = FixedTestEvalConfig.from_mapping(
             values.get("fixed_test_eval")
@@ -3203,16 +3550,38 @@ class TrainingConfig(_DeeplyImmutableConfig):
         if (
             self.sparse_optimizer == "rowwise_adagrad"
             and self.embedding_distribution != "sharded"
+            and not self.gset.enabled
         ):
             raise ValueError(
-                "training.rowwise_adagrad requires embedding_distribution=sharded"
+                "training.rowwise_adagrad requires embedding_distribution=sharded "
+                "unless training.gset.enabled=true"
             )
         if self.dense_distribution != "ddp":
             raise ValueError("training.dense_distribution must be ddp")
         self.embedding_sharding.validate()
+        self.gset.validate()
         self.ddp.validate()
         self.fixed_test_eval.validate()
         self.checkpoint.validate()
+        if self.gset.enabled:
+            if self.embedding_distribution not in {"replicated", "sharded"}:
+                raise ValueError(
+                    "training.gset.enabled=true requires "
+                    "embedding_distribution=replicated or sharded"
+                )
+            if self.sparse_optimizer != "rowwise_adagrad":
+                raise ValueError(
+                    "training.gset.enabled=true requires "
+                    "sparse_optimizer=rowwise_adagrad (Kraken rAdaGrad)"
+                )
+            if not self.embedding_sparse_gradients:
+                raise ValueError(
+                    "training.gset.enabled=true requires embedding_sparse_gradients=true"
+                )
+            if self.adagrad_weight_decay != 0.0:
+                raise ValueError(
+                    "training.gset.enabled=true requires adagrad_weight_decay=0"
+                )
         if (
             self.embedding_distribution == "sharded"
             and not self.embedding_sparse_gradients
@@ -3278,10 +3647,12 @@ class TrainingConfig(_DeeplyImmutableConfig):
         if (
             self.embedding_weight_dtype == "bf16"
             and self.embedding_distribution != "sharded"
+            and not self.gset.enabled
         ):
             raise ValueError(
                 "training.embedding_weight_dtype=bf16 currently requires "
-                "embedding_distribution=sharded so Adagrad state remains FP32"
+                "embedding_distribution=sharded so Adagrad state remains FP32, "
+                "or training.gset.enabled=true with rowwise_adagrad"
             )
         if type(self.log_every_steps) is not int or self.log_every_steps <= 0:
             raise ValueError("training.log_every_steps must be a positive integer")
@@ -3620,8 +3991,9 @@ class ResolvedHashEncoding:
 class ResolvedPreHashedEncoding:
     """Upstream int64 hashes bucketed by their unchanged uint64 low bits.
 
-    ``num_buckets`` counts usable non-padding buckets.  Model tables therefore
-    contain ``num_buckets + 1`` rows and reserve row zero for true null/padding.
+    ``num_buckets`` is the table size. Row 0 is a normal learnable id
+    (``id & (num_buckets-1)``). Nulls and rectangular pads use
+    ``CATEGORICAL_MISSING_ID`` (-1) and are skipped at lookup.
     """
 
     encoding: Literal["pre_hashed"] = "pre_hashed"
@@ -3726,6 +4098,10 @@ class ResolvedConfig(_DeeplyImmutableConfig):
     categorical_input_by_name: Mapping[str, ResolvedCategoricalInput]
     # Scalar feature names available to OneTrans NS auto_split.
     scalar_feature_names: tuple[str, ...]
+    # UI-MixFormer request-axis (user) vs candidate-axis (item) packs.
+    mixformer_user_feature_inputs: tuple[str, ...] = ()
+    mixformer_item_feature_inputs: tuple[str, ...] = ()
+    mixformer_user_head_count: int | None = None
 
 
 def tokenizable_input_names(
@@ -4409,7 +4785,11 @@ def resolve_encoded_input_dims(
             dims[feature.name] = categorical_dims[feature.name]
     for sequence in config.sequences:
         if sequence.encoder == "longer":
-            dims[sequence.name] = sequence.longer_encoded_width()
+            dims[sequence.name] = (
+                config.model.token_dim
+                if sequence.longer_history_group is not None
+                else sequence.longer_encoded_width()
+            )
         elif sequence.encoder == "stca":
             dims[sequence.name] = sequence.stca_encoded_width()
         elif sequence.encoder in {"mean_pool", "attention_pool"}:
@@ -4421,6 +4801,137 @@ def resolve_encoded_input_dims(
     return dims
 
 
+def _mixformer_adapter_axis_sources(
+    config: AppConfig,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Request-axis vs candidate-axis physical sources from the train adapter."""
+
+    adapter = config.data.train.adapter
+    options = adapter.options if adapter is not None else {}
+    context = {str(name) for name in options.get("context_features", ())}
+    items = {str(name) for name in options.get("item_features", ())}
+    if options.get("search_scene_ids") is not None:
+        context.add(
+            str(options.get("coarse_scene_index_column", "coarse_scene_index"))
+        )
+        context.add(
+            str(options.get("coarse_scene_prior_id_column", "coarse_scene_prior_id"))
+        )
+    return frozenset(context), frozenset(items)
+
+
+def _mixformer_ui_head_split(
+    user_width: int,
+    item_width: int,
+    num_heads: int,
+    requested_user_heads: int | None,
+) -> int:
+    """Pick N_U so each UI subset packs into an even contiguous split.
+
+    Paper: ``N_G = floor(D_ns^G N / D_ns)``, ``N_U = N - N_G``. When that
+    ratio does not divide the current industrial widths, fall back to the
+    published practical split ``N_U:N_G = 1:1``.
+    """
+
+    if user_width <= 0 or item_width <= 0:
+        raise ValueError(
+            "UI-MixFormer requires non-empty user-side and item-side "
+            f"non-sequential packs, got user_width={user_width}, "
+            f"item_width={item_width}"
+        )
+    total = user_width + item_width
+
+    def packs(user_heads: int) -> bool:
+        item_heads = num_heads - user_heads
+        return (
+            user_heads > 0
+            and item_heads > 0
+            and user_width % user_heads == 0
+            and item_width % item_heads == 0
+        )
+
+    if requested_user_heads is not None:
+        if not packs(requested_user_heads):
+            raise ValueError(
+                "model.mixformer_user_head_count must evenly split both the "
+                f"user pack ({user_width}) and the item pack ({item_width}) "
+                f"across N={num_heads} heads; got N_U={requested_user_heads}"
+            )
+        return requested_user_heads
+
+    formula_item_heads = (item_width * num_heads) // total
+    formula_user_heads = num_heads - formula_item_heads
+    if packs(formula_user_heads):
+        return formula_user_heads
+    if num_heads % 2 == 0 and packs(num_heads // 2):
+        return num_heads // 2
+    packed = [count for count in range(1, num_heads) if packs(count)]
+    if not packed:
+        raise ValueError(
+            "UI-MixFormer could not find an even user/item head split for "
+            f"user_width={user_width}, item_width={item_width}, N={num_heads}"
+        )
+    return min(packed, key=lambda count: abs(count - formula_user_heads))
+
+
+def resolve_mixformer_ui_layout(
+    config: AppConfig,
+    feature_token_inputs: Sequence[str],
+    encoded_input_dims: Mapping[str, int],
+    feature_token_count: int,
+) -> tuple[tuple[str, ...], tuple[str, ...], int | None]:
+    """Split MixFormer non-sequential inputs into UI user/item packs."""
+
+    enabled = (
+        config.model.mixformer_user_item_decouple
+        or config.model.mixformer_user_head_count is not None
+    )
+    if not enabled or config.model.name not in {"mixformer", "mdl_mixformer"}:
+        return (), (), None
+
+    request_sources, item_sources = _mixformer_adapter_axis_sources(config)
+    if not request_sources or not item_sources:
+        raise ValueError(
+            "UI-MixFormer requires adapter context_features (request-axis) and "
+            "item_features (candidate-axis) so user/item heads are disjoint"
+        )
+    feature_by_name = {feature.name: feature for feature in config.features}
+    user_names: list[str] = []
+    item_names: list[str] = []
+    unknown: list[str] = []
+    for name in feature_token_inputs:
+        feature = feature_by_name.get(name)
+        if feature is None:
+            unknown.append(name)
+            continue
+        source = feature.source
+        if source in request_sources:
+            user_names.append(name)
+        elif source in item_sources:
+            item_names.append(name)
+        else:
+            unknown.append(f"{name} (source={source})")
+    if unknown:
+        raise ValueError(
+            "UI-MixFormer feature_token_inputs must map to adapter request or "
+            "item sources: " + ", ".join(unknown)
+        )
+    if not user_names or not item_names:
+        raise ValueError(
+            "UI-MixFormer requires both request-axis and candidate-axis "
+            "non-sequential features in the MixFormer pack"
+        )
+    user_width = sum(int(encoded_input_dims[name]) for name in user_names)
+    item_width = sum(int(encoded_input_dims[name]) for name in item_names)
+    user_heads = _mixformer_ui_head_split(
+        user_width,
+        item_width,
+        feature_token_count,
+        config.model.mixformer_user_head_count,
+    )
+    return tuple(user_names), tuple(item_names), user_heads
+
+
 def resolve_app_config(config: AppConfig) -> ResolvedConfig:
     # Build all derived values in one place so validation and model setup agree.
     categorical_inputs = resolve_encoding_strategies(config)
@@ -4428,6 +4939,11 @@ def resolve_app_config(config: AppConfig) -> ResolvedConfig:
     categorical_dims = resolve_categorical_embedding_dims(
         config, categorical_input_by_name
     )
+    if config.training.gset.enabled:
+        categorical_dims = {
+            name: int(config.training.gset.compress_dim)
+            for name in categorical_input_by_name
+        }
     encoded_input_dims = resolve_encoded_input_dims(config, categorical_dims)
     tokenization = resolve_tokenization(
         config.tokenization,
@@ -4451,6 +4967,16 @@ def resolve_app_config(config: AppConfig) -> ResolvedConfig:
         for name in tokenization.feature_token_inputs
         if name not in sequence_names
     )
+    (
+        mixformer_user_feature_inputs,
+        mixformer_item_feature_inputs,
+        mixformer_user_head_count,
+    ) = resolve_mixformer_ui_layout(
+        config,
+        tokenization.feature_token_inputs,
+        encoded_input_dims,
+        tokenization.feature_token_count,
+    )
     return ResolvedConfig(
         tokenization=tokenization,
         categorical_embedding_dims=categorical_dims,
@@ -4459,6 +4985,9 @@ def resolve_app_config(config: AppConfig) -> ResolvedConfig:
         categorical_inputs=categorical_inputs,
         categorical_input_by_name=categorical_input_by_name,
         scalar_feature_names=scalar_feature_names,
+        mixformer_user_feature_inputs=mixformer_user_feature_inputs,
+        mixformer_item_feature_inputs=mixformer_item_feature_inputs,
+        mixformer_user_head_count=mixformer_user_head_count,
     )
 
 
@@ -4886,6 +5415,80 @@ def validate_app_config(config: AppConfig) -> None:
     validate_vocab_strategy_references(config)
 
     resolved = resolve_app_config(config)
+    if config.training.gset.enabled:
+        categorical_names = set(resolved.categorical_input_by_name)
+        policy_names = (
+            set(config.training.gset.feature_admission_probabilities)
+            | set(config.training.gset.feature_ttl_steps)
+            | set(config.training.gset.high_priority_features)
+        )
+        unknown_gset_features = sorted(policy_names - categorical_names)
+        if unknown_gset_features:
+            raise ValueError(
+                "training.gset policies reference unknown categorical inputs: "
+                + ", ".join(unknown_gset_features)
+            )
+        if not categorical_names:
+            raise ValueError(
+                "training.gset.enabled=true requires at least one categorical input"
+            )
+        if (
+            config.training.gset.score_task is not None
+            and config.training.gset.score_task not in config.task_names
+        ):
+            raise ValueError(
+                "training.gset.score_task references an unknown task: "
+                + config.training.gset.score_task
+            )
+        shared_policy_names = sorted(
+            name
+            for name in policy_names
+            if bool(
+                getattr(
+                    resolved.categorical_input_by_name[name].encoding,
+                    "share_embedding",
+                    False,
+                )
+            )
+        )
+        if shared_policy_names:
+            raise ValueError(
+                "training.gset policies for shared-embedding aliases must be "
+                "declared on their owning base input instead: "
+                + ", ".join(shared_policy_names)
+            )
+        gset_dims = {
+            int(resolved.categorical_embedding_dims[name])
+            for name in categorical_names
+        }
+        if len(gset_dims) != 1:
+            raise ValueError(
+                "training.gset.enabled=true requires one common embedding_dim "
+                "across all categorical inputs so they can share one physical table"
+            )
+        if config.runtime.distributed not in {"none", "ddp"}:
+            raise ValueError(
+                "training.gset.enabled=true requires runtime.distributed=none or ddp; "
+                "sharded GSET routes IDs with id % world_size, replicated GSET "
+                "union-admits keys in sorted order before lookup"
+            )
+        if config.runtime.compile and config.model.name != "mixformer":
+            raise ValueError(
+                "training.gset.enabled=true is incompatible with runtime.compile; "
+                "the dynamic KV mapper is a control-plane operation. MixFormer "
+                "is the exception: it compiles dense blocks only and leaves GSET "
+                "in eager Python."
+            )
+        if config.runtime.cuda_graph_backbone:
+            raise ValueError(
+                "training.gset.enabled=true is incompatible with "
+                "runtime.cuda_graph_backbone"
+            )
+        if config.training.sparse_update_mode != "ddp_synced_adagrad":
+            raise ValueError(
+                "training.gset.enabled=true requires "
+                "sparse_update_mode=ddp_synced_adagrad"
+            )
     _validate_mdl_extra_embeddings(config, resolved)
     _validate_mdl_domain_priors(config, resolved)
     sequence_by_name = {sequence.name: sequence for sequence in config.sequences}
@@ -5015,7 +5618,14 @@ def validate_app_config(config: AppConfig) -> None:
                     )
     if (
         config.model.name
-        in {"onetrans", "mdl_onetrans", "mixformer", "mdl_mixformer"}
+        in {
+            "rankmixer",
+            "mdl_rankmixer",
+            "onetrans",
+            "mdl_onetrans",
+            "mixformer",
+            "mdl_mixformer",
+        }
         and config.model.sequence_fusion == "timestamp_aware"
     ):
         for group in resolved.tokenization.sequence_token_groups:
@@ -5238,6 +5848,90 @@ def validate_app_config(config: AppConfig) -> None:
                 f"{owner.name!r}; remove other members from "
                 "downstream token inputs: " + ", ".join(duplicate_outputs)
             )
+    longer_history_groups: dict[str, list[SequenceConfig]] = {}
+    for sequence in config.sequences:
+        if sequence.longer_history_group is not None:
+            longer_history_groups.setdefault(
+                sequence.longer_history_group,
+                [],
+            ).append(sequence)
+    if longer_history_groups:
+        if config.model.name not in {"rankmixer", "mdl_rankmixer"}:
+            raise ValueError(
+                "longer_history_group is only supported by rankmixer or "
+                "mdl_rankmixer"
+            )
+        if config.model.sequence_fusion != "timestamp_aware":
+            raise ValueError(
+                "longer_history_group requires model.sequence_fusion=timestamp_aware"
+            )
+        if config.model.global_sequence_max_length is None:
+            raise ValueError(
+                "longer_history_group requires model.global_sequence_max_length"
+            )
+    groups_by_feature_input = {
+        input_name: token_group
+        for token_group in resolved.tokenization.feature_token_groups
+        for input_name in token_group.input_refs
+    }
+    for history_group, members in longer_history_groups.items():
+        if len(members) < 2:
+            raise ValueError(
+                f"LONGER history group {history_group!r} requires at least two members"
+            )
+        owner = members[0]
+        signature = (
+            owner.longer_dim,
+            owner.resolved_longer_num_heads(config.model.num_heads),
+            owner.resolved_longer_hidden_dim(),
+            owner.longer_query_tokens,
+            owner.longer_self_layers,
+            owner.rankmixer_summary_tokens,
+            owner.longer_token_merge,
+            owner.longer_inner_layers,
+            owner.longer_user_global_inputs,
+            owner.longer_user_global_tokens,
+            owner.longer_cls_tokens,
+            owner.resolved_longer_candidate_global_tokens(),
+            owner.target_inputs,
+        )
+        incompatible = [
+            member.name
+            for member in members[1:]
+            if (
+                member.longer_dim,
+                member.resolved_longer_num_heads(config.model.num_heads),
+                member.resolved_longer_hidden_dim(),
+                member.longer_query_tokens,
+                member.longer_self_layers,
+                member.rankmixer_summary_tokens,
+                member.longer_token_merge,
+                member.longer_inner_layers,
+                member.longer_user_global_inputs,
+                member.longer_user_global_tokens,
+                member.longer_cls_tokens,
+                member.resolved_longer_candidate_global_tokens(),
+                member.target_inputs,
+            )
+            != signature
+        ]
+        if incompatible:
+            raise ValueError(
+                f"LONGER history group {history_group!r} has incompatible members: "
+                + ", ".join(incompatible)
+            )
+        invalid_feature_groups = [
+            member.name
+            for member in members
+            if member.name not in groups_by_feature_input
+            or groups_by_feature_input[member.name].input_refs != (member.name,)
+        ]
+        if invalid_feature_groups:
+            raise ValueError(
+                f"LONGER history group {history_group!r} must retain one singleton "
+                "RankMixer feature-token slot per member: "
+                + ", ".join(invalid_feature_groups)
+            )
     # Model-specific checks use resolved values because defaults affect token counts.
     feature_token_count = resolved.tokenization.feature_token_count
     if feature_token_count <= 0:
@@ -5402,12 +6096,33 @@ def validate_app_config(config: AppConfig) -> None:
                 "to divide evenly across feature heads: "
                 f"{packed_input_dim} % {feature_token_count} != 0"
             )
-        user_heads = config.model.mixformer_user_head_count
-        if user_heads is not None and user_heads >= feature_token_count:
-            raise ValueError(
-                "model.mixformer_user_head_count must be smaller than the "
-                "resolved feature head count"
+        ui_enabled = (
+            config.model.mixformer_user_item_decouple
+            or config.model.mixformer_user_head_count is not None
+        )
+        if ui_enabled:
+            user_heads = resolved.mixformer_user_head_count
+            if user_heads is None:
+                raise ValueError("UI-MixFormer resolved without a user head count")
+            if not resolved.mixformer_user_feature_inputs:
+                raise ValueError("UI-MixFormer resolved without user-side features")
+            if not resolved.mixformer_item_feature_inputs:
+                raise ValueError("UI-MixFormer resolved without item-side features")
+            user_width = sum(
+                resolved.encoded_input_dims[name]
+                for name in resolved.mixformer_user_feature_inputs
             )
+            item_width = sum(
+                resolved.encoded_input_dims[name]
+                for name in resolved.mixformer_item_feature_inputs
+            )
+            item_heads = feature_token_count - user_heads
+            if user_width % user_heads != 0 or item_width % item_heads != 0:
+                raise ValueError(
+                    "UI-MixFormer user/item packs must divide evenly across "
+                    f"N_U={user_heads} and N_G={item_heads}: "
+                    f"user_width={user_width}, item_width={item_width}"
+                )
 
 
 def _merge_config_mappings(

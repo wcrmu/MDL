@@ -801,6 +801,31 @@ class SingleRankEmbeddingFastPathTest(unittest.TestCase):
         self.assertIsNotNone(emb_a.weight.grad)
         self.assertIsNotNone(emb_b.weight.grad)
 
+    def test_zero_id_is_learnable_when_padding_idx_is_none(self) -> None:
+        table = EmbeddingTableSpec("item", num_embeddings=8, embedding_dim=3)
+        plan = plan_embedding_shards(
+            [table],
+            world_size=1,
+            strategy="row_wise",
+            table_wise_max_rows=32,
+        )
+        embedding = ShardedEmbedding(
+            table.num_embeddings,
+            table.embedding_dim,
+            table_name=table.name,
+            shard_spec=plan.tables[table.name],
+            padding_idx=None,
+            collect_stats=False,
+        )
+        self.assertFalse(torch.equal(embedding.weight[0], torch.zeros(3)))
+        ids = torch.tensor([0, -1, 0], dtype=torch.long)
+        output = embedding(ids)
+        torch.testing.assert_close(output[0], embedding.weight[0].detach())
+        torch.testing.assert_close(output[1], torch.zeros(3))
+        output.square().sum().backward()
+        self.assertIsNotNone(embedding.weight.grad)
+        self.assertGreater(embedding.weight.grad[0].abs().sum().item(), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

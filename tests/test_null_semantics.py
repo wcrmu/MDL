@@ -114,7 +114,7 @@ class NullAnchorCompressTest(unittest.TestCase):
         )
         torch.testing.assert_close(
             actual["fields"]["goods_id_hn"],
-            torch.tensor([[1, 3], [0, 0]]),
+            torch.tensor([[1, 3], [-1, -1]]),
         )
         torch.testing.assert_close(
             actual["fields"]["age"],

@@ -32,6 +32,7 @@ from src.dataloader import (
     request_group_blocks_from_axis_bundle,
     row_sequence_selection_after_truncate_then_compact,
     table_pre_compaction_sequence_lengths,
+    _sequence_membership_positions,
 )
 from src.train import _table_effective_sequence_lengths, _table_sequence_lengths
 
@@ -86,6 +87,163 @@ class RequestGroupBlockTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "exceeds"):
             block.slice_candidates(1, 2)
+
+
+def _agg_pack_block(
+    *,
+    source_id: int,
+    raw_row: int,
+    request_id: str,
+    candidate_count: int,
+    length: int,
+    order: int,
+) -> RequestGroupBlock:
+    return RequestGroupBlock(
+        source_id=source_id,
+        raw_row_index=raw_row,
+        request_id=request_id,
+        representative_request_position=order,
+        candidate_positions=np.arange(candidate_count, dtype=np.int64) + order * 10,
+        candidate_offset=0,
+        candidate_count=candidate_count,
+        pre_compaction_sequence_lengths={"clk": length},
+        effective_bucket_length=length,
+        stable_group_order=order,
+    )
+
+
+class AggRowPackTest(unittest.TestCase):
+    def test_groups_consecutive_requests_of_one_physical_row(self) -> None:
+        from src.dataloader import iter_grouped_agg_row_blocks
+
+        blocks = [
+            _agg_pack_block(
+                source_id=0, raw_row=7, request_id="a", candidate_count=2, length=10, order=0
+            ),
+            _agg_pack_block(
+                source_id=0, raw_row=7, request_id="b", candidate_count=3, length=20, order=1
+            ),
+            _agg_pack_block(
+                source_id=0, raw_row=8, request_id="c", candidate_count=1, length=5, order=2
+            ),
+        ]
+        groups = list(iter_grouped_agg_row_blocks(iter(blocks)))
+        self.assertEqual([len(group) for group in groups], [2, 1])
+        self.assertEqual(
+            [block.request_id for block in groups[0]],
+            ["a", "b"],
+        )
+        self.assertEqual(groups[1][0].request_id, "c")
+
+    def test_pack_keeps_whole_agg_rows_and_counts_rows_not_candidates(self) -> None:
+        from src.dataloader import iter_length_bucketed_packs
+
+        blocks = [
+            _agg_pack_block(
+                source_id=1, raw_row=0, request_id="a", candidate_count=2, length=10, order=0
+            ),
+            _agg_pack_block(
+                source_id=1, raw_row=0, request_id="b", candidate_count=3, length=20, order=1
+            ),
+            _agg_pack_block(
+                source_id=1, raw_row=1, request_id="c", candidate_count=4, length=5, order=2
+            ),
+            _agg_pack_block(
+                source_id=1, raw_row=2, request_id="d", candidate_count=1, length=6, order=3
+            ),
+        ]
+        packs = list(
+            iter_length_bucketed_packs(
+                iter(blocks),
+                buckets=(),
+                default_batch_size=2,
+                shuffle_buffer_rows=0,
+                pack_unit="agg_rows",
+                length_bucket_metric="sum",
+            )
+        )
+        self.assertEqual(len(packs), 2)
+        self.assertEqual(
+            [block.request_id for block in packs[0]],
+            ["a", "b", "c"],
+        )
+        self.assertEqual([block.request_id for block in packs[1]], ["d"])
+
+    def test_shuffle_does_not_split_an_agg_row(self) -> None:
+        from src.dataloader import iter_length_bucketed_packs
+
+        blocks = [
+            _agg_pack_block(
+                source_id=0, raw_row=0, request_id="a0", candidate_count=2, length=4, order=0
+            ),
+            _agg_pack_block(
+                source_id=0, raw_row=0, request_id="a1", candidate_count=2, length=5, order=1
+            ),
+            _agg_pack_block(
+                source_id=0, raw_row=1, request_id="b0", candidate_count=2, length=3, order=2
+            ),
+            _agg_pack_block(
+                source_id=0, raw_row=1, request_id="b1", candidate_count=2, length=3, order=3
+            ),
+            _agg_pack_block(
+                source_id=0, raw_row=2, request_id="c0", candidate_count=2, length=3, order=4
+            ),
+        ]
+        packs = list(
+            iter_length_bucketed_packs(
+                iter(blocks),
+                buckets=(),
+                default_batch_size=1,
+                shuffle_buffer_rows=16,
+                shuffle_seed=7,
+                pack_unit="agg_rows",
+            )
+        )
+        grouped = {
+            frozenset(block.request_id for block in pack) for pack in packs
+        }
+        self.assertIn(frozenset({"a0", "a1"}), grouped)
+        self.assertIn(frozenset({"b0", "b1"}), grouped)
+        self.assertIn(frozenset({"c0"}), grouped)
+
+    def test_length_buckets_count_complete_agg_rows(self) -> None:
+        from src.config import LengthBucketConfig
+        from src.dataloader import iter_length_bucketed_packs
+
+        blocks = [
+            _agg_pack_block(
+                source_id=0, raw_row=0, request_id="short0", candidate_count=1, length=2, order=0
+            ),
+            _agg_pack_block(
+                source_id=0, raw_row=0, request_id="short1", candidate_count=1, length=2, order=1
+            ),
+            _agg_pack_block(
+                source_id=0, raw_row=1, request_id="long0", candidate_count=1, length=50, order=2
+            ),
+        ]
+        buckets = (
+            LengthBucketConfig(max_length=10, batch_size=2),
+            LengthBucketConfig(max_length=None, batch_size=1),
+        )
+        packs = list(
+            iter_length_bucketed_packs(
+                iter(blocks),
+                buckets=buckets,
+                default_batch_size=2,
+                shuffle_buffer_rows=0,
+                pack_unit="agg_rows",
+                length_bucket_metric="sum",
+            )
+        )
+        ids = [tuple(block.request_id for block in pack) for pack in packs]
+        self.assertIn(("short0", "short1"), ids)
+        self.assertIn(("long0",), ids)
+
+    def test_agg_row_pack_unit_rejects_legacy_reader(self) -> None:
+        from src.config import ReaderConfig
+
+        with self.assertRaisesRegex(ValueError, "pack_unit='agg_rows'"):
+            ReaderConfig(pack_unit="agg_rows", agg_direct_mode="legacy").validate()
 
 
 class RequestGroupBuilderTest(unittest.TestCase):
@@ -691,6 +849,28 @@ class SequenceSelectionPlanTest(unittest.TestCase):
 # --- Axis-separated adapt / source registry / pack materialize ---
 
 class CompactListColumnTest(unittest.TestCase):
+    def test_same_dtype_numpy_rows_use_dense_packing(self) -> None:
+        column = compact_list_column_from_rows(
+            [
+                np.asarray([1, 2], dtype=np.int64),
+                np.asarray([], dtype=np.int64),
+                None,
+                np.asarray([3], dtype=np.int64),
+            ]
+        )
+        np.testing.assert_array_equal(column.values, [1, 2, 3])
+        np.testing.assert_array_equal(column.offsets, [0, 2, 2, 2, 3])
+
+    def test_mixed_numpy_dtypes_keep_first_dtype_casting(self) -> None:
+        column = compact_list_column_from_rows(
+            [
+                np.asarray([1, 2], dtype=np.int64),
+                np.asarray([3], dtype=np.int32),
+            ]
+        )
+        self.assertEqual(column.values.dtype, np.dtype(np.int64))
+        np.testing.assert_array_equal(column.values, [1, 2, 3])
+
     def test_object_rows_with_trailing_nulls_stay_object(self) -> None:
         """Later object-ndarray nulls must not select int64 packing.
 
@@ -713,6 +893,38 @@ class CompactListColumnTest(unittest.TestCase):
         column = compact_list_column_from_rows([[1, 2], [3, None], [4]])
         self.assertEqual(column.values.dtype, object)
         self.assertEqual(list(column[1]), [3, None])
+
+
+class SequenceMembershipPositionsTest(unittest.TestCase):
+    def test_trusted_numpy_memberships_preserve_token_order_and_duplicates(self) -> None:
+        selected = _sequence_membership_positions(
+            np.asarray(
+                [
+                    np.asarray([0, 1], dtype=np.int64),
+                    np.asarray([1], dtype=np.int64),
+                    np.asarray([0, 0], dtype=np.int64),
+                ],
+                dtype=object,
+            ),
+            known_requests={0, 1},
+            index_column="ups_x_indices",
+            raw_row=0,
+            validate_structure=False,
+        )
+        self.assertEqual(selected, {0: [0, 2, 2], 1: [0, 1]})
+
+    def test_trusted_numpy_memberships_do_not_hide_unknown_request(self) -> None:
+        with self.assertRaises(KeyError):
+            _sequence_membership_positions(
+                np.asarray(
+                    [np.asarray([0, 2], dtype=np.int64)],
+                    dtype=object,
+                ),
+                known_requests={0, 1},
+                index_column="ups_x_indices",
+                raw_row=0,
+                validate_structure=False,
+            )
 
 
 class PreparePackedAxisBatchNullTest(unittest.TestCase):

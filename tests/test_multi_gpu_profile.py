@@ -31,11 +31,33 @@ class MultiGpuProfileTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {"MDL_LOCAL_BATCH_SCALE": "0.5"}):
             self.assertEqual(_local_batch_scale_for_world_size(8), 0.5)
 
+    def test_agg_row_pack_unit_skips_eight_gpu_derate(self) -> None:
+        os.environ.pop("MDL_LOCAL_BATCH_SCALE", None)
+        os.environ.pop("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", None)
+        config = load_app_config("configs/mixformer.yaml")
+        updated = _apply_world_size_training_profile(config, world_size=8)
+        self.assertEqual(updated.data.train.reader.pack_unit, "agg_rows")
+        self.assertEqual(updated.training.batch_size, 64)
+        self.assertEqual(
+            [bucket.batch_size for bucket in updated.data.train.reader.length_buckets],
+            [64, 64, 64, 64, 64],
+        )
+        self.assertEqual(updated.training.gradient_accumulation_steps, 64)
+        self.assertLess(
+            updated.data.test.reader.length_buckets[0].batch_size,
+            config.data.test.reader.length_buckets[0].batch_size,
+        )
+
     def test_apply_profile_derates_eight_gpu_batches(self) -> None:
         os.environ.pop("MDL_LOCAL_BATCH_SCALE", None)
         os.environ.pop("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", None)
         config = load_app_config("configs/onetrans.yaml")
-        updated = _apply_world_size_training_profile(config, world_size=8)
+        # Inconclusive/local P2P probe may report OK; pin no-P2P so this test
+        # covers the small-HBM / non-NVLink emb+prefetch path.
+        with mock.patch(
+            "src.train._local_cuda_p2p_accessible", return_value=False
+        ), mock.patch("src.train._small_hbm_cuda_device", return_value=True):
+            updated = _apply_world_size_training_profile(config, world_size=8)
         self.assertEqual(updated.training.batch_size, 960)  # 1280 * 0.75
         train_buckets = updated.data.train.reader.length_buckets
         self.assertEqual(train_buckets[0].batch_size, 960)
@@ -51,24 +73,62 @@ class MultiGpuProfileTest(unittest.TestCase):
         os.environ.pop("MDL_LOCAL_BATCH_SCALE", None)
         os.environ.pop("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", None)
         config = load_app_config("configs/onetrans.yaml")
-        updated = _apply_world_size_training_profile(config, world_size=6)
+        with mock.patch(
+            "src.train._local_cuda_p2p_accessible", return_value=False
+        ), mock.patch("src.train._small_hbm_cuda_device", return_value=True):
+            updated = _apply_world_size_training_profile(config, world_size=6)
         self.assertEqual(updated.training.batch_size, config.training.batch_size)
-        self.assertEqual(
-            updated.data.train.reader.device_prefetch_batches,
-            config.data.train.reader.device_prefetch_batches,
-        )
         self.assertGreaterEqual(
             updated.data.train.reader.host_prepare_prefetch, 4
         )
         self.assertGreaterEqual(updated.training.ddp.bucket_cap_mb, 100.0)
         self.assertEqual(os.environ.get("MDL_GROUPED_EMB_MAX_OUTPUT_MIB"), "512")
 
+    def test_onetrans_nvlink_deepens_datapath_and_emb_cap(self) -> None:
+        os.environ.pop("MDL_LOCAL_BATCH_SCALE", None)
+        os.environ.pop("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", None)
+        config = load_app_config("configs/onetrans.yaml")
+        with mock.patch(
+            "src.train._local_cuda_p2p_accessible", return_value=True
+        ), mock.patch("src.train._small_hbm_cuda_device", return_value=False):
+            updated = _apply_world_size_training_profile(config, world_size=4)
+        # 1280 * 1.20 — NVLink/large-HBM fills activation headroom for sps.
+        self.assertEqual(updated.training.batch_size, 1536)
+        self.assertEqual(updated.data.train.reader.length_buckets[0].batch_size, 1536)
+        self.assertEqual(updated.data.train.reader.device_prefetch_batches, 2)
+        self.assertGreaterEqual(
+            updated.data.train.reader.host_prepare_prefetch, 10
+        )
+        self.assertGreaterEqual(updated.data.train.reader.prefetch_batches, 6)
+        self.assertGreaterEqual(updated.data.train.reader.num_workers, 4)
+        self.assertGreaterEqual(updated.data.train.reader.adapter_workers, 6)
+        self.assertTrue(updated.data.train.reader.overlap_host_prepare)
+        self.assertEqual(os.environ.get("MDL_GROUPED_EMB_MAX_OUTPUT_MIB"), "1024")
+
+    def test_mdl_onetrans_nvlink_deepens_host_keeps_full_remat_rescue(self) -> None:
+        os.environ.pop("MDL_LOCAL_BATCH_SCALE", None)
+        os.environ.pop("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", None)
+        config = load_app_config("configs/mdl_onetrans.yaml")
+        with mock.patch(
+            "src.train._local_cuda_p2p_accessible", return_value=True
+        ), mock.patch("src.train._small_hbm_cuda_device", return_value=False):
+            updated = _apply_world_size_training_profile(config, world_size=4)
+        # Full remat still drops device prefetch; host runway deepens on NVLink.
+        # 1024 * 1.15 mild batch fill for free HBM without dropping remat rescue.
+        self.assertEqual(updated.training.batch_size, 1178)
+        self.assertEqual(updated.data.train.reader.device_prefetch_batches, 0)
+        self.assertGreaterEqual(
+            updated.data.train.reader.host_prepare_prefetch, 10
+        )
+        self.assertGreaterEqual(updated.data.train.reader.prefetch_batches, 6)
+        self.assertEqual(os.environ.get("MDL_GROUPED_EMB_MAX_OUTPUT_MIB"), "384")
+
     def test_rankmixer_profile_deepens_prefetch_pipeline(self) -> None:
         os.environ.pop("MDL_LOCAL_BATCH_SCALE", None)
         os.environ.pop("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", None)
         config = load_app_config("configs/rankmixer.yaml")
         self.assertEqual(config.runtime.activation_checkpoint, "none")
-        self.assertTrue(config.runtime.cuda_graph_backbone)
+        self.assertFalse(config.runtime.cuda_graph_backbone)
         with mock.patch(
             "src.train._local_cuda_p2p_accessible", return_value=True
         ), mock.patch("src.train._small_hbm_cuda_device", return_value=False):
@@ -97,7 +157,7 @@ class MultiGpuProfileTest(unittest.TestCase):
         os.environ.pop("MDL_GROUPED_EMB_MAX_OUTPUT_MIB", None)
         config = load_app_config("configs/mdl_rankmixer.yaml")
         self.assertEqual(config.runtime.activation_checkpoint, "none")
-        self.assertTrue(config.runtime.cuda_graph_backbone)
+        self.assertFalse(config.runtime.cuda_graph_backbone)
         self.assertTrue(config.training.fused_dense_optimizer)
         with mock.patch(
             "src.train._local_cuda_p2p_accessible", return_value=True
@@ -155,7 +215,12 @@ class MultiGpuProfileTest(unittest.TestCase):
                 ),
             ),
         )
-        updated = _apply_world_size_training_profile(config, world_size=4)
+        # Pin no-P2P so this asserts the tight full-remat emb rescue (256MiB),
+        # not the milder NVLink full-remat bump (384MiB).
+        with mock.patch(
+            "src.train._local_cuda_p2p_accessible", return_value=False
+        ), mock.patch("src.train._small_hbm_cuda_device", return_value=True):
+            updated = _apply_world_size_training_profile(config, world_size=4)
         self.assertEqual(updated.runtime.varlen_packing, "compact")
         self.assertEqual(updated.runtime.sequence_projection_chunk_tokens, 32768)
         self.assertFalse(updated.model.use_request_cache)
@@ -198,7 +263,7 @@ class MultiGpuProfileTest(unittest.TestCase):
         class _FakeProc:
             def cpu_affinity(self, cores=None):
                 if cores is None:
-                    return assigned.get("cores", [])
+                    return list(range(32))
                 assigned["cores"] = list(cores)
                 return None
 
@@ -208,6 +273,10 @@ class MultiGpuProfileTest(unittest.TestCase):
             clear=False,
         ), mock.patch("psutil.cpu_count", return_value=32), mock.patch(
             "psutil.Process", return_value=_FakeProc()
+        ), mock.patch(
+            "src.train._RANK_LOCAL_CPU_CORES", None
+        ), mock.patch(
+            "src.train._visible_gpu_local_cpu_sets", return_value=[]
         ):
             prep = _apply_local_rank_cpu_affinity("host_prepare")
             train = _apply_local_rank_cpu_affinity("train")
@@ -215,6 +284,45 @@ class MultiGpuProfileTest(unittest.TestCase):
         self.assertTrue(train)
         self.assertTrue(set(prep).isdisjoint(set(train)))
         self.assertTrue(all(8 <= c < 16 for c in prep + train))
+
+    def test_local_rank_cpu_affinity_uses_gpu_numa_and_keeps_smt_pairs(self) -> None:
+        assigned: dict[str, list[int]] = {}
+
+        class _FakeProc:
+            def cpu_affinity(self, cores=None):
+                if cores is None:
+                    return list(range(16))
+                assigned["cores"] = list(cores)
+                return None
+
+        gpu_sets = [
+            list(range(8)),
+            list(range(8)),
+            list(range(8, 16)),
+            list(range(8, 16)),
+        ]
+
+        def _smt_pairs(cpus):
+            groups = {}
+            for cpu in sorted(cpus):
+                groups.setdefault(cpu // 2, []).append(cpu)
+            return list(groups.values())
+
+        with mock.patch.dict(
+            "os.environ",
+            {"LOCAL_RANK": "2", "LOCAL_WORLD_SIZE": "4", "WORLD_SIZE": "4"},
+            clear=False,
+        ), mock.patch("psutil.Process", return_value=_FakeProc()), mock.patch(
+            "src.train._RANK_LOCAL_CPU_CORES", None
+        ), mock.patch(
+            "src.train._visible_gpu_local_cpu_sets", return_value=gpu_sets
+        ), mock.patch(
+            "src.train._cpu_core_groups", side_effect=_smt_pairs
+        ):
+            prep = _apply_local_rank_cpu_affinity("host_prepare")
+            train = _apply_local_rank_cpu_affinity("train")
+        self.assertTrue(set(prep).isdisjoint(set(train)))
+        self.assertEqual(sorted(prep + train), [8, 9, 10, 11])
 
 
 if __name__ == "__main__":

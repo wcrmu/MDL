@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from importlib import import_module
 import errno
 import gc
@@ -16,12 +17,14 @@ import os
 import pickle
 from pathlib import Path
 import queue
+import re
 import shutil
 import sqlite3
 import tempfile
 import threading
 from time import perf_counter, time, time_ns
 from typing import Any, Callable, Iterator, MutableMapping
+from uuid import uuid4
 
 # Torchrun workers import this module before main()'s allocator bootstrap.
 # Set both env names before ``import torch`` so expandable segments are active
@@ -45,7 +48,9 @@ from .config import (
 )
 from .checkpoint import (
     check_staging_space,
+    CheckpointDataWindow,
     CheckpointUploader,
+    COMMIT_MARKER,
     DataCursor,
     DEFAULT_SHARD_CHUNK_BYTES,
     estimate_staging_space,
@@ -118,12 +123,79 @@ from .embeddings import (
     sharded_embedding_modules,
 )
 from .model import build_model
+from .mfalcon import mfalcon_score_candidates
 from .modules.attention import varlen_attention_available, varlen_attention_backend
+from .modules.gset import (
+    GlobalSharedEmbeddingTable,
+    gset_batch_outcomes,
+    iter_gset_tables,
+)
 from .modules.mlp import SparseMoEPerTokenFFN
 from .optim import ShardedAdagrad, ShardedRowWiseAdagrad
 
 
 logger = logging.getLogger(__name__)
+
+_HOUR_PARTITION_RE = re.compile(
+    r"(?:^|/)pt=(\d{4}-\d{2}-\d{2})/hr=(\d{2})(?:/|$)"
+)
+
+
+def _format_checkpoint_hour(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:00:00Z")
+
+
+def plan_checkpoint_data_windows(config: AppConfig) -> tuple[CheckpointDataWindow, ...]:
+    """Split configured hourly inputs into contiguous data-time checkpoints."""
+
+    settings = getattr(config.training, "checkpoint", None)
+    if settings is None:
+        return ()
+    interval = int(getattr(settings, "data_window_hours", 0))
+    if interval <= 0:
+        return ()
+    by_hour: dict[datetime, list[str]] = {}
+    for raw in config.data.train.inputs:
+        text = str(raw)
+        match = _HOUR_PARTITION_RE.search(text)
+        if match is None:
+            raise ValueError(
+                "data-window checkpointing requires every training input to live "
+                "under pt=YYYY-MM-DD/hr=HH; cannot determine the hour for "
+                f"{text!r}"
+            )
+        value = datetime.strptime(
+            f"{match.group(1)}-{match.group(2)}", "%Y-%m-%d-%H"
+        ).replace(tzinfo=timezone.utc)
+        by_hour.setdefault(value, []).append(text)
+    if not by_hour:
+        raise ValueError("data-window checkpointing requires training inputs")
+    hours = sorted(by_hour)
+    for previous, current in zip(hours, hours[1:]):
+        if current != previous + timedelta(hours=1):
+            raise ValueError(
+                "data-window checkpoint inputs must be contiguous; missing hour "
+                f"between {_format_checkpoint_hour(previous)} and "
+                f"{_format_checkpoint_hour(current)}"
+            )
+    windows: list[CheckpointDataWindow] = []
+    for start_index in range(0, len(hours), interval):
+        selected = hours[start_index : start_index + interval]
+        start = selected[0]
+        end = selected[-1] + timedelta(hours=1)
+        inputs = tuple(
+            item
+            for hour in selected
+            for item in sorted(by_hour[hour])
+        )
+        windows.append(
+            CheckpointDataWindow(
+                start=_format_checkpoint_hour(start),
+                end=_format_checkpoint_hour(end),
+                inputs=inputs,
+            )
+        )
+    return tuple(windows)
 
 _CONTROL_PROCESS_GROUP: torch_dist.ProcessGroup | None = None
 # Cold scenario discovery on HDFS can exceed the default 10-minute store wait
@@ -812,37 +884,164 @@ def _local_world_size() -> int:
     return max(1, _env_int("WORLD_SIZE", 1))
 
 
-def _apply_local_rank_cpu_affinity(role: str) -> list[int]:
-    """Partition host CPUs across local ranks so 6/8-GPU prepare does not collide.
+def _parse_cpu_list(value: str) -> list[int]:
+    """Parse Linux cpulist syntax (for example ``0-3,8,10-11``)."""
 
-    Every rank used to pin its host-prepare child to ``0..n_cpu//3`` and the
-    train parent to the remainder — on 6–8 GPU that means six prepare children
-    fighting over the same cores while train threads also overlap. Slice the
-    machine by ``LOCAL_RANK`` instead.
-    """
+    cpus: list[int] = []
+    for item in str(value).strip().split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" not in item:
+            cpus.append(int(item))
+            continue
+        start_raw, end_raw = item.split("-", 1)
+        start, end = int(start_raw), int(end_raw)
+        if end < start:
+            raise ValueError(f"invalid CPU range {item!r}")
+        cpus.extend(range(start, end + 1))
+    return sorted(set(cpus))
+
+
+def _cpu_core_groups(cpus: list[int]) -> list[list[int]]:
+    """Group SMT siblings so rank/role partitions do not share physical cores."""
+
+    groups: dict[tuple[int, int], list[int]] = {}
+    for cpu in sorted(set(int(item) for item in cpus)):
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package = int((topology / "physical_package_id").read_text().strip())
+            core = int((topology / "core_id").read_text().strip())
+        except (OSError, ValueError):
+            # Compatibility fallback for containers without CPU topology
+            # mounted: each logical CPU becomes an independent group.
+            package, core = -1, cpu
+        groups.setdefault((package, core), []).append(cpu)
+    return [groups[key] for key in sorted(groups)]
+
+
+def _partition_physical_cores(
+    cpus: list[int],
+    *,
+    partition_index: int,
+    partition_count: int,
+) -> list[int]:
+    """Return one balanced partition, keeping all SMT siblings together."""
+
+    groups = _cpu_core_groups(cpus)
+    count = max(1, int(partition_count))
+    index = max(0, min(int(partition_index), count - 1))
+    start = len(groups) * index // count
+    end = len(groups) * (index + 1) // count
+    return [cpu for group in groups[start:end] for cpu in group]
+
+
+def _visible_gpu_local_cpu_sets(local_world: int) -> list[list[int]]:
+    """Read each visible GPU's NUMA-local CPUs without invoking nvidia-smi."""
+
+    if not torch.cuda.is_available():
+        return []
+    try:
+        device_count = int(torch.cuda.device_count())
+    except Exception:
+        return []
+    if device_count < int(local_world):
+        return []
+    local_sets: list[list[int]] = []
+    for device_index in range(int(local_world)):
+        try:
+            props = torch.cuda.get_device_properties(device_index)
+            pci_address = (
+                f"{int(props.pci_domain_id):04x}:"
+                f"{int(props.pci_bus_id):02x}:"
+                f"{int(props.pci_device_id):02x}.0"
+            )
+            raw = Path(
+                f"/sys/bus/pci/devices/{pci_address}/local_cpulist"
+            ).read_text()
+            local_sets.append(_parse_cpu_list(raw))
+        except (AttributeError, OSError, RuntimeError, ValueError):
+            return []
+    return local_sets
+
+
+_RANK_LOCAL_CPU_CORES: tuple[int, ...] | None = None
+
+
+def _local_rank_cpu_cores() -> list[int]:
+    """Resolve this rank's GPU-local CPU slice once, before affinity narrows."""
+
+    global _RANK_LOCAL_CPU_CORES
+    if _RANK_LOCAL_CPU_CORES is not None:
+        return list(_RANK_LOCAL_CPU_CORES)
+    try:
+        import psutil
+    except ImportError:
+        return []
+    try:
+        allowed = list(psutil.Process().cpu_affinity())
+    except Exception:
+        allowed = list(range(int(psutil.cpu_count(logical=True) or 4)))
+    if not allowed:
+        return []
+    local_world = _local_world_size()
+    local_rank = max(0, min(_env_int("LOCAL_RANK", 0), local_world - 1))
+    gpu_cpu_sets = _visible_gpu_local_cpu_sets(local_world)
+    if len(gpu_cpu_sets) == local_world:
+        local_set = sorted(set(allowed).intersection(gpu_cpu_sets[local_rank]))
+        if local_set:
+            locality = frozenset(gpu_cpu_sets[local_rank])
+            peers = [
+                rank
+                for rank, cpus in enumerate(gpu_cpu_sets)
+                if frozenset(cpus) == locality
+            ]
+            rank_cores = _partition_physical_cores(
+                local_set,
+                partition_index=peers.index(local_rank),
+                partition_count=len(peers),
+            )
+            _RANK_LOCAL_CPU_CORES = tuple(rank_cores)
+            return rank_cores
+
+    # CPU-only / topology-unavailable fallback preserves rank isolation.
+    rank_cores = _partition_physical_cores(
+        allowed,
+        partition_index=local_rank,
+        partition_count=local_world,
+    )
+    _RANK_LOCAL_CPU_CORES = tuple(rank_cores)
+    return rank_cores
+
+
+def _apply_local_rank_cpu_affinity(
+    role: str,
+    *,
+    rank_cores: list[int] | tuple[int, ...] | None = None,
+) -> list[int]:
+    """Partition NUMA-local physical cores between prepare and train work."""
 
     try:
         import psutil
     except ImportError:
         return []
-    n_cpu = int(psutil.cpu_count(logical=True) or 4)
-    local_world = _local_world_size()
-    local_rank = max(0, min(_env_int("LOCAL_RANK", 0), local_world - 1))
-    slice_size = max(1, n_cpu // local_world)
-    start = local_rank * slice_size
-    end = n_cpu if local_rank == local_world - 1 else start + slice_size
-    slice_cores = list(range(start, end))
-    if not slice_cores:
+    slice_cores = (
+        _local_rank_cpu_cores() if rank_cores is None else list(rank_cores)
+    )
+    core_groups = _cpu_core_groups(slice_cores)
+    if not core_groups:
         return []
     if role == "host_prepare":
-        # Pack/tensorize is CPU-heavy: take ~2/3 of the rank slice.
-        n_prep = max(2, (len(slice_cores) * 2) // 3)
-        cores = slice_cores[:n_prep]
+        # Pack/tensorize plus adapter workers are CPU-heavy: take ~2/3 of the
+        # rank's physical cores, including each core's SMT sibling(s).
+        n_prep = max(1, (len(core_groups) * 2) // 3)
+        selected = core_groups[:n_prep]
     elif role == "train":
-        n_prep = max(2, (len(slice_cores) * 2) // 3)
-        cores = slice_cores[n_prep:] or slice_cores[-1:]
+        n_prep = max(1, (len(core_groups) * 2) // 3)
+        selected = core_groups[n_prep:] or core_groups[-1:]
     else:
-        cores = slice_cores
+        selected = core_groups
+    cores = [cpu for group in selected for cpu in group]
     try:
         psutil.Process().cpu_affinity(cores)
     except Exception:
@@ -935,6 +1134,12 @@ def _apply_world_size_training_profile(
             "on",
         }
     small_hbm = _small_hbm_cuda_device()
+    training = config.training
+    data = config.data
+    runtime = config.runtime
+    model = config.model
+    onetrans_family = _is_onetrans_family(config)
+    full_remat = str(getattr(runtime, "activation_checkpoint", "none")) == "full"
     scale = _local_batch_scale_for_world_size(
         world_size, rankmixer_family=rankmixer_family
     )
@@ -958,23 +1163,39 @@ def _apply_world_size_training_profile(
         and not os.environ.get("MDL_LOCAL_BATCH_SCALE", "").strip()
     ):
         scale = 1.42
-    training = config.training
-    data = config.data
-    runtime = config.runtime
-    model = config.model
-    onetrans_family = _is_onetrans_family(config)
-    full_remat = str(getattr(runtime, "activation_checkpoint", "none")) == "full"
+    # OneTrans on NVLink + large HBM (H100): fill activation headroom by
+    # raising per-rank batch. This is the throughput/HBM lever — deeper
+    # host/prefetch alone only cuts wait, it does not consume free HBM.
+    # Override with MDL_LOCAL_BATCH_SCALE. Conservative vs the ~20% free
+    # HBM field report: plain onetrans +20%, full-remat mdl +15%.
+    if (
+        abs(scale - 1.0) < 1.0e-9
+        and onetrans_family
+        and multi_gpu
+        and p2p_ok
+        and not small_hbm
+        and not os.environ.get("MDL_LOCAL_BATCH_SCALE", "").strip()
+    ):
+        scale = 1.15 if full_remat else 1.20
     if abs(scale - 1.0) >= 1.0e-9:
-        old_bs = int(training.batch_size)
-        new_bs = _scale_int_batch(old_bs, scale)
-        training = replace(training, batch_size=new_bs)
         train_split = data.train
         test_split = data.test
-        if train_split is not None:
-            train_split = replace(
-                train_split,
-                reader=_scale_reader_batches(train_split.reader, scale),
+        env_forced = bool(os.environ.get("MDL_LOCAL_BATCH_SCALE", "").strip())
+        scale_train = env_forced or (
+            train_split is None
+            or str(getattr(train_split.reader, "pack_unit", "candidates"))
+            != "agg_rows"
+        )
+        if scale_train:
+            training = replace(
+                training,
+                batch_size=_scale_int_batch(int(training.batch_size), scale),
             )
+            if train_split is not None:
+                train_split = replace(
+                    train_split,
+                    reader=_scale_reader_batches(train_split.reader, scale),
+                )
         if test_split is not None:
             test_split = replace(
                 test_split,
@@ -983,9 +1204,15 @@ def _apply_world_size_training_profile(
         data = replace(data, train=train_split, test=test_split)
 
     # Cap emb A2A staging. Explicit launcher exports always win.
+    # NVLink/P2P + large HBM: allow larger chunks so emb A2A is less BW-starved
+    # (infra only; does not change model numerics).
     if multi_gpu:
-        if rankmixer_family and p2p_ok and not small_hbm:
-            emb_cap = "1024"
+        if (rankmixer_family or onetrans_family) and p2p_ok and not small_hbm:
+            if onetrans_family and full_remat:
+                # Full remat still shares HBM with activations; milder bump.
+                emb_cap = "384" if world_size >= 4 else "512"
+            else:
+                emb_cap = "1024"
         elif rankmixer_family:
             # No-P2P / 24GB: medium chunks — 768+ regressed sps on 4×4090.
             emb_cap = "512"
@@ -1051,12 +1278,14 @@ def _apply_world_size_training_profile(
             reader = replace(reader, device_prefetch_batches=0)
             reader_changed = True
         # Deepen device prefetch only when P2P + HBM can absorb it.
+        # Plain OneTrans (act!=full) on NVLink/large HBM can hide H2D like
+        # RankMixer; mdl_onetrans full remat keeps the drop-to-0 rescue above.
         deepen_device = (
-            rankmixer_family
-            and multi_gpu
+            multi_gpu
             and p2p_ok
             and not small_hbm
             and 0 < reader.device_prefetch_batches < 2
+            and (rankmixer_family or (onetrans_family and not full_remat))
         )
         # Keep prior ≥6-GPU RankMixer deepen even when P2P probe is unclear
         # (matches existing 6/8-GPU util profile tests).
@@ -1080,7 +1309,12 @@ def _apply_world_size_training_profile(
             reader_changed = True
         # Deep host-prepare / Arrow prefetch for all multi-GPU families.
         # RankMixer-family util-protect mock: host=10/pf=6.
-        if rankmixer_family and multi_gpu:
+        # OneTrans on NVLink/large HBM gets the same runway so wait does not
+        # dominate e2e util; no-P2P / small-HBM stay on the milder 6/4 path.
+        onetrans_nvlink = (
+            onetrans_family and multi_gpu and p2p_ok and not small_hbm
+        )
+        if (rankmixer_family and multi_gpu) or onetrans_nvlink:
             target_host = 10
             target_prefetch = 6
         elif multi_gpu:
@@ -1097,6 +1331,17 @@ def _apply_world_size_training_profile(
             reader_changed = True
         if multi_gpu and 0 < reader.prefetch_batches < target_prefetch:
             reader = replace(reader, prefetch_batches=target_prefetch)
+            reader_changed = True
+        # Prod YAMLs often ship workers=2; under-feeds GPU on HDFS/NVLink boxes.
+        if multi_gpu and 0 < reader.num_workers < 4:
+            reader = replace(reader, num_workers=4)
+            reader_changed = True
+        adapter_target = 6 if onetrans_nvlink or (rankmixer_family and p2p_ok) else 4
+        if multi_gpu and 0 < reader.adapter_workers < adapter_target:
+            reader = replace(reader, adapter_workers=adapter_target)
+            reader_changed = True
+        if not reader.overlap_host_prepare and multi_gpu:
+            reader = replace(reader, overlap_host_prepare=True)
             reader_changed = True
         if (
             rankmixer_family
@@ -1214,8 +1459,20 @@ def _setup_distributed(config: AppConfig) -> DistributedContext:
         if device.type == "cuda":
             # WORLD_SIZE is already set by torchrun here; apply NCCL HBM/BW
             # knobs before ProcessGroupNCCL allocates channel/scratch buffers.
+            # RankMixer always prefers collective BW. Plain OneTrans (not full
+            # remat) on multi-GPU also benefits; mdl_onetrans full remat keeps
+            # the tighter OneTrans HBM caps via hbm_caps_min_world_size=4.
             _configure_nccl_runtime_env(
-                prefer_collective_bw=_is_rankmixer_family(config),
+                prefer_collective_bw=(
+                    _is_rankmixer_family(config)
+                    or (
+                        _is_onetrans_family(config)
+                        and str(
+                            getattr(config.runtime, "activation_checkpoint", "none")
+                        )
+                        != "full"
+                    )
+                ),
                 hbm_caps_min_world_size=(
                     4 if _is_onetrans_family(config) else 6
                 ),
@@ -2183,6 +2440,8 @@ def _iter_batch_tables_direct(
             shuffle_buffer_rows=reader.shuffle_buffer_rows,
             shuffle_seed=reader.shuffle_seed,
             shard_rank=shard_rank,
+            pack_unit=getattr(reader, "pack_unit", "candidates"),
+            length_bucket_metric=reader.length_bucket_metric,
         ):
             packed = build_packed_request_plan(pack)
             registry.observe_pack(packed.blocks)
@@ -2481,7 +2740,7 @@ def _estimate_prepared_batch_bytes(config: AppConfig, table: object) -> int:
                 and feature.source not in table.candidate_values
             )
             axis_rows = table.n_requests if request_level else table.n_candidates
-            if feature.kind == "categorical" and feature.pooling == "mean":
+            if feature.is_bag:
                 values = (
                     table.request_values
                     if request_level
@@ -2537,7 +2796,7 @@ def _estimate_prepared_batch_bytes(config: AppConfig, table: object) -> int:
     tensor_bytes = 0
     bag_max_lengths: dict[str, int] = {}
     for feature in config.features:
-        if feature.kind == "categorical" and feature.pooling == "mean":
+        if feature.is_bag:
             if feature.max_length is not None:
                 # The configured truncation limit is already a conservative
                 # tensor bound. Scanning every bag column with Arrow kernels
@@ -3139,6 +3398,161 @@ def _share_feature_batch_for_ipc(batch: FeatureBatch) -> FeatureBatch:
     return batch
 
 
+def _compact_share_ipc_enabled(
+    environ: MutableMapping[str, str] | None = None,
+) -> bool:
+    """Whether share-memory IPC sends packed bases plus view metadata only.
+
+    A coalesced production batch has only a few base buffers but hundreds of
+    tensor views.  Letting ``ForkingPickler`` visit every view repeatedly
+    serializes storage-rebuild records and sends redundant file handles.  The
+    compact protocol publishes each shared base once and rebuilds all views in
+    the parent.  Keep an environment fallback for field rollback without a
+    config regeneration.
+    """
+
+    env = os.environ if environ is None else environ
+    raw = str(env.get("MDL_HOST_PREPARE_COMPACT_SHARE", "1")).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        "MDL_HOST_PREPARE_COMPACT_SHARE must be a boolean "
+        "(1/0, true/false, yes/no, on/off)"
+    )
+
+
+def _host_prepare_direct_shared_enabled(
+    environ: MutableMapping[str, str] | None = None,
+) -> bool:
+    """Build coalesced buffers directly in shared memory when possible.
+
+    The legacy path builds a private packed buffer and ``share_memory_()``
+    copies the whole batch a second time.  Keep an independent rollback switch
+    because this path relies on PyTorch's CPU shared-storage allocator.
+    """
+
+    env = os.environ if environ is None else environ
+    raw = str(env.get("MDL_HOST_PREPARE_DIRECT_SHARED", "1")).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        "MDL_HOST_PREPARE_DIRECT_SHARED must be a boolean "
+        "(1/0, true/false, yes/no, on/off)"
+    )
+
+
+def _host_prepare_pipeline_depth(
+    environ: MutableMapping[str, str] | None = None,
+) -> int:
+    """Bounded fetch/pack versus tensorize overlap inside the prepare child.
+
+    Depth two means one batch can be tensorized by the worker while the child
+    main thread fetches and packs its successor.  Set
+    ``MDL_HOST_PREPARE_PIPELINE_DEPTH=1`` for the legacy serial path.
+    """
+
+    env = os.environ if environ is None else environ
+    raw = str(env.get("MDL_HOST_PREPARE_PIPELINE_DEPTH", "1")).strip()
+    try:
+        depth = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            "MDL_HOST_PREPARE_PIPELINE_DEPTH must be an integer in [1, 2]"
+        ) from error
+    if not 1 <= depth <= 2:
+        raise ValueError(
+            "MDL_HOST_PREPARE_PIPELINE_DEPTH must be an integer in [1, 2]"
+        )
+    return depth
+
+
+def _host_prepare_torch_threads(
+    environ: MutableMapping[str, str] | None = None,
+    *,
+    model_name: str | None = None,
+) -> int:
+    """Small tensorization ops are fastest with one bounded Torch CPU thread."""
+
+    env = os.environ if environ is None else environ
+    default_threads = 2 if model_name == "mdl_rankmixer" else 1
+    raw = str(
+        env.get("MDL_HOST_PREPARE_TORCH_THREADS", str(default_threads))
+    ).strip()
+    try:
+        threads = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            "MDL_HOST_PREPARE_TORCH_THREADS must be an integer in [1, 64]"
+        ) from error
+    if not 1 <= threads <= 64:
+        raise ValueError(
+            "MDL_HOST_PREPARE_TORCH_THREADS must be an integer in [1, 64]"
+        )
+    return threads
+
+
+def _iter_host_prepared_batches(
+    table_iter: Iterator[object],
+    prepare_batch: Callable[[object], FeatureBatch],
+    *,
+    pipeline_depth: int,
+    progress_beat: Callable[[str], None],
+) -> Iterator[FeatureBatch]:
+    """Prepare tables serially or with one bounded tensorization lookahead.
+
+    The table iterator stays on the child main thread: HDFS/Arrow generators
+    and their adapter-process pools are not moved across threads.  At depth
+    two, only ``prepare_batch`` runs on a single worker while the main thread
+    advances the iterator and packs the successor.  The next future is
+    submitted before yielding the current batch, so IPC publication overlaps
+    the successor's tensorization too.
+    """
+
+    if pipeline_depth == 1:
+        for table in table_iter:
+            progress_beat("table")
+            yield prepare_batch(table)
+        return
+    if pipeline_depth != 2:
+        raise ValueError("host-prepare pipeline_depth must be 1 or 2")
+
+    try:
+        first_table = next(table_iter)
+    except StopIteration:
+        return
+    progress_beat("table")
+    executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="mdl-host-tensorize",
+    )
+    future = executor.submit(prepare_batch, first_table)
+    del first_table
+    try:
+        while True:
+            try:
+                next_table = next(table_iter)
+                has_next = True
+                progress_beat("table")
+            except StopIteration:
+                next_table = None
+                has_next = False
+
+            batch = future.result()
+            if has_next:
+                # Submit before yielding: the caller can publish/free ``batch``
+                # while tensorization for ``next_table`` is already running.
+                future = executor.submit(prepare_batch, next_table)
+            yield batch
+            if not has_next:
+                return
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
 def _encode_feature_batch_views(value: Any, buffers: tuple[Tensor, ...]) -> Any:
     if isinstance(value, dict):
         return {
@@ -3170,6 +3584,64 @@ def _decode_feature_batch_views(value: Any, buffers: tuple[Tensor, ...]) -> Any:
         _, index, size, stride, offset = value
         return buffers[int(index)].as_strided(size, stride, int(offset))
     return value
+
+
+def _feature_batch_view_payload(
+    batch: FeatureBatch,
+    buffers: tuple[Tensor, ...],
+) -> dict[str, Any]:
+    """Encode a coalesced FeatureBatch without serializing its tensor views."""
+
+    return {
+        "features": _encode_feature_batch_views(batch.features, buffers),
+        "labels": _encode_feature_batch_views(batch.labels, buffers),
+        "label_mask": _encode_feature_batch_views(batch.label_mask, buffers),
+        "scenario_id": _encode_feature_batch_views(batch.scenario_id, buffers),
+        "group_id": batch.group_id,
+        "prediction_keys": batch.prediction_keys,
+    }
+
+
+def _share_feature_batch_payload_for_ipc(batch: FeatureBatch) -> dict[str, Any]:
+    """Publish shared packed bases once plus lightweight tensor-view metadata."""
+
+    if not batch._packed_buffers:
+        raise ValueError("compact share IPC requires coalesced _packed_buffers")
+    buffers = tuple(buffer.share_memory_() for buffer in batch._packed_buffers)
+    return {
+        "_host_prepare_transport": "share",
+        "buffers": buffers,
+        **_feature_batch_view_payload(batch, buffers),
+    }
+
+
+def _load_shared_feature_batch_from_ipc(
+    payload: dict[str, Any],
+    *,
+    pin_memory: bool,
+    pinned_pool: _PinnedHostBufferPool | None = None,
+) -> FeatureBatch:
+    """Rebuild views from shared bases, then immediately privatize/pin them."""
+
+    buffers = tuple(payload["buffers"])
+    labels = payload["labels"]
+    label_mask = payload["label_mask"]
+    shared = FeatureBatch(
+        features=_decode_feature_batch_views(payload["features"], buffers),
+        labels=None if labels is None else _decode_feature_batch_views(labels, buffers),
+        label_mask=(
+            None
+            if label_mask is None
+            else _decode_feature_batch_views(label_mask, buffers)
+        ),
+        scenario_id=_decode_feature_batch_views(payload["scenario_id"], buffers),
+        group_id=list(payload["group_id"]),
+        prediction_keys=dict(payload["prediction_keys"]),
+        _packed_buffers=buffers,
+    )
+    if pin_memory:
+        return _pin_feature_batch_with_pool(shared, pool=pinned_pool)
+    return privatize_shared_feature_batch(shared)
 
 
 _DTYPE_TO_NUMPY = {
@@ -3336,14 +3808,10 @@ def _spill_feature_batch_for_ipc(batch: FeatureBatch) -> tuple[dict[str, Any], i
         finally:
             mapped.close()
         payload = {
+            "_host_prepare_transport": "memfd",
             "size": total,
             "buffers": buffer_records,
-            "features": _encode_feature_batch_views(batch.features, batch._packed_buffers),
-            "labels": _encode_feature_batch_views(batch.labels, batch._packed_buffers),
-            "label_mask": _encode_feature_batch_views(batch.label_mask, batch._packed_buffers),
-            "scenario_id": _encode_feature_batch_views(batch.scenario_id, batch._packed_buffers),
-            "group_id": batch.group_id,
-            "prediction_keys": batch.prediction_keys,
+            **_feature_batch_view_payload(batch, batch._packed_buffers),
         }
     except BaseException:
         os.close(fd)
@@ -3482,6 +3950,7 @@ def _host_prepare_process_main(
     scan_cursor_storage: Any | None = None,
     scan_resume_plan: ScanResumePlan | None = None,
     scan_cursor_split_key: str | None = None,
+    rank_cpu_cores: tuple[int, ...] | None = None,
 ) -> None:
     """Child entry: pack+tensorize and push FeatureBatches to the train process.
 
@@ -3539,6 +4008,7 @@ def _host_prepare_process_main(
             fd_conn=fd_conn,
             parent_pid=parent_pid,
             terminal_ack_conn=terminal_ack_conn,
+            rank_cpu_cores=rank_cpu_cores,
         )
     finally:
         set_io_progress_hook(None)
@@ -3573,6 +4043,7 @@ def _host_prepare_process_body(
     fd_conn: Any | None = None,
     parent_pid: int | None = None,
     terminal_ack_conn: Any | None = None,
+    rank_cpu_cores: tuple[int, ...] | None = None,
 ) -> None:
     _beat = progress_beat
     os.environ["MDL_HOST_PREPARE_PROCESS"] = "1"
@@ -3594,9 +4065,23 @@ def _host_prepare_process_body(
             torch_mp.set_sharing_strategy("file_system")
         except (RuntimeError, ValueError, AttributeError):
             pass
-    # Inherit LOCAL_RANK from the train parent and take this rank's CPU slice
-    # so 6–8 co-located prepare children do not all fight over cores 0..N/3.
-    _apply_local_rank_cpu_affinity("host_prepare")
+    # The child hides CUDA above; use the GPU-local NUMA slice resolved by its
+    # parent before spawn so adapter workers inherit the correct affinity too.
+    _apply_local_rank_cpu_affinity(
+        "host_prepare",
+        rank_cores=rank_cpu_cores,
+    )
+    # The host path is hundreds of small gathers/copies, where a large intra-op
+    # pool costs more than it saves. More importantly, 8 rank-local children
+    # must not each create a machine-sized Torch pool inside a small affinity.
+    torch.set_num_threads(
+        _host_prepare_torch_threads(model_name=str(config.model.name))
+    )
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        # May already have been fixed by an embedding/runtime import.
+        pass
     limit_malloc_arenas()
     try:
         split = config.data.train if split_name == "train" else config.data.test
@@ -3612,11 +4097,12 @@ def _host_prepare_process_body(
         )
         _beat("after-table-iter-open")
         try:
-            produced = 0
-            for table in table_iter:
-                _beat("table")
+            direct_shared = use_share and _host_prepare_direct_shared_enabled()
+            pipeline_depth = _host_prepare_pipeline_depth()
+
+            def _prepare_table(table: object) -> FeatureBatch:
                 with io_progress_pulses(15.0):
-                    batch = _prepare_feature_batch(
+                    prepared = _prepare_feature_batch(
                         config,
                         split,
                         table,
@@ -3627,11 +4113,31 @@ def _host_prepare_process_body(
                         include_group_id,
                     )
                     if coalesce_tensors:
-                        batch = _coalesce_feature_batch(batch, pin_memory=False)
+                        prepared = _coalesce_feature_batch(
+                            prepared,
+                            pin_memory=False,
+                            # Build straight into the final shared storage. A
+                            # later share_memory_() is then a no-op instead of a
+                            # full-batch private->shm copy.
+                            shared_memory=direct_shared,
+                        )
+                    return prepared
+
+            produced = 0
+            prepared_batches = _iter_host_prepared_batches(
+                table_iter,
+                _prepare_table,
+                pipeline_depth=pipeline_depth,
+                progress_beat=_beat,
+            )
+            for batch in prepared_batches:
                 if use_share:
-                    _queue_put_interruptible(
-                        queue, _share_feature_batch_for_ipc(batch)
+                    shared_item: object = (
+                        _share_feature_batch_payload_for_ipc(batch)
+                        if _compact_share_ipc_enabled()
+                        else _share_feature_batch_for_ipc(batch)
                     )
+                    _queue_put_interruptible(queue, shared_item)
                 else:
                     if fd_conn is None or parent_pid is None:
                         raise RuntimeError(
@@ -3984,10 +4490,17 @@ class _ProcessHostPrepareIterator:
                 torch_mp.set_sharing_strategy("file_system")
             except (RuntimeError, ValueError, AttributeError):
                 pass
+        rank_cpu_cores = tuple(_local_rank_cpu_cores())
+        rank_physical_cores = len(_cpu_core_groups(list(rank_cpu_cores)))
         # Platform trainjob logs often capture stdout only (Train step | …),
         # not the Python logging handlers — print so IPC mode is searchable.
         ipc_message = (
             f"host-prepare IPC mode={self._ipc_mode} "
+            f"compact_share={int(_compact_share_ipc_enabled())} "
+            f"direct_shared={int(_host_prepare_direct_shared_enabled())} "
+            f"pipeline_depth={_host_prepare_pipeline_depth()} "
+            f"torch_threads={_host_prepare_torch_threads(model_name=str(config.model.name))} "
+            f"rank_cpus={len(rank_cpu_cores)}/{rank_physical_cores} "
             f"shm_free_mib={(_dev_shm_free_bytes() or 0) / (1024 * 1024):.1f} "
             f"pin_memory={self._pin_memory} "
             f"pinned_pool={'on' if self._pinned_pool is not None else 'off'} "
@@ -4047,6 +4560,7 @@ class _ProcessHostPrepareIterator:
                         shard_world_size=shard_world_size,
                     )
                 ),
+                "rank_cpu_cores": rank_cpu_cores,
             },
             name=f"mdl-host-prepare-{split_name}",
             daemon=False,
@@ -4255,6 +4769,12 @@ class _ProcessHostPrepareIterator:
                 "expected FeatureBatch or memfd payload dict"
             )
         try:
+            if item.get("_host_prepare_transport") == "share":
+                return _load_shared_feature_batch_from_ipc(
+                    item,
+                    pin_memory=self._pin_memory,
+                    pinned_pool=self._pinned_pool,
+                )
             memfd = self._recv_memfd_handle()
             return _load_feature_batch_from_ipc(
                 item,
@@ -4716,17 +5236,22 @@ class _DevicePrefetchIterator:
 def _classify_model_parameters(model: nn.Module) -> _ParameterGroups:
     """Separate optimizer ownership from native sparse-gradient ownership.
 
-    All ``nn.Embedding`` parameters retain the repository's existing Adagrad
-    optimizer assignment. Only embeddings constructed with ``sparse=True``
-    need to bypass DDP's reducer, since standard NCCL cannot all-reduce their
-    COO gradients.
+    Row-sparse ID tables (``nn.Embedding(sparse=True)``, GSET, sharded
+    embeddings) keep the Adagrad / rAdaGrad assignment. Dense ``nn.Embedding``
+    tables — MixFormer/OneTrans action-type and position lookups that index
+    ``.weight`` directly — produce dense gradients, so they follow the dense
+    optimizer. Putting them in ``ShardedRowWiseAdagrad`` raises because that
+    optimizer only accepts one-dimensional COO grads. Only ``sparse=True``
+    tables bypass DDP's reducer, since standard NCCL cannot all-reduce COO.
     """
 
     embedding_ids: set[int] = set()
     sparse_gradient_ids: set[int] = set()
     sharded_ids: set[int] = set()
     for module in model.modules():
-        if isinstance(module, ShardedEmbedding):
+        if isinstance(module, ShardedEmbedding) or (
+            isinstance(module, GlobalSharedEmbeddingTable) and module.row_sharded
+        ):
             module_parameter_ids = {
                 id(parameter) for parameter in module.parameters(recurse=False)
             }
@@ -4735,12 +5260,13 @@ def _classify_model_parameters(model: nn.Module) -> _ParameterGroups:
             continue
         if not isinstance(module, nn.Embedding):
             continue
+        if not module.sparse:
+            continue
         module_parameter_ids = {
             id(parameter) for parameter in module.parameters(recurse=False)
         }
         embedding_ids.update(module_parameter_ids)
-        if module.sparse:
-            sparse_gradient_ids.update(module_parameter_ids)
+        sparse_gradient_ids.update(module_parameter_ids)
 
     dense: list[nn.Parameter] = []
     embeddings: list[nn.Parameter] = []
@@ -5260,11 +5786,14 @@ def _maybe_compile_model(config: AppConfig, model: nn.Module) -> nn.Module:
         return model
     if not hasattr(torch, "compile"):
         raise RuntimeError("runtime.compile requires torch.compile support")
-    # RankMixer: fuse dense blocks+logits only. Compiling the full module pulls
-    # sharded-embedding host splits into inductor CUDAGraphs and thrashs.
+    # RankMixer / MixFormer: fuse dense blocks only. Compiling the full module
+    # pulls sharded-embedding host splits into inductor CUDAGraphs and thrashs.
     raw = model.module if isinstance(model, DistributedDataParallel) else model
     compile_dense = getattr(raw, "compile_dense_backbone", None)
-    if callable(compile_dense) and getattr(config.model, "name", None) == "rankmixer":
+    if callable(compile_dense) and getattr(config.model, "name", None) in {
+        "rankmixer",
+        "mixformer",
+    }:
         compile_dense()
         return model
     compile_mode = getattr(config.runtime, "compile_mode", "default")
@@ -5665,8 +6194,6 @@ def _log_sharded_embedding_memory(
     sparse_optimizer: str = "adagrad",
 ) -> None:
     modules = sharded_embedding_modules(model)
-    if not modules:
-        return
     local_tables: list[dict[str, Any]] = []
     for module in modules:
         state = optimizer.state.get(module.weight, {}) if optimizer is not None else {}
@@ -5685,6 +6212,27 @@ def _log_sharded_embedding_memory(
                 ),
             }
         )
+    for table in iter_gset_tables(model):
+        if not table.row_sharded:
+            continue
+        state = optimizer.state.get(table.weight, {}) if optimizer is not None else {}
+        accumulator = state.get("sum")
+        local_tables.append(
+            {
+                "name": "gset",
+                "strategy": "id_mod",
+                "global_rows": int(table.num_embeddings),
+                "local_rows": int(table.weight.size(0)),
+                "weight_bytes": _tensor_nbytes(table.weight),
+                "state_bytes": (
+                    _tensor_nbytes(accumulator)
+                    if isinstance(accumulator, Tensor)
+                    else 0
+                ),
+            }
+        )
+    if not local_tables:
+        return
     gathered: list[object] = [local_tables]
     if context.enabled:
         gathered = [None] * context.world_size
@@ -6090,32 +6638,37 @@ def _aggregate_train_result(
 
 
 def _checkpoint_plan_message(config: AppConfig) -> str:
-    """One-line summary of whether periodic HDFS checkpoints will run."""
+    """One-line summary of whether resumable checkpoints will run."""
 
     settings = getattr(config.training, "checkpoint", None)
     if settings is None or not settings.enabled:
         return (
             "Checkpointing | disabled "
-            "(training.checkpoint.dir is unset; periodic HDFS saves and "
+            "(training.checkpoint.dir is unset; resumable saves and "
             "resume are off)"
         )
     run_name = settings.run_name or config.model.name
     return (
         "Checkpointing | enabled "
         f"dir={settings.dir} run_name={run_name} "
-        f"every_steps={settings.every_steps} keep_last={settings.keep_last} "
+        f"every_steps={settings.every_steps} "
+        f"data_window_hours={settings.data_window_hours} "
+        f"sparse_delta={str(settings.sparse_delta).lower()} "
+        f"keep_last={settings.keep_last} "
         f"save_on_exit={settings.save_on_exit} resume={settings.resume} "
-        f"async_upload={settings.async_upload} data_resume={settings.data_resume}"
+        f"async_upload={settings.async_upload} "
+        f"upload_stall_timeout_sec={settings.upload_stall_timeout_sec:g} "
+        f"data_resume={settings.data_resume}"
     )
 
 
 class _CheckpointCoordinator:
-    """Periodic resumable checkpoints for one rank of a training run.
+    """Resumable checkpoints for one rank of a training run.
 
-    Saving stages this rank's files on local disk and hands them to a background
-    uploader, so a multi-GiB step costs the training loop a local write rather
-    than an HDFS round trip. Resuming restores weights, optimizer accumulators,
-    the global step, and the rank's input-scan position.
+    Sparse files are streamed through a background uploader while this rank
+    serializes later segments. Data-window saves then wait for the global
+    commit before training continues. Resuming restores weights, optimizer
+    accumulators, the global step, and the rank's input-scan position.
     """
 
     def __init__(
@@ -6136,6 +6689,11 @@ class _CheckpointCoordinator:
         self._context = context
         self._staging_root = staging_root
         self._run_name = run_name
+        self._lineage_id = (
+            str(settings.lineage_id).strip()
+            if getattr(settings, "lineage_id", None)
+            else run_name
+        )
         self._log = log_steps and context.rank == 0
         self._chunk_bytes = int(
             getattr(settings, "shard_chunk_bytes", DEFAULT_SHARD_CHUNK_BYTES)
@@ -6148,6 +6706,10 @@ class _CheckpointCoordinator:
         # the reader's lead is only comparable against rows trained since this
         # process resumed.
         self._rows_at_start = 0
+        self._parent_directory: str | None = None
+        self._generation = 0
+        self._trained_through: str | None = None
+        self._active_window_index = 0
 
     @classmethod
     def create(
@@ -6179,9 +6741,11 @@ class _CheckpointCoordinator:
         # An explicit staging_dir also pins the path: ``gettempdir()`` follows
         # TMPDIR, which host-prepare repoints at /dev/shm once its shared-memory
         # IPC comes up.
-        staging_root = Path(
-            settings.staging_dir or tempfile.gettempdir()
-        ) / "mdl-checkpoint-staging"
+        staging_root = (
+            Path(settings.staging_dir)
+            if settings.staging_dir
+            else Path(tempfile.gettempdir()) / "mdl-checkpoint-staging"
+        )
         uploader = CheckpointUploader(
             store,
             rank=context.rank,
@@ -6189,6 +6753,7 @@ class _CheckpointCoordinator:
             keep_last=settings.keep_last,
             ready_timeout_sec=settings.ready_timeout_sec,
             asynchronous=settings.async_upload,
+            stream_timeout_sec=settings.upload_stall_timeout_sec,
         )
         if context.rank == 0:
             print(
@@ -6197,8 +6762,11 @@ class _CheckpointCoordinator:
                 f"staging_dir={staging_root} "
                 f"staging_default={settings.staging_dir is None} "
                 f"every_steps={settings.every_steps} "
+                f"data_window_hours={settings.data_window_hours} "
+                f"sparse_delta={str(settings.sparse_delta).lower()} "
                 f"keep_last={settings.keep_last} "
                 f"async_upload={settings.async_upload} "
+                f"upload_stall_timeout_sec={settings.upload_stall_timeout_sec:g} "
                 f"data_resume={settings.data_resume} "
                 f"resume={settings.resume}",
                 flush=True,
@@ -6220,25 +6788,42 @@ class _CheckpointCoordinator:
 
     # --- Resume ---
 
-    def _agreed_resume_directory(self) -> str | None:
+    def _agreed_resume_directory(
+        self,
+        data_windows: tuple[CheckpointDataWindow, ...] = (),
+    ) -> str | None:
         """Pick one committed step for the whole job, decided by rank 0.
 
         Ranks start seconds apart, so each resolving ``auto`` independently could
         split the job across two steps if a commit lands during startup.
         """
 
-        directory: str | None = None
+        payload: list[dict[str, str | None]] = [
+            {"directory": None, "error": None}
+        ]
         if self._context.rank == 0:
-            checkpoint = resolve_resume_checkpoint(
-                self._store,
-                self._settings.resume,
-            )
-            directory = None if checkpoint is None else checkpoint.directory
+            try:
+                checkpoint = resolve_resume_checkpoint(
+                    self._store,
+                    self._settings.resume,
+                    lineage_id=self._lineage_id,
+                    requested_windows=data_windows,
+                )
+                payload[0]["directory"] = (
+                    None if checkpoint is None else checkpoint.directory
+                )
+            except Exception as error:  # every rank must fail, not hang in broadcast
+                payload[0]["error"] = f"{type(error).__name__}: {error}"
         if self._context.enabled:
-            payload = [directory]
-            torch_dist.broadcast_object_list(payload, src=0)
-            directory = payload[0]
-        return directory
+            torch_dist.broadcast_object_list(
+                payload,
+                src=0,
+                group=self._context.control_group,
+            )
+        result = payload[0]
+        if result["error"] is not None:
+            raise RuntimeError(f"checkpoint resume selection failed: {result['error']}")
+        return result["directory"]
 
     def restore(
         self,
@@ -6250,8 +6835,9 @@ class _CheckpointCoordinator:
         dense_optimizer: torch.optim.Optimizer | None,
         replicated_sparse_optimizer: torch.optim.Optimizer | None,
         sharded_optimizer: ShardedAdagrad | ShardedRowWiseAdagrad | None,
+        data_windows: tuple[CheckpointDataWindow, ...] = (),
     ) -> Any | None:
-        directory = self._agreed_resume_directory()
+        directory = self._agreed_resume_directory(data_windows)
         if directory is None:
             if self._log:
                 print(
@@ -6299,7 +6885,18 @@ class _CheckpointCoordinator:
 
         self._last_saved_step = resumed.step
         self._rows_at_start = int(resumed.rows)
-        self.scan_resume_plan = self._resume_plan(resumed.data_cursor)
+        self._parent_directory = directory
+        self._generation = int(resumed.generation)
+        self._trained_through = resumed.trained_through
+        self._active_window_index = self._window_index_after_resume(
+            resumed,
+            data_windows,
+        )
+        self.scan_resume_plan = (
+            self._resume_plan(resumed.data_cursor)
+            if self._active_window_index < len(data_windows) or not data_windows
+            else None
+        )
         if self._log:
             plan = self.scan_resume_plan
             position = (
@@ -6314,6 +6911,89 @@ class _CheckpointCoordinator:
                 flush=True,
             )
         return resumed
+
+    @staticmethod
+    def _window_index_after_resume(
+        resumed: Any,
+        windows: tuple[CheckpointDataWindow, ...],
+    ) -> int:
+        def _validate_manifest(
+            saved: CheckpointDataWindow,
+            requested: CheckpointDataWindow,
+        ) -> None:
+            if (
+                saved.input_manifest_digest is not None
+                and saved.input_manifest_digest != requested.manifest_digest()
+            ):
+                raise ValueError(
+                    "resume checkpoint input manifest changed for data window "
+                    f"[{requested.start}, {requested.end})"
+                )
+            if (
+                saved.input_count is not None
+                and int(saved.input_count) != requested.manifest_count()
+            ):
+                raise ValueError(
+                    "resume checkpoint input count changed for data window "
+                    f"[{requested.start}, {requested.end})"
+                )
+
+        if not windows:
+            return 0
+        if resumed.data_window is not None and not resumed.window_complete:
+            for index, window in enumerate(windows):
+                if (
+                    window.start == resumed.data_window.start
+                    and window.end == resumed.data_window.end
+                ):
+                    _validate_manifest(resumed.data_window, window)
+                    return index
+            raise ValueError(
+                "resume checkpoint belongs to an incomplete data window outside "
+                "the requested training range"
+            )
+        watermark = resumed.trained_through
+        if watermark is None:
+            # Legacy checkpoints predate data-time metadata. Treat them as the
+            # base immediately preceding the requested range.
+            return 0
+        if watermark < windows[0].start:
+            raise ValueError(
+                f"checkpoint trained_through={watermark} leaves a gap before "
+                f"requested start={windows[0].start}"
+            )
+        for index, window in enumerate(windows):
+            if watermark == window.start:
+                return index
+            if watermark == window.end:
+                if (
+                    resumed.data_window is not None
+                    and resumed.data_window.start == window.start
+                    and resumed.data_window.end == window.end
+                ):
+                    _validate_manifest(resumed.data_window, window)
+                return index + 1
+            if window.start < watermark < window.end:
+                raise ValueError(
+                    f"checkpoint trained_through={watermark} is inside data window "
+                    f"[{window.start}, {window.end}); only committed boundaries are valid"
+                )
+        if watermark == windows[-1].end:
+            return len(windows)
+        raise ValueError(
+            f"checkpoint trained_through={watermark} is outside requested data windows"
+        )
+
+    @property
+    def active_window_index(self) -> int:
+        return self._active_window_index
+
+    def begin_window(self, index: int, *, rows: int) -> None:
+        self._active_window_index = int(index)
+        self._rows_at_start = int(rows)
+        self.scan_resume_plan = None
+        if self.scan_cursor is not None:
+            self.scan_cursor.clear()
 
     def _resume_plan(self, cursor: DataCursor | None) -> ScanResumePlan | None:
         if cursor is None or not self._settings.data_resume or cursor.position <= 0:
@@ -6331,6 +7011,8 @@ class _CheckpointCoordinator:
     # --- Saving ---
 
     def due(self, step: int) -> bool:
+        if int(getattr(self._settings, "data_window_hours", 0)) > 0:
+            return False
         every = int(self._settings.every_steps)
         return (
             every > 0
@@ -6377,6 +7059,7 @@ class _CheckpointCoordinator:
             sharded_optimizer=sharded_optimizer,
             chunk_bytes=self._chunk_bytes,
             upload_window=self._uploader.stream_window,
+            split_large_tables=bool(getattr(self._settings, "sparse_delta", False)),
         )
         self._estimate = estimate
         summary = check_staging_space(
@@ -6437,7 +7120,10 @@ class _CheckpointCoordinator:
         replicated_sparse_optimizer: torch.optim.Optimizer | None,
         sharded_optimizer: ShardedAdagrad | ShardedRowWiseAdagrad | None,
         watchdog: _StepWatchdog | None = None,
-    ) -> None:
+        on_exit: bool = False,
+        data_window: CheckpointDataWindow | None = None,
+        window_complete: bool = False,
+    ) -> bool:
         _step_watchdog_beat(
             watchdog,
             "checkpoint_stage",
@@ -6446,24 +7132,56 @@ class _CheckpointCoordinator:
         )
         started = perf_counter()
         directory = step_directory_name(step)
+        # A rollback/retrain can reach a step number that already has a durable
+        # checkpoint. Never overwrite it in place: its old _COMMIT would make
+        # mixed old/new files visible during the rewrite. Rank 0 also creates a
+        # per-attempt token so stale _READY markers from an interrupted upload
+        # cannot satisfy the next commit.
+        attempt_payload: list[dict[str, str | None]] = [
+            {"attempt_id": None, "error": None}
+        ]
+        if context.rank == 0:
+            try:
+                if self._store.exists(directory, COMMIT_MARKER):
+                    raise FileExistsError(
+                        f"committed checkpoint {self._store.uri(directory)} "
+                        "already exists; use a new checkpoint run_name/lineage "
+                        "for rollback branches"
+                    )
+                attempt_payload[0]["attempt_id"] = uuid4().hex
+            except Exception as error:
+                attempt_payload[0]["error"] = f"{type(error).__name__}: {error}"
+        if context.enabled:
+            torch_dist.broadcast_object_list(
+                attempt_payload,
+                src=0,
+                group=context.control_group,
+            )
+        if attempt_payload[0]["error"] is not None:
+            raise RuntimeError(
+                "checkpoint attempt could not start: "
+                f"{attempt_payload[0]['error']}"
+            )
+        attempt_id = attempt_payload[0]["attempt_id"]
+        if attempt_id is None:
+            raise RuntimeError("checkpoint attempt did not receive an ID")
         if self._store.is_remote:
-            staging_dir = self._staging_root_ready() / self._run_name / directory
+            # Local ranks share the node filesystem but finish uploads at
+            # different times.  A rank owns and removes only this directory;
+            # sharing the step directory let a fast rank's rmtree delete a
+            # slower peer's not-yet-uploaded fallback files.
+            staging_dir = (
+                self._staging_root_ready()
+                / self._run_name
+                / directory
+                / f"rank-{context.rank:05d}"
+            )
             cleanup_staging = True
         else:
             # A local run directory is already the destination; staging there
             # turns the "upload" into marker writes instead of a second copy.
             staging_dir = Path(self._store.uri(directory))
             cleanup_staging = False
-        if cleanup_staging and self._estimate is not None:
-            # Cheap statvfs each time: staging is shared with everything else on
-            # the node, so passing the startup check does not keep it roomy.
-            check_staging_space(
-                self._staging_root,
-                self._estimate,
-                local_ranks=_local_world_size(),
-                enforce=bool(getattr(self._settings, "preflight_staging", True)),
-            )
-        cursor = self._data_cursor(config, context, rows)
 
         def _beat() -> None:
             _step_watchdog_beat(
@@ -6473,33 +7191,121 @@ class _CheckpointCoordinator:
                 device=context.device,
             )
 
-        staged = stage_training_checkpoint(
-            config,
-            model,
-            staging_dir,
-            step=step,
-            rows=rows,
-            rank=context.rank,
-            world_size=context.world_size,
-            dense_optimizer=dense_optimizer,
-            replicated_sparse_optimizer=replicated_sparse_optimizer,
-            sharded_optimizer=sharded_optimizer,
-            data_cursor=cursor,
-            elapsed_seconds=elapsed_seconds,
-            run_name=self._run_name,
-            cleanup_staging=cleanup_staging,
-            chunk_bytes=self._chunk_bytes,
-            # Hand each file over as it lands so staging holds a chunk or two
-            # rather than every rank's whole shard.
-            publish=self._uploader.stream_publisher(
-                staging_dir,
-                step,
-                enabled=cleanup_staging,
-                heartbeat=_beat,
-            ),
+        # Whole-step capacity must be decided before writing tens of GiB. A
+        # periodic save is best-effort and all ranks skip it together if any
+        # prior upload is still pending. The one exit save waits for capacity;
+        # silently dropping the only checkpoint would report a successful run
+        # with nothing resumable.
+        slot_timeout = float(self._settings.ready_timeout_sec) if on_exit else 0.0
+        slot_available = self._uploader.wait_for_step_capacity(
+            step,
+            slot_timeout,
+            heartbeat=_beat,
         )
+        if not on_exit and context.enabled:
+            available = torch.tensor(
+                1 if slot_available else 0,
+                dtype=torch.int32,
+                device=context.device,
+            )
+            torch_dist.all_reduce(available, op=torch_dist.ReduceOp.MIN)
+            slot_available = bool(available.item())
+        if not slot_available:
+            message = (
+                f"checkpoint step {step} could not reserve a staging slot: "
+                "a previous checkpoint upload is still pending"
+            )
+            if on_exit:
+                raise RuntimeError(f"final {message}")
+            if self._log:
+                print(f"Checkpoint skipped | {message}", flush=True)
+            return False
+        if not self._uploader.reserve_step(step):
+            raise RuntimeError(
+                f"checkpoint step {step} lost its staging reservation"
+            )
+        try:
+            if cleanup_staging and self._estimate is not None:
+                # Cheap statvfs each time: staging is shared with everything else on
+                # the node, so passing the startup check does not keep it roomy.
+                check_staging_space(
+                    self._staging_root,
+                    self._estimate,
+                    local_ranks=_local_world_size(),
+                    enforce=bool(
+                        getattr(self._settings, "preflight_staging", True)
+                    ),
+                )
+            cursor = self._data_cursor(config, context, rows)
+            sparse_stream = bool(getattr(self._settings, "sparse_delta", False))
+            generation = self._generation + 1
+            full_every = int(getattr(self._settings, "sparse_full_every", 8))
+            sparse_kind = (
+                "full"
+                if (
+                    not sparse_stream
+                    or self._parent_directory is None
+                    or generation % full_every == 0
+                )
+                else "delta"
+            )
+            sparse_parent = (
+                self._parent_directory
+                if sparse_stream and sparse_kind == "delta"
+                else None
+            )
+            trained_through = self._trained_through
+            if data_window is not None:
+                if window_complete:
+                    trained_through = data_window.end
+                    cursor = None
+                elif trained_through is None:
+                    trained_through = data_window.start
+            staged = stage_training_checkpoint(
+                config,
+                model,
+                staging_dir,
+                step=step,
+                rows=rows,
+                rank=context.rank,
+                world_size=context.world_size,
+                dense_optimizer=dense_optimizer,
+                replicated_sparse_optimizer=replicated_sparse_optimizer,
+                sharded_optimizer=sharded_optimizer,
+                data_cursor=cursor,
+                elapsed_seconds=elapsed_seconds,
+                run_name=self._run_name,
+                cleanup_staging=cleanup_staging,
+                chunk_bytes=self._chunk_bytes,
+                sparse_stream=sparse_stream,
+                sparse_kind=sparse_kind,
+                parent_checkpoint=self._parent_directory,
+                sparse_parent_checkpoint=sparse_parent,
+                generation=generation,
+                lineage_id=self._lineage_id,
+                data_window=data_window,
+                window_complete=window_complete,
+                trained_through=trained_through,
+                attempt_id=attempt_id,
+                # Hand each file over as it lands so staging holds a chunk or two
+                # rather than every rank's whole shard.
+                publish=self._uploader.stream_publisher(
+                    staging_dir,
+                    step,
+                    enabled=cleanup_staging,
+                    heartbeat=_beat,
+                ),
+            )
+        except BaseException:
+            self._uploader.abort_step(
+                step,
+                staging_dir,
+                cleanup_staging=cleanup_staging,
+            )
+            raise
         self._last_saved_step = step
-        self._uploader.submit(staged)
+        if not self._uploader.submit(staged):
+            return False
         _step_watchdog_beat(
             watchdog,
             "checkpoint_staged",
@@ -6521,6 +7327,66 @@ class _CheckpointCoordinator:
                 f"data_position={data_position} uri={self._store.uri(directory)}",
                 flush=True,
             )
+        if on_exit:
+            outcome = self._uploader.wait_for_step(
+                step,
+                float(self._settings.ready_timeout_sec),
+                heartbeat=_beat,
+            )
+            if outcome is None:
+                # Do not spend the same full timeout again from ``finally``.
+                # The worker is daemonized; a native HDFS call may still be
+                # wedged, so stop accepting work and let the failed rank exit.
+                self._uploader.close(timeout_sec=0.0)
+                raise RuntimeError(
+                    f"final checkpoint step {step} did not finish within "
+                    f"{float(self._settings.ready_timeout_sec):.0f}s: "
+                    f"{self._store.uri(directory)}"
+                )
+            if context.enabled:
+                # Non-zero ranks finish their local publisher after writing
+                # _READY, while rank 0 alone waits for all peers and writes
+                # _COMMIT.  This reduction is therefore both an agreement on
+                # success and a barrier behind rank 0's durable commit.
+                _step_watchdog_beat(
+                    watchdog,
+                    "checkpoint_global_commit",
+                    detail=f"steps={step}",
+                    device=context.device,
+                )
+                status_device = (
+                    torch.device("cpu")
+                    if context.control_group is not None
+                    else context.device
+                )
+                committed = torch.tensor(
+                    1 if outcome else 0,
+                    dtype=torch.int32,
+                    device=status_device,
+                )
+                torch_dist.all_reduce(
+                    committed,
+                    op=torch_dist.ReduceOp.MIN,
+                    group=context.control_group,
+                )
+                outcome = bool(committed.item())
+            if not outcome:
+                raise RuntimeError(
+                    f"final checkpoint step {step} failed to commit on every rank: "
+                    f"{self._store.uri(directory)}"
+                )
+            self._parent_directory = directory
+            self._generation = generation
+            self._trained_through = trained_through
+            if sparse_stream and sharded_optimizer is not None:
+                clear = getattr(sharded_optimizer, "clear_dirty_rows", None)
+                if not callable(clear):
+                    raise RuntimeError(
+                        "sparse delta checkpoint committed but optimizer has no "
+                        "dirty-row reset"
+                    )
+                clear()
+        return True
 
     def close(self) -> None:
         self._uploader.close(timeout_sec=self._settings.ready_timeout_sec)
@@ -6576,10 +7442,20 @@ def train_mdl(
             config = _prepare_fixed_test_eval(config, context)
             fixed_test_eval = config.training.fixed_test_eval
         config = _resolve_distributed_cardinality_audit(config, context, "train")
+        data_windows = plan_checkpoint_data_windows(config)
+        if data_windows and log_steps and context.rank == 0:
+            print(
+                "Checkpoint data windows | "
+                f"count={len(data_windows)} "
+                f"interval_hours={config.training.checkpoint.data_window_hours} "
+                f"range=[{data_windows[0].start},{data_windows[-1].end})",
+                flush=True,
+            )
         vocab_maps = load_vocab_maps(config)
         base_model = _build_model_on_device(config, vocab_maps, device)
         _validate_sharded_embedding_metadata(context, base_model)
         parameter_groups = _classify_model_parameters(base_model)
+        gset_tables = tuple(iter_gset_tables(base_model))
         _synchronize_sparse_parameter_replicas(
             context,
             parameter_groups.sparse_sync,
@@ -6605,6 +7481,13 @@ def train_mdl(
         replicated_embedding_params = list(parameter_groups.embedding_optimizer)
         sharded_embedding_params = list(parameter_groups.sharded_optimizer)
         sparse_params = replicated_embedding_params + sharded_embedding_params
+        sparse_optimizer_name = getattr(
+            config.training,
+            "sparse_optimizer",
+            "adagrad",
+        )
+        gset_config = getattr(config.training, "gset", None)
+        gset_enabled = bool(getattr(gset_config, "enabled", False))
         dense_optimizer: torch.optim.Optimizer | None = None
         embedding_optimizer: torch.optim.Optimizer | None = None
         sharded_embedding_optimizer: torch.optim.Optimizer | None = None
@@ -6619,14 +7502,28 @@ def train_mdl(
         if replicated_embedding_params:
             _mark_sparse_invariant_checks_explicitly_disabled()
             sparse_lr = config.training.lr_sparse or config.training.lr_dense
-            embedding_optimizer = torch.optim.Adagrad(
-                replicated_embedding_params,
-                lr=sparse_lr,
-                lr_decay=config.training.adagrad_lr_decay,
-                weight_decay=config.training.adagrad_weight_decay,
-                initial_accumulator_value=config.training.adagrad_initial_accumulator_value,
-                eps=config.training.adagrad_eps,
-            )
+            replicated_optimizer_kwargs = {
+                "lr": sparse_lr,
+                "lr_decay": config.training.adagrad_lr_decay,
+                "weight_decay": config.training.adagrad_weight_decay,
+                "initial_accumulator_value": (
+                    config.training.adagrad_initial_accumulator_value
+                ),
+                "eps": config.training.adagrad_eps,
+            }
+            if sparse_optimizer_name == "rowwise_adagrad":
+                # Kraken rAdaGrad: one FP32 accumulator per physical embedding
+                # row. GSET additionally uses its optimizer hooks to reset a
+                # recycled slot before the new logical key is updated.
+                embedding_optimizer = ShardedRowWiseAdagrad(
+                    replicated_embedding_params,
+                    **replicated_optimizer_kwargs,
+                )
+            else:
+                embedding_optimizer = torch.optim.Adagrad(
+                    replicated_embedding_params,
+                    **replicated_optimizer_kwargs,
+                )
             optimizers.append(embedding_optimizer)
         if sharded_embedding_params:
             _mark_sparse_invariant_checks_explicitly_disabled()
@@ -6639,8 +7536,15 @@ def train_mdl(
                     config.training.adagrad_initial_accumulator_value
                 ),
                 "eps": config.training.adagrad_eps,
+                "track_dirty_rows": bool(
+                    getattr(
+                        getattr(config.training, "checkpoint", None),
+                        "sparse_delta",
+                        False,
+                    )
+                ),
             }
-            if config.training.sparse_optimizer == "rowwise_adagrad":
+            if sparse_optimizer_name == "rowwise_adagrad":
                 sharded_embedding_optimizer = ShardedRowWiseAdagrad(
                     sharded_embedding_params,
                     **optimizer_kwargs,
@@ -6665,7 +7569,7 @@ def train_mdl(
                 context,
                 base_model,
                 sharded_embedding_optimizer,
-                sparse_optimizer=config.training.sparse_optimizer,
+                sparse_optimizer=sparse_optimizer_name,
             )
         # Captured before any resume: the schedule rewrites group["lr"] every
         # step, so a checkpointed optimizer carries a scheduled lr, not the base.
@@ -6693,6 +7597,7 @@ def train_mdl(
                 dense_optimizer=dense_optimizer,
                 replicated_sparse_optimizer=embedding_optimizer,
                 sharded_optimizer=sharded_embedding_optimizer,
+                data_windows=data_windows,
             )
         )
         lr_decay_steps = _resolve_lr_decay_steps(config, max_steps)
@@ -6703,6 +7608,10 @@ def train_mdl(
             device=device,
             dtype=torch.float32,
         )
+        gset_score_task_index = 0
+        if gset_enabled:
+            score_task = getattr(gset_config, "score_task", None) or config.task_names[0]
+            gset_score_task_index = config.task_names.index(score_task)
         non_blocking = _non_blocking_transfer(config, "train", device)
         gradient_accumulation_steps = int(
             getattr(config.training, "gradient_accumulation_steps", 1)
@@ -6717,10 +7626,14 @@ def train_mdl(
             * context.world_size
             * gradient_accumulation_steps
         )
+        train_pack_unit = str(
+            getattr(config.data.train.reader, "pack_unit", "candidates")
+        )
         if log_steps and context.rank == 0:
             print(
                 "Batching | "
                 f"configured_batch_per_rank={configured_batch_per_rank} "
+                f"pack_unit={train_pack_unit} "
                 f"runtime_world_size={context.world_size} "
                 f"gradient_accumulation_steps={gradient_accumulation_steps} "
                 f"runtime_effective_global_batch={runtime_effective_global_batch} "
@@ -6762,24 +7675,6 @@ def train_mdl(
         if training_started_observer is not None:
             training_started_observer()
         start = perf_counter()
-        host_batch_iterator = iter(
-            iter_feature_batches(
-                config,
-                "train",
-                vocab_maps,
-                require_labels=True,
-                shard_rank=context.rank,
-                shard_world_size=context.world_size,
-                pin_memory=non_blocking,
-                include_group_id=False,
-                scan_cursor=(
-                    None if checkpointing is None else checkpointing.scan_cursor
-                ),
-                scan_resume_plan=(
-                    None if checkpointing is None else checkpointing.scan_resume_plan
-                ),
-            )
-        )
         train_data = getattr(getattr(config, "data", None), "train", None)
         train_reader = getattr(train_data, "reader", None)
         device_prefetch_depth = (
@@ -6804,14 +7699,71 @@ def train_mdl(
         # a later step. host_prepare_idle_timeout_sec remains the ceiling that
         # eventually calls a permanently silent reader dead.
         step_batch_budget_sec = getattr(train_reader, "step_batch_budget_sec", 30.0)
-        batch_iterator = (
-            _DevicePrefetchIterator(
-                host_batch_iterator,
-                device,
-                device_prefetch_depth,
+
+        active_data_window_index = (
+            checkpointing.active_window_index
+            if data_windows and checkpointing is not None
+            else 0
+        )
+        completed_all_data_windows = bool(
+            data_windows and active_data_window_index >= len(data_windows)
+        )
+        current_data_window: CheckpointDataWindow | None = (
+            None
+            if not data_windows or completed_all_data_windows
+            else data_windows[active_data_window_index]
+        )
+
+        def _training_config_for_window(
+            window: CheckpointDataWindow | None,
+        ) -> AppConfig:
+            if window is None:
+                return config
+            return replace(
+                config,
+                data=replace(
+                    config.data,
+                    train=replace(config.data.train, inputs=window.inputs),
+                ),
             )
-            if batches_on_device
-            else host_batch_iterator
+
+        current_train_config = _training_config_for_window(current_data_window)
+
+        def _open_batch_iterator(
+            window_config: AppConfig,
+            resume_plan: ScanResumePlan | None,
+        ) -> Iterator[FeatureBatch]:
+            host = iter(
+                iter_feature_batches(
+                    window_config,
+                    "train",
+                    vocab_maps,
+                    require_labels=True,
+                    shard_rank=context.rank,
+                    shard_world_size=context.world_size,
+                    pin_memory=non_blocking,
+                    include_group_id=False,
+                    scan_cursor=(
+                        None if checkpointing is None else checkpointing.scan_cursor
+                    ),
+                    scan_resume_plan=resume_plan,
+                )
+            )
+            if batches_on_device:
+                return _DevicePrefetchIterator(
+                    host,
+                    device,
+                    device_prefetch_depth,
+                )
+            return host
+
+        batch_iterator = (
+            None
+            if completed_all_data_windows
+            else _open_batch_iterator(
+                current_train_config,
+                None if checkpointing is None else checkpointing.scan_resume_plan,
+            )
         )
         starved_steps = 0
         last_device_batch: FeatureBatch | None = None
@@ -6829,7 +7781,7 @@ def train_mdl(
         window_h2d_seconds = 0.0
         window_forward_seconds = 0.0
         window_backward_seconds = 0.0
-        while max_steps is None or steps < max_steps:
+        while batch_iterator is not None and (max_steps is None or steps < max_steps):
             observing = step_observer is not None
             tracing = observing and synchronize_step_observer
             if tracing:
@@ -6960,7 +7912,68 @@ def train_mdl(
                                 f"dropped_incomplete_micro_batches={accumulation_index} "
                                 f"required={gradient_accumulation_steps}"
                             )
-                    break
+                    accumulation_index = 0
+                    if not data_windows:
+                        break
+                    # A data-window boundary is a synchronous consistency
+                    # point. Stop reader/prefetch children before staging so
+                    # their Arrow/shared/pinned pools do not compete with the
+                    # sparse GPU->CPU snapshot for host memory.
+                    close = getattr(batch_iterator, "close", None)
+                    if callable(close):
+                        close()
+                    batch_iterator = None
+                    last_device_batch = None
+                    last_trace_batch = None
+                    _sync_device(device)
+                    if checkpointing is None or current_data_window is None:
+                        raise RuntimeError(
+                            "data-window training reached a boundary without an "
+                            "enabled checkpoint coordinator"
+                        )
+                    checkpointing.save(
+                        current_train_config,
+                        base_model,
+                        context,
+                        step=steps,
+                        rows=rows,
+                        elapsed_seconds=perf_counter() - start,
+                        dense_optimizer=dense_optimizer,
+                        replicated_sparse_optimizer=embedding_optimizer,
+                        sharded_optimizer=sharded_embedding_optimizer,
+                        watchdog=step_watchdog,
+                        on_exit=True,
+                        data_window=current_data_window,
+                        window_complete=True,
+                    )
+                    active_data_window_index += 1
+                    completed_all_data_windows = (
+                        active_data_window_index >= len(data_windows)
+                    )
+                    if log_steps and context.rank == 0:
+                        print(
+                            "Data window committed | "
+                            f"window=[{current_data_window.start},"
+                            f"{current_data_window.end}) step={steps} rows={rows}",
+                            flush=True,
+                        )
+                    if completed_all_data_windows:
+                        current_data_window = None
+                        break
+                    checkpointing.begin_window(
+                        active_data_window_index,
+                        rows=rows,
+                    )
+                    current_data_window = data_windows[active_data_window_index]
+                    current_train_config = _training_config_for_window(
+                        current_data_window
+                    )
+                    batch_iterator = _open_batch_iterator(
+                        current_train_config,
+                        None,
+                    )
+                    initial_steps = steps
+                    continue
                 if verdict == "retry":
                     if log_steps and context.rank == 0:
                         print(
@@ -7020,7 +8033,19 @@ def train_mdl(
                 detail=f"steps={steps} local_rows={local_rows}",
                 device=device,
             )
-            with _gradient_sync_context(
+            if gset_enabled:
+                if batch.labels is None:
+                    raise ValueError("GSET training requires batch labels")
+                gset_context = gset_batch_outcomes(
+                    base_model,
+                    batch.labels,
+                    batch.label_mask,
+                    task_index=gset_score_task_index,
+                    active=rank_active,
+                )
+            else:
+                gset_context = nullcontext()
+            with gset_context, _gradient_sync_context(
                 model,
                 synchronize=(
                     not context.enabled
@@ -7180,9 +8205,18 @@ def train_mdl(
                     config.training.sparse_clip_norm,
                 )
             if scaler.is_enabled():
+                gset_steps_before = {
+                    id(table): table.stats().current_step for table in gset_tables
+                }
                 for optimizer in optimizers:
                     scaler.step(optimizer)
                 scaler.update()
+                # GradScaler may skip only the sparse optimizer on overflow.
+                # Its step hook then cannot release GSET's accumulation pins;
+                # close that logical boundary without resetting pending rows.
+                for table in gset_tables:
+                    if table.stats().current_step == gset_steps_before[id(table)]:
+                        table.optimizer_step_completed()
             else:
                 for optimizer in optimizers:
                     optimizer.step()
@@ -7287,7 +8321,13 @@ def train_mdl(
                     # Train step: early banners are easy to miss in truncated
                     # trainjob tails, and a silent disable looks like a code bug.
                     + (
-                        f" checkpoint=on(every={config.training.checkpoint.every_steps})"
+                        (
+                            " checkpoint=on(data_hours="
+                            f"{config.training.checkpoint.data_window_hours})"
+                            if config.training.checkpoint.data_window_hours > 0
+                            else " checkpoint=on(steps="
+                            f"{config.training.checkpoint.every_steps})"
+                        )
                         if checkpointing is not None
                         else " checkpoint=off"
                     )
@@ -7347,7 +8387,7 @@ def train_mdl(
                 del fixed_test_result
             if checkpointing is not None and checkpointing.due(steps):
                 checkpointing.save(
-                    config,
+                    current_train_config,
                     base_model,
                     context,
                     step=steps,
@@ -7358,6 +8398,16 @@ def train_mdl(
                     sharded_optimizer=sharded_embedding_optimizer,
                     watchdog=step_watchdog,
                 )
+        # Release Arrow workers, shared-memory queues and pinned host slabs
+        # before a final/recovery snapshot. The cursor channel outlives the
+        # iterator, so its last published position remains available below.
+        if batch_iterator is not None:
+            close = getattr(batch_iterator, "close", None)
+            if callable(close):
+                close()
+            batch_iterator = None
+        last_device_batch = None
+        last_trace_batch = None
         audit_report = ddp_auditor.report(context)
         if log_steps and context.rank == 0 and audit_report is not None:
             print(f"DDP graph audit | {audit_report}")
@@ -7385,7 +8435,7 @@ def train_mdl(
 
         if checkpointing is not None and checkpointing.due_on_exit(steps):
             checkpointing.save(
-                config,
+                current_train_config,
                 base_model,
                 context,
                 step=steps,
@@ -7395,8 +8445,19 @@ def train_mdl(
                 replicated_sparse_optimizer=embedding_optimizer,
                 sharded_optimizer=sharded_embedding_optimizer,
                 watchdog=step_watchdog,
+                on_exit=True,
+                data_window=current_data_window,
+                window_complete=False,
             )
-        if save_checkpoint and config.training.save_checkpoint and config.training.checkpoint_path:
+        if (
+            save_checkpoint
+            and config.training.save_checkpoint
+            and config.training.checkpoint_path
+        ):
+            checkpoint_settings = getattr(config.training, "checkpoint", None)
+            sparse_stream = bool(
+                getattr(checkpoint_settings, "sparse_delta", False)
+            )
             save_model_checkpoint(
                 config,
                 base_model,
@@ -7404,6 +8465,15 @@ def train_mdl(
                 rank=context.rank,
                 world_size=context.world_size,
                 sharded_optimizer=sharded_embedding_optimizer,
+                chunk_bytes=int(
+                    getattr(
+                        checkpoint_settings,
+                        "shard_chunk_bytes",
+                        DEFAULT_SHARD_CHUNK_BYTES,
+                    )
+                ),
+                sparse_stream=sparse_stream,
+                sparse_kind="full",
             )
         return result
     except torch.cuda.OutOfMemoryError as error:
@@ -7893,7 +8963,12 @@ def _run_fixed_test_eval(
                     batch = replay_batch
 
                 with _autocast_context(config, context.device):
-                    logits = model(batch.features, batch.scenario_id)["logits"]
+                    logits = _inference_logits(
+                        config,
+                        model,
+                        batch.features,
+                        batch.scenario_id,
+                    )
                 if not rank_active:
                     continue
                 if batch.labels is None:
@@ -8164,6 +9239,27 @@ def _load_inference_model(
     return model, vocab_maps
 
 
+def _inference_logits(
+    config: AppConfig,
+    model: nn.Module,
+    features: dict[str, Any],
+    scenario_id: Tensor,
+) -> Tensor:
+    """Run the ordinary or M-FALCON serving path from one config switch."""
+
+    microbatch_size = int(
+        getattr(config.runtime, "mfalcon_microbatch_size", 0)
+    )
+    if microbatch_size <= 0:
+        return model(features, scenario_id)["logits"]
+    return mfalcon_score_candidates(
+        model,
+        features,
+        scenario_id,
+        microbatch_size=microbatch_size,
+    )
+
+
 @torch.no_grad()
 def evaluate_mdl(
     config: AppConfig,
@@ -8274,7 +9370,12 @@ def evaluate_mdl(
                     raise RuntimeError("inactive evaluation rank has no replay batch")
                 batch = last_device_batch
             with _autocast_context(config, device):
-                logits = model(batch.features, batch.scenario_id)["logits"]
+                logits = _inference_logits(
+                    config,
+                    model,
+                    batch.features,
+                    batch.scenario_id,
+                )
             if not rank_active:
                 continue
             if batch.labels is None:
@@ -8446,7 +9547,12 @@ def predict_mdl(
             break
         batch = move_feature_batch(batch, device, non_blocking=non_blocking)
         with _autocast_context(config, device):
-            logits = model(batch.features, batch.scenario_id)["logits"]
+            logits = _inference_logits(
+                config,
+                model,
+                batch.features,
+                batch.scenario_id,
+            )
         probabilities = torch.sigmoid(logits.float()).cpu().tolist()
         for row_index, (group_id, scores) in enumerate(
             zip(batch.group_id, probabilities)

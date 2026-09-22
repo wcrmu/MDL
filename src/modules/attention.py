@@ -111,6 +111,7 @@ def _call_varlen_attention(
     *,
     causal: bool,
     fixed_capacity: bool = True,
+    softmax_scale: float | None = None,
 ) -> Tensor:
     """Execute Dao flash-attn Varlen in fixed-capacity or compact mode.
 
@@ -151,6 +152,7 @@ def _call_varlen_attention(
         max_query_length,
         max_key_length,
         dropout_p=0.0,
+        softmax_scale=softmax_scale,
         causal=causal,
     )
     if not isinstance(output, Tensor):

@@ -2,14 +2,15 @@
 
 ## Scope
 
-The implementation is based on `paper/mixformer/main.tex`. The standalone
-`mixformer` path follows the published architecture. `mdl_mixformer` is an
-explicitly experimental composition of the published MixFormer backbone and
-the repository's MDL scenario/task-token semantics.
+The implementation is based on MixFormer's published architecture. The
+standalone `mixformer` path follows that architecture, including UI-MixFormer
+when `model.mixformer_user_item_decouple` is true. `mdl_mixformer` is an
+explicitly experimental composition of the MixFormer backbone and the
+repository's MDL scenario/task-token semantics.
 
-The production overlays reuse the current 147-field adapter contract, the nine
-main UPS behavior streams, request-level feature deduplication, three task
-labels, and coarse/fine scenario variants.
+The production MixFormer YAMLs are standalone files. They reuse the current
+adapter contract, eight UPS behavior streams, request-level feature
+deduplication, three task labels, and coarse/fine scenario variants.
 
 ## Paper-to-code mapping
 
@@ -23,7 +24,7 @@ labels, and coarse/fine scenario variants.
 | `z_i = Attention(q_i, h^i) + q_i` | `MixFormerCrossAttention.forward` |
 | Per-head output fusion | `MixFormerOutputFusion` |
 | `L` stacked blocks and task-specific networks | `MixFormerModel` |
-| UI-MixFormer one-way HeadMixing mask | `model.mixformer_user_head_count` |
+| UI-MixFormer user/item split, one-way HeadMixing mask, user-side request reuse | `model.mixformer_user_item_decouple` |
 
 The cross attention uses the algebraically equivalent single-query reordering
 shown in the manuscript's commented efficiency derivation:
@@ -33,24 +34,79 @@ softmax(q (H W_k)^T / sqrt(D)) H W_v
 = softmax((q W_k) H^T / sqrt(D)) H W_v
 ```
 
-This avoids materializing sequence-length-sized projected K/V tensors. When
-the adapter supplies request-to-candidate row indices, candidate queries are
-packed on a small target axis and attend to one request-major history tensor.
-The long history is not copied per candidate.
+This avoids materializing sequence-length-sized projected K/V tensors.
+Scores use the printed MixFormer form `q^T k / sqrt(D)` with no extra
+query RMSNorm; Query Mixer and the sequence SwiGLU already own the paper's
+pre-RMSNorm residuals.
+
+## Request-level reuse vs UI-MixFormer
+
+Two different request-level optimizations exist, and they are not the same
+thing:
+
+1. **History / sequence RLB** (already present for vanilla MixFormer). The
+   adapter supplies candidate-to-request `row_indices`. Candidate queries are
+   packed onto a small target axis and attend one request-major history tensor.
+   The long sequence is transformed once per unique request and is not copied
+   per candidate.
+2. **UI-MixFormer user-side RLB** (paper UI-MixFormer). Non-sequential features
+   are split into user-side `N_U` heads and item-side `N_G` heads. HeadMixing
+   is masked so user outputs cannot contain item chunks. Because user heads do
+   not depend on candidate features, the user Query Mixer and user-head
+   attention can run once per request and be reused across candidates.
+
+Vanilla MixFormer with history RLB still ran Query Mixer and all `N` attention
+heads on the candidate axis: user and item chunks were mixed, so user queries
+were candidate-specific. Enabling UI-MixFormer is what makes the user-side
+modules request-major.
+
+On `MixFormerModel` both (1) and (2) are used together. On `MDLMixFormerModel`
+the split, mask, and history RLB are used, but user Query Mixer / user-head
+attention stay on the candidate axis: scenario/task tokens are candidate-sized
+and the scenario query router can make otherwise-shared user queries
+candidate-specific.
+
+## UI-MixFormer layout
+
+Paper formulas:
+
+```text
+N_G = floor(D_ns^G * N / D_ns)
+N_U = N - N_G
+```
+
+The manuscript also says a practical 1:1 split is used. The resolver tries the
+formula first, then 1:1 when `N` is even, then the packed split closest to the
+formula.
+
+The user/item axis comes from the train adapter: `context_features` are
+request-axis (user), `item_features` are candidate-axis (item), plus coarse-scene
+derived request columns. Each side is concatenated and even-split independently,
+then projected to `D`.
+
+On the current production pack:
+
+- user width **624** (request-axis features)
+- item width **1312** (candidate-axis features)
+- `N=8`
+- formula would pick `N_U=3`, `N_G=5`, but `1312 % 5 != 0`
+- 1:1 packs: `N_U=N_G=4` (`624/4=156`, `1312/4=328`)
+
+Configs leave `mixformer_user_head_count: null` so this auto-split is used.
+Set it only to force a specific even split.
 
 ## Current-data choices
 
-- The 144 active non-sequential inputs have a packed embedding width of 3216.
-  It divides exactly into the paper's `N=16` contiguous slices (201 values per
-  head), so no padding or learned global pre-projection is used.
-- The nine main behavior streams remain raw event streams and retain their
-  configured truncation/order/null semantics. Their total configured capacity
-  is 2048 events.
-- All nine physical streams derive `time_delta_log1p_seconds` from the same
-  request `impr_time`. Since this is a monotonic request-relative clock, the
-  MixFormer profiles globally interleave valid actions by time delta and add a
-  learned stream/type embedding to each action. This realizes the paper's
-  single temporally ordered sequence without inventing absolute timestamps.
+- The 144 active non-sequential inputs have a packed embedding width of 1936.
+  It divides exactly into `N=8` contiguous slices (242 values per head), so no
+  padding or learned global pre-projection is used.
+- The eight main behavior streams remain raw event streams and retain their
+  configured truncation/order/null semantics. Timestamp-aware fusion merges
+  them into one global 8000-event window.
+- All physical streams derive time from the same request clock. MixFormer
+  profiles globally interleave valid actions by `time` and add a learned
+  stream/type embedding to each action. This realizes the paper's single
+  temporally ordered sequence without inventing absolute timestamps.
   Separator tokens are disabled because the paper defines only real actions in
   `S`, and action type is already represented explicitly.
 - Raw action field widths differ by behavior family and do not naturally equal
@@ -58,26 +114,28 @@ The long history is not copied per candidate.
   embedding into `N*D` before the paper's per-layer sequence SwiGLU. This is
   the minimal data-shape adaptation; all MixFormer block equations remain
   unchanged.
-- The manuscript reports `D=386` for MixFormer-small, but its HeadMixing
-  definition requires `D/N` with `N=16`. The implementation uses the internally
-  consistent `D=384`.
-- The SwiGLU intermediate width is not disclosed. `H=1024` is used. With
-  `N=16`, `D=384`, `L=4`, the current three-task production model has about
-  **278.80M dense parameters**, close to the paper's reported 282M
-  MixFormer-small budget.
-- The coarse `mdl_mixformer` composition has **504.74M dense parameters** with
-  the current scenario/task domain modules. Sparse embedding tables are not
+- The manuscript reports `D=386` for MixFormer-small, but HeadMixing requires
+  `D/N` with `N=16`. Production configs use a reduced `N=8`, `D=128`
+  (`128/8=16`), not the paper-small width `N=16`, `D=384`.
+- The SwiGLU intermediate width is not disclosed. Production uses `H=512`.
+  Sequence tokens are aligned to `N·D=1024`. With `N=8`, `D=128`, `L=4`,
+  and `task_head_hidden_dim=1024` left unchanged, the three-task MixFormer
+  has about **24.80M dense parameters**. That is far below the paper's
+  reported 282M MixFormer-small budget.
+- The coarse `mdl_mixformer` composition has **46.41M dense parameters** with
+  the current scenario/task domain modules. Domain MHA uses `num_heads=8`
+  so `token_dim` divides evenly (`128/8=16`). Sparse embedding tables are not
   included in either count.
-- UI-MixFormer's mask is implemented but disabled in the supplied configs.
-  The current feature contract does not yet declare a verified user/item
-  boundary in the ordered 3216-wide pack. Enabling it prematurely would make
-  the mask syntactically valid but semantically wrong.
+
+This is not a bit-identical Douyin UI-MixFormer: the industrial feature
+contract, reduced `D=128`, and undisclosed SwiGLU `H=512` differ. The semantic
+target is the paper's UI equations plus request-level user sharing.
 
 ## MDL-MixFormer innovation
 
 Each `MDLMixFormerBlock` performs:
 
-1. the published MixFormer Query Mixer;
+1. the published MixFormer Query Mixer (with the UI mask when decoupling is on);
 2. active-scenario query routing;
 3. the published sequence cross attention and Output Fusion;
 4. MDL scenario/task domain interaction over the newly fused heads.
@@ -102,10 +160,13 @@ presented as a published MDL or MixFormer result.
 
 ## Configurations
 
-- `configs/mixformer.yaml`: coarse search/recommendation production profile.
-- `configs/mdl_mixformer.yaml`: coarse-scene, three-task MDL profile.
-- `configs/mixformer_fine.yaml`: fine-scene discovery sibling.
-- `configs/mdl_mixformer_fine.yaml`: fine-scene MDL sibling.
+- `configs/mixformer.yaml`: standalone coarse search/recommendation production profile.
+- `configs/mdl_mixformer.yaml`: standalone coarse-scene, three-task MDL profile.
+- `configs/mixformer_fine.yaml`: standalone fine-scene sibling of `mixformer.yaml`.
+- `configs/mdl_mixformer_fine.yaml`: standalone fine-scene MDL sibling.
+
+All four are self-contained and do not `extends` OneTrans. All four enable
+`mixformer_user_item_decouple: true`.
 
 Validate or run them through the existing CLI:
 

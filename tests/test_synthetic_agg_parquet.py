@@ -8,7 +8,6 @@ import unittest
 import pyarrow.parquet as pq
 
 from scripts.generate_synthetic_agg_parquet import (
-    OBSERVED_MEDIAN_SEQUENCE_LENGTHS,
     SyntheticAggManifest,
     generate_synthetic_agg_dataset,
 )
@@ -27,7 +26,9 @@ ROOT = Path(__file__).resolve().parents[1]
 class SyntheticAggParquetTest(unittest.TestCase):
     def test_generated_wide_agg_file_runs_through_production_adapter(self) -> None:
         config = load_app_config(ROOT / "configs" / "rankmixer.yaml")
-        short_lengths = {name: 2 for name in OBSERVED_MEDIAN_SEQUENCE_LENGTHS}
+        short_lengths = {
+            name: 2 for name in config.data.train.adapter.options["ups_types"]
+        }
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory) / "parquet"
             manifest = generate_synthetic_agg_dataset(
@@ -42,7 +43,7 @@ class SyntheticAggParquetTest(unittest.TestCase):
             )
             parquet_path = next(output_dir.glob("*.parquet"))
             self.assertEqual(len(pq.read_schema(parquet_path)), 300)
-            self.assertEqual(manifest.projected_columns, 271)
+            self.assertEqual(manifest.projected_columns, 239)
             self.assertEqual(manifest.candidates, 4)
             self.assertGreater(manifest.projected_compressed_bytes, 0)
 
@@ -84,8 +85,8 @@ class SyntheticAggParquetTest(unittest.TestCase):
         self.assertIsNotNone(bucket)
         # Independent scenario/task priors have their own encoders and
         # activations, so the sum-based memory bucket must count them rather
-        # than only the nine backbone histories.
-        self.assertEqual(bucket["workload_length"], 11676)
+        # than only the eight backbone histories.
+        self.assertEqual(bucket["workload_length"], 12518)
         self.assertIsNone(bucket["max_length"])
         rendered = override["data"]["train"]["reader"]["length_buckets"]
         self.assertEqual(rendered[bucket["bucket_index"]]["batch_size"], 40)

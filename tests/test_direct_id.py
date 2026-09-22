@@ -132,7 +132,7 @@ class ScalarDirectIdTest(unittest.TestCase):
 
         actual = _tensorize_categorical(config, feature, table, {})
 
-        torch.testing.assert_close(actual, torch.tensor([0, 2, 0]))
+        torch.testing.assert_close(actual, torch.tensor([-1, 2, -1]))
 
     def test_shared_namespace_with_identity_root_stays_vectorized(self) -> None:
         root = _identity_input("item_id", "item", num_buckets=16)
@@ -181,14 +181,13 @@ class PreHashedIdTest(unittest.TestCase):
             salted.validate("feature.encoding")
 
     def test_python_mapping_preserves_signed_int64_bits(self) -> None:
-        self.assertEqual(pre_hashed_bucket(-1, 8), 8)
-        self.assertEqual(pre_hashed_bucket(-8, 8), 1)
-        self.assertEqual(pre_hashed_bucket(-(1 << 63), 8), 1)
-        self.assertEqual(pre_hashed_bucket((1 << 63) - 1, 8), 8)
-        with self.assertRaisesRegex(ValueError, "must not be zero"):
-            pre_hashed_bucket(0, 8)
+        self.assertEqual(pre_hashed_bucket(-1, 8), 7)
+        self.assertEqual(pre_hashed_bucket(-8, 8), 0)
+        self.assertEqual(pre_hashed_bucket(-(1 << 63), 8), 0)
+        self.assertEqual(pre_hashed_bucket((1 << 63) - 1, 8), 7)
+        self.assertEqual(pre_hashed_bucket(0, 8), 0)
 
-    def test_scalar_arrow_path_is_vectorized_and_null_is_padding(self) -> None:
+    def test_scalar_arrow_path_maps_zero_and_null_separately(self) -> None:
         categorical = _pre_hashed_input("item_hash", "item_hash")
         config = _config([categorical])
         feature = FeatureConfig(
@@ -197,7 +196,7 @@ class PreHashedIdTest(unittest.TestCase):
         table = pa.table(
             {
                 "item_hash": pa.array(
-                    [None, -1, -8, -(1 << 63), 1, (1 << 63) - 1],
+                    [None, 0, -1, -8, -(1 << 63), 1, (1 << 63) - 1],
                     type=pa.int64(),
                 )
             }
@@ -209,19 +208,11 @@ class PreHashedIdTest(unittest.TestCase):
         ):
             actual = _tensorize_categorical(config, feature, table, {})
 
-        torch.testing.assert_close(actual, torch.tensor([0, 8, 1, 1, 2, 8]))
-
-    def test_non_null_zero_is_rejected(self) -> None:
-        categorical = _pre_hashed_input("item_hash", "item_hash")
-        config = _config([categorical])
-        feature = FeatureConfig(
-            name="item_hash", kind="categorical", source="item_hash"
+        torch.testing.assert_close(
+            actual, torch.tensor([-1, 0, 7, 0, 0, 1, 7])
         )
-        table = pa.table({"item_hash": pa.array([1, 0], type=pa.int64())})
-        with self.assertRaisesRegex(ValueError, "non-null zero"):
-            _tensorize_categorical(config, feature, table, {})
 
-    def test_non_null_zero_scan_can_be_explicitly_disabled(self) -> None:
+    def test_non_null_zero_is_an_ordinary_bucket(self) -> None:
         categorical = _pre_hashed_input("item_hash", "item_hash")
         config = _config([categorical])
         feature = FeatureConfig(
@@ -229,15 +220,9 @@ class PreHashedIdTest(unittest.TestCase):
         )
         table = pa.table({"item_hash": pa.array([1, 0], type=pa.int64())})
 
-        actual = _tensorize_categorical(
-            config,
-            feature,
-            table,
-            {},
-            validate_prehashed_nonzero=False,
-        )
+        actual = _tensorize_categorical(config, feature, table, {})
 
-        torch.testing.assert_close(actual, torch.tensor([2, 1]))
+        torch.testing.assert_close(actual, torch.tensor([1, 0]))
 
     def test_sequence_uses_vectorized_low_bit_mapping(self) -> None:
         categorical = _pre_hashed_input(
@@ -275,7 +260,7 @@ class PreHashedIdTest(unittest.TestCase):
         torch.testing.assert_close(actual["lengths"], torch.tensor([2, 0]))
         torch.testing.assert_close(
             actual["fields"]["item_hash"],
-            torch.tensor([[8, 1], [0, 0]]),
+            torch.tensor([[7, 0], [-1, -1]]),
         )
 
 
@@ -317,7 +302,7 @@ class SequenceDirectIdTest(unittest.TestCase):
         torch.testing.assert_close(actual["lengths"], torch.tensor([2, 1]))
         torch.testing.assert_close(
             actual["fields"]["item_id"],
-            torch.tensor([[2, 3], [4, 0]]),
+            torch.tensor([[2, 3], [4, -1]]),
         )
         torch.testing.assert_close(
             actual["fields"]["age"],
@@ -426,7 +411,7 @@ class SequenceDirectIdTest(unittest.TestCase):
 
         torch.testing.assert_close(
             actual["fields"]["item_id"],
-            torch.tensor([[1, 2], [3, 0]]),
+            torch.tensor([[1, 2], [3, -1]]),
         )
 
 

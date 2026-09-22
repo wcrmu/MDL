@@ -9,7 +9,8 @@ files, streams Arrow batches, encodes configured features, and builds the
 ``FeatureBatch`` objects consumed by training and inference.
 
 It also owns the direct agg Arrow path (``reader.agg_direct_mode``): request
-group blocks, length-bucket packing, and axis ``PreparedAxisBatch`` materialization.
+group blocks, length-bucket packing, optional agg-row pack units, and axis
+``PreparedAxisBatch`` materialization.
 
 Remote HDFS/viewfs helpers live here as well (thread-local HadoopFileSystem,
 timed open/close, retry, flock, and pre_buffer Parquet reads).
@@ -113,6 +114,7 @@ from .features import (
     encode_categorical_sequence_field,
     encode_categorical_value,
     encode_categorical_values,
+    tensor_padding_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -3146,6 +3148,17 @@ class ScanCursorChannel:
         except (UnicodeDecodeError, ValueError):
             return None
 
+    def clear(self) -> None:
+        """Forget a completed split before the next data window starts."""
+
+        self._local = b""
+        if self._storage is None:
+            return
+        try:
+            self._storage.value = b""
+        except Exception:  # noqa: BLE001 - the next publish repairs the cursor
+            pass
+
     def _read_shared(self) -> bytes:
         try:
             return bytes(self._storage.value)
@@ -4218,8 +4231,8 @@ def _is_missing_label(value: Any, sentinels: Sequence[Any]) -> bool:
 
 
 # Coarse search/recommendation routing: index space is 0/1 for scenarios.source
-# (source_encoding=index). Prior embeddings use a separate identity space 1/2 so
-# padding_id=0 never collides with a real scenario.
+# (source_encoding=index). Prior embeddings use identity ids 1/2; row 0 of that
+# small table is unused, not a reserved padding_idx.
 COARSE_SCENE_INDEX_COLUMN = "coarse_scene_index"
 COARSE_SCENE_PRIOR_ID_COLUMN = "coarse_scene_prior_id"
 SEARCH_SCENARIO_INDEX = 0
@@ -5136,7 +5149,7 @@ def _req_context_value(
         raise ValueError(
             f"req context column {column!r} must be list-valued at raw row {raw_row}"
         ) from error
-    if not outer:
+    if len(outer) == 0:
         return [] if multivalue else None
     if not multivalue:
         if validate_contract and len(outer) != 1:
@@ -5176,6 +5189,44 @@ def _sequence_membership_positions(
     if validate_structure is None:
         validate_structure = validate_contract
     selected: dict[int, list[int]] = {request: [] for request in known_requests}
+    if not validate_structure and all(
+        isinstance(membership, np.ndarray)
+        and membership.ndim == 1
+        and membership.dtype.kind in "iu"
+        for membership in memberships
+    ):
+        # Arrow's trusted path already exposes each token membership as a
+        # numeric NumPy view.  Flatten once and invert the token-major mapping
+        # with vectorized masks instead of allocating a Python int list for
+        # every token.
+        lengths = np.fromiter(
+            (len(membership) for membership in memberships),
+            dtype=np.int64,
+            count=len(memberships),
+        )
+        if len(memberships):
+            flat_memberships = np.concatenate(memberships)
+            token_positions = np.repeat(
+                np.arange(len(memberships), dtype=np.int64),
+                lengths,
+            )
+        else:
+            flat_memberships = np.empty(0, dtype=np.int64)
+            token_positions = np.empty(0, dtype=np.int64)
+        matched = 0
+        for request in known_requests:
+            mask = flat_memberships == request
+            request_positions = token_positions[mask]
+            matched += int(request_positions.shape[0])
+            selected[request] = request_positions.tolist()
+        if matched == int(flat_memberships.shape[0]):
+            return selected
+        # Preserve the previous trusted-path failure mode for an unexpected
+        # request id instead of silently discarding malformed membership.
+        for value in flat_memberships:
+            request = int(value)
+            if request not in selected:
+                raise KeyError(request)
     for token_position, raw_membership in enumerate(memberships):
         if isinstance(raw_membership, np.ndarray):
             members: Any = raw_membership
@@ -5320,6 +5371,41 @@ def _select_sequence(
             item = item[0]
         normalized.append(item)
     return normalized
+
+
+def _accumulate_agg_memberships(
+    membership_positions: Mapping[str, Mapping[int, Sequence[int]]],
+    request_positions: Mapping[int, int],
+) -> dict[int, dict[str, list[int]]]:
+    """Union earlier-request UPS events onto each request in one agg row.
+
+    ``request_positions`` maps the agg-local request index to its
+    ``context_indices`` order. A later request sees every event visible to
+    itself or to any earlier request; it never sees later-request-only events.
+    Physical token indices stay newest-to-oldest (ascending). MixFormer
+    tokenization is unchanged: these indices still select UPS sequence tokens.
+    """
+
+    accumulated: dict[int, dict[str, list[int]]] = {}
+    for request_index, current_order in request_positions.items():
+        current_order = int(current_order)
+        merged: dict[str, list[int]] = {}
+        for ups, members in membership_positions.items():
+            seen: set[int] = set()
+            events: list[int] = []
+            for other_request, order in request_positions.items():
+                if int(order) > current_order:
+                    continue
+                for event_index in members.get(other_request, ()):
+                    event = int(event_index)
+                    if event in seen:
+                        continue
+                    seen.add(event)
+                    events.append(event)
+            events.sort()
+            merged[ups] = events
+        accumulated[int(request_index)] = merged
+    return accumulated
 
 
 def _select_global_recent_sequence_positions(
@@ -5489,7 +5575,7 @@ def _flatten_singleton_ups_array(
     return array, True
 
 
-def _arrow_array_to_pylist(pa: Any, array: Any) -> list[Any]:
+def _arrow_array_to_pylist(pa: Any, array: Any) -> Any:
     """Materialize an Arrow array as Python objects / NumPy row views.
 
     For the common ``list<primitive>`` and ``list<list<primitive>>`` columns in
@@ -5511,7 +5597,17 @@ def _arrow_array_to_pylist(pa: Any, array: Any) -> list[Any]:
         if (
             pa.types.is_integer(grandchild.type)
             or pa.types.is_floating(grandchild.type)
-        ) and not grandchild.null_count:
+        ) and not (
+            array.null_count or child.null_count or grandchild.null_count
+        ):
+            # Recent Arrow builds materialize nested numeric lists as an object
+            # ndarray whose leaves are zero-copy NumPy views.  This avoids the
+            # Python nested-list construction below and remains index/iteration
+            # compatible with every adapter consumer.
+            try:
+                return array.to_numpy(zero_copy_only=False)
+            except (TypeError, ValueError, NotImplementedError):
+                pass
             try:
                 outer_offsets = array.offsets.to_numpy()
                 inner_offsets = child.offsets.to_numpy()
@@ -5582,7 +5678,7 @@ def _arrow_array_to_pylist(pa: Any, array: Any) -> list[Any]:
     ]
 
 
-def _arrow_list_array_to_numpy_rows(pa: Any, array: Any) -> list[Any] | None:
+def _arrow_list_array_to_numpy_rows(pa: Any, array: Any) -> Any | None:
     """Return per-row NumPy views for ``list<primitive>`` columns.
 
     Used for flattened UPS histories so membership gather can fancy-index
@@ -5603,17 +5699,11 @@ def _arrow_list_array_to_numpy_rows(pa: Any, array: Any) -> list[Any] | None:
     if child.null_count:
         return None
     try:
-        offsets = array.offsets.to_numpy()
-        values = child.to_numpy(zero_copy_only=False)
+        # Arrow performs the outer object-array construction in native code;
+        # each element is still a NumPy view of the primitive value buffer.
+        return array.to_numpy(zero_copy_only=False)
     except (TypeError, ValueError, NotImplementedError):
         return None
-    if array.null_count:
-        is_null = array.is_null().to_numpy(zero_copy_only=False)
-        return [
-            None if is_null[index] else values[offsets[index] : offsets[index + 1]]
-            for index in range(len(array))
-        ]
-    return [values[offsets[index] : offsets[index + 1]] for index in range(len(array))]
 
 
 def _adapter_table_to_python(
@@ -5890,6 +5980,7 @@ class _MdlRankMixerAdapterPlan:
     time_delta_transform: str
     sequence_max_lengths: Mapping[str, int]
     global_sequence_max_length: int | None
+    accumulate_agg_history: bool
     compact_request_lists: bool
     request_time_column: str
     aligned_groups: tuple[tuple[str, ...], ...]
@@ -5975,6 +6066,9 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         raise ValueError(
             "adapter option 'global_sequence_max_length' must be a positive integer or null"
         )
+    accumulate_agg_history = options.get("accumulate_agg_history", False)
+    if type(accumulate_agg_history) is not bool:
+        raise ValueError("adapter option 'accumulate_agg_history' must be a boolean")
     compact_request_lists = options.get("compact_request_lists", False)
     if type(compact_request_lists) is not bool:
         raise ValueError("adapter option 'compact_request_lists' must be a boolean")
@@ -6024,14 +6118,6 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
             )
     if set(time_delta_outputs) - set(ups_types):
         raise ValueError("time_delta_outputs contains an unknown UPS type")
-    if global_sequence_max_length is not None:
-        missing_global_times = sorted(set(ups_types) - set(time_delta_outputs))
-        if missing_global_times:
-            raise ValueError(
-                "adapter global_sequence_max_length requires a time_delta_outputs "
-                "entry for every UPS type; missing: "
-                + ", ".join(missing_global_times)
-            )
     unknown_sequence_limits = sorted(set(sequence_max_lengths) - set(ups_types))
     if unknown_sequence_limits:
         raise ValueError(
@@ -6041,6 +6127,17 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
 
     required = tuple(context.required_columns)
     required_set = frozenset(required)
+    if global_sequence_max_length is not None:
+        missing_time_columns = [
+            f"{ups}_x_time"
+            for ups in ups_types
+            if f"{ups}_x_time" not in required_set and ups not in time_delta_outputs
+        ]
+        if missing_time_columns:
+            raise ValueError(
+                "adapter global_sequence_max_length requires every UPS "
+                "`*_x_time` column; missing: " + ", ".join(missing_time_columns)
+            )
     scalar_features = frozenset((context_set | item_set) - bag_features)
     label_columns = frozenset(labels.values())
     label_mask_columns = frozenset(label_masks.values())
@@ -6184,7 +6281,11 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
     raw_sequence_columns = frozenset(
         {
             *sequence_columns,
-            *(f"{ups}_x_time" for ups in ups_types if ups in time_delta_outputs),
+            *(
+                f"{ups}_x_time"
+                for ups in ups_types
+                if ups in time_delta_outputs or global_sequence_max_length is not None
+            ),
         }
     )
     integer_output_columns = frozenset(
@@ -6218,6 +6319,7 @@ def _build_mdl_rankmixer_adapter_plan(context: Any) -> _MdlRankMixerAdapterPlan:
         time_delta_transform=time_delta_transform,
         sequence_max_lengths=sequence_max_lengths,
         global_sequence_max_length=global_sequence_max_length,
+        accumulate_agg_history=accumulate_agg_history,
         compact_request_lists=compact_request_lists,
         request_time_column=request_time_column,
         aligned_groups=aligned_groups,
@@ -6427,6 +6529,13 @@ def build_arrow_axis_source(
                 validate_structure=validate_structure,
             )
 
+        accumulated_memberships: dict[int, dict[str, list[int]]] | None = None
+        if plan.accumulate_agg_history:
+            accumulated_memberships = _accumulate_agg_memberships(
+                membership_positions,
+                positions,
+            )
+
         # First-wins request slots keyed by request_id (search_id).
         row_request_slots: dict[int, int] = {}
         for request_index in dict.fromkeys(candidate_requests):
@@ -6462,12 +6571,18 @@ def build_arrow_axis_source(
                 request_raw_rows.append(raw_row)
                 request_local_positions.append(int(request_position))
                 selected_by_type: dict[str, list[int]]
+                if accumulated_memberships is not None:
+                    request_events = accumulated_memberships[int(request_index)]
+                else:
+                    request_events = None
                 if plan.global_sequence_max_length is not None:
                     candidates_by_type = {
                         ups: list(
-                            membership_positions[ups].get(request_index, ())[
-                                : plan.global_sequence_max_length
-                            ]
+                            (
+                                request_events[ups]
+                                if request_events is not None
+                                else membership_positions[ups].get(request_index, ())
+                            )[: plan.global_sequence_max_length]
                         )
                         for ups in plan.ups_types
                     }
@@ -6495,7 +6610,9 @@ def build_arrow_axis_source(
                     selected_by_type = {}
                     for ups in plan.ups_types:
                         selected = list(
-                            membership_positions[ups].get(request_index, ())
+                            request_events[ups]
+                            if request_events is not None
+                            else membership_positions[ups].get(request_index, ())
                         )
                         max_length = plan.sequence_max_lengths.get(ups)
                         if max_length is not None:
@@ -6979,6 +7096,13 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                     validate_structure=validate_structure,
                 )
 
+        accumulated_memberships: dict[int, dict[str, list[int]]] | None = None
+        if is_agg and plan.accumulate_agg_history:
+            accumulated_memberships = _accumulate_agg_memberships(
+                membership_positions,
+                positions,
+            )
+
         unique_candidate_requests = tuple(dict.fromkeys(candidate_requests))
         if validate_structure:
             for request_index in unique_candidate_requests:
@@ -7080,10 +7204,14 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                     time_values = row.get(raw_time_column)
                     if is_agg:
                         expected = membership_lengths[ups]
+                        if accumulated_memberships is not None:
+                            selected_events = accumulated_memberships[
+                                int(request_index)
+                            ][ups]
+                        else:
+                            selected_events = membership_positions[ups][request_index]
                         positions_for_global = list(
-                            membership_positions[ups][request_index][
-                                :global_sequence_max_length
-                            ]
+                            selected_events[:global_sequence_max_length]
                         )
                     else:
                         raw_times = _as_list(
@@ -7130,9 +7258,14 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                     expected_length = global_expected_lengths[ups]
                     max_length = None
                 else:
-                    selected_positions = (
-                        membership_positions[ups][request_index] if is_agg else None
-                    )
+                    if is_agg and accumulated_memberships is not None:
+                        selected_positions = accumulated_memberships[
+                            int(request_index)
+                        ][ups]
+                    elif is_agg:
+                        selected_positions = membership_positions[ups][request_index]
+                    else:
+                        selected_positions = None
                     expected_length = membership_lengths.get(ups)
                     max_length = sequence_max_lengths.get(ups)
                 pos_index: Any = None
@@ -7705,7 +7838,7 @@ def _validate_flat_table_static_contract(
     categorical_bag_columns = {
         feature.source
         for feature in config.features
-        if feature.kind == "categorical" and feature.pooling == "mean"
+        if feature.is_bag
     }
     scenario_columns = {config.scenarios.source} if config.scenarios.source else set()
     allowed_list_columns = (
@@ -7723,7 +7856,7 @@ def _validate_flat_table_static_contract(
         raise ValueError(
             f"adapter output for split {split_name!r} has list-valued non-sequence column(s): "
             + ", ".join(unexpected_list_columns)
-            + ". Only configured sequence fields, categorical features with pooling=mean, "
+            + ". Only configured sequence fields, categorical bag features, "
             "dense features with dimension > 1, and scenario masks may use list-valued cells."
         )
 
@@ -7791,12 +7924,20 @@ def _initialize_adapter_process(
     global _PROCESS_ADAPTER_NAME
     global _PROCESS_ADAPTER_SPLIT_NAME
 
-    # Prefer parent prepare/tensorize when cores are contended: adapter workers
-    # are throughput-oriented background producers.
+    # Prefer parent prepare/tensorize under rank-local CPU contention. Retain a
+    # field override because isolated high-core nodes can favor equal priority.
+    raw_nice = os.environ.get("MDL_ADAPTER_NICE", "10")
     try:
-        os.nice(10)
-    except OSError:
-        pass
+        nice_increment = int(raw_nice)
+    except ValueError as error:
+        raise ValueError("MDL_ADAPTER_NICE must be an integer in [0, 19]") from error
+    if not 0 <= nice_increment <= 19:
+        raise ValueError("MDL_ADAPTER_NICE must be an integer in [0, 19]")
+    if nice_increment:
+        try:
+            os.nice(nice_increment)
+        except OSError:
+            pass
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -8414,6 +8555,8 @@ def _numpy_backed_tensor(array: Any, dtype: torch.dtype) -> Tensor:
 def _identity_array_tensor(
     array: Any,
     categorical_input: ResolvedCategoricalInput,
+    *,
+    missing_id_override: int | None = None,
 ) -> Tensor:
     """Convert a numeric identity column without Python element processing."""
 
@@ -8426,10 +8569,13 @@ def _identity_array_tensor(
             f"identity input {categorical_input.name!r} must be an Arrow integer column, "
             f"got {array.type}"
         )
-    if array.null_count:
-        array = pc.fill_null(array, encoding.padding_id)
-
-    min_max = pc.min_max(array).as_py()
+    missing_id = (
+        tensor_padding_id(encoding)
+        if missing_id_override is None
+        else int(missing_id_override)
+    )
+    present = pc.drop_null(array) if array.null_count else array
+    min_max = pc.min_max(present).as_py() if len(present) else None
     minimum = min_max.get("min") if min_max is not None else None
     maximum = min_max.get("max") if min_max is not None else None
     invalid_bounds = (minimum is not None and int(minimum) < 0) or (
@@ -8440,12 +8586,14 @@ def _identity_array_tensor(
             f"identity input {categorical_input.name!r} contains IDs outside "
             f"[0, {encoding.num_buckets}): min={minimum}, max={maximum}"
         )
+    if array.null_count:
+        array = pc.fill_null(array, missing_id)
     if invalid_bounds:
         valid = pc.and_(
             pc.greater_equal(array, 0),
             pc.less(array, encoding.num_buckets),
         )
-        array = pc.if_else(valid, array, encoding.padding_id)
+        array = pc.if_else(valid, array, missing_id)
     array = pc.cast(array, target_type=pa.int64(), safe=True)
     return _numpy_backed_tensor(array, torch.long)
 
@@ -8453,10 +8601,13 @@ def _identity_array_tensor(
 def _identity_column_tensor(
     table: Any,
     categorical_input: ResolvedCategoricalInput,
+    *,
+    missing_id_override: int | None = None,
 ) -> Tensor:
     return _identity_array_tensor(
         _column_array(table, categorical_input.source),
         categorical_input,
+        missing_id_override=missing_id_override,
     )
 
 
@@ -8465,8 +8616,10 @@ def _pre_hashed_array_tensor(
     categorical_input: ResolvedCategoricalInput,
     *,
     validate_nonzero: bool = True,
+    preserve_raw_int64: bool = False,
+    missing_raw_id: int = 0,
 ) -> Tensor:
-    """Vectorize unsigned-low-bit bucketing while preserving null as zero."""
+    """Tensorize pre-hashed IDs, optionally preserving all 64 raw bits."""
 
     encoding = categorical_input.encoding
     if not isinstance(encoding, ResolvedPreHashedEncoding):
@@ -8477,19 +8630,18 @@ def _pre_hashed_array_tensor(
             f"pre_hashed input {categorical_input.name!r} must be an Arrow int64 column, "
             f"got {array.type}"
         )
-    if validate_nonzero:
-        zero_mask = pc.equal(array, 0)
-        has_zero = pc.any(zero_mask).as_py()
-        if has_zero:
-            raise ValueError(
-                f"pre_hashed input {categorical_input.name!r} contains non-null zero values"
-            )
-    encoded = pc.add(
-        pc.bit_wise_and(array, encoding.num_buckets - 1),
-        1,
+    encoded = (
+        array
+        if preserve_raw_int64
+        else pc.bit_wise_and(array, encoding.num_buckets - 1)
     )
     if encoded.null_count:
-        encoded = pc.fill_null(encoded, encoding.padding_id)
+        encoded = pc.fill_null(
+            encoded,
+            int(missing_raw_id)
+            if preserve_raw_int64
+            else tensor_padding_id(encoding),
+        )
     return _numpy_backed_tensor(encoded, torch.long)
 
 
@@ -8498,15 +8650,32 @@ def _pre_hashed_column_tensor(
     categorical_input: ResolvedCategoricalInput,
     *,
     validate_nonzero: bool = True,
+    preserve_raw_int64: bool = False,
+    missing_raw_id: int = 0,
 ) -> Tensor:
     return _pre_hashed_array_tensor(
         _column_array(table, categorical_input.source),
         categorical_input,
         validate_nonzero=validate_nonzero,
+        preserve_raw_int64=preserve_raw_int64,
+        missing_raw_id=missing_raw_id,
     )
 
 
 # --- Categorical encoding ---
+
+
+def _uses_dracarys_feature_xor(config: AppConfig) -> bool:
+    gset = getattr(config.training, "gset", None)
+    return bool(
+        gset is not None
+        and gset.enabled
+        and gset.key_mode == "feature_xor_raw64"
+    )
+
+
+def _dracarys_missing_raw_id(config: AppConfig) -> int:
+    return int(config.training.gset.missing_raw_id)
 
 
 def _effective_categorical_input(
@@ -8544,13 +8713,22 @@ def _tensorize_categorical(
         config,
         config.resolved.categorical_input_by_name[feature.name],
     )
+    dracarys_raw = _uses_dracarys_feature_xor(config)
     if isinstance(categorical_input.encoding, ResolvedIdentityEncoding):
-        return _identity_column_tensor(table, categorical_input)
+        return _identity_column_tensor(
+            table,
+            categorical_input,
+            missing_id_override=(
+                _dracarys_missing_raw_id(config) if dracarys_raw else None
+            ),
+        )
     if isinstance(categorical_input.encoding, ResolvedPreHashedEncoding):
         return _pre_hashed_column_tensor(
             table,
             categorical_input,
             validate_nonzero=validate_prehashed_nonzero,
+            preserve_raw_int64=dracarys_raw,
+            missing_raw_id=_dracarys_missing_raw_id(config),
         )
     unseen_policy = config.vocab_strategy.defaults.unseen_policy
     encoded = encode_categorical_values(
@@ -8616,12 +8794,12 @@ def _tensorize_categorical_bag(
 
     Truncation follows ``feature.max_length`` / ``truncation`` via Arrow-native
     list ops + ``list_flatten`` (no temporary ``[N, max_length]`` pad).
-    The returned ``values`` tensor is CSR-like ``[sum(lengths)]``; mean-pool
+    The returned ``values`` tensor is CSR-like ``[sum(lengths)]``; bag pooling
     reconstructs per-row segments from ``lengths``.
     """
 
-    if feature.pooling != "mean":
-        raise TypeError("_tensorize_categorical_bag requires pooling=mean")
+    if not feature.is_bag:
+        raise TypeError("_tensorize_categorical_bag requires bag pooling")
     categorical_input = _effective_categorical_input(
         config,
         config.resolved.categorical_input_by_name[feature.name],
@@ -8639,13 +8817,22 @@ def _tensorize_categorical_bag(
         length_array = pc.fill_null(length_array, 0)
     lengths = _numpy_backed_tensor(length_array, torch.long)
     flat_array = pc.list_flatten(array)
+    dracarys_raw = _uses_dracarys_feature_xor(config)
     if isinstance(categorical_input.encoding, ResolvedIdentityEncoding):
-        encoded = _identity_array_tensor(flat_array, categorical_input)
+        encoded = _identity_array_tensor(
+            flat_array,
+            categorical_input,
+            missing_id_override=(
+                _dracarys_missing_raw_id(config) if dracarys_raw else None
+            ),
+        )
     elif isinstance(categorical_input.encoding, ResolvedPreHashedEncoding):
         encoded = _pre_hashed_array_tensor(
             flat_array,
             categorical_input,
             validate_nonzero=validate_prehashed_nonzero,
+            preserve_raw_int64=dracarys_raw,
+            missing_raw_id=_dracarys_missing_raw_id(config),
         )
     else:
         unseen_policy = config.vocab_strategy.defaults.unseen_policy
@@ -8858,9 +9045,24 @@ def _list_offsets_tensor(array: Any) -> Tensor:
     return _numpy_backed_tensor(array.offsets, torch.long)
 
 
-def _direct_dense_values(array: Any, dimension: int, field_name: str) -> Tensor:
+def _direct_dense_values(
+    array: Any,
+    dimension: int,
+    field_name: str,
+    *,
+    integer: bool = False,
+) -> Tensor:
     pa, pc, _ds, _pq = _require_pyarrow()
     if dimension == 1:
+        if integer:
+            if not pa.types.is_integer(array.type):
+                raise TypeError(
+                    f"timestamp sequence field {field_name!r} must contain "
+                    f"integer values, got {array.type}"
+                )
+            if array.null_count:
+                array = pc.fill_null(array, 0)
+            return _numpy_backed_tensor(array, torch.int64)
         if not (pa.types.is_integer(array.type) or pa.types.is_floating(array.type)):
             raise TypeError(
                 f"dense sequence field {field_name!r} must contain numeric values, got {array.type}"
@@ -9021,6 +9223,7 @@ def _gather_abs_windows_prehashed_padded(
     padding_id: int,
     validate_nonzero: bool,
     feature_name: str,
+    preserve_raw_int64: bool = False,
     window_lengths: np.ndarray | None = None,
     pad_mask: np.ndarray | None = None,
     unique_list: Sequence[int] | None = None,
@@ -9078,11 +9281,11 @@ def _gather_abs_windows_prehashed_padded(
         ]
         flat = np.concatenate(views) if views else np.empty(0, dtype=sample_dtype)
     normalized = flat.astype(np.int64, copy=False)
-    if validate_nonzero and normalized.size and bool(np.any(normalized == 0)):
-        raise ValueError(
-            f"pre_hashed input {feature_name!r} contains non-null zero values"
-        )
-    encoded = (normalized & (int(num_buckets) - 1)) + 1
+    encoded = (
+        normalized
+        if preserve_raw_int64
+        else normalized & (int(num_buckets) - 1)
+    )
     if int(lengths.min(initial=0)) == max_length and total == n_rows * max_length:
         return torch.from_numpy(
             np.ascontiguousarray(encoded.reshape(n_rows, max_length))
@@ -9112,16 +9315,19 @@ def _gather_abs_windows_dense_padded(
     window_lengths: np.ndarray | None = None,
     pad_mask: np.ndarray | None = None,
     gather_plan: tuple[list[np.ndarray], list[np.ndarray], int] | None = None,
+    integer: bool = False,
 ) -> Tensor:
-    """Gather ragged abs windows into a padded float32 sequence tensor."""
+    """Gather ragged abs windows into a padded sequence tensor."""
 
     n_rows = int(abs_lo.shape[0])
+    output_dtype = np.int64 if integer else np.float32
+    torch_dtype = torch.int64 if integer else torch.float32
     if dimension <= 1:
         shape: tuple[int, ...] = (n_rows, max_length)
     else:
         shape = (n_rows, max_length, dimension)
     if n_rows == 0 or max_length == 0:
-        return torch.zeros(shape, dtype=torch.float32)
+        return torch.zeros(shape, dtype=torch_dtype)
     lengths = abs_hi - abs_lo if window_lengths is None else window_lengths
     if gather_plan is not None:
         src_by_unique, dst_by_unique, total = gather_plan
@@ -9129,8 +9335,8 @@ def _gather_abs_windows_dense_padded(
         total = int(lengths.sum())
         src_by_unique = dst_by_unique = None  # type: ignore[assignment]
     if total == 0:
-        return torch.zeros(shape, dtype=torch.float32)
-    sample_dtype = np.float32
+        return torch.zeros(shape, dtype=torch_dtype)
+    sample_dtype = output_dtype
     for buffer in values_by_unique:
         if buffer.size:
             sample_dtype = buffer.dtype
@@ -9151,13 +9357,13 @@ def _gather_abs_windows_dense_padded(
             for row_index in range(n_rows)
         ]
         flat = np.concatenate(views)
-    values = flat.astype(np.float32, copy=False)
+    values = np.asarray(flat, dtype=output_dtype)
     if dimension <= 1:
         if int(lengths.min(initial=0)) == max_length and total == n_rows * max_length:
             return torch.from_numpy(
                 np.ascontiguousarray(values.reshape(n_rows, max_length))
             )
-        out = np.zeros((n_rows, max_length), dtype=np.float32)
+        out = np.zeros((n_rows, max_length), dtype=output_dtype)
         mask = (
             pad_mask
             if pad_mask is not None
@@ -9165,8 +9371,8 @@ def _gather_abs_windows_dense_padded(
         )
         out[mask] = values
         return torch.from_numpy(out)
-    values = np.asarray(values, dtype=np.float32).reshape(total, dimension)
-    out = np.zeros((n_rows, max_length, dimension), dtype=np.float32)
+    values = np.asarray(values, dtype=output_dtype).reshape(total, dimension)
+    out = np.zeros((n_rows, max_length, dimension), dtype=output_dtype)
     cursor = 0
     for row_index in range(n_rows):
         length = int(lengths[row_index])
@@ -9347,20 +9553,37 @@ def _tensorize_direct_sequence(
                 config,
                 config.resolved.categorical_input_by_name[qualified],
             )
+            dracarys_raw = _uses_dracarys_feature_xor(config)
             if isinstance(categorical_input.encoding, ResolvedIdentityEncoding):
-                values = _identity_array_tensor(flat, categorical_input)
+                values = _identity_array_tensor(
+                    flat,
+                    categorical_input,
+                    missing_id_override=(
+                        _dracarys_missing_raw_id(config)
+                        if dracarys_raw
+                        else None
+                    ),
+                )
             elif isinstance(categorical_input.encoding, ResolvedPreHashedEncoding):
                 values = _pre_hashed_array_tensor(
                     flat,
                     categorical_input,
                     validate_nonzero=validate_prehashed_nonzero,
+                    preserve_raw_int64=dracarys_raw,
+                    missing_raw_id=_dracarys_missing_raw_id(config),
                 )
             else:  # Guarded by _direct_sequence_supported.
                 raise TypeError("unsupported direct categorical sequence encoding")
-            padding_value: int | float = categorical_input.encoding.padding_id
+            padding_value: int | float = tensor_padding_id(categorical_input.encoding)
         else:
-            values = _direct_dense_values(flat, field.dimension, field.name)
-            padding_value = 0.0
+            integer = sequence.is_timestamp_field(field.name)
+            values = _direct_dense_values(
+                flat,
+                field.dimension,
+                field.name,
+                integer=integer,
+            )
+            padding_value = 0 if integer else 0.0
         tensor_fields[field.name] = _gather_padded_sequence(
             values,
             starts,
@@ -9490,18 +9713,32 @@ def _tensorize_multi_field_sequence(
                 else torch.zeros(len(rows), 0, dtype=torch.long)
             )
         elif field.kind == "dense":
-            encoded_dense = [
-                [_dense_vector(item, field.dimension) for item in row] for row in rows
-            ]
-            zero = [0.0] * field.dimension
-            padded_dense = [
-                row + [zero] * (max_length - len(row)) for row in encoded_dense
-            ]
-            tensor_fields[field.name] = (
-                torch.tensor(padded_dense, dtype=torch.float32)
-                if max_length > 0
-                else torch.zeros(len(rows), 0, field.dimension, dtype=torch.float32)
-            )
+            if sequence.is_timestamp_field(field.name) and field.dimension == 1:
+                encoded = [
+                    [0 if item is None else int(item) for item in row] for row in rows
+                ]
+                padded = [row + [0] * (max_length - len(row)) for row in encoded]
+                tensor_fields[field.name] = (
+                    torch.tensor(padded, dtype=torch.long)
+                    if max_length > 0
+                    else torch.zeros(len(rows), 0, dtype=torch.long)
+                )
+            else:
+                encoded_dense = [
+                    [_dense_vector(item, field.dimension) for item in row]
+                    for row in rows
+                ]
+                zero_vec = [0.0] * field.dimension
+                padded_dense = [
+                    row + [zero_vec] * (max_length - len(row)) for row in encoded_dense
+                ]
+                tensor_fields[field.name] = (
+                    torch.tensor(padded_dense, dtype=torch.float32)
+                    if max_length > 0
+                    else torch.zeros(
+                        len(rows), 0, field.dimension, dtype=torch.float32
+                    )
+                )
         else:
             raise ValueError(f"unsupported sequence field kind {field.kind!r}")
     return {
@@ -10083,6 +10320,8 @@ def _tensorize_python_categorical_values(
 
     categorical_input = _effective_categorical_input(config, categorical_input)
     encoding = categorical_input.encoding
+    dracarys_raw = _uses_dracarys_feature_xor(config)
+    dracarys_missing = _dracarys_missing_raw_id(config)
 
     def int64_values() -> tuple[np.ndarray, np.ndarray]:
         if isinstance(values, np.ndarray):
@@ -10160,28 +10399,32 @@ def _tensorize_python_categorical_values(
             normalized = np.where(
                 valid,
                 normalized,
-                int(encoding.padding_id),
+                tensor_padding_id(encoding),
             )
         elif nulls.any():
             normalized = normalized.copy()
         if nulls.any():
-            normalized[nulls] = int(encoding.padding_id)
+            normalized[nulls] = (
+                dracarys_missing
+                if dracarys_raw
+                else tensor_padding_id(encoding)
+            )
         return torch.from_numpy(normalized)
 
     if isinstance(encoding, ResolvedPreHashedEncoding):
         normalized, nulls = int64_values()
-        if (
-            validate_prehashed_nonzero
-            and normalized.size
-            and bool(np.any((normalized == 0) & ~nulls))
-        ):
-            raise ValueError(
-                f"pre_hashed input {categorical_input.name!r} contains "
-                "non-null zero values"
-            )
-        encoded_values = np.bitwise_and(normalized, encoding.num_buckets - 1) + 1
+        encoded_values = (
+            normalized
+            if dracarys_raw
+            else np.bitwise_and(normalized, encoding.num_buckets - 1)
+        )
         if nulls.any():
-            encoded_values[nulls] = int(encoding.padding_id)
+            encoded_values = np.array(encoded_values, copy=True, dtype=np.int64)
+            encoded_values[nulls] = (
+                dracarys_missing
+                if dracarys_raw
+                else tensor_padding_id(encoding)
+            )
         return torch.from_numpy(encoded_values)
 
     unseen_policy = config.vocab_strategy.defaults.unseen_policy
@@ -10329,8 +10572,8 @@ def _tensorize_python_categorical_bag(
 ) -> dict[str, Tensor]:
     """Encode list-valued Python rows as flat values plus row lengths."""
 
-    if feature.pooling != "mean":
-        raise TypeError("_tensorize_python_categorical_bag requires pooling=mean")
+    if not feature.is_bag:
+        raise TypeError("_tensorize_python_categorical_bag requires bag pooling")
     if type(values).__name__ == "SequenceColumnBatch":
         flat, lengths_arr = _gather_bag_from_sequence_column_batch(
             values,
@@ -10350,16 +10593,11 @@ def _tensorize_python_categorical_bag(
             and flat.dtype.kind in "iu"
         ):
             normalized = flat.astype(np.int64, copy=False)
-            if (
-                validate_prehashed_nonzero
-                and normalized.size
-                and bool(np.any(normalized == 0))
-            ):
-                raise ValueError(
-                    f"pre_hashed input {categorical_input.name!r} contains "
-                    "non-null zero values"
-                )
-            encoded = np.bitwise_and(normalized, int(encoding.num_buckets) - 1) + 1
+            encoded = (
+                normalized
+                if _uses_dracarys_feature_xor(config)
+                else np.bitwise_and(normalized, int(encoding.num_buckets) - 1)
+            )
             if not encoded.flags.c_contiguous:
                 encoded = np.ascontiguousarray(encoded)
             return {
@@ -10681,9 +10919,10 @@ def _tensorize_axis_sequence(
                 shared_abs_hi,
                 max_length=max_length,
                 num_buckets=int(encoding.num_buckets),
-                padding_id=int(encoding.padding_id),
+                padding_id=tensor_padding_id(encoding),
                 validate_nonzero=validate_prehashed_nonzero,
                 feature_name=categorical_input.name,
+                preserve_raw_int64=_uses_dracarys_feature_xor(config),
                 window_lengths=shared_window_lengths,
                 pad_mask=shared_np_pad_mask,
                 unique_list=shared_unique_list,
@@ -10746,9 +10985,10 @@ def _tensorize_axis_sequence(
                         shared_abs_hi,
                         max_length=max_length,
                         num_buckets=int(encoding.num_buckets),
-                        padding_id=int(encoding.padding_id),
+                        padding_id=tensor_padding_id(encoding),
                         validate_nonzero=validate_prehashed_nonzero,
                         feature_name=categorical_input.name,
+                        preserve_raw_int64=_uses_dracarys_feature_xor(config),
                         window_lengths=shared_window_lengths,
                         pad_mask=shared_np_pad_mask,
                         unique_list=shared_unique_list,
@@ -10759,7 +10999,7 @@ def _tensorize_axis_sequence(
                     continue
                 if isinstance(encoding, ResolvedIdentityEncoding):
                     n_rows = int(shared_abs_lo.shape[0])
-                    padding_id = int(encoding.padding_id)
+                    padding_id = tensor_padding_id(encoding)
                     num_buckets = int(encoding.num_buckets)
                     window_lengths = (
                         shared_window_lengths
@@ -10846,6 +11086,7 @@ def _tensorize_axis_sequence(
                     window_lengths=shared_window_lengths,
                     pad_mask=shared_np_pad_mask,
                     gather_plan=shared_gather_plan,
+                    integer=sequence.is_timestamp_field(field.name),
                 )
                 if use_direct_shapes and int(field.dimension) == 1:
                     tensor_fields[field.name] = flat
@@ -11095,13 +11336,15 @@ def _tensorize_axis_sequence(
                 config,
                 categorical_input,
             )
-            padding_value: int | float = int(
-                getattr(effective_input.encoding, "padding_id", 0)
-            )
+            padding_value: int | float = tensor_padding_id(effective_input.encoding)
         else:
             if field.dimension == 1:
+                integer = sequence.is_timestamp_field(field.name)
                 if isinstance(selected, np.ndarray) and selected.dtype.kind in "fiu":
-                    scalar_np = selected.astype(np.float32, copy=False)
+                    scalar_np = selected.astype(
+                        np.int64 if integer else np.float32,
+                        copy=False,
+                    )
                     if use_direct_shapes:
                         flat_values = torch.from_numpy(np.ascontiguousarray(scalar_np))
                     else:
@@ -11109,20 +11352,28 @@ def _tensorize_axis_sequence(
                             np.ascontiguousarray(scalar_np).reshape(-1, 1)
                         )
                 else:
-                    scalar_values = [
-                        0.0 if value is None else float(value) for value in selected
-                    ]
+                    if integer:
+                        scalar_values = [
+                            0 if value is None else int(value) for value in selected
+                        ]
+                        tensor_dtype = torch.int64
+                    else:
+                        scalar_values = [
+                            0.0 if value is None else float(value)
+                            for value in selected
+                        ]
+                        tensor_dtype = torch.float32
                     flat_values = torch.tensor(
                         (
                             scalar_values
                             if use_direct_shapes
                             else [[value] for value in scalar_values]
                         ),
-                        dtype=torch.float32,
+                        dtype=tensor_dtype,
                     )
                     if not scalar_values and not use_direct_shapes:
-                        flat_values = torch.empty((0, 1), dtype=torch.float32)
-                padding_value = 0.0
+                        flat_values = torch.empty((0, 1), dtype=tensor_dtype)
+                padding_value = 0 if integer else 0.0
             else:
                 dense_rows = [
                     _dense_vector(value, field.dimension) for value in selected
@@ -11256,7 +11507,7 @@ def axis_batch_to_feature_batch(
         )
         values = source_values[feature.source]
         if feature.kind == "categorical":
-            if feature.pooling == "mean":
+            if feature.is_bag:
                 column_groups = None
                 if type(values).__name__ == "SequenceColumnBatch":
                     column_index = values.column_index
@@ -11486,7 +11737,7 @@ def table_to_feature_batch(
                     vocab_maps,
                     validate_prehashed_nonzero=validate_prehashed_nonzero,
                 )
-                if feature.pooling == "mean"
+                if feature.is_bag
                 else _tensorize_categorical(
                     config,
                     feature,
@@ -11587,8 +11838,12 @@ def _coalesce_feature_batch(
     batch: FeatureBatch,
     *,
     pin_memory: bool,
+    shared_memory: bool = False,
 ) -> FeatureBatch:
     """Copy every tensor leaf into one contiguous base buffer per dtype."""
+
+    if pin_memory and shared_memory:
+        raise ValueError("coalesced buffers cannot be both pinned and shared")
 
     leaves: list[Tensor] = []
     seen_leaves: set[int] = set()
@@ -11617,7 +11872,33 @@ def _coalesce_feature_batch(
     buffers: list[Tensor] = []
     for dtype, tensors in by_dtype.items():
         total = sum(tensor.numel() for tensor in tensors)
-        buffer = torch.empty(total, dtype=dtype, pin_memory=pin_memory)
+        if shared_memory:
+            # Allocate the final IPC storage directly.  ``empty(...).share_memory_()``
+            # first allocates a private tensor and then copies its entire
+            # (uninitialized) storage into shm; for wide production batches that
+            # redundant move costs more than tensorization itself.
+            element_size = int(torch.empty((), dtype=dtype).element_size())
+            if total:
+                new_shared = getattr(torch.UntypedStorage, "_new_shared", None)
+                if callable(new_shared):
+                    storage = new_shared(total * element_size, device="cpu")
+                    buffer = torch.empty(0, dtype=dtype).set_(
+                        storage,
+                        0,
+                        (total,),
+                        (1,),
+                    )
+                else:
+                    # Older PyTorch builds do not expose the direct allocator.
+                    # Preserve correctness with the public API; this retains the
+                    # old extra copy only on those compatibility builds.
+                    buffer = torch.empty(total, dtype=dtype).share_memory_()
+            else:
+                # Empty shared storages are allocator/version dependent and
+                # carry no copy cost, so use the public compatibility path.
+                buffer = torch.empty(0, dtype=dtype).share_memory_()
+        else:
+            buffer = torch.empty(total, dtype=dtype, pin_memory=pin_memory)
         buffers.append(buffer)
         buf_np = buffer.numpy()
         offset = 0
@@ -12685,6 +12966,127 @@ def iter_shuffled_request_groups(
     yield from _shuffle_blocks(buffered, generator)
 
 
+def iter_grouped_agg_row_blocks(
+    blocks: Iterator[RequestGroupBlock],
+) -> Iterator[tuple[RequestGroupBlock, ...]]:
+    """Group consecutive request blocks that share one physical agg row.
+
+    Direct-agg adapters emit every request of a parquet row before the next
+    row, so ``(source_id, raw_row_index)`` runs are complete agg rows. The
+    packer shuffles these groups atomically and never splits them.
+    """
+
+    current_key: tuple[int, int] | None = None
+    current: list[RequestGroupBlock] = []
+    for block in blocks:
+        key = (int(block.source_id), int(block.raw_row_index))
+        if current_key is None or key == current_key:
+            current_key = key
+            current.append(block)
+            continue
+        yield tuple(current)
+        current_key = key
+        current = [block]
+    if current:
+        yield tuple(current)
+
+
+def _agg_group_candidate_count(group: tuple[RequestGroupBlock, ...]) -> int:
+    return sum(int(block.candidate_count) for block in group)
+
+
+def _agg_group_effective_length(
+    group: tuple[RequestGroupBlock, ...],
+    *,
+    metric: str,
+) -> int:
+    if not group:
+        return 0
+    lengths = [int(block.effective_bucket_length) for block in group]
+    if metric == "sum":
+        return int(sum(lengths))
+    return int(max(lengths))
+
+
+def _shuffle_agg_groups(
+    groups: list[tuple[RequestGroupBlock, ...]],
+    generator: torch.Generator,
+) -> list[tuple[RequestGroupBlock, ...]]:
+    if len(groups) <= 1:
+        return groups
+    permutation = torch.randperm(len(groups), generator=generator).tolist()
+    return [groups[index] for index in permutation]
+
+
+def iter_shuffled_agg_row_groups(
+    groups: Iterator[tuple[RequestGroupBlock, ...]],
+    *,
+    shuffle_buffer_rows: int,
+    shuffle_seed: int,
+    shard_rank: int = 0,
+) -> Iterator[tuple[RequestGroupBlock, ...]]:
+    """Shuffle complete agg rows; the buffer is still measured in candidates."""
+
+    if shuffle_buffer_rows < 0:
+        raise ValueError("shuffle_buffer_rows must be non-negative")
+    if shuffle_buffer_rows == 0:
+        yield from groups
+        return
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(shuffle_seed) + int(shard_rank))
+    buffered: list[tuple[RequestGroupBlock, ...]] = []
+    buffered_rows = 0
+    for group in groups:
+        group_rows = _agg_group_candidate_count(group)
+        if group_rows > shuffle_buffer_rows:
+            yield from _shuffle_agg_groups(buffered, generator)
+            buffered = []
+            buffered_rows = 0
+            yield group
+            continue
+        while buffered and buffered_rows + group_rows > shuffle_buffer_rows:
+            selected_index = int(
+                torch.randint(len(buffered), (), generator=generator).item()
+            )
+            selected = buffered[selected_index]
+            buffered[selected_index] = buffered[-1]
+            buffered.pop()
+            buffered_rows -= _agg_group_candidate_count(selected)
+            yield selected
+        buffered.append(group)
+        buffered_rows += group_rows
+    yield from _shuffle_agg_groups(buffered, generator)
+
+
+def iter_packed_agg_row_groups(
+    groups: Iterator[tuple[RequestGroupBlock, ...]],
+    *,
+    batch_size: int,
+) -> Iterator[tuple[RequestGroupBlock, ...]]:
+    """Pack ``batch_size`` complete agg rows and flatten to request blocks."""
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    buffered: list[RequestGroupBlock] = []
+    buffered_groups = 0
+    for group in groups:
+        if not group:
+            continue
+        if buffered_groups and buffered_groups + 1 > batch_size:
+            yield tuple(buffered)
+            buffered = []
+            buffered_groups = 0
+        buffered.extend(group)
+        buffered_groups += 1
+        if buffered_groups == batch_size:
+            yield tuple(buffered)
+            buffered = []
+            buffered_groups = 0
+    if buffered:
+        yield tuple(buffered)
+
+
 def iter_packed_request_groups(
     blocks: Iterator[RequestGroupBlock],
     *,
@@ -12746,12 +13148,68 @@ def iter_length_bucketed_packs(
     shuffle_buffer_rows: int = 0,
     shuffle_seed: int = 0,
     shard_rank: int = 0,
+    pack_unit: str = "candidates",
+    length_bucket_metric: str = "max",
 ) -> Iterator[tuple[RequestGroupBlock, ...]]:
     """Shuffle then pack by sequence-length bucket (request groups preserved).
 
     ``buckets`` entries expose ``max_length`` / ``batch_size`` like
     ``LengthBucketConfig``. Empty ``buckets`` packs with ``default_batch_size``.
+    ``pack_unit='agg_rows'`` counts complete physical agg rows and never
+    slices a row across packs. ``length_bucket_metric`` only combines the
+    per-request lengths already stored on each block.
     """
+
+    if pack_unit not in {"candidates", "agg_rows"}:
+        raise ValueError("pack_unit must be candidates or agg_rows")
+
+    if pack_unit == "agg_rows":
+        grouped = iter_grouped_agg_row_blocks(blocks)
+        shuffled_groups = iter_shuffled_agg_row_groups(
+            grouped,
+            shuffle_buffer_rows=shuffle_buffer_rows,
+            shuffle_seed=shuffle_seed,
+            shard_rank=shard_rank,
+        )
+        if not buckets:
+            yield from iter_packed_agg_row_groups(
+                shuffled_groups,
+                batch_size=default_batch_size,
+            )
+            return
+
+        finite_boundaries = [
+            int(bucket.max_length)
+            for bucket in buckets
+            if bucket.max_length is not None
+        ]
+        buffered: list[list[RequestGroupBlock]] = [[] for _ in buckets]
+        buffered_groups = [0] * len(buckets)
+        for group in shuffled_groups:
+            if not group:
+                continue
+            bucket_index = length_bucket_index(
+                _agg_group_effective_length(group, metric=length_bucket_metric),
+                finite_boundaries,
+            )
+            capacity = int(buckets[bucket_index].batch_size)
+            if (
+                buffered_groups[bucket_index]
+                and buffered_groups[bucket_index] + 1 > capacity
+            ):
+                yield tuple(buffered[bucket_index])
+                buffered[bucket_index] = []
+                buffered_groups[bucket_index] = 0
+            buffered[bucket_index].extend(group)
+            buffered_groups[bucket_index] += 1
+            if buffered_groups[bucket_index] == capacity:
+                yield tuple(buffered[bucket_index])
+                buffered[bucket_index] = []
+                buffered_groups[bucket_index] = 0
+        for bucket_index in range(len(buckets)):
+            if buffered_groups[bucket_index]:
+                yield tuple(buffered[bucket_index])
+        return
 
     shuffled = iter_shuffled_request_groups(
         blocks,
@@ -12873,6 +13331,8 @@ def compact_list_column_from_rows(rows: Sequence[Any]) -> CompactListColumn:
     saw_none = False
     numeric_nd = True
     sample_dtype: Any = None
+    numeric_rows: list[Any] = []
+    same_numeric_dtype = True
     for index, row in enumerate(rows):
         if row is None:
             length = 0
@@ -12894,6 +13354,12 @@ def compact_list_column_from_rows(rows: Sequence[Any]) -> CompactListColumn:
                 elif sample_dtype is None:
                     sample_dtype = row.dtype
                     sample = row.item(0) if length else sample
+                    numeric_rows.append(row)
+                else:
+                    same_numeric_dtype = (
+                        same_numeric_dtype and row.dtype == sample_dtype
+                    )
+                    numeric_rows.append(row)
         else:
             numeric_nd = False
             length = len(row)
@@ -12915,6 +13381,15 @@ def compact_list_column_from_rows(rows: Sequence[Any]) -> CompactListColumn:
         )
 
     if numeric_nd and sample_dtype is not None and sample_dtype != object:
+        if same_numeric_dtype:
+            # Sequence gathers produce hundreds of same-dtype NumPy fragments.
+            # ``concatenate`` performs the copy in NumPy instead of entering
+            # Python once per request row.  Mixed dtypes retain the assignment
+            # path below so its historical casting semantics stay unchanged.
+            return CompactListColumn(
+                values=np.concatenate(numeric_rows),
+                offsets=offsets,
+            )
         values = np.empty(total, dtype=sample_dtype)
         cursor = 0
         for row in rows:
@@ -13172,28 +13647,46 @@ def request_group_blocks_from_axis_bundle(
     for candidate_index, slot in enumerate(bundle.candidate_to_request):
         positions_by_slot[int(slot)].append(int(candidate_index))
 
+    # Sequence lengths are columnar. Compute each whole request axis once
+    # instead of calling ``row_length`` inside request × sequence Python loops.
+    # The resulting per-request values and bucketing contract are identical.
+    sequence_lengths: list[tuple[str, np.ndarray]] = []
+    for sequence in sequences:
+        if not sequence.fields:
+            continue
+        source = sequence.fields[0].source
+        if source not in bundle.sequence_features:
+            raise ValueError(f"sequence source {source!r} missing from axis bundle")
+        seq_column = bundle.sequence_features[source]
+        offsets = getattr(seq_column, "offsets", None)
+        if offsets is not None:
+            lengths = np.diff(np.asarray(offsets, dtype=np.int64))
+        else:
+            lengths = np.fromiter(
+                (len(seq_column[slot]) for slot in range(bundle.n_requests)),
+                dtype=np.int64,
+                count=bundle.n_requests,
+            )
+        if int(lengths.shape[0]) != int(bundle.n_requests):
+            raise ValueError(
+                f"sequence source {source!r} has {int(lengths.shape[0])} "
+                f"request lengths, expected {bundle.n_requests}"
+            )
+        tensor_max_length = _sequence_tensor_max_length(sequence)
+        if tensor_max_length is not None:
+            lengths = np.minimum(lengths, int(tensor_max_length))
+        sequence_lengths.append((sequence.name, lengths))
+
     blocks: list[RequestGroupBlock] = []
     for stable_group_order, positions in enumerate(positions_by_slot):
         if not positions:
             raise ValueError(
                 f"request slot {stable_group_order} has no candidates in axis bundle"
             )
-        pre_compaction: dict[str, int] = {}
-        for sequence in sequences:
-            if not sequence.fields:
-                continue
-            source = sequence.fields[0].source
-            if source not in bundle.sequence_features:
-                raise ValueError(f"sequence source {source!r} missing from axis bundle")
-            seq_column = bundle.sequence_features[source]
-            if isinstance(seq_column, CompactListColumn):
-                length = seq_column.row_length(stable_group_order)
-            else:
-                length = len(seq_column[stable_group_order])
-            tensor_max_length = _sequence_tensor_max_length(sequence)
-            if tensor_max_length is not None:
-                length = min(length, int(tensor_max_length))
-            pre_compaction[sequence.name] = int(length)
+        pre_compaction = {
+            name: int(lengths[stable_group_order])
+            for name, lengths in sequence_lengths
+        }
         blocks.append(
             RequestGroupBlock(
                 source_id=source_id,

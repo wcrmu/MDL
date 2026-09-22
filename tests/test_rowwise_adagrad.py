@@ -216,6 +216,7 @@ class PlannerAndConfigTest(unittest.TestCase):
         config = load_app_config(root / "configs" / "mdl_rankmixer.yaml")
         self.assertEqual(config.training.sparse_optimizer, "rowwise_adagrad")
         self.assertEqual(config.training.embedding_distribution, "sharded")
+        self.assertTrue(config.training.gset.enabled)
         self.assertEqual(config.runtime.attention_backend, "flash")
         self.assertEqual(config.runtime.nproc_per_node, 2)
 
@@ -228,6 +229,7 @@ class PlannerAndConfigTest(unittest.TestCase):
 
         bad_dist = replace(
             config.training,
+            gset=replace(config.training.gset, enabled=False, capacity=0),
             embedding_distribution="replicated",
         )
         with self.assertRaisesRegex(ValueError, "embedding_distribution=sharded"):

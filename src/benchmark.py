@@ -343,8 +343,8 @@ def _analytical_dense_flops_per_step(
         configured_max = getattr(model, "global_sequence_max_length", None)
         max_seq = float(configured_max) if configured_max else 2048.0
         seq_len = min(avg_seq, max_seq)
-        # Sequence FFN runs on request-level histories (≤C). Use C as a
-        # conservative stand-in for unique requests to avoid undercount.
+        # Sequence FFN and UI user-side Query Mixer / attention are request-level
+        # (≤C). Use C as a conservative stand-in for unique requests.
         forward = layers * (
             12.0 * candidates * feature_tokens * head_dim * h
             + 6.0 * candidates * seq_len * (feature_tokens * head_dim) * h
@@ -921,7 +921,7 @@ def _categorical_size(config: AppConfig, name: str) -> int:
     if encoding.encoding == "hash":
         return encoding.num_buckets + 1
     if encoding.encoding == "pre_hashed":
-        return encoding.num_buckets + 1
+        return encoding.num_buckets
     if encoding.encoding == "identity":
         return encoding.num_buckets
     return 2
@@ -936,7 +936,7 @@ def _synthetic_ids(
     if num_embeddings <= 1:
         return torch.zeros(size, dtype=torch.long, device=device)
     return torch.randint(
-        1,
+        0,
         num_embeddings,
         size,
         dtype=torch.long,
@@ -971,7 +971,7 @@ def _synthetic_feature_batch(
         request_level = candidates_per_request > 1 and feature.source in context_sources
         rows = request_rows if request_level else batch_size
         if feature.kind == "categorical":
-            if feature.pooling == "mean":
+            if feature.is_bag:
                 bag_length = min(feature.max_length or 4, 8)
                 flat_ids = _synthetic_ids(
                     (rows * bag_length,),
@@ -1235,7 +1235,7 @@ def _make_embedding_ids(
         generator = torch.Generator(device=device.type)
         generator.manual_seed(seed)
         return torch.randint(
-            1,
+            0,
             module.num_embeddings,
             (count,),
             dtype=torch.long,
@@ -1246,7 +1246,7 @@ def _make_embedding_ids(
         import numpy as np
 
         values = np.random.default_rng(seed).zipf(exponent, size=count)
-        values = 1 + ((values - 1) % (module.num_embeddings - 1))
+        values = (values - 1) % module.num_embeddings
         return torch.as_tensor(values, dtype=torch.long, device=device)
     except ImportError as error:
         raise RuntimeError("zipf embedding benchmark requires NumPy") from error

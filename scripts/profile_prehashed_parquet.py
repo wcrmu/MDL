@@ -36,7 +36,9 @@ MASK64 = (1 << 64) - 1
 # have to be repeated merely to diagnose that a strict collision target is
 # incompatible with the available embedding-memory budget.
 DEFAULT_BUCKETS = tuple(1 << exponent for exponent in range(10, 37))
-# Must match scripts/build_production_configs.CONTEXT_FEATURE_COUNT (47/100 split).
+# Must match the physical sample fixture / parquet profiler split (47 request
+# fields, remaining item fields). Production models consume the v3 43/82
+# contract after ``materialize_v3_sample``.
 DEFAULT_CONTEXT_FEATURE_COUNT = 47
 DEFAULT_SKU_FIELDS = (
     "sku_id_hn",

@@ -15,16 +15,22 @@ from scripts.build_production_configs import (
     CANDIDATE_ITEM_SCALAR_FIELDS,
     CONTEXT_FEATURE_COUNT,
     CONTEXT_SCALAR_FIELDS,
+    CORE_ITEM_FIELDS,
+    CORE_USER_GLOBAL_FIELDS,
     EXPECTED_FEATURE_COUNT,
     EXPECTED_LABELS,
     EXPECTED_UPS_TYPES,
     ITEM_BAG_FIELDS,
+    LONGER_TARGET_GLOBAL_FIELDS,
     MULTIVALUE_MAX_LENGTHS,
     OBSERVED_MULTIVALUE_MAX_LENGTHS,
+    ONETRANS_NS_TOKENS,
     ONETRANS_SEQUENCE_LENGTH_CAPS,
     PACK_MULTIVALUE_MAX_LENGTHS,
     PHASE2_TASK_PRIOR_SEQUENCES,
     PRODUCTION_COARSE_CONFIG_NAMES,
+    PRODUCTION_GSET,
+    PRODUCTION_GSET_CAPACITY,
     RANKMIXER_SEMANTIC_FEATURE_GROUPS,
     REQUEST_CONTEXT_BAG_FIELDS,
     REQUEST_CONTEXT_SCALAR_FIELDS,
@@ -35,11 +41,15 @@ from scripts.build_production_configs import (
     TASK_IMPORTANT_FIELDS,
     TASK_IMPORTANT_FIELDS_BY_TASK,
     TASK_IMPORTANT_IDENTITY_SHAPES,
+    V3_CONTEXT_FEATURES,
+    V3_ITEM_FEATURES,
+    V3_SEQUENCE_LENGTHS,
     apply_embedding_profile,
     build_config,
     build_name_estimate_report,
     derive_fine_payload,
     fine_config_name,
+    materialize_v3_sample,
     _cap_multivalue_observed_max,
     _find_sequence_field,
     _resolve_share_root,
@@ -51,7 +61,12 @@ from scripts.build_production_configs import (
     write_fine_siblings,
 )
 from scripts.profile_prehashed_parquet import profile_spec_from_mapping
-from src.config import AppConfig, ResolvedPreHashedEncoding, load_app_config
+from src.config import (
+    AppConfig,
+    REQUEST_SCENE_FEATURE_NAMES,
+    ResolvedPreHashedEncoding,
+    load_app_config,
+)
 from src.dataloader import (
     COARSE_SCENE_INDEX_COLUMN,
     COARSE_SCENE_PRIOR_ID_COLUMN,
@@ -77,10 +92,17 @@ def _compact_production_config(model_name: str):
 
     config = load_app_config(ROOT / "configs" / f"{model_name}.yaml")
     config = resolve_auto_scenarios(config, [9, 17])
+    onetrans = model_name in {"onetrans", "mdl_onetrans"}
+    compact_global_limit = config.model.global_sequence_max_length
     sequences = tuple(
         replace(
             sequence,
             max_length=2,
+            _transport_max_length=(
+                compact_global_limit
+                if sequence._transport_max_length is not None
+                else None
+            ),
             longer_query_tokens=(
                 min(sequence.longer_query_tokens, 2)
                 if sequence.encoder == "longer"
@@ -96,13 +118,11 @@ def _compact_production_config(model_name: str):
         limits = {
             name: 2 for name in split.adapter.options.get("sequence_max_lengths", {})
         }
-        adapter = replace(
-            split.adapter,
-            options={**split.adapter.options, "sequence_max_lengths": limits},
-        )
+        options = {**split.adapter.options, "sequence_max_lengths": limits}
+        if compact_global_limit is not None:
+            options["global_sequence_max_length"] = compact_global_limit
+        adapter = replace(split.adapter, options=options)
         return replace(split, adapter=adapter)
-
-    onetrans = model_name in {"onetrans", "mdl_onetrans"}
     config = replace(
         config,
         data=replace(
@@ -121,6 +141,9 @@ def _compact_production_config(model_name: str):
             pyramid_round_to=1,
             final_s_tokens=2 if onetrans else config.model.final_s_tokens,
             max_position_embeddings=(64 if onetrans else None),
+            global_sequence_max_length=(
+                config.model.global_sequence_max_length
+            ),
             first_domain_sequence_layer=(1 if model_name == "mdl_onetrans" else None),
         ),
         runtime=replace(
@@ -132,14 +155,22 @@ def _compact_production_config(model_name: str):
             attention_backend="auto",
             distributed="none",
             nproc_per_node=None,
+            cuda_graph_backbone=False,
         ),
         training=replace(
             config.training,
             batch_size=2,
             embedding_distribution="replicated",
             embedding_weight_dtype="fp32",
-            # Toy CPU forwards use replicated tables; Row-Wise is sharded-only.
-            sparse_optimizer="adagrad",
+            sparse_optimizer=(
+                "rowwise_adagrad" if config.training.gset.enabled else "adagrad"
+            ),
+            gset=replace(
+                config.training.gset,
+                capacity=4096,
+            )
+            if config.training.gset.enabled
+            else config.training.gset,
         ),
     )
     config.validate()
@@ -147,7 +178,7 @@ def _compact_production_config(model_name: str):
 
 
 def _compact_generated_stca_config(config: AppConfig) -> AppConfig:
-    """Shrink generated nine-stream STCA wiring without changing its topology."""
+    """Shrink generated seven-stream STCA wiring without changing its topology."""
 
     sequences = tuple(
         replace(
@@ -206,13 +237,19 @@ def _compact_generated_stca_config(config: AppConfig) -> AppConfig:
             attention_backend="auto",
             distributed="none",
             nproc_per_node=None,
+            cuda_graph_backbone=False,
         ),
         training=replace(
             config.training,
             batch_size=2,
             embedding_distribution="replicated",
             embedding_weight_dtype="fp32",
-            sparse_optimizer="adagrad",
+            sparse_optimizer=(
+                "rowwise_adagrad" if config.training.gset.enabled else "adagrad"
+            ),
+            gset=replace(config.training.gset, capacity=4096)
+            if config.training.gset.enabled
+            else config.training.gset,
         ),
     )
     compact.validate()
@@ -231,7 +268,7 @@ def _synthetic_model_features(config, batch_size: int = 2) -> dict[str, object]:
         if feature.kind == "dense":
             result[feature.name] = torch.randn(batch_size, feature.dimension)
             continue
-        if feature.pooling == "mean":
+        if feature.is_bag:
             values = torch.randint(1, 15, (batch_size, 2))
             values[lengths == 1, 1] = 0
             result[feature.name] = {
@@ -264,7 +301,11 @@ def _synthetic_model_features(config, batch_size: int = 2) -> dict[str, object]:
 
 
 def _synthetic_report(sample: dict) -> dict:
-    spec = profile_spec_from_mapping(sample)
+    sample = materialize_v3_sample(sample)
+    spec = profile_spec_from_mapping(
+        sample,
+        context_feature_count=CONTEXT_FEATURE_COUNT,
+    )
     fields = {}
     for source in spec.all_sources:
         fields[source] = {
@@ -372,17 +413,17 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
 
         self.assertEqual(
             [item["name"] for item in payload["features"][:EXPECTED_FEATURE_COUNT]],
-            [item["name"] for item in self.sample["features"]],
+            list(V3_CONTEXT_FEATURES + V3_ITEM_FEATURES),
         )
         by_name = {item["name"]: item for item in payload["features"]}
-        self.assertEqual(by_name["goods_name_bigram_hn"]["pooling"], "mean")
+        self.assertEqual(by_name["goods_name_bigram_hn"]["pooling"], "sum")
         self.assertEqual(
             by_name["sku_id_hn"]["pooling_null_policy"],
             "include_as_padding",
         )
-        self.assertEqual(by_name["sku_spec_vids_hn"]["pooling"], "mean")
+        self.assertEqual(by_name["sku_spec_vids_hn"]["pooling"], "sum")
         self.assertEqual(by_name["sku_spec_vids_hn"]["max_length"], 256)
-        self.assertEqual(summary["bag_feature_count"], 80)
+        self.assertEqual(summary["bag_feature_count"], 67)
         self.assertEqual(
             set(MULTIVALUE_MAX_LENGTHS),
             set(OBSERVED_MULTIVALUE_MAX_LENGTHS),
@@ -394,7 +435,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             )
         )
         self.assertLessEqual(max(MULTIVALUE_MAX_LENGTHS.values()), 512)
-        self.assertEqual(sum(PACK_MULTIVALUE_MAX_LENGTHS.values()), 9114)
+        self.assertEqual(sum(PACK_MULTIVALUE_MAX_LENGTHS.values()), 7770)
         self.assertEqual(
             OBSERVED_MULTIVALUE_MAX_LENGTHS["cart_long_spec_vids_hn"],
             10005,
@@ -408,33 +449,38 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             [128, 128, 128, 256, 256, 512],
         )
 
-        main_sequences = payload["sequences"][:9]
+        main_sequences = payload["sequences"][: len(EXPECTED_UPS_TYPES)]
         self.assertEqual(
             [item["name"] for item in main_sequences],
-            [item["name"] for item in self.sample["sequences"]],
+            list(EXPECTED_UPS_TYPES),
         )
         for sequence in main_sequences:
             self.assertEqual(sequence["encoder"], "longer")
-            self.assertEqual(sequence["longer_output"], "summary")
-            self.assertEqual(sequence["longer_token_merge"], 1)
-            # Default build_config model is mdl_rankmixer: LONGER keeps scene
-            # user-global (scene_id_hn) like standalone RankMixer.
-            self.assertEqual(sequence["rankmixer_summary_tokens"], 3)
+            self.assertEqual(sequence["longer_output"], "full")
+            self.assertEqual(sequence["longer_history_group"], "main_history")
+            self.assertEqual(sequence["longer_token_merge"], 8)
+            self.assertEqual(sequence["longer_inner_layers"], 1)
+            self.assertEqual(sequence["longer_query_tokens"], 100)
+            # One request/query-intent token + CLS + two candidate anchors.
+            self.assertEqual(sequence["rankmixer_summary_tokens"], 4)
             self.assertEqual(sequence["longer_dim"], 32)
             self.assertEqual(sequence["longer_num_heads"], 4)
-            self.assertEqual(sequence["longer_hidden_dim"], 64)
+            self.assertEqual(sequence["longer_hidden_dim"], 128)
             self.assertEqual(
                 sequence["target_inputs"],
-                ["goods_id_hn", "cat1_id_hn", "price_hn"],
+                list(LONGER_TARGET_GLOBAL_FIELDS),
             )
             self.assertEqual(
                 sequence["longer_user_global_inputs"],
-                ["scene_id_hn"],
+                list(CORE_USER_GLOBAL_FIELDS),
             )
             self.assertEqual(sequence["longer_user_global_tokens"], 1)
             self.assertEqual(sequence["longer_cls_tokens"], 1)
-            self.assertEqual(sequence["longer_candidate_global_tokens"], 1)
-            self.assertEqual(sequence["max_length"], 10)
+            self.assertEqual(sequence["longer_candidate_global_tokens"], 2)
+            self.assertEqual(
+                sequence["max_length"],
+                V3_SEQUENCE_LENGTHS[sequence["name"]],
+            )
             self.assertEqual(sequence["sequence_order"], "newest_to_oldest")
             self.assertEqual(sequence["truncation"], "head")
             self.assertEqual(
@@ -474,10 +520,9 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         )
         self.assertEqual(task_priors["task_fst_cart_prior"]["pool_dim"], 32)
         self.assertEqual(
-            TASK_IMPORTANT_FIELDS_BY_TASK["fst_cart"][-4:],
+            TASK_IMPORTANT_FIELDS_BY_TASK["fst_cart"][-3:],
             (
                 "cat_id_hn",
-                "goods_cluster_id_1w_hn",
                 "mall_id_hn",
                 "goods_id_hn",
             ),
@@ -485,13 +530,12 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         # Pay keeps taxonomy identity but drops the two sparsest tables; the
         # order/GMV anchors replace them.
         self.assertEqual(
-            TASK_IMPORTANT_FIELDS_BY_TASK["upid_pay"][-5:],
+            TASK_IMPORTANT_FIELDS_BY_TASK["upid_pay"][-4:],
             (
                 "idx_c_ordr_cnt_15d_hn",
                 "nfk_gmv_14d_hn",
                 "u_fst_ordr_cnt_mix_d_hn",
                 "cat_id_hn",
-                "goods_cluster_id_1w_hn",
             ),
         )
         self.assertNotIn("goods_id_hn", TASK_IMPORTANT_FIELDS_BY_TASK["upid_pay"])
@@ -527,7 +571,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         query_identity = by_name[
             task_important_name("cateid_filter", "origin_query_hash_hn")
         ]
-        self.assertEqual(query_identity["pooling"], "mean")
+        self.assertEqual(query_identity["pooling"], "sum")
         self.assertEqual(query_identity["max_length"], 46)
         self.assertTrue(
             any(
@@ -566,11 +610,11 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             "src.dataloader:adapt_mdl_rankmixer_parquet",
         )
         adapter_payload = payload["data"]["train"]["adapter"]
-        self.assertEqual(len(adapter_payload["input_columns"]), 259)
-        self.assertEqual(len(adapter_payload["optional_input_columns"]), 12)
+        self.assertEqual(len(adapter_payload["input_columns"]), 228)
+        self.assertEqual(len(adapter_payload["optional_input_columns"]), 11)
         self.assertEqual(
             len(payload["data"]["test"]["adapter"]["optional_input_columns"]),
-            13,
+            12,
         )
         self.assertIn("impr_x_time", adapter_payload["input_columns"])
         self.assertNotIn("impr_x_indices", adapter_payload["input_columns"])
@@ -621,15 +665,14 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             "offline_outside_goods_id_list_hn_share",
             "buy_long_spec_vids_hn",
             "impr_3h_tg_hn",
-            "query_pay_cnt_15d_hn",
+            "hash_language_hn",
             "opt_id_hn",
         ):
             self.assertIn(name, adapter_options["context_features"])
             self.assertNotIn(name, adapter_options["item_features"])
         for name in (
             "clk_cnt_1d_hn",
-            "clk_3d_cnt_hn",
-            "clk_1d_cat_cnt_hn",
+            "clk_8d_cnt_hn",
             "cart_cnt_1d_hn",
             "cart_cnt_3d_hn",
         ):
@@ -644,7 +687,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             "cart_long_hit_samestyle_i2i_idx_hn",
         ):
             self.assertIn(name, adapter_options["multivalue_features"])
-            self.assertEqual(by_name[name]["pooling"], "mean")
+            self.assertEqual(by_name[name]["pooling"], "sum")
         self.assertEqual(
             by_name["cart_long_hit_samestyle_i2i_idx_hn"]["max_length"],
             16,
@@ -658,25 +701,25 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             {
                 feature["source"]: feature["max_length"]
                 for feature in payload["features"][:EXPECTED_FEATURE_COUNT]
-                if feature.get("pooling") == "mean"
+                if feature.get("pooling") in {"mean", "sum"}
             },
             PACK_MULTIVALUE_MAX_LENGTHS,
         )
         for name in (
             "multimodal_i2i_hit_clk_size_hn",
             "multimodal_i2i_hit_cart_size_hn",
-            "query_pay_cnt_15d_hn",
+            "hash_language_hn",
             "opt_id_hn",
         ):
             self.assertNotIn(name, adapter_options["multivalue_features"])
             self.assertNotIn("pooling", by_name[name])
         aligned_sku = adapter_options["aligned_multivalue_groups"][0]
-        self.assertEqual(len(aligned_sku), 8)
+        self.assertEqual(len(aligned_sku), 5)
         self.assertNotIn("sku_spec_hn", aligned_sku)
         self.assertIn("sku_id_hn", aligned_sku)
-        self.assertIn("sku_spec_hash_hn", aligned_sku)
+        self.assertIn("sku_price_dis_hn", aligned_sku)
         self.assertIn("sku_spec_hn", adapter_options["multivalue_features"])
-        self.assertEqual(by_name["sku_spec_hn"]["pooling"], "mean")
+        self.assertEqual(by_name["sku_spec_hn"]["pooling"], "sum")
         self.assertEqual(
             by_name["sku_spec_hn"]["pooling_null_policy"], "include_as_padding"
         )
@@ -716,6 +759,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         self.assertEqual(payload["runtime"]["attention_backend"], "flash")
         self.assertEqual(payload["runtime"]["activation_checkpoint"], "none")
         self.assertEqual(payload["training"]["embedding_distribution"], "sharded")
+        self.assertEqual(payload["training"]["gset"], PRODUCTION_GSET)
         self.assertEqual(payload["training"]["embedding_weight_dtype"], "bf16")
         self.assertEqual(payload["training"]["lr_dense"], 1.0e-4)
         self.assertEqual(payload["training"]["lr_sparse"], 1.0e-4)
@@ -966,16 +1010,40 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
 
         rankmixer = payloads["rankmixer"]
         self.assertEqual(len(rankmixer["features"]), EXPECTED_FEATURE_COUNT)
-        self.assertEqual(len(rankmixer["sequences"]), 9)
+        self.assertEqual(len(rankmixer["sequences"]), 8)
+        self.assertFalse(rankmixer["tokenization"]["omit_scene_features"])
+        self.assertEqual(len(rankmixer["tokenization"]["feature_tokens"]), 32)
+        self.assertEqual(rankmixer["model"]["token_dim"], 768)
+        rankmixer_scene_group = next(
+            token
+            for token in rankmixer["tokenization"]["feature_tokens"]
+            if token["name"] == "request_page_scene"
+        )
+        self.assertTrue(
+            REQUEST_SCENE_FEATURE_NAMES.issubset(rankmixer_scene_group["inputs"])
+        )
         self.assertTrue(
             all(sequence["encoder"] == "longer" for sequence in rankmixer["sequences"])
         )
         self.assertNotIn("scenario_tokens", rankmixer["tokenization"])
         self.assertNotIn("task_tokens", rankmixer["tokenization"])
-
+        self.assertEqual(rankmixer["model"]["sequence_fusion"], "timestamp_aware")
+        self.assertEqual(rankmixer["model"]["global_sequence_max_length"], 8000)
+        self.assertEqual(
+            rankmixer["data"]["train"]["adapter"]["options"][
+                "global_sequence_max_length"
+            ],
+            8000,
+        )
         onetrans = payloads["onetrans"]
         self.assertEqual(len(onetrans["features"]), EXPECTED_FEATURE_COUNT)
-        self.assertEqual(len(onetrans["sequences"]), 9)
+        self.assertEqual(len(onetrans["sequences"]), 8)
+        self.assertFalse(onetrans["tokenization"]["omit_scene_features"])
+        self.assertTrue(
+            REQUEST_SCENE_FEATURE_NAMES.issubset(
+                onetrans["tokenization"]["feature_token_inputs"]
+            )
+        )
         self.assertTrue(
             all(sequence["encoder"] == "raw" for sequence in onetrans["sequences"])
         )
@@ -986,14 +1054,66 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             [token["name"] for token in onetrans["tokenization"]["sequence_tokens"]],
             list(EXPECTED_UPS_TYPES),
         )
-        self.assertEqual(onetrans["model"]["sequence_fusion"], "intent_ordered")
+        self.assertEqual(onetrans["model"]["sequence_fusion"], "timestamp_aware")
+        self.assertFalse(onetrans["model"]["use_sep_tokens"])
+        self.assertNotIn("global_sequence_max_length", onetrans["model"])
         self.assertEqual(onetrans["model"]["num_ns_tokens"], 32)
+        self.assertEqual(onetrans["model"]["final_s_tokens"], 32)
+        self.assertEqual(
+            onetrans["model"]["max_position_embeddings"],
+            sum(ONETRANS_SEQUENCE_LENGTH_CAPS.values()) + ONETRANS_NS_TOKENS,
+        )
+        self.assertNotIn(
+            "global_sequence_max_length",
+            onetrans["data"]["train"]["adapter"]["options"],
+        )
+        self.assertNotIn(
+            "time_delta_outputs",
+            onetrans["data"]["train"]["adapter"]["options"],
+        )
+        for sequence in onetrans["sequences"]:
+            self.assertEqual(sequence["timestamp_field"], "time")
+            self.assertNotIn("time_delta_field", sequence)
+            self.assertEqual(sequence["fields"][0]["name"], "time")
+            self.assertEqual(
+                sequence["fields"][0]["source"],
+                f"{sequence['name']}_x_time",
+            )
 
         mdl_onetrans = payloads["mdl_onetrans"]
-        self.assertEqual(len(mdl_onetrans["features"]), 185)
-        self.assertEqual(len(mdl_onetrans["sequences"]), 17)
+        self.assertEqual(len(mdl_onetrans["features"]), 162)
+        self.assertEqual(len(mdl_onetrans["sequences"]), 16)
+        self.assertFalse(mdl_onetrans["tokenization"]["omit_scene_features"])
+        self.assertTrue(
+            REQUEST_SCENE_FEATURE_NAMES.issubset(
+                mdl_onetrans["tokenization"]["feature_token_inputs"]
+            )
+        )
         self.assertTrue(mdl_onetrans["model"]["experimental_model_acknowledged"])
         self.assertEqual(mdl_onetrans["model"]["first_domain_sequence_layer"], 0)
+        self.assertEqual(mdl_onetrans["model"]["sequence_fusion"], "timestamp_aware")
+        self.assertFalse(mdl_onetrans["model"]["use_sep_tokens"])
+        self.assertNotIn("global_sequence_max_length", mdl_onetrans["model"])
+        self.assertEqual(mdl_onetrans["model"]["final_s_tokens"], 32)
+        self.assertEqual(
+            mdl_onetrans["model"]["max_position_embeddings"],
+            sum(ONETRANS_SEQUENCE_LENGTH_CAPS.values()) + ONETRANS_NS_TOKENS,
+        )
+        self.assertNotIn(
+            "global_sequence_max_length",
+            mdl_onetrans["data"]["train"]["adapter"]["options"],
+        )
+        for sequence in mdl_onetrans["sequences"][:8]:
+            self.assertEqual(sequence["timestamp_field"], "time")
+            self.assertNotIn("time_delta_field", sequence)
+            self.assertEqual(sequence["fields"][0]["name"], "time")
+        for sequence in mdl_onetrans["sequences"][8:]:
+            self.assertEqual(sequence.get("time_delta_field"), "time_delta_log1p_seconds")
+            self.assertNotIn("timestamp_field", sequence)
+        self.assertIn(
+            "time_delta_outputs",
+            mdl_onetrans["data"]["train"]["adapter"]["options"],
+        )
         prior_names = {
             SCENARIO_CONDITIONED_HISTORY_PRIOR,
             "scenario_global_impr_prior",
@@ -1003,7 +1123,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             "task_upid_pay_ups_clk_sku_prior",
         }
         self.assertEqual(
-            {sequence["name"] for sequence in mdl_onetrans["sequences"][9:]},
+            {sequence["name"] for sequence in mdl_onetrans["sequences"][8:]},
             prior_names,
         )
         self.assertEqual(
@@ -1021,29 +1141,39 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         self.assertEqual(
             task_priors,
             {
-                "fst_cart": ("task_fst_cart_prior",),
-                # Pay carries a second, denser stream: buy_long is an empty
-                # list on ~24% of requests.
-                "upid_pay": (
-                    "task_upid_pay_prior",
-                    "task_upid_pay_ups_clk_sku_prior",
-                ),
-                "cateid_filter": ("task_cateid_filter_prior",),
+                "fst_cart": tuple(task_prior_inputs("fst_cart")),
+                "upid_pay": tuple(task_prior_inputs("upid_pay")),
+                "cateid_filter": tuple(task_prior_inputs("cateid_filter")),
             },
         )
         for token in mdl_onetrans["tokenization"]["scenario_tokens"]:
             name = token["name"]
             priors = token["prior_inputs"]
+            scene_stat_priors = [
+                f"scenario_prior_{source}"
+                for source in SCENARIO_IMPRESSION_PRIOR_FIELDS
+            ]
+            self.assertIn(
+                "scenario_important_scene_id_hn",
+                token["important_inputs"],
+            )
             if name == "global":
                 self.assertEqual(
                     priors,
                     [
-                        f"scenario_global_{ups}_prior"
-                        for ups in SCENARIO_SHARED_PRIOR_UPS
+                        *scene_stat_priors,
+                        *[
+                            f"scenario_global_{ups}_prior"
+                            for ups in SCENARIO_SHARED_PRIOR_UPS
+                        ],
                     ],
                 )
             else:
                 self.assertTrue(priors[0].endswith("_prior_coarse_scene") or priors[0].startswith("scenario_"))
+                self.assertEqual(
+                    priors[1:],
+                    [*scene_stat_priors, SCENARIO_CONDITIONED_HISTORY_PRIOR],
+                )
                 self.assertTrue(
                     any(p.endswith("_clk_long_prior") for p in priors),
                     msg=priors,
@@ -1084,7 +1214,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(sum(ONETRANS_SEQUENCE_LENGTH_CAPS.values()), 2048)
+        self.assertEqual(sum(ONETRANS_SEQUENCE_LENGTH_CAPS.values()), 41100)
 
     def test_builds_stca_rankmixer_variants_without_changing_task_priors(
         self,
@@ -1121,7 +1251,10 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 regular_width = sum(
                     config.resolved.encoded_input_dims[name] for name in regular_inputs
                 )
-                self.assertEqual(regular_width % 31, 0)
+                token_count = config.resolved.tokenization.feature_token_count
+                regular_slots = token_count - 1
+                self.assertGreater(regular_slots, 0)
+                self.assertEqual(regular_width % regular_slots, 0)
                 self.assertEqual(
                     config.resolved.encoded_input_dims[main_sequences[0]["name"]],
                     256,
@@ -1132,7 +1265,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 for sequence in main_sequences:
                     self.assertEqual(
                         sequence["target_inputs"],
-                        ["goods_id_hn", "cat1_id_hn", "price_hn"],
+                        list(CORE_ITEM_FIELDS),
                     )
                     self.assertEqual(sequence["rankmixer_summary_tokens"], 1)
                     self.assertEqual(sequence["stca_dim"], 256)
@@ -1342,61 +1475,70 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
 
     def test_request_indexed_inputs_match_repeated_candidate_inputs(self) -> None:
         torch.manual_seed(53)
-        candidate_to_request = torch.tensor([0, 0, 1, 1], dtype=torch.long)
 
-        def expand(value):
-            if isinstance(value, torch.Tensor):
-                return value.index_select(0, candidate_to_request)
-            if isinstance(value, dict):
-                return {name: expand(child) for name, child in value.items()}
-            return value
+        def assert_mapping(
+            model_name: str,
+            candidate_to_request: torch.Tensor,
+        ) -> None:
+            def expand(value):
+                if isinstance(value, torch.Tensor):
+                    return value.index_select(0, candidate_to_request)
+                if isinstance(value, dict):
+                    return {name: expand(child) for name, child in value.items()}
+                return value
 
+            config = _compact_production_config(model_name)
+            request_features = _synthetic_model_features(config, batch_size=2)
+            expanded = {name: expand(value) for name, value in request_features.items()}
+            context_sources = set(config.data.train.adapter.options["context_features"])
+            indexed = dict(expanded)
+            for feature in config.features:
+                if feature.source not in context_sources:
+                    continue
+                value = request_features[feature.name]
+                indexed[feature.name] = (
+                    {**value, "row_indices": candidate_to_request}
+                    if isinstance(value, dict)
+                    else {
+                        "values": value,
+                        "row_indices": candidate_to_request,
+                    }
+                )
+            for sequence in config.sequences:
+                indexed[sequence.name] = {
+                    **request_features[sequence.name],
+                    "row_indices": candidate_to_request,
+                }
+
+            model = build_model(config, {}, embedding_size_override=16).eval()
+            scenario_id = candidate_to_request.clone()
+            with torch.no_grad():
+                expected = model(expanded, scenario_id)["logits"]
+                actual = model(indexed, scenario_id)["logits"]
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+        expanded_mapping = torch.tensor([0, 0, 1, 1], dtype=torch.long)
         for model_name in (
             "rankmixer",
             "mdl_rankmixer",
             "onetrans",
             "mdl_onetrans",
         ):
-            with self.subTest(model=model_name):
-                config = _compact_production_config(model_name)
-                request_features = _synthetic_model_features(config, batch_size=2)
-                expanded = {
-                    name: expand(value) for name, value in request_features.items()
-                }
-                context_sources = set(
-                    config.data.train.adapter.options["context_features"]
-                )
-                indexed = dict(expanded)
-                for feature in config.features:
-                    if feature.source not in context_sources:
-                        continue
-                    value = request_features[feature.name]
-                    indexed[feature.name] = (
-                        {**value, "row_indices": candidate_to_request}
-                        if isinstance(value, dict)
-                        else {
-                            "values": value,
-                            "row_indices": candidate_to_request,
-                        }
-                    )
-                for sequence in config.sequences:
-                    indexed[sequence.name] = {
-                        **request_features[sequence.name],
-                        "row_indices": candidate_to_request,
-                    }
+            with self.subTest(model=model_name, mapping="expanded"):
+                assert_mapping(model_name, expanded_mapping)
 
-                model = build_model(config, {}, embedding_size_override=16).eval()
-                scenario_id = torch.tensor([0, 0, 1, 1], dtype=torch.long)
-                with torch.no_grad():
-                    expected = model(expanded, scenario_id)["logits"]
-                    actual = model(indexed, scenario_id)["logits"]
-                torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        # Equal request/candidate counts are not enough to infer that histories
+        # are already candidate-aligned; duplicated row indices must still gather.
+        equal_count_mapping = torch.tensor([0, 0], dtype=torch.long)
+        for model_name in ("rankmixer", "mdl_rankmixer"):
+            with self.subTest(model=model_name, mapping="equal_count_duplicate"):
+                assert_mapping(model_name, equal_count_mapping)
 
     def test_production_profiles_use_expected_runtime(self) -> None:
         expected_runtime = {
             # checkpoint, graph, packing and fused-dense reflect the latest
             # measured HBM/util winners for each family.
-            "rankmixer": ("flash", False, 2, "none", True, "fixed", True),
+            "rankmixer": ("flash", False, 2, "none", False, "fixed", True),
             "onetrans": ("flash", False, 2, "none", False, "fixed", True),
             "mdl_onetrans": (
                 "flash",
@@ -1412,7 +1554,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 False,
                 2,
                 "none",
-                True,
+                False,
                 "compact",
                 True,
             ),
@@ -1450,6 +1592,11 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertFalse(config.runtime.validate_scenario_ids)
                 self.assertEqual(config.training.embedding_weight_dtype, "bf16")
                 self.assertEqual(config.training.sparse_optimizer, "rowwise_adagrad")
+                self.assertTrue(config.training.gset.enabled)
+                self.assertEqual(config.training.gset.capacity, PRODUCTION_GSET_CAPACITY)
+                self.assertEqual(config.training.gset.key_mode, "namespace")
+                self.assertEqual(config.training.gset.compress_dim, 16)
+                self.assertEqual(config.training.embedding_distribution, "sharded")
                 self.assertEqual(
                     config.training.checkpoint_path,
                     f"artifacts/checkpoints/{model_name}_2xh100_phase2_shared_dim",
@@ -1558,12 +1705,15 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 for name, limit in adapter_limits.items():
                     self.assertGreaterEqual(limit, main_sequences[name])
                 self.assertTrue(config.data.train.reader.coalesce_pinned_tensors)
-                self.assertEqual(config.data.train.reader.num_workers, 2)
-                self.assertEqual(config.data.train.reader.adapter_workers, 4)
+                self.assertEqual(config.data.train.reader.num_workers, 4)
+                self.assertEqual(config.data.train.reader.adapter_workers, 6)
+                self.assertEqual(config.data.train.reader.prefetch_batches, 4)
+                self.assertEqual(config.data.train.reader.host_prepare_prefetch, 6)
+                self.assertTrue(config.data.train.reader.overlap_host_prepare)
                 self.assertEqual(config.data.train.reader.scanner_batch_rows, 128)
                 self.assertEqual(
                     config.data.train.reader.device_prefetch_batches,
-                    0 if model_name == "mdl_onetrans" else 1,
+                    {"onetrans": 2, "mdl_onetrans": 0}.get(model_name, 1),
                 )
                 self.assertEqual(config.data.train.reader.length_bucket_metric, "sum")
                 self.assertEqual(
@@ -1576,7 +1726,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     config.resolved.categorical_embedding_dims["goods_id_hn"],
-                    32,
+                    config.training.gset.compress_dim,
                 )
                 if model_name in {"mdl_rankmixer", "mdl_onetrans"}:
                     prior_goods = config.resolved.categorical_input_by_name[
@@ -1592,7 +1742,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         config.resolved.categorical_embedding_dims[
                             "task_upid_pay_prior.goods_id_hn"
                         ],
-                        32,
+                        config.training.gset.compress_dim,
                     )
                     physical = sum(
                         1
@@ -1602,13 +1752,11 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     # Phase-2 keeps task/scenario-history priors independent;
                     # this now includes four candidate/query identity tables
                     # and one important table per task rather than per source.
-                    self.assertEqual(physical, 306)
+                    self.assertEqual(physical, 281)
                     if model_name == "mdl_onetrans":
-                        self.assertEqual(len(config.sequences), 17)
+                        self.assertEqual(len(config.sequences), 16)
                         # Every prior a task token reads must exist as a loaded
-                        # sequence, which is more than one per task: pay carries
-                        # a supplemental stream for the requests where buy_long
-                        # is empty.
+                        # sequence.
                         self.assertEqual(
                             {
                                 sequence.name
@@ -1639,6 +1787,8 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 embedding_distribution="sharded",
                 embedding_weight_dtype="bf16",
                 embedding_collect_stats=False,
+                sparse_optimizer="rowwise_adagrad",
+                gset=replace(config.training.gset, enabled=False, capacity=0),
             ),
         )
         config.validate()
@@ -1693,19 +1843,17 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
 
     def test_embedding_profiles_share_shapes_and_hit_memory_targets(self) -> None:
         report = build_name_estimate_report(self.sample)
+        # GSET collapses every hash table onto one physical pool, then shards
+        # rows with id % world_size. Hash-bucket profiles still change YAML
+        # encodings, not GPU tables.
+        gset_rows = PRODUCTION_GSET_CAPACITY + 1
+        gset_gib = (gset_rows * 16 * 2 + gset_rows * 4) / (1024**3)
         expected = {
-            # Growth-aware PROFILE_DRIVEN_EMBEDDING_SHAPES win after every Phase-2
-            # tier, so shared/query/aggressive bucket profiles collapse to the same
-            # planned memory once those overrides apply.
-            # Counts include independent global scenario priors, the per-task
-            # important tables, and the pay coverage prior; dead near-constants
-            # are removed. Small-table collision floors nudge planned GiB slightly
-            # above the pre-floor 66.257 baseline.
-            "baseline": (305, 66.268),
-            "shared": (304, 66.268),
-            "shared_dim": (304, 66.268),
-            "shared_dim_query_bucket": (304, 66.268),
-            "shared_dim_aggressive_bucket": (304, 66.268),
+            "baseline": (1, gset_gib),
+            "shared": (1, gset_gib),
+            "shared_dim": (1, gset_gib),
+            "shared_dim_query_bucket": (1, gset_gib),
+            "shared_dim_aggressive_bucket": (1, gset_gib),
         }
         for profile, (tables, gib) in expected.items():
             with self.subTest(profile=profile):
@@ -1802,7 +1950,6 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                             self.assertNotIn("share_with", field["encoding"])
                     for alias, root in (
                         ("buy_long.spec_hn", "cart_long.spec_hn"),
-                        ("ups_clk_sku.spec_hn", "cart_long.spec_hn"),
                         ("buy_long.sku_ids_hn", "cart_long.sku_ids_hn"),
                     ):
                         field = _find_sequence_field(payload, alias)
@@ -1909,7 +2056,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 production_bags = {
                     feature.source: feature.max_length
                     for feature in config.features[:EXPECTED_FEATURE_COUNT]
-                    if feature.pooling == "mean"
+                    if feature.is_bag
                 }
                 self.assertEqual(
                     set(production_bags),
@@ -1940,7 +2087,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                             len(SEARCH_SCENE_IDS),
                         )
                         for name in (
-                            "query_pay_cnt_15d_hn",
+                            "hash_language_hn",
                             "opt_id_hn",
                             "buy_long_spec_vids_hn",
                             "offline_outside_goods_id_list_hn_share",
@@ -2027,7 +2174,8 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         self.assertEqual(len(plan.item_features), EXPECTED_FEATURE_COUNT - CONTEXT_FEATURE_COUNT)
 
     def test_production_rankmixer_yamls_use_paper_longer_targets(self) -> None:
-        expected_targets = ("goods_id_hn", "cat1_id_hn", "price_hn")
+        expected_targets = LONGER_TARGET_GLOBAL_FIELDS
+        expected_user_globals = CORE_USER_GLOBAL_FIELDS
         for config_name in (
             "rankmixer.yaml",
             "mdl_rankmixer.yaml",
@@ -2044,23 +2192,31 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                 self.assertTrue(longer)
                 for sequence in longer:
                     self.assertEqual(sequence.target_inputs, expected_targets)
-                    # RankMixer and MDL-RankMixer both keep scene_id on LONGER
-                    # user-global; MDL still also routes scene via scenario tokens.
                     self.assertEqual(
                         sequence.longer_user_global_inputs,
-                        ("scene_id_hn",),
+                        expected_user_globals,
                     )
                     self.assertEqual(sequence.longer_user_global_tokens, 1)
-                    self.assertEqual(sequence.rankmixer_summary_tokens, 3)
+                    self.assertEqual(sequence.rankmixer_summary_tokens, 4)
                     self.assertEqual(sequence.longer_cls_tokens, 1)
-                    self.assertEqual(sequence.longer_candidate_global_tokens, 1)
+                    self.assertEqual(sequence.longer_candidate_global_tokens, 2)
+                    self.assertEqual(sequence.longer_history_group, "main_history")
+                    self.assertEqual(sequence.longer_query_tokens, 100)
+                    self.assertEqual(sequence.longer_token_merge, 8)
+                    self.assertEqual(sequence.longer_output, "full")
                     self.assertEqual(sequence.longer_dim, 32)
                     self.assertEqual(sequence.longer_num_heads, 4)
-                    self.assertEqual(sequence.longer_hidden_dim, 64)
+                    self.assertEqual(sequence.longer_hidden_dim, 128)
                     self.assertEqual(
                         config.resolved.encoded_input_dims[sequence.name],
-                        96,
+                        768,
                     )
+                self.assertEqual(len(longer), 8)
+                self.assertEqual(
+                    config.resolved.tokenization.feature_token_count,
+                    32,
+                )
+                self.assertEqual(config.model.token_dim, 768)
 
     def test_production_mdl_yamls_flatten_spec_sku_aliases(self) -> None:
         for config_name in ("mdl_rankmixer.yaml", "mdl_onetrans.yaml"):
@@ -2095,11 +2251,6 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                             getattr(field.encoding, "share_with", None),
                             msg=f"{sequence_name}.{field.name}",
                         )
-                ups = next(
-                    item for item in config.sequences if item.name == "ups_clk_sku"
-                )
-                ups_spec = next(item for item in ups.fields if item.name == "spec_hn")
-                self.assertEqual(ups_spec.encoding.share_with, "cart_long.spec_hn")
 
     def test_mdl_models_share_identical_prior_contract(self) -> None:
         report = build_name_estimate_report(self.sample)
@@ -2236,7 +2387,10 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         )
         current = yaml.safe_load(yaml.safe_dump(generated, sort_keys=False))
         current["runtime"]["master_port"] = 29999
+        current["runtime"]["cuda_graph_backbone"] = True
         current["training"]["batch_size"] = 777
+        current["training"]["embedding_distribution"] = "replicated"
+        current["training"]["gset"] = {"enabled": False, "capacity": 0}
         current["data"]["train"]["inputs"] = ["/production/train"]
         current["data"]["train"]["reader"]["num_workers"] = 7
         current["model"]["mdl_feature_interaction"] = "direct_ffn"
@@ -2272,6 +2426,9 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             "residual_ffn",
         )
         self.assertEqual(merged["model"]["mdl_token_state"], "coupled")
+        self.assertEqual(merged["training"]["gset"], PRODUCTION_GSET)
+        self.assertEqual(merged["training"]["embedding_distribution"], "sharded")
+        self.assertFalse(merged["runtime"]["cuda_graph_backbone"])
 
     def test_production_fine_yamls_match_derived_siblings(self) -> None:
         for coarse_name in PRODUCTION_COARSE_CONFIG_NAMES:

@@ -1052,7 +1052,7 @@ class STCAModelIntegrationTest(unittest.TestCase):
                     candidate_count,
                     feature.dimension,
                 )
-            elif feature.pooling == "mean":
+            elif feature.is_bag:
                 result[feature.name] = {
                     "values": torch.randint(1, 15, (candidate_count, 2)),
                     "lengths": torch.full(

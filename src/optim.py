@@ -9,8 +9,11 @@ import copy
 import torch
 from torch import Tensor, nn
 
+from .modules.gset import gset_owner_for_parameter
+
 
 _ROWWISE_ADAGRAD_KERNEL = None
+_DIRTY_ROW_KERNEL = None
 
 
 def _rowwise_adagrad_kernel():
@@ -40,6 +43,8 @@ def _rowwise_adagrad_kernel():
         eps,
         stride_param,
         stride_vals,
+        dirty_words_ptr,
+        TRACK_DIRTY: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         """One program per touched row: update accumulator and embedding row."""
@@ -48,6 +53,10 @@ def _rowwise_adagrad_kernel():
         if pid >= n_touched:
             return
         row = tl.load(rows_ptr + pid)
+        if TRACK_DIRTY:
+            word = row // 32
+            bit = (1 << (row % 32)).to(tl.int32)
+            tl.atomic_or(dirty_words_ptr + word, bit)
         offs = tl.arange(0, BLOCK)
         mask = offs < dim
         vals = tl.load(vals_ptr + pid * stride_vals + offs, mask=mask, other=0.0).to(
@@ -73,6 +82,7 @@ def fused_rowwise_adagrad_update(
     *,
     lr: float,
     eps: float,
+    dirty_words: torch.Tensor | None = None,
 ) -> None:
     """Fused row-wise Adagrad update for one embedding table (Triton).
 
@@ -104,8 +114,146 @@ def fused_rowwise_adagrad_update(
         float(eps),
         parameter.stride(0),
         vals.stride(0),
+        accumulator if dirty_words is None else dirty_words,
+        TRACK_DIRTY=dirty_words is not None,
         BLOCK=block,
     )
+
+
+def _dirty_row_kernel():
+    """Lazily compile the packed dirty-bit marker used by plain Adagrad."""
+
+    global _DIRTY_ROW_KERNEL
+    if _DIRTY_ROW_KERNEL is not None:
+        return _DIRTY_ROW_KERNEL
+
+    import triton
+    import triton.language as tl
+
+    globals()["tl"] = tl
+
+    @triton.jit
+    def _mark_dirty_rows_kernel(words_ptr, rows_ptr, count, BLOCK: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < count
+        rows = tl.load(rows_ptr + offsets, mask=mask, other=0)
+        words = rows // 32
+        bits = (1 << (rows % 32)).to(tl.int32)
+        tl.atomic_or(words_ptr + words, bits, mask=mask)
+
+    _DIRTY_ROW_KERNEL = _mark_dirty_rows_kernel
+    return _DIRTY_ROW_KERNEL
+
+
+class DirtyRowTracker:
+    """Packed per-parameter dirty rows owned by this optimizer rank.
+
+    CUDA tensors use one bit per local embedding row.  CPU tensors use a bool
+    mask because that path is primarily tests/small models and avoiding a
+    platform-specific atomic bit operation keeps it simple.  Rows are marked
+    where the owner-routed sparse gradient is consumed; no cross-rank ID gather
+    is necessary.
+    """
+
+    def __init__(self, parameters: Iterable[nn.Parameter], *, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self._masks: dict[nn.Parameter, Tensor] = {}
+        if not self.enabled:
+            return
+        for parameter in parameters:
+            rows = int(parameter.shape[0])
+            if parameter.is_cuda:
+                mask = torch.zeros(
+                    ((rows + 31) // 32,),
+                    dtype=torch.int32,
+                    device=parameter.device,
+                )
+            else:
+                mask = torch.zeros((rows,), dtype=torch.bool, device=parameter.device)
+            self._masks[parameter] = mask
+
+    def packed_mask(self, parameter: nn.Parameter) -> Tensor | None:
+        mask = self._masks.get(parameter)
+        if mask is None or not parameter.is_cuda:
+            return None
+        return mask
+
+    def mark(self, parameter: nn.Parameter, rows: Tensor) -> None:
+        mask = self._masks.get(parameter)
+        if mask is None or rows.numel() == 0:
+            return
+        if parameter.is_cuda:
+            import triton
+
+            values = rows.contiguous()
+            block = 256
+            _dirty_row_kernel()[(triton.cdiv(values.numel(), block),)](
+                mask,
+                values,
+                values.numel(),
+                BLOCK=block,
+            )
+            return
+        mask.index_fill_(0, rows.to(device=mask.device, dtype=torch.long), True)
+
+    def iter_rows(
+        self,
+        parameter: nn.Parameter,
+        *,
+        max_rows: int,
+    ) -> Iterable[Tensor]:
+        """Yield sorted local row IDs in bounded CPU tensors."""
+
+        mask = self._masks.get(parameter)
+        if mask is None:
+            return
+        limit = max(1, int(max_rows))
+        if not parameter.is_cuda:
+            rows = torch.nonzero(mask, as_tuple=False).flatten().to(dtype=torch.int64)
+            for start in range(0, int(rows.numel()), limit):
+                yield rows.narrow(0, start, min(limit, rows.numel() - start)).cpu()
+            return
+
+        # Scan a bounded number of packed words at a time.  Expanding the full
+        # 500M-row mask to a bool tensor would erase the memory benefit of the
+        # bitset exactly when checkpointing starts.
+        bits = torch.arange(32, dtype=torch.int64, device=mask.device)
+        bit_values = torch.bitwise_left_shift(
+            torch.ones(32, dtype=torch.int64, device=mask.device), bits
+        )
+        words_per_scan = max(1, min(131072, (limit + 31) // 32))
+        total_rows = int(parameter.shape[0])
+        pending: Tensor | None = None
+        for word_start in range(0, int(mask.numel()), words_per_scan):
+            words = mask.narrow(
+                0,
+                word_start,
+                min(words_per_scan, mask.numel() - word_start),
+            )
+            nonzero = torch.nonzero(words != 0, as_tuple=False).flatten()
+            if nonzero.numel() == 0:
+                continue
+            values = words.index_select(0, nonzero).to(torch.int64) & 0xFFFFFFFF
+            present = torch.bitwise_and(values[:, None], bit_values[None, :]) != 0
+            expanded = ((nonzero + word_start)[:, None] * 32 + bits[None, :])[
+                present
+            ]
+            expanded = expanded[expanded < total_rows]
+            if pending is not None:
+                expanded = torch.cat((pending, expanded))
+                pending = None
+            offset = 0
+            while int(expanded.numel()) - offset >= limit:
+                yield expanded.narrow(0, offset, limit).cpu()
+                offset += limit
+            if offset < int(expanded.numel()):
+                pending = expanded.narrow(0, offset, expanded.numel() - offset)
+        if pending is not None and pending.numel():
+            yield pending.cpu()
+
+    def clear(self) -> None:
+        for mask in self._masks.values():
+            mask.zero_()
 
 
 class ShardedAdagrad(torch.optim.Optimizer):
@@ -126,6 +274,7 @@ class ShardedAdagrad(torch.optim.Optimizer):
         eps: float = 1.0e-10,
         *,
         state_dtype: torch.dtype = torch.float32,
+        track_dirty_rows: bool = False,
     ) -> None:
         if lr <= 0.0:
             raise ValueError("lr must be positive")
@@ -158,6 +307,26 @@ class ShardedAdagrad(torch.optim.Optimizer):
                     dtype=state_dtype,
                     device=parameter.device,
                 )
+        self._dirty_rows = DirtyRowTracker(
+            (
+                parameter
+                for group in self.param_groups
+                for parameter in group["params"]
+            ),
+            enabled=track_dirty_rows,
+        )
+
+    @property
+    def tracks_dirty_rows(self) -> bool:
+        return self._dirty_rows.enabled
+
+    def iter_dirty_rows(
+        self, parameter: nn.Parameter, *, max_rows: int
+    ) -> Iterable[Tensor]:
+        return self._dirty_rows.iter_rows(parameter, max_rows=max_rows)
+
+    def clear_dirty_rows(self) -> None:
+        self._dirty_rows.clear()
 
     @torch.no_grad()
     def step(
@@ -194,6 +363,7 @@ class ShardedAdagrad(torch.optim.Optimizer):
                 clear_lr = lr / (1.0 + (step - 1.0) * lr_decay)
                 if rows.numel() == 0:
                     continue
+                self._dirty_rows.mark(parameter, rows)
 
                 accumulator: Tensor = state["sum"]
                 state_values = values.to(dtype=accumulator.dtype)
@@ -227,6 +397,7 @@ class ShardedRowWiseAdagrad(torch.optim.Optimizer):
         eps: float = 1.0e-10,
         *,
         state_dtype: torch.dtype = torch.float32,
+        track_dirty_rows: bool = False,
     ) -> None:
         if lr <= 0.0:
             raise ValueError("lr must be positive")
@@ -264,6 +435,26 @@ class ShardedRowWiseAdagrad(torch.optim.Optimizer):
                     dtype=state_dtype,
                     device=parameter.device,
                 )
+        self._dirty_rows = DirtyRowTracker(
+            (
+                parameter
+                for group in self.param_groups
+                for parameter in group["params"]
+            ),
+            enabled=track_dirty_rows,
+        )
+
+    @property
+    def tracks_dirty_rows(self) -> bool:
+        return self._dirty_rows.enabled
+
+    def iter_dirty_rows(
+        self, parameter: nn.Parameter, *, max_rows: int
+    ) -> Iterable[Tensor]:
+        return self._dirty_rows.iter_rows(parameter, max_rows=max_rows)
+
+    def clear_dirty_rows(self) -> None:
+        self._dirty_rows.clear()
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         # Deep-copy first: Optimizer.load_state_dict casts state tensors to the
@@ -306,11 +497,26 @@ class ShardedRowWiseAdagrad(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        gset_owners: dict[int, Any] = {}
         for group in self.param_groups:
             lr = float(group["lr"])
             lr_decay = float(group["lr_decay"])
             eps = float(group["eps"])
             for parameter in group["params"]:
+                owner = gset_owner_for_parameter(parameter)
+                if owner is not None:
+                    gset_owners[id(owner)] = owner
+                    reset_rows = owner.consume_pending_optimizer_reset_rows()
+                    if reset_rows.numel():
+                        accumulator = self.state[parameter]["sum"]
+                        accumulator.index_fill_(
+                            0,
+                            reset_rows.to(
+                                device=accumulator.device,
+                                dtype=torch.long,
+                            ),
+                            float(group["initial_accumulator_value"]),
+                        )
                 grad = parameter.grad
                 if grad is None:
                     continue
@@ -353,8 +559,11 @@ class ShardedRowWiseAdagrad(torch.optim.Optimizer):
                         values,
                         lr=clear_lr,
                         eps=eps,
+                        dirty_words=self._dirty_rows.packed_mask(parameter),
                     )
                     continue
+
+                self._dirty_rows.mark(parameter, rows)
 
                 if values.dtype == torch.float32:
                     state_values = values
@@ -374,4 +583,6 @@ class ShardedRowWiseAdagrad(torch.optim.Optimizer):
                     update,
                     alpha=-clear_lr,
                 )
+        for owner in gset_owners.values():
+            owner.optimizer_step_completed()
         return loss

@@ -170,6 +170,17 @@ class ModelConfigOverlayTest(unittest.TestCase):
         )
         self.assertTrue(production.model.experimental_model_acknowledged)
         self.assertEqual(production.model.first_domain_sequence_layer, 0)
+        self.assertEqual(production.model.sequence_fusion, "timestamp_aware")
+        self.assertFalse(production.model.use_sep_tokens)
+        self.assertIsNone(production.model.global_sequence_max_length)
+        self.assertEqual(production.model.max_position_embeddings, 41132)
+        production_onetrans = load_app_config(root / "configs" / "onetrans.yaml")
+        self.assertEqual(production_onetrans.model.sequence_fusion, "timestamp_aware")
+        self.assertFalse(production_onetrans.model.use_sep_tokens)
+        self.assertIsNone(production_onetrans.model.global_sequence_max_length)
+        self.assertEqual(production_onetrans.model.max_position_embeddings, 41132)
+        self.assertEqual(production_onetrans.sequences[0].timestamp_field, "time")
+        self.assertIsNone(production_onetrans.sequences[0].time_delta_field)
         s_names = {
             name
             for group in production.resolved.tokenization.sequence_token_groups
@@ -196,10 +207,21 @@ class ModelConfigOverlayTest(unittest.TestCase):
                 all(name.startswith("task_") for name in token.prior_inputs)
             )
         for token in production.tokenization.scenario_tokens:
+            self.assertIn(
+                "scenario_important_scene_id_hn",
+                token.important_inputs,
+            )
+            scene_stat_priors = {
+                "scenario_prior_scene_impr_cnt_15d_hn",
+                "scenario_prior_scene_clk_cnt_15d_hit_hn",
+                "scenario_prior_scene_impr_cnt_15d_hit_hn",
+            }
+            self.assertTrue(scene_stat_priors.issubset(token.prior_inputs))
             if token.name == "global":
                 self.assertEqual(
                     set(token.prior_inputs),
                     {
+                        *scene_stat_priors,
                         "scenario_global_impr_prior",
                         "scenario_global_clk_long_prior",
                         "scenario_global_view_long_prior",
@@ -216,6 +238,10 @@ class ModelConfigOverlayTest(unittest.TestCase):
                 )
                 self.assertIn(
                     "scenario_prior_scene_impr_cnt_15d_hit_hn",
+                    token.prior_inputs,
+                )
+                self.assertIn(
+                    "scenario_prior_scene_clk_cnt_15d_hit_hn",
                     token.prior_inputs,
                 )
 

@@ -684,7 +684,10 @@ class SparseDDPTest(unittest.TestCase):
         sparse_sync_ids = {id(ref.parameter) for ref in groups.sparse_sync}
         dense_ids = {id(parameter) for parameter in groups.dense_optimizer}
         self.assertIn(id(model.embedding.weight), embedding_ids)
-        self.assertIn(id(model.position.weight), embedding_ids)
+        # Dense nn.Embedding tables (type/position) produce dense grads, so
+        # they cannot share ShardedRowWiseAdagrad with COO ID tables.
+        self.assertIn(id(model.position.weight), dense_ids)
+        self.assertNotIn(id(model.position.weight), embedding_ids)
         self.assertNotIn(id(model.position.weight), sparse_sync_ids)
         self.assertIn(id(model.output.weight), dense_ids)
 

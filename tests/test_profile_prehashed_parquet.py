@@ -8,7 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 
-from scripts.build_production_configs import CONTEXT_FEATURE_COUNT
+from scripts.build_production_configs import SAMPLE_CONTEXT_FEATURE_COUNT
 from scripts.profile_prehashed_parquet import (
     DEFAULT_CONTEXT_FEATURE_COUNT,
     _bucket_report,
@@ -476,18 +476,18 @@ class PreHashedParquetProfileTest(unittest.TestCase):
         )
 
         self.assertEqual(DEFAULT_CONTEXT_FEATURE_COUNT, 47)
-        self.assertEqual(DEFAULT_CONTEXT_FEATURE_COUNT, CONTEXT_FEATURE_COUNT)
+        self.assertEqual(DEFAULT_CONTEXT_FEATURE_COUNT, SAMPLE_CONTEXT_FEATURE_COUNT)
 
         # --input is required; omit --context-feature-count to exercise the default.
         profile_args = profile_parser().parse_args(["--input", "/tmp/unused"])
         recommend_args = recommend_parser().parse_args(["--input", "/tmp/unused"])
-        self.assertEqual(profile_args.context_feature_count, CONTEXT_FEATURE_COUNT)
-        self.assertEqual(recommend_args.context_feature_count, CONTEXT_FEATURE_COUNT)
+        self.assertEqual(profile_args.context_feature_count, SAMPLE_CONTEXT_FEATURE_COUNT)
+        self.assertEqual(recommend_args.context_feature_count, SAMPLE_CONTEXT_FEATURE_COUNT)
 
         sample = Path("tests/fixtures/mdl_sample.yaml")
         if sample.exists():
             spec = load_profile_spec(sample)
-            self.assertEqual(len(spec.context_sources), CONTEXT_FEATURE_COUNT)
+            self.assertEqual(len(spec.context_sources), SAMPLE_CONTEXT_FEATURE_COUNT)
 
 
 if __name__ == "__main__":
