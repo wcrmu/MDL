@@ -1,0 +1,10 @@
+extends: mixformer_fine.yaml
+training:
+  checkpoint:
+    run_name: more_fine_v2
+runtime:
+  compile: false
+model:
+  name: more
+  num_layers: 2
+  more_num_shared_anchors: 5

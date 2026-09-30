@@ -21,6 +21,8 @@ Mixed-length leftover False is only a padding mask: when Dao
 ``flash_attn_varlen_func`` is importable the valid keys are packed and that
 kernel replaces masked SDPA. The varlen call is ``torch.compiler.disable``'d
 so inductor graph-breaks instead of baking unmasked FLASH for mixed L.
+Attention dispatch itself also stays eager to preserve dynamic masks; dense
+projection, query mixing and output fusion remain eligible for compilation.
 Grouped item attention also packs dummy ``max_targets`` query slots.
 Arbitrary attention patterns are not expressed.
 """
@@ -35,13 +37,12 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .attention import (
-    SDPBackend,
     _call_varlen_attention,
     ensure_contiguous,
     packing_for_masks,
-    sdpa_kernel,
     validate_varlen_inputs,
     varlen_attention_available,
+    _sdpa_context,
 )
 
 
@@ -425,6 +426,7 @@ class MixFormerCrossAttention(nn.Module):
         *,
         sequence_chunk_tokens: int = 0,
         user_head_count: int | None = None,
+        attention_backend: str = "auto",
     ) -> None:
         super().__init__()
         if num_heads <= 0 or dim <= 0 or hidden_dim <= 0:
@@ -439,6 +441,9 @@ class MixFormerCrossAttention(nn.Module):
         self.sequence_dim = num_heads * dim
         self.scale = dim**-0.5
         self.sequence_chunk_tokens = sequence_chunk_tokens
+        if attention_backend not in {"auto", "sdpa", "flash"}:
+            raise ValueError("attention_backend must be auto, sdpa, or flash")
+        self.attention_backend = attention_backend
         self.sequence_norm = MixFormerRMSNorm(self.sequence_dim)
         self.sequence_ffn = DenseSwiGLUFFN(self.sequence_dim, hidden_dim)
         # One independent D x D key/value matrix for every query head.
@@ -549,7 +554,9 @@ class MixFormerCrossAttention(nn.Module):
         if valid_mask.numel() == 0:
             return True
         if torch.compiler.is_compiling():
-            return True
+            # Unknown density must keep the mask. Compaction removes globally
+            # empty columns, not padding in shorter rows.
+            return False
         cached = getattr(valid_mask, "_mixformer_dense", None)
         if isinstance(cached, bool):
             return cached
@@ -557,7 +564,8 @@ class MixFormerCrossAttention(nn.Module):
 
     def _can_varlen_history(self, query: Tensor) -> bool:
         return (
-            varlen_attention_available()
+            self.attention_backend != "sdpa"
+            and varlen_attention_available()
             and query.is_cuda
             and query.dtype in {torch.float16, torch.bfloat16}
         )
@@ -613,7 +621,7 @@ class MixFormerCrossAttention(nn.Module):
             cu_query = query_packing.cumulative_lengths
             max_query_length = int(query.size(1))
         if packed_query.numel() == 0 or packed_key.numel() == 0:
-            return query.new_zeros(query.shape)
+            return query * 0 + history.sum() * 0
         packed_output = _call_varlen_attention(
             packed_query,
             packed_key,
@@ -636,6 +644,7 @@ class MixFormerCrossAttention(nn.Module):
             *([1] * (context.ndim - 1)),
         )
 
+    @torch.compiler.disable
     def _attend_history(
         self,
         query: Tensor,
@@ -653,11 +662,12 @@ class MixFormerCrossAttention(nn.Module):
         squeeze = query.ndim == 3
         if squeeze:
             query = query.unsqueeze(1)
-        if self._can_varlen_history(query) and not torch.compiler.is_compiling():
-            # Compiled MixFormer captures unmasked SDPA FLASH (tokenizer
-            # compact windows). Forcing Dao varlen into that graph graph-breaks
-            # Query Mixer / sequence SwiGLU around packing `.item()` and lost
-            # ~45% forward at 11% leftover pad. Eager mixed-length still packs.
+        can_varlen = self._can_varlen_history(query)
+        if self.attention_backend == "flash" and not can_varlen:
+            raise RuntimeError("MixFormer strict flash requires CUDA FP16/BF16 and flash-attn varlen")
+        if can_varlen:
+            # Dispatch stays eager even inside a compiled dense backbone.
+            # Dynamic padding/occupancy must never be specialized as all-valid.
             dense_keys = self._history_is_dense(valid_mask)
             if not dense_keys or query_mask is not None:
                 context = self._attend_history_varlen(
@@ -677,30 +687,7 @@ class MixFormerCrossAttention(nn.Module):
         if not dense:
             safe_mask, valid_any = self._sdpa_key_mask(valid_mask)
             attn_mask = safe_mask[:, None, None, :]
-        can_flash = (
-            attn_mask is None
-            and query_heads.is_cuda
-            and query_heads.dtype in {torch.float16, torch.bfloat16}
-            and SDPBackend is not None
-            and sdpa_kernel is not None
-        )
-        if can_flash:
-            with sdpa_kernel(
-                [
-                    SDPBackend.FLASH_ATTENTION,
-                    SDPBackend.EFFICIENT_ATTENTION,
-                    SDPBackend.MATH,
-                ]
-            ):
-                context = F.scaled_dot_product_attention(
-                    query_heads,
-                    history_heads,
-                    history_heads,
-                    dropout_p=0.0,
-                    is_causal=False,
-                    scale=self.scale,
-                )
-        else:
+        with _sdpa_context(self.attention_backend):
             context = F.scaled_dot_product_attention(
                 query_heads,
                 history_heads,
@@ -711,6 +698,8 @@ class MixFormerCrossAttention(nn.Module):
                 scale=self.scale,
             )
         context = context.permute(0, 2, 1, 3)
+        if query_mask is not None:
+            context = context * query_mask[:, :, None, None].to(context.dtype)
         if valid_any is not None:
             context = context * valid_any.to(dtype=context.dtype).reshape(
                 valid_any.size(0),
@@ -834,7 +823,7 @@ class MixFormerCrossAttention(nn.Module):
         also slicing the length axis would only add launch overhead.
         """
 
-        if self.sequence_chunk_tokens <= 0 or length <= 0:
+        if self.attention_backend == "flash" or self.sequence_chunk_tokens <= 0 or length <= 0:
             return length
         if self.sequence_chunk_tokens >= 256:
             return length
@@ -1278,7 +1267,7 @@ class MixFormerCrossAttention(nn.Module):
             sequence_row_indices,
         )
         if sequence.size(1) == 0:
-            return query
+            return query + self._empty_sequence_anchor(sequence).to(query.dtype)
         score_query = self._project_query(query)
         if sequence_row_indices is None:
             if request_layout is not None:
@@ -1345,7 +1334,8 @@ class MixFormerCrossAttention(nn.Module):
         if user_query.size(0) != sequence.size(0):
             raise ValueError("UI user queries must be request-major")
         if sequence.size(1) == 0:
-            return user_query, item_query
+            anchor = self._empty_sequence_anchor(sequence)
+            return user_query + anchor.to(user_query.dtype), item_query + anchor.to(item_query.dtype)
 
         user_score = self._project_query(user_query, 0)
         item_score = self._project_query(item_query, user_head_count)
@@ -1382,6 +1372,14 @@ class MixFormerCrossAttention(nn.Module):
             user_query + self._project_context(user_context, 0),
             item_query + self._project_context(item_context, n_u),
         )
+
+    def _empty_sequence_anchor(self, sequence: Tensor) -> Tensor:
+        # Keep sequence tokenizers and every CA parameter in the graph on empty
+        # ranks/batches. This yields exact zero gradients, not unused parameters.
+        anchor = sequence.sum() * 0
+        for parameter in self.parameters():
+            anchor = anchor + parameter.reshape(-1)[0].to(sequence.dtype) * 0
+        return anchor
 
     def _broadcast_item_history(
         self,
@@ -1743,6 +1741,7 @@ class MixFormerBlock(nn.Module):
         sequence_hidden_dim: int | None = None,
         sequence_chunk_tokens: int = 0,
         user_head_count: int | None = None,
+        attention_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.query_mixer = MixFormerQueryMixer(
@@ -1757,6 +1756,7 @@ class MixFormerBlock(nn.Module):
             sequence_hidden_dim or hidden_dim,
             sequence_chunk_tokens=sequence_chunk_tokens,
             user_head_count=user_head_count,
+            attention_backend=attention_backend,
         )
         self.output_fusion = MixFormerOutputFusion(
             num_heads,

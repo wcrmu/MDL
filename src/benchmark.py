@@ -352,6 +352,40 @@ def _analytical_dense_flops_per_step(
         )
         return train_mult * forward
 
+    if name == "uniformer":
+        # One lazy cross-attention per behavior stream, then task-space attention.
+        tim_layers = float(getattr(model, "uniformer_tim_layers", 1))
+        streams = max(float(len(getattr(config, "sequences", ()))), 1.0)
+        # input_tokens_per_step already sums all streams; do not multiply the
+        # history by stream count or cap it at 512. Request count is unavailable
+        # here, so this remains an estimate, not an exact MFU measurement.
+        seq_len = avg_seq
+        forward = 6.0 * candidates * seq_len * d * h  # once-only lazy KV SwiGLU
+        forward += layers * (
+            streams * candidates * feature_tokens * (4.0 * d * d + 6.0 * d * h)
+            + 4.0 * candidates * feature_tokens * seq_len * d
+            + 16.0 * candidates * feature_tokens * d * d
+            + 16.0 * candidates * feature_tokens * feature_tokens * d
+            + 12.0 * candidates * feature_tokens * d * h
+        )
+        forward += tim_layers * (
+            candidates * len(config.task_names) * (12.0 * d * d + 6.0 * d * h
+                + 8.0 * feature_tokens * d + 4.0 * len(config.task_names) * d)
+        )
+        return train_mult * forward
+
+    if name == "more":
+        shared = float(getattr(model, "more_num_shared_anchors", 5))
+        width = feature_tokens + shared + float(len(config.task_names))
+        seq_len = avg_seq
+        anchors = shared + float(len(config.task_names))
+        forward = layers * (
+            candidates * seq_len * (6.0 * d * h + 4.0 * d * d)
+            + 12.0 * candidates * width * d * h
+            + candidates * anchors * (4.0 * seq_len * d + 4.0 * d * d + 6.0 * d * h)
+        )
+        return train_mult * forward
+
     return 0.0
 
 

@@ -8665,7 +8665,7 @@ def _pre_hashed_column_tensor(
 # --- Categorical encoding ---
 
 
-def _uses_dracarys_feature_xor(config: AppConfig) -> bool:
+def _uses_feature_xor_raw64(config: AppConfig) -> bool:
     gset = getattr(config.training, "gset", None)
     return bool(
         gset is not None
@@ -8674,7 +8674,7 @@ def _uses_dracarys_feature_xor(config: AppConfig) -> bool:
     )
 
 
-def _dracarys_missing_raw_id(config: AppConfig) -> int:
+def _gset_missing_raw_id(config: AppConfig) -> int:
     return int(config.training.gset.missing_raw_id)
 
 
@@ -8713,13 +8713,13 @@ def _tensorize_categorical(
         config,
         config.resolved.categorical_input_by_name[feature.name],
     )
-    dracarys_raw = _uses_dracarys_feature_xor(config)
+    feature_xor_raw = _uses_feature_xor_raw64(config)
     if isinstance(categorical_input.encoding, ResolvedIdentityEncoding):
         return _identity_column_tensor(
             table,
             categorical_input,
             missing_id_override=(
-                _dracarys_missing_raw_id(config) if dracarys_raw else None
+                _gset_missing_raw_id(config) if feature_xor_raw else None
             ),
         )
     if isinstance(categorical_input.encoding, ResolvedPreHashedEncoding):
@@ -8727,8 +8727,8 @@ def _tensorize_categorical(
             table,
             categorical_input,
             validate_nonzero=validate_prehashed_nonzero,
-            preserve_raw_int64=dracarys_raw,
-            missing_raw_id=_dracarys_missing_raw_id(config),
+            preserve_raw_int64=feature_xor_raw,
+            missing_raw_id=_gset_missing_raw_id(config),
         )
     unseen_policy = config.vocab_strategy.defaults.unseen_policy
     encoded = encode_categorical_values(
@@ -8817,13 +8817,13 @@ def _tensorize_categorical_bag(
         length_array = pc.fill_null(length_array, 0)
     lengths = _numpy_backed_tensor(length_array, torch.long)
     flat_array = pc.list_flatten(array)
-    dracarys_raw = _uses_dracarys_feature_xor(config)
+    feature_xor_raw = _uses_feature_xor_raw64(config)
     if isinstance(categorical_input.encoding, ResolvedIdentityEncoding):
         encoded = _identity_array_tensor(
             flat_array,
             categorical_input,
             missing_id_override=(
-                _dracarys_missing_raw_id(config) if dracarys_raw else None
+                _gset_missing_raw_id(config) if feature_xor_raw else None
             ),
         )
     elif isinstance(categorical_input.encoding, ResolvedPreHashedEncoding):
@@ -8831,8 +8831,8 @@ def _tensorize_categorical_bag(
             flat_array,
             categorical_input,
             validate_nonzero=validate_prehashed_nonzero,
-            preserve_raw_int64=dracarys_raw,
-            missing_raw_id=_dracarys_missing_raw_id(config),
+            preserve_raw_int64=feature_xor_raw,
+            missing_raw_id=_gset_missing_raw_id(config),
         )
     else:
         unseen_policy = config.vocab_strategy.defaults.unseen_policy
@@ -9553,14 +9553,14 @@ def _tensorize_direct_sequence(
                 config,
                 config.resolved.categorical_input_by_name[qualified],
             )
-            dracarys_raw = _uses_dracarys_feature_xor(config)
+            feature_xor_raw = _uses_feature_xor_raw64(config)
             if isinstance(categorical_input.encoding, ResolvedIdentityEncoding):
                 values = _identity_array_tensor(
                     flat,
                     categorical_input,
                     missing_id_override=(
-                        _dracarys_missing_raw_id(config)
-                        if dracarys_raw
+                        _gset_missing_raw_id(config)
+                        if feature_xor_raw
                         else None
                     ),
                 )
@@ -9569,8 +9569,8 @@ def _tensorize_direct_sequence(
                     flat,
                     categorical_input,
                     validate_nonzero=validate_prehashed_nonzero,
-                    preserve_raw_int64=dracarys_raw,
-                    missing_raw_id=_dracarys_missing_raw_id(config),
+                    preserve_raw_int64=feature_xor_raw,
+                    missing_raw_id=_gset_missing_raw_id(config),
                 )
             else:  # Guarded by _direct_sequence_supported.
                 raise TypeError("unsupported direct categorical sequence encoding")
@@ -10320,8 +10320,8 @@ def _tensorize_python_categorical_values(
 
     categorical_input = _effective_categorical_input(config, categorical_input)
     encoding = categorical_input.encoding
-    dracarys_raw = _uses_dracarys_feature_xor(config)
-    dracarys_missing = _dracarys_missing_raw_id(config)
+    feature_xor_raw = _uses_feature_xor_raw64(config)
+    feature_xor_missing = _gset_missing_raw_id(config)
 
     def int64_values() -> tuple[np.ndarray, np.ndarray]:
         if isinstance(values, np.ndarray):
@@ -10405,8 +10405,8 @@ def _tensorize_python_categorical_values(
             normalized = normalized.copy()
         if nulls.any():
             normalized[nulls] = (
-                dracarys_missing
-                if dracarys_raw
+                feature_xor_missing
+                if feature_xor_raw
                 else tensor_padding_id(encoding)
             )
         return torch.from_numpy(normalized)
@@ -10415,14 +10415,14 @@ def _tensorize_python_categorical_values(
         normalized, nulls = int64_values()
         encoded_values = (
             normalized
-            if dracarys_raw
+            if feature_xor_raw
             else np.bitwise_and(normalized, encoding.num_buckets - 1)
         )
         if nulls.any():
             encoded_values = np.array(encoded_values, copy=True, dtype=np.int64)
             encoded_values[nulls] = (
-                dracarys_missing
-                if dracarys_raw
+                feature_xor_missing
+                if feature_xor_raw
                 else tensor_padding_id(encoding)
             )
         return torch.from_numpy(encoded_values)
@@ -10595,7 +10595,7 @@ def _tensorize_python_categorical_bag(
             normalized = flat.astype(np.int64, copy=False)
             encoded = (
                 normalized
-                if _uses_dracarys_feature_xor(config)
+                if _uses_feature_xor_raw64(config)
                 else np.bitwise_and(normalized, int(encoding.num_buckets) - 1)
             )
             if not encoded.flags.c_contiguous:
@@ -10922,7 +10922,7 @@ def _tensorize_axis_sequence(
                 padding_id=tensor_padding_id(encoding),
                 validate_nonzero=validate_prehashed_nonzero,
                 feature_name=categorical_input.name,
-                preserve_raw_int64=_uses_dracarys_feature_xor(config),
+                preserve_raw_int64=_uses_feature_xor_raw64(config),
                 window_lengths=shared_window_lengths,
                 pad_mask=shared_np_pad_mask,
                 unique_list=shared_unique_list,
@@ -10988,7 +10988,7 @@ def _tensorize_axis_sequence(
                         padding_id=tensor_padding_id(encoding),
                         validate_nonzero=validate_prehashed_nonzero,
                         feature_name=categorical_input.name,
-                        preserve_raw_int64=_uses_dracarys_feature_xor(config),
+                        preserve_raw_int64=_uses_feature_xor_raw64(config),
                         window_lengths=shared_window_lengths,
                         pad_mask=shared_np_pad_mask,
                         unique_list=shared_unique_list,

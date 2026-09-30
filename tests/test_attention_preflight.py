@@ -161,12 +161,12 @@ class AttentionCapabilityHelperTest(unittest.TestCase):
             ("mdl_onetrans", True, False, None),
             ("mdl_onetrans", True, True, {"first_domain_sequence_layer": 4}),
             ("mdl_onetrans", True, True, {"first_domain_sequence_layer": None}),
-            ("mixformer", False, False, None),
-            ("mdl_mixformer", False, True, None),
+            ("mixformer", True, True, None),
+            ("mdl_mixformer", True, True, None),
             (
                 "mdl_mixformer",
-                False,
-                False,
+                True,
+                True,
                 {
                     "use_task_feature_interaction": False,
                     "use_scenario_feature_interaction": False,

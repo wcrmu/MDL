@@ -1,0 +1,10 @@
+# Dense-optimizer ablation only, not a reproduction of the paper's private data.
+# Sparse GSET/ID tables intentionally retain the project's row-wise Adagrad.
+extends: uniformer.yaml
+training:
+  dense_optimizer: adamw
+  lr_dense: 0.001
+  dense_weight_decay: 0.001
+  checkpoint:
+    run_name: uniformer_adamw
+    resume: none

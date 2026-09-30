@@ -345,7 +345,7 @@ def vocab_strategy_fingerprint(strategy_or_config: VocabStrategy | AppConfig) ->
 
 
 # Missing / rectangular-pad sentinel. Not a table row.
-# Production pre_hashed/identity follow the dracarys contract: id=0 is a normal
+# Production pre_hashed/identity keep id=0 as a normal
 # learnable embedding row. Nulls and tensor pads use this negative id and are
 # skipped at lookup, not mapped onto row 0.
 CATEGORICAL_MISSING_ID = -1
@@ -391,7 +391,7 @@ def pre_hashed_bucket(value: Any, num_buckets: int) -> int:
 
     The power-of-two requirement makes signed and unsigned modulo identical
     without ``abs`` and avoids the ``INT64_MIN`` overflow corner case.  ``0`` is
-    a normal bucket (dracarys / gigantic contract). True null is
+    a normal bucket. True null is
     ``CATEGORICAL_MISSING_ID``, not row 0.
     """
 

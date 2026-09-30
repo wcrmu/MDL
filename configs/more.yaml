@@ -1,0 +1,14 @@
+# MORE on the current coarse feature contract.
+# M=8 feature tokens (UI-MixFormer 4+4), K=5 shared anchors, T=3 task anchors.
+# 128 % 16 == 0, which selective token mixing requires. num_layers is the
+# MORE block count. The paper's M=15/K=8/T=9/d=256 does not match this pack.
+extends: mixformer.yaml
+training:
+  checkpoint:
+    run_name: more_v2
+runtime:
+  compile: false
+model:
+  name: more
+  num_layers: 2
+  more_num_shared_anchors: 5

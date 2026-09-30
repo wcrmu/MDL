@@ -130,6 +130,7 @@ from .modules.gset import (
     gset_batch_outcomes,
     iter_gset_tables,
 )
+from .modules.rank_table import RankEmbeddingTable
 from .modules.mlp import SparseMoEPerTokenFFN
 from .optim import ShardedAdagrad, ShardedRowWiseAdagrad
 
@@ -371,7 +372,7 @@ def _varlen_attention_reasons(config: AppConfig) -> tuple[str, ...]:
     """Human-readable reasons this config needs ``flash_attn`` varlen Flash."""
 
     reasons: list[str] = []
-    if config.model.name in {"longer", "onetrans", "mdl_onetrans"}:
+    if config.model.name in {"longer", "onetrans", "mdl_onetrans", "uniformer", "more", "mixformer", "mdl_mixformer"}:
         reasons.append(f"model={config.model.name}")
     longer_sequences = [
         sequence.name
@@ -400,6 +401,8 @@ def _needs_padded_sdpa_flash(config: AppConfig) -> bool:
     """
 
     model = config.model
+    if model.name in {"uniformer", "mixformer", "mdl_mixformer"}:
+        return True
     if getattr(model, "readout", "default") == "task_query":
         return True
     if model.name not in {
@@ -5250,8 +5253,16 @@ def _classify_model_parameters(model: nn.Module) -> _ParameterGroups:
     sharded_ids: set[int] = set()
     for module in model.modules():
         if isinstance(module, ShardedEmbedding) or (
-            isinstance(module, GlobalSharedEmbeddingTable) and module.row_sharded
+            isinstance(module, (GlobalSharedEmbeddingTable, RankEmbeddingTable))
+            and module.row_sharded
         ):
+            module_parameter_ids = {
+                id(parameter) for parameter in module.parameters(recurse=False)
+            }
+            embedding_ids.update(module_parameter_ids)
+            sharded_ids.update(module_parameter_ids)
+            continue
+        if isinstance(module, RankEmbeddingTable):
             module_parameter_ids = {
                 id(parameter) for parameter in module.parameters(recurse=False)
             }
@@ -5354,12 +5365,20 @@ def _build_dense_optimizer(
     config: AppConfig,
     device: torch.device,
 ) -> torch.optim.Optimizer:
-    """Construct RMSprop with an explicit speed-vs-peak-memory policy."""
+    """Construct the configured dense optimizer, leaving sparse tables separate."""
+
+    if config.training.dense_optimizer in {"adam", "adamw"}:
+        cls = torch.optim.AdamW if config.training.dense_optimizer == "adamw" else torch.optim.Adam
+        return cls(parameters, lr=config.training.lr_dense,
+                   betas=tuple(config.training.adam_betas), eps=config.training.adam_eps,
+                   weight_decay=config.training.dense_weight_decay,
+                   fused=config.training.fused_dense_optimizer and device.type == "cuda")
 
     kwargs: dict[str, Any] = {
         "lr": config.training.lr_dense,
         "alpha": config.training.rmsprop_alpha,
         "momentum": config.training.rmsprop_momentum,
+        "weight_decay": config.training.dense_weight_decay,
     }
     fused_requested = (
         getattr(config.training, "fused_dense_optimizer", False)
@@ -5793,6 +5812,8 @@ def _maybe_compile_model(config: AppConfig, model: nn.Module) -> nn.Module:
     if callable(compile_dense) and getattr(config.model, "name", None) in {
         "rankmixer",
         "mixformer",
+        "uniformer",
+        "more",
     }:
         compile_dense()
         return model
@@ -6277,7 +6298,15 @@ def _mark_sparse_invariant_checks_explicitly_disabled() -> None:
 @torch.no_grad()
 def _gradient_values(parameters: list[nn.Parameter]) -> list[Tensor]:
     grads: list[Tensor] = []
+    seen: set[int] = set()
     for parameter in parameters:
+        owner_ref = getattr(parameter, "_mdl_gset_owner", None)
+        owner = owner_ref() if callable(owner_ref) else None
+        if isinstance(owner, RankEmbeddingTable):
+            parameter = owner.weight
+        if id(parameter) in seen:
+            continue
+        seen.add(id(parameter))
         if parameter.grad is None:
             continue
         grad = parameter.grad
@@ -8332,7 +8361,7 @@ def train_mdl(
                         else " checkpoint=off"
                     )
                 )
-                memory_report = _host_memory_report(host_batch_iterator)
+                memory_report = _host_memory_report(batch_iterator)
                 if memory_report:
                     print(f"Host memory | step={steps} {memory_report}", flush=True)
                 # Window-aggregated per-task moments for collapse detection.

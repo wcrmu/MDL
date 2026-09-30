@@ -66,7 +66,7 @@ from src.embeddings import (  # noqa: E402
 
 
 # Physical sample fixture / parquet profiler still uses a 47/100 request/item
-# split. Production models consume the dracarys v3 contract below.
+# split. Production models consume the v3 feature contract below.
 SAMPLE_CONTEXT_FEATURE_COUNT = 47
 # Physical fixture keeps the original 47/100 split, then appends v3-only names.
 SAMPLE_FEATURE_COUNT = 154

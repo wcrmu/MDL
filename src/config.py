@@ -94,6 +94,8 @@ ModelName = Literal[
     "mdl_onetrans",  # Experimental MDL-OneTrans composition; requires acknowledgement.
     "mixformer",  # Standalone paper-aligned MixFormer unified query/sequence model.
     "mdl_mixformer",  # Experimental domain-conditioned MDL-MixFormer composition.
+    "uniformer",  # UniFormer FIM/TIM on the current user/item feature pack.
+    "more",  # MORE anchor backbone on the current user/item feature pack.
     "longer",  # Standalone LONGER sequence recommendation model.
 ]
 
@@ -2643,6 +2645,12 @@ class ModelConfig:
     sparse_moe_dtsi_training_output: DTSITrainingOutputType | None = None
     # mdl_onetrans is an experimental composition, not a published model.
     experimental_model_acknowledged: bool = False
+    # UniFormer FIM depth is model.num_layers. TIM depth is separate because
+    # the paper stacks feature interaction and task interaction in series.
+    uniformer_tim_layers: int = 1
+    # MORE Shared Anchor count. Private anchors are one per task label.
+    # d_model must be divisible by (feature tokens + shared anchors + tasks).
+    more_num_shared_anchors: int = 5
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "ModelConfig":
@@ -2664,11 +2672,13 @@ class ModelConfig:
             "mdl_onetrans",
             "mixformer",
             "mdl_mixformer",
+            "uniformer",
+            "more",
             "longer",
         }:
             raise ValueError(
                 "model.name must be rankmixer, mdl_rankmixer, onetrans, "
-                "mdl_onetrans, mixformer, mdl_mixformer, or longer"
+                "mdl_onetrans, mixformer, mdl_mixformer, uniformer, more, or longer"
             )
         if self.token_dim <= 0:
             raise ValueError("model.token_dim must be positive")
@@ -2848,6 +2858,18 @@ class ModelConfig:
             raise ValueError(
                 "model.global_sequence_max_length must be a positive integer or null"
             )
+        if type(self.uniformer_tim_layers) is not int or self.uniformer_tim_layers <= 0:
+            raise ValueError("model.uniformer_tim_layers must be a positive integer")
+        if (
+            type(self.more_num_shared_anchors) is not int
+            or self.more_num_shared_anchors <= 0
+        ):
+            raise ValueError("model.more_num_shared_anchors must be a positive integer")
+        if self.name in {"uniformer", "more"} and not self.mixformer_user_item_decouple:
+            raise ValueError(
+                f"model.name={self.name} requires mixformer_user_item_decouple=true "
+                "so request-axis and candidate-axis features stay in separate tokens"
+            )
         if self.global_sequence_max_length is not None:
             if self.name not in {
                 "rankmixer",
@@ -2856,6 +2878,8 @@ class ModelConfig:
                 "mdl_mixformer",
                 "onetrans",
                 "mdl_onetrans",
+                "uniformer",
+                "more",
             }:
                 raise ValueError(
                     "model.global_sequence_max_length requires timestamp-aware "
@@ -2887,9 +2911,15 @@ class ModelConfig:
         if (
             self.mixformer_user_item_decouple
             or self.mixformer_user_head_count is not None
-        ) and self.name not in {"mixformer", "mdl_mixformer"}:
+        ) and self.name not in {
+            "mixformer",
+            "mdl_mixformer",
+            "uniformer",
+            "more",
+        }:
             raise ValueError(
-                "UI-MixFormer requires mixformer or mdl_mixformer"
+                "the user/item feature split requires mixformer, mdl_mixformer, "
+                "uniformer, or more"
             )
         if self.rankmixer_ffn_type not in {"dense", "sparse_moe"}:
             raise ValueError("model.rankmixer_ffn_type must be dense or sparse_moe")
@@ -3210,7 +3240,7 @@ class GSETConfig(_DeeplyImmutableConfig):
     enabled: bool = False
     capacity: int = 0
     # Shared physical table width. Enabling GSET overrides every categorical
-    # embedding_dim with this value. Dracarys feature_xor_raw64 additionally
+    # embedding_dim with this value. key_mode=feature_xor_raw64 additionally
     # requires compress_dim=16.
     compress_dim: int = 16
     key_mode: Literal["namespace", "feature_xor_raw64"] = "namespace"
@@ -3270,15 +3300,15 @@ class GSETConfig(_DeeplyImmutableConfig):
         if self.key_mode == "feature_xor_raw64":
             if self.compress_dim != 16:
                 raise ValueError(
-                    "Dracarys feature_xor_raw64 requires training.gset.compress_dim=16"
+                    "training.gset.key_mode=feature_xor_raw64 requires training.gset.compress_dim=16"
                 )
             if self.eviction_policy != "lru":
                 raise ValueError(
-                    "Dracarys feature_xor_raw64 requires training.gset.eviction_policy=lru"
+                    "training.gset.key_mode=feature_xor_raw64 requires training.gset.eviction_policy=lru"
                 )
             if float(self.admission_probability) != 1.0:
                 raise ValueError(
-                    "Dracarys feature_xor_raw64 inserts every new ID and requires "
+                    "training.gset.key_mode=feature_xor_raw64 inserts every new ID and requires "
                     "training.gset.admission_probability=1"
                 )
             if (
@@ -3288,7 +3318,7 @@ class GSETConfig(_DeeplyImmutableConfig):
                 or self.default_ttl_steps is not None
             ):
                 raise ValueError(
-                    "Dracarys feature_xor_raw64 uses one global cold-ID shrinker; "
+                    "training.gset.key_mode=feature_xor_raw64 uses one global cold-ID shrinker; "
                     "per-feature admission, TTL, and priority policies must be empty"
                 )
         if not 0.0 <= float(self.admission_probability) <= 1.0:
@@ -3391,7 +3421,10 @@ class TrainingConfig(_DeeplyImmutableConfig):
     lr_decay_steps: int | None = None
     lr_min_ratio: float = 0.0
     # Optimizer names are constrained for paper alignment and implementation scope.
-    dense_optimizer: Literal["rmsprop"] = "rmsprop"
+    dense_optimizer: Literal["rmsprop", "adam", "adamw"] = "rmsprop"
+    dense_weight_decay: float = 0.0
+    adam_betas: tuple[float, float] = (0.9, 0.999)
+    adam_eps: float = 1.0e-8
     # True prefers fused/foreach throughput. False forces the scalar RMSprop
     # path unless a bounded foreach bucket is configured below.
     fused_dense_optimizer: bool = True
@@ -3507,10 +3540,14 @@ class TrainingConfig(_DeeplyImmutableConfig):
                 )
         if not 0.0 <= self.lr_min_ratio <= 1.0:
             raise ValueError("training.lr_min_ratio must be in [0, 1]")
-        if self.dense_optimizer != "rmsprop":
-            raise ValueError(
-                "training.dense_optimizer must be rmsprop for paper alignment"
-            )
+        if self.dense_optimizer not in {"rmsprop", "adam", "adamw"}:
+            raise ValueError("training.dense_optimizer must be rmsprop, adam, or adamw")
+        if self.dense_weight_decay < 0:
+            raise ValueError("training.dense_weight_decay must be non-negative")
+        if len(self.adam_betas) != 2 or any(not 0 <= beta < 1 for beta in self.adam_betas):
+            raise ValueError("training.adam_betas must contain two values in [0, 1)")
+        if self.adam_eps <= 0:
+            raise ValueError("training.adam_eps must be positive")
         if not 0.0 <= self.rmsprop_alpha < 1.0:
             raise ValueError("training.rmsprop_alpha must be in [0, 1)")
         if self.rmsprop_momentum < 0.0:
@@ -4874,6 +4911,34 @@ def _mixformer_ui_head_split(
     return min(packed, key=lambda count: abs(count - formula_user_heads))
 
 
+def uniformer_semantic_groups(config, user_names, item_names):
+    """Validate complete, disjoint semantic groups without splitting fields."""
+    groups = config.tokenization.ns_tokens
+    if not groups:
+        raise ValueError("UniFormer requires explicit tokenization.ns_tokens semantic groups")
+    user_set, item_set = set(user_names), set(item_names)
+    seen = set()
+    users, items = [], []
+    for group in groups:
+        names = set(group.inputs)
+        if not names or len(names) != len(group.inputs) or names & seen:
+            raise ValueError("UniFormer semantic groups must be nonempty and disjoint")
+        if names <= user_set:
+            users.append(group)
+        elif names <= item_set:
+            items.append(group)
+        else:
+            raise ValueError(f"UniFormer semantic group {group.name!r} mixes axes or unknown inputs")
+        seen.update(names)
+    if seen != user_set | item_set:
+        raise ValueError("UniFormer semantic groups must cover every consumed feature exactly once")
+    if not users or not items:
+        raise ValueError("UniFormer requires user and candidate semantic groups")
+    if len(groups) != config.tokenization.num_feature_tokens:
+        raise ValueError("UniFormer num_feature_tokens must equal the semantic group count")
+    return tuple(users), tuple(items)
+
+
 def resolve_mixformer_ui_layout(
     config: AppConfig,
     feature_token_inputs: Sequence[str],
@@ -4886,7 +4951,12 @@ def resolve_mixformer_ui_layout(
         config.model.mixformer_user_item_decouple
         or config.model.mixformer_user_head_count is not None
     )
-    if not enabled or config.model.name not in {"mixformer", "mdl_mixformer"}:
+    if not enabled or config.model.name not in {
+        "mixformer",
+        "mdl_mixformer",
+        "uniformer",
+        "more",
+    }:
         return (), (), None
 
     request_sources, item_sources = _mixformer_adapter_axis_sources(config)
@@ -4923,6 +4993,9 @@ def resolve_mixformer_ui_layout(
         )
     user_width = sum(int(encoded_input_dims[name]) for name in user_names)
     item_width = sum(int(encoded_input_dims[name]) for name in item_names)
+    if config.model.name == "uniformer":
+        user_groups, _ = uniformer_semantic_groups(config, user_names, item_names)
+        return tuple(user_names), tuple(item_names), len(user_groups)
     user_heads = _mixformer_ui_head_split(
         user_width,
         item_width,
@@ -5625,6 +5698,8 @@ def validate_app_config(config: AppConfig) -> None:
             "mdl_onetrans",
             "mixformer",
             "mdl_mixformer",
+            "uniformer",
+            "more",
         }
         and config.model.sequence_fusion == "timestamp_aware"
     ):
@@ -5648,6 +5723,8 @@ def validate_app_config(config: AppConfig) -> None:
         "mdl_onetrans",
         "mixformer",
         "mdl_mixformer",
+        "uniformer",
+        "more",
     }:
         s_sequence_names = {
             input_name
@@ -5698,7 +5775,7 @@ def validate_app_config(config: AppConfig) -> None:
         if raw_sequences:
             raise ValueError(
                 "encoder=raw delegates event-level sequence modeling to the backbone "
-                "and is only valid for onetrans/mixformer families: "
+                "and is only valid for onetrans, mixformer, uniformer, or more: "
                 + ", ".join(raw_sequences)
             )
     for sequence in config.sequences:
@@ -6048,7 +6125,12 @@ def validate_app_config(config: AppConfig) -> None:
                 "requires tokenization.ns_tokens or scalar feature inputs"
             )
         resolve_onetrans_max_position_embeddings(config, resolved)
-    if config.model.name in {"mixformer", "mdl_mixformer"}:
+    if config.model.name in {"mixformer", "mdl_mixformer", "uniformer", "more"}:
+        if config.model.name in {"uniformer", "more"}:
+            if config.model.use_request_cache:
+                raise ValueError(f"{config.model.name} supports within-forward KV sharing, not model.use_request_cache")
+            if config.runtime.activation_checkpoint != "none" or config.runtime.cuda_graph_backbone:
+                raise ValueError(f"{config.model.name} does not yet support activation_checkpoint or cuda_graph_backbone")
         if not resolved.tokenization.sequence_token_groups:
             raise ValueError(
                 f"model.name={config.model.name!r} requires at least one sequence token"
@@ -6090,7 +6172,7 @@ def validate_app_config(config: AppConfig) -> None:
             resolved.encoded_input_dims[name]
             for name in resolved.tokenization.feature_token_inputs
         )
-        if packed_input_dim % feature_token_count != 0:
+        if config.model.name != "uniformer" and packed_input_dim % feature_token_count != 0:
             raise ValueError(
                 "MixFormer requires the concatenated non-sequential embedding width "
                 "to divide evenly across feature heads: "
@@ -6117,11 +6199,28 @@ def validate_app_config(config: AppConfig) -> None:
                 for name in resolved.mixformer_item_feature_inputs
             )
             item_heads = feature_token_count - user_heads
-            if user_width % user_heads != 0 or item_width % item_heads != 0:
+            if config.model.name != "uniformer" and (
+                user_width % user_heads != 0 or item_width % item_heads != 0
+            ):
                 raise ValueError(
                     "UI-MixFormer user/item packs must divide evenly across "
                     f"N_U={user_heads} and N_G={item_heads}: "
                     f"user_width={user_width}, item_width={item_width}"
+                )
+        if config.model.name == "more":
+            mixing_width = (
+                feature_token_count
+                + config.model.more_num_shared_anchors
+                + len(config.task_names)
+            )
+            if mixing_width <= 0 or config.model.token_dim % mixing_width != 0:
+                raise ValueError(
+                    "MORE selective mixing requires token_dim to be divisible by "
+                    "feature tokens + shared anchors + tasks: "
+                    f"{config.model.token_dim} % {mixing_width} != 0 "
+                    f"(M={feature_token_count}, "
+                    f"K={config.model.more_num_shared_anchors}, "
+                    f"T={len(config.task_names)})"
                 )
 
 

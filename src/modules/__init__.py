@@ -26,6 +26,7 @@ from .gset import (
     gset_batch_outcomes,
     set_gset_batch_outcomes,
 )
+from .more import MORERanker
 from .stca import (
     STCAInputLayer,
     STCASequenceCache,
@@ -33,6 +34,7 @@ from .stca import (
     SingleQueryTargetAttention,
     SwiGLUFFN,
 )
+from .uniformer import UniFormerRanker
 
 __all__ = [
     "DomainAwareAttention",
@@ -44,6 +46,7 @@ __all__ = [
     "GlobalSharedEmbeddingTable",
     "clear_gset_batch_outcomes",
     "gset_batch_outcomes",
+    "MORERanker",
     "MixFormerBlock",
     "MixFormerCrossAttention",
     "MixFormerHeadMixing",
@@ -62,5 +65,6 @@ __all__ = [
     "STCASequenceEncoder",
     "SingleQueryTargetAttention",
     "SwiGLUFFN",
+    "UniFormerRanker",
     "set_gset_batch_outcomes",
 ]

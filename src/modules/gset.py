@@ -39,6 +39,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 import torch.distributed as dist
 
+from ..features import CATEGORICAL_MISSING_ID
 from ..embeddings import (
     _active_id_mask,
     _all_to_all_variable,
@@ -50,14 +51,14 @@ from ..embeddings import (
 
 _GSET_STATE_VERSION = 1
 _PARAMETER_OWNERS: dict[int, weakref.ReferenceType["GlobalSharedEmbeddingTable"]] = {}
-_DRACARYS_GLOBAL_NAMESPACE = "__dracarys_global__"
+_FEATURE_XOR_GLOBAL_NAMESPACE = "__feature_xor_global__"
 
 
-def dracarys_feature_hash64(feature_name: str) -> int:
-    """Return the stable signed-int64 hash used in Dracarys feature XOR IDs."""
+def feature_xor_hash64(feature_name: str) -> int:
+    """Return the stable signed-int64 hash used in feature XOR IDs."""
 
     if not isinstance(feature_name, str) or not feature_name:
-        raise ValueError("Dracarys feature name must be a non-empty string")
+        raise ValueError("feature name must be a non-empty string")
     unsigned = int.from_bytes(
         sha256(feature_name.encode("utf-8")).digest()[:8],
         "little",
@@ -66,7 +67,7 @@ def dracarys_feature_hash64(feature_name: str) -> int:
     return unsigned if unsigned < (1 << 63) else unsigned - (1 << 64)
 
 
-def dracarys_feature_xor_ids(logical_ids: Tensor, feature_name: str) -> Tensor:
+def feature_xor_ids(logical_ids: Tensor, feature_name: str) -> Tensor:
     """Compute ``hash(feature_name) XOR raw_int64_value`` bit-for-bit."""
 
     if logical_ids.dtype not in {
@@ -76,10 +77,10 @@ def dracarys_feature_xor_ids(logical_ids: Tensor, feature_name: str) -> Tensor:
         torch.int64,
         torch.uint8,
     }:
-        raise TypeError("Dracarys logical IDs must use an integer tensor dtype")
+        raise TypeError("feature XOR logical IDs must use an integer tensor dtype")
     values = logical_ids.to(dtype=torch.int64)
     feature_hash = torch.tensor(
-        dracarys_feature_hash64(feature_name),
+        feature_xor_hash64(feature_name),
         dtype=torch.int64,
         device=values.device,
     )
@@ -2054,21 +2055,28 @@ class GSETEmbeddingView(nn.Module):
         *,
         padding_idx: int | None = None,
         policy: GSETNamespacePolicy | None = None,
-        dracarys_feature_xor: bool = False,
+        feature_xor_raw64: bool = False,
+        raw_int64: bool = False,
     ) -> None:
         super().__init__()
         self.namespace = namespace
-        self.dracarys_feature_xor = bool(dracarys_feature_xor)
+        self.feature_xor_raw64 = bool(feature_xor_raw64)
+        self.raw_int64 = bool(raw_int64)
         registered_namespace = (
-            _DRACARYS_GLOBAL_NAMESPACE
-            if self.dracarys_feature_xor
+            _FEATURE_XOR_GLOBAL_NAMESPACE
+            if self.feature_xor_raw64 and not self.raw_int64
             else namespace
         )
         self.namespace_index = table.register_namespace(
             registered_namespace,
-            None if self.dracarys_feature_xor else policy,
+            None if self.feature_xor_raw64 or self.raw_int64 else policy,
         )
-        self.padding_idx = None if self.dracarys_feature_xor else padding_idx
+        if self.raw_int64:
+            self.padding_idx = (
+                CATEGORICAL_MISSING_ID if padding_idx is None else int(padding_idx)
+            )
+        else:
+            self.padding_idx = None if self.feature_xor_raw64 else padding_idx
         self.num_embeddings = table.num_embeddings
         self.embedding_dim = table.embedding_dim
         # A weak reference avoids registering the same large table under every
@@ -2100,9 +2108,9 @@ class GSETEmbeddingView(nn.Module):
         valid_lengths: Tensor | None = None,
     ) -> Tensor:
         lookup_ids = (
-            dracarys_feature_xor_ids(logical_ids, self.namespace)
-            if self.dracarys_feature_xor
-            else logical_ids
+            logical_ids
+            if self.raw_int64 or not self.feature_xor_raw64
+            else feature_xor_ids(logical_ids, self.namespace)
         )
         output = self.table.lookup(
             self.namespace_index,
@@ -2112,7 +2120,7 @@ class GSETEmbeddingView(nn.Module):
             row_negative_counts=row_negative_counts,
             row_lengths=row_lengths,
             valid_lengths=valid_lengths,
-            allow_negative_ids=self.dracarys_feature_xor,
+            allow_negative_ids=self.feature_xor_raw64 or self.raw_int64,
         )
         if not isinstance(output, Tensor):
             raise RuntimeError("GSET lookup returned an invalid result")
@@ -2128,9 +2136,9 @@ class GSETEmbeddingView(nn.Module):
         valid_lengths: Tensor | None = None,
     ) -> Tensor:
         lookup_ids = (
-            dracarys_feature_xor_ids(logical_ids, self.namespace)
-            if self.dracarys_feature_xor
-            else logical_ids
+            logical_ids
+            if self.raw_int64 or not self.feature_xor_raw64
+            else feature_xor_ids(logical_ids, self.namespace)
         )
         return self.table.count_policy_records(
             self.namespace_index,
@@ -2140,7 +2148,7 @@ class GSETEmbeddingView(nn.Module):
             row_negative_counts=row_negative_counts,
             row_lengths=row_lengths,
             valid_lengths=valid_lengths,
-            allow_negative_ids=self.dracarys_feature_xor,
+            allow_negative_ids=self.feature_xor_raw64 or self.raw_int64,
         )
 
 
@@ -2156,10 +2164,12 @@ def gset_owner_for_parameter(
     return None if fallback is None else fallback()
 
 
-def iter_gset_tables(module: nn.Module) -> Iterator[GlobalSharedEmbeddingTable]:
+def iter_gset_tables(module: nn.Module) -> Iterator[Any]:
+    from .rank_table import RankEmbeddingTable
+
     seen: set[int] = set()
     for child in module.modules():
-        if not isinstance(child, GlobalSharedEmbeddingTable):
+        if not isinstance(child, (GlobalSharedEmbeddingTable, RankEmbeddingTable)):
             continue
         if id(child) in seen:
             continue

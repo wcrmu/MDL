@@ -1,0 +1,8 @@
+# Dense-optimizer ablation only. Other project hyperparameters are unchanged.
+extends: more.yaml
+training:
+  dense_optimizer: adam
+  dense_weight_decay: 0.0
+  checkpoint:
+    run_name: more_adam
+    resume: none

@@ -251,6 +251,27 @@ class DirtyRowTracker:
         if pending is not None and pending.numel():
             yield pending.cpu()
 
+    def rebind(self, old: nn.Parameter, new: nn.Parameter) -> None:
+        mask = self._masks.pop(old, None)
+        if not self.enabled:
+            return
+        rows = int(new.shape[0])
+        if new.is_cuda:
+            fresh = torch.zeros(
+                ((rows + 31) // 32,),
+                dtype=torch.int32,
+                device=new.device,
+            )
+            if isinstance(mask, Tensor) and mask.is_cuda:
+                count = min(int(mask.numel()), int(fresh.numel()))
+                fresh[:count].copy_(mask[:count])
+        else:
+            fresh = torch.zeros((rows,), dtype=torch.bool, device=new.device)
+            if isinstance(mask, Tensor):
+                count = min(int(mask.shape[0]), rows)
+                fresh[:count].copy_(mask[:count].to(device=fresh.device))
+        self._masks[new] = fresh
+
     def clear(self) -> None:
         for mask in self._masks.values():
             mask.zero_()
@@ -307,6 +328,10 @@ class ShardedAdagrad(torch.optim.Optimizer):
                     dtype=state_dtype,
                     device=parameter.device,
                 )
+                owner = gset_owner_for_parameter(parameter)
+                attach = getattr(owner, "attach_optimizer", None)
+                if callable(attach):
+                    attach(self)
         self._dirty_rows = DirtyRowTracker(
             (
                 parameter
@@ -379,6 +404,42 @@ class ShardedAdagrad(torch.optim.Optimizer):
         return loss
 
 
+def _extend_optimizer_state_tensor(value: Tensor, new_rows: int, fill: float = 0.0) -> Tensor:
+    if int(value.shape[0]) == new_rows:
+        return value
+    if value.ndim == 1:
+        grown = value.new_full((new_rows,), fill)
+    else:
+        grown = value.new_full((new_rows, *value.shape[1:]), fill)
+    count = min(int(value.shape[0]), new_rows)
+    grown[:count].copy_(value[:count])
+    return grown
+
+
+def rebind_optimizer_parameter(
+    optimizer: torch.optim.Optimizer,
+    old: nn.Parameter,
+    new: nn.Parameter,
+) -> None:
+    """Point an embedding optimizer at a grown rank-table parameter."""
+
+    initial_accumulator = 0.0
+    for group in optimizer.param_groups:
+        if any(parameter is old for parameter in group["params"]):
+            initial_accumulator = float(group.get("initial_accumulator_value", 0.0))
+        group["params"] = [new if parameter is old else parameter for parameter in group["params"]]
+    state = optimizer.state.pop(old, None)
+    if isinstance(state, dict):
+        accumulator = state.get("sum")
+        if isinstance(accumulator, Tensor) and int(accumulator.shape[0]) != int(new.shape[0]):
+            state["sum"] = _extend_optimizer_state_tensor(accumulator, int(new.shape[0]), initial_accumulator)
+        optimizer.state[new] = state
+    tracker = getattr(optimizer, "_dirty_rows", None)
+    rebind = getattr(tracker, "rebind", None)
+    if rebind is not None:
+        rebind(old, new)
+
+
 class ShardedRowWiseAdagrad(torch.optim.Optimizer):
     """Row-wise Adagrad over already-local embedding parameters.
 
@@ -435,6 +496,10 @@ class ShardedRowWiseAdagrad(torch.optim.Optimizer):
                     dtype=state_dtype,
                     device=parameter.device,
                 )
+                owner = gset_owner_for_parameter(parameter)
+                attach = getattr(owner, "attach_optimizer", None)
+                if callable(attach):
+                    attach(self)
         self._dirty_rows = DirtyRowTracker(
             (
                 parameter

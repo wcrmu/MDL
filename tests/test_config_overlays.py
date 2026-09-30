@@ -36,6 +36,8 @@ class ModelConfigOverlayTest(unittest.TestCase):
             "mdl_onetrans",
             "mixformer",
             "mdl_mixformer",
+            "uniformer",
+            "more",
         ):
             for suffix in ("", "_fine"):
                 config_name = f"{model_name}{suffix}.yaml"
@@ -58,6 +60,8 @@ class ModelConfigOverlayTest(unittest.TestCase):
             "mdl_onetrans",
             "mixformer",
             "mdl_mixformer",
+            "uniformer",
+            "more",
         ):
             for suffix in ("", "_fine"):
                 config_name = f"{model_name}{suffix}.yaml"
@@ -81,6 +85,8 @@ class ModelConfigOverlayTest(unittest.TestCase):
             "mdl_onetrans",
             "mixformer",
             "mdl_mixformer",
+            "uniformer",
+            "more",
         ):
             for suffix in ("", "_fine"):
                 config_name = f"{model_name}{suffix}.yaml"

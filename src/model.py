@@ -22,7 +22,7 @@ from .config import (
     resolve_categorical_base_input,
     resolve_onetrans_max_position_embeddings,
 )
-from .features import embedding_padding_idx
+from .features import CATEGORICAL_MISSING_ID, embedding_padding_idx
 from .embeddings import (
     EmbeddingShardingPlan,
     EmbeddingTableSpec,
@@ -62,10 +62,9 @@ from .modules.mixformer import (
 )
 from .modules.gset import (
     GSETEmbeddingView,
-    GSETNamespacePolicy,
-    GlobalSharedEmbeddingTable,
     empty_gset_policy_records,
 )
+from .modules.rank_table import RankEmbeddingTable
 from .modules.stca import STCASequenceCache, STCASequenceEncoder
 
 
@@ -2730,7 +2729,7 @@ class FeatureEncoderBank(nn.Module):
             else torch.float32
         )
         self.embedding_weight_dtype = embedding_weight_dtype
-        self.gset_table: GlobalSharedEmbeddingTable | None = None
+        self.gset_table: RankEmbeddingTable | None = None
         gset_config = getattr(config.training, "gset", None)
         if gset_config is not None and gset_config.enabled:
             embedding_dims = set(categorical_dims.values())
@@ -2738,23 +2737,11 @@ class FeatureEncoderBank(nn.Module):
                 raise ValueError(
                     "GSET requires one common categorical embedding dimension"
                 )
-            gset_capacity = int(gset_config.capacity)
-            if embedding_size_override is not None:
-                gset_capacity = min(gset_capacity, int(embedding_size_override))
-            self.gset_table = GlobalSharedEmbeddingTable(
-                capacity=gset_capacity,
-                embedding_dim=next(iter(embedding_dims)),
+            self.gset_table = RankEmbeddingTable(
+                next(iter(embedding_dims)),
                 init_std=config.model.init_std,
                 sparse=sparse_gradients,
                 dtype=embedding_weight_dtype,
-                admission_probability=gset_config.admission_probability,
-                score_decay=gset_config.score_decay,
-                positive_weight=gset_config.positive_weight,
-                score_update_interval=gset_config.score_update_interval,
-                default_ttl_steps=gset_config.default_ttl_steps,
-                eviction_enabled=gset_config.eviction_enabled,
-                eviction_policy=gset_config.eviction_policy,
-                seed=gset_config.seed,
                 row_sharded=config.training.embedding_distribution == "sharded",
             )
 
@@ -3242,31 +3229,11 @@ class FeatureEncoderBank(nn.Module):
         padding_idx: int | None,
     ) -> nn.Module:
         if self.gset_table is not None:
-            gset = self.config.training.gset
-            dracarys_feature_xor = gset.key_mode == "feature_xor_raw64"
-            policy = (
-                None
-                if dracarys_feature_xor
-                else GSETNamespacePolicy(
-                    admission_probability=float(
-                        gset.feature_admission_probabilities.get(
-                            table_name,
-                            gset.admission_probability,
-                        )
-                    ),
-                    ttl_steps=gset.feature_ttl_steps.get(
-                        table_name,
-                        gset.default_ttl_steps,
-                    ),
-                    high_priority=table_name in gset.high_priority_features,
-                )
-            )
             return GSETEmbeddingView(
                 self.gset_table,
                 table_name,
-                padding_idx=None if dracarys_feature_xor else padding_idx,
-                policy=policy,
-                dracarys_feature_xor=dracarys_feature_xor,
+                padding_idx=CATEGORICAL_MISSING_ID,
+                raw_int64=True,
             )
         if self.config.training.embedding_distribution == "replicated":
             embedding = _init_embedding(
@@ -3561,7 +3528,7 @@ class FeatureEncoderBank(nn.Module):
                     pooling=feature.pooling,
                     negative_ids_are_valid=(
                         isinstance(id_embedding, GSETEmbeddingView)
-                        and id_embedding.dracarys_feature_xor
+                        and (id_embedding.feature_xor_raw64 or id_embedding.raw_int64)
                     ),
                 )
                 if apply_row_indices:
@@ -4694,9 +4661,10 @@ class FeatureEncoderBank(nn.Module):
                                 self.embeddings[feature.name],
                                 GSETEmbeddingView,
                             )
-                            and self.embeddings[
-                                feature.name
-                            ].dracarys_feature_xor
+                            and (
+                                self.embeddings[feature.name].feature_xor_raw64
+                                or self.embeddings[feature.name].raw_int64
+                            )
                         ),
                     )
                 )
@@ -6088,7 +6056,7 @@ class OneTransTokenizer(nn.Module):
     ) -> OneTransRequestCache:
         if self.require_compact_sequence_batches:
             if mask.size(1):
-                compact = mask[:, 0].any()
+                compact = mask[:, 0].any() | ~mask.any()
                 message = (
                     "runtime.require_compact_sequence_batches requires sequence "
                     "payloads padded only to the longest row in the batch"
@@ -9557,6 +9525,7 @@ def _build_mixformer_blocks(
                 )
             ),
             user_head_count=config.resolved.mixformer_user_head_count,
+            attention_backend=config.runtime.attention_backend,
         )
         for _ in range(config.model.num_layers)
     )
@@ -9621,7 +9590,8 @@ class MixFormerModel(nn.Module):
 
         Full-model ``torch.compile`` would capture the dynamic GSET mapper and
         host embedding splits. Dense-only compile keeps kernel fusion inside
-        Query Mixer, sequence SwiGLU, SDPA, and Output Fusion.
+        Query Mixer, sequence SwiGLU and Output Fusion. Attention dispatch is
+        explicitly eager: compaction does not eliminate per-request padding.
         """
 
         if self._dense_compiled is not None:
@@ -9636,8 +9606,7 @@ class MixFormerModel(nn.Module):
             # Inductor CUDAGraphs overwrite MixFormer residuals across
             # gradient-accumulation microbatches. Keep static-shape fusion
             # without graph replay; recapture only when compact L changes.
-            # Full-graph max_autotune_gemm (v5) kept bwd ~14.2s but lost
-            # FLASH fusion (fwd 4.67s -> 6.76s, 2607 vs 2844 sps).
+            # Kernel selection remains outside the graph for mixed-length masks.
             compile_kwargs["dynamic"] = False
 
         if use_ui:
@@ -9941,6 +9910,7 @@ class MDLMixFormerBlock(nn.Module):
                 )
             ),
             user_head_count=config.resolved.mixformer_user_head_count,
+            attention_backend=config.runtime.attention_backend,
         )
         _init_domain_interaction_modules(self, config, metadata)
         self.include_global_scenario = config.model.use_global_scenario_token
@@ -10298,6 +10268,22 @@ def build_model(
         )
     if config.model.name == "longer":
         return LongerModel(
+            config,
+            vocab_maps,
+            embedding_size_override=embedding_size_override,
+        )
+    if config.model.name == "uniformer":
+        from .uniformer_model import UniFormerModel
+
+        return UniFormerModel(
+            config,
+            vocab_maps,
+            embedding_size_override=embedding_size_override,
+        )
+    if config.model.name == "more":
+        from .more_model import MOREModel
+
+        return MOREModel(
             config,
             vocab_maps,
             embedding_size_override=embedding_size_override,
