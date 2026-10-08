@@ -157,14 +157,11 @@ data:
       - nfk_gmv_14d_hn
       - nfk_sales_14d_hn
       - nfk_price_14d_hn
-      - ud_id_bin_hn
-      - compoergn_id_hn
       - cart_hit_i2i_idx_hn
       - us_ctr_price_dis50_hn
       - multimodal_i2i_hit_cart_size_hn
       - impr_clk_6h_cnt_hn
       - auto_price_p10_dis_hn
-      - clk_8d_cnt_hn
       - cart_long_hit_samestyle_i2i_idx_hn
       - clk_hit_i2i_idx_hn
       - goods_name_bigram_hn
@@ -400,15 +397,12 @@ data:
         - nfk_gmv_14d_hn
         - nfk_sales_14d_hn
         - nfk_price_14d_hn
-        - ud_id_bin_hn
-        - compoergn_id_hn
         - f_goods_view_times_tg_l1_hn
         - cart_hit_i2i_idx_hn
         - us_ctr_price_dis50_hn
         - multimodal_i2i_hit_cart_size_hn
         - impr_clk_6h_cnt_hn
         - auto_price_p10_dis_hn
-        - clk_8d_cnt_hn
         - cart_long_hit_samestyle_i2i_idx_hn
         - clk_hit_i2i_idx_hn
         - goods_name_bigram_hn
@@ -493,7 +487,6 @@ data:
         - goods_scene_clk_cnt_15d_hn
         - scene_cart_cnt_15d_hn
         - cart_hit_i2i_idx_hn
-        - clk_8d_cnt_hn
         - cart_long_hit_samestyle_i2i_idx_hn
         - clk_hit_i2i_idx_hn
         - goods_name_bigram_hn
@@ -827,14 +820,11 @@ data:
       - nfk_gmv_14d_hn
       - nfk_sales_14d_hn
       - nfk_price_14d_hn
-      - ud_id_bin_hn
-      - compoergn_id_hn
       - cart_hit_i2i_idx_hn
       - us_ctr_price_dis50_hn
       - multimodal_i2i_hit_cart_size_hn
       - impr_clk_6h_cnt_hn
       - auto_price_p10_dis_hn
-      - clk_8d_cnt_hn
       - cart_long_hit_samestyle_i2i_idx_hn
       - clk_hit_i2i_idx_hn
       - goods_name_bigram_hn
@@ -1071,15 +1061,12 @@ data:
         - nfk_gmv_14d_hn
         - nfk_sales_14d_hn
         - nfk_price_14d_hn
-        - ud_id_bin_hn
-        - compoergn_id_hn
         - f_goods_view_times_tg_l1_hn
         - cart_hit_i2i_idx_hn
         - us_ctr_price_dis50_hn
         - multimodal_i2i_hit_cart_size_hn
         - impr_clk_6h_cnt_hn
         - auto_price_p10_dis_hn
-        - clk_8d_cnt_hn
         - cart_long_hit_samestyle_i2i_idx_hn
         - clk_hit_i2i_idx_hn
         - goods_name_bigram_hn
@@ -1164,7 +1151,6 @@ data:
         - goods_scene_clk_cnt_15d_hn
         - scene_cart_cnt_15d_hn
         - cart_hit_i2i_idx_hn
-        - clk_8d_cnt_hn
         - cart_long_hit_samestyle_i2i_idx_hn
         - clk_hit_i2i_idx_hn
         - goods_name_bigram_hn
@@ -2271,24 +2257,6 @@ features:
     type: pre_hashed
     num_buckets: 1024
     padding_id: 0
-- name: ud_id_bin_hn
-  kind: categorical
-  source: ud_id_bin_hn
-  embedding_scope: feature
-  embedding_dim: 8
-  encoding:
-    type: pre_hashed
-    num_buckets: 256
-    padding_id: 0
-- name: compoergn_id_hn
-  kind: categorical
-  source: compoergn_id_hn
-  embedding_scope: feature
-  embedding_dim: 8
-  encoding:
-    type: pre_hashed
-    num_buckets: 256
-    padding_id: 0
 - name: f_goods_view_times_tg_l1_hn
   kind: categorical
   source: f_goods_view_times_tg_l1_hn
@@ -2347,19 +2315,6 @@ features:
     type: pre_hashed
     num_buckets: 2048
     padding_id: 0
-- name: clk_8d_cnt_hn
-  kind: categorical
-  source: clk_8d_cnt_hn
-  embedding_scope: feature
-  embedding_dim: 16
-  encoding:
-    type: pre_hashed
-    num_buckets: 1024
-    padding_id: 0
-  pooling: sum
-  pooling_null_policy: exclude
-  max_length: 1
-  truncation: head
 - name: cart_long_hit_samestyle_i2i_idx_hn
   kind: categorical
   source: cart_long_hit_samestyle_i2i_idx_hn
@@ -5336,8 +5291,6 @@ tokenization:
     - mall_id_hn
     - sellr_type_hn
     - site_x_asian_code_hn
-    - ud_id_bin_hn
-    - compoergn_id_hn
   - name: sku_commerce
     inputs:
     - sku_id_hn
@@ -5416,7 +5369,6 @@ tokenization:
     inputs:
     - idx_goods_creative_id_hn
     - clk_cnt_1d_hn
-    - clk_8d_cnt_hn
     - cart_cnt_1d_hn
     - cart_cnt_3d_hn
   - name: history_impr

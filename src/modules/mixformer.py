@@ -662,6 +662,9 @@ class MixFormerCrossAttention(nn.Module):
         squeeze = query.ndim == 3
         if squeeze:
             query = query.unsqueeze(1)
+        # Residual sequence activations may remain FP32 under autocast while
+        # projected queries are BF16. External flash-attn does not autocast K/V.
+        history = history.to(dtype=query.dtype)
         can_varlen = self._can_varlen_history(query)
         if self.attention_backend == "flash" and not can_varlen:
             raise RuntimeError("MixFormer strict flash requires CUDA FP16/BF16 and flash-attn varlen")

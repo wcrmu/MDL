@@ -1000,18 +1000,6 @@ features:
   kind: categorical
   source: ups_in_cart_2h_sku_cur_prices_hn
   embedding_dim: 16
-- name: ud_id_bin_hn
-  kind: categorical
-  source: ud_id_bin_hn
-  embedding_dim: 8
-- name: compoergn_id_hn
-  kind: categorical
-  source: compoergn_id_hn
-  embedding_dim: 8
-- name: clk_8d_cnt_hn
-  kind: categorical
-  source: clk_8d_cnt_hn
-  embedding_dim: 64
 sequences:
 - name: impr
   layout: parallel_lists

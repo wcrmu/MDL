@@ -423,7 +423,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         )
         self.assertEqual(by_name["sku_spec_vids_hn"]["pooling"], "sum")
         self.assertEqual(by_name["sku_spec_vids_hn"]["max_length"], 256)
-        self.assertEqual(summary["bag_feature_count"], 67)
+        self.assertEqual(summary["bag_feature_count"], 66)
         self.assertEqual(
             set(MULTIVALUE_MAX_LENGTHS),
             set(OBSERVED_MULTIVALUE_MAX_LENGTHS),
@@ -435,7 +435,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             )
         )
         self.assertLessEqual(max(MULTIVALUE_MAX_LENGTHS.values()), 512)
-        self.assertEqual(sum(PACK_MULTIVALUE_MAX_LENGTHS.values()), 7770)
+        self.assertEqual(sum(PACK_MULTIVALUE_MAX_LENGTHS.values()), 7769)
         self.assertEqual(
             OBSERVED_MULTIVALUE_MAX_LENGTHS["cart_long_spec_vids_hn"],
             10005,
@@ -610,7 +610,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             "src.dataloader:adapt_mdl_rankmixer_parquet",
         )
         adapter_payload = payload["data"]["train"]["adapter"]
-        self.assertEqual(len(adapter_payload["input_columns"]), 228)
+        self.assertEqual(len(adapter_payload["input_columns"]), 225)
         self.assertEqual(len(adapter_payload["optional_input_columns"]), 11)
         self.assertEqual(
             len(payload["data"]["test"]["adapter"]["optional_input_columns"]),
@@ -672,7 +672,6 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             self.assertNotIn(name, adapter_options["item_features"])
         for name in (
             "clk_cnt_1d_hn",
-            "clk_8d_cnt_hn",
             "cart_cnt_1d_hn",
             "cart_cnt_3d_hn",
         ):
@@ -1081,7 +1080,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             )
 
         mdl_onetrans = payloads["mdl_onetrans"]
-        self.assertEqual(len(mdl_onetrans["features"]), 162)
+        self.assertEqual(len(mdl_onetrans["features"]), 159)
         self.assertEqual(len(mdl_onetrans["sequences"]), 16)
         self.assertFalse(mdl_onetrans["tokenization"]["omit_scene_features"])
         self.assertTrue(
@@ -1751,7 +1750,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     # Phase-2 keeps task/scenario-history priors independent;
                     # this now includes four candidate/query identity tables
                     # and one important table per task rather than per source.
-                    self.assertEqual(physical, 281)
+                    self.assertEqual(physical, 278)
                     if model_name == "mdl_onetrans":
                         self.assertEqual(len(config.sequences), 16)
                         # Every prior a task token reads must exist as a loaded

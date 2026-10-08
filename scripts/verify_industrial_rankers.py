@@ -60,8 +60,10 @@ def update_probe(config, device, steps):
             initial_accumulator_value=config.training.adagrad_initial_accumulator_value,
             eps=config.training.adagrad_eps))
     base_lrs = [[g["lr"] for g in o.param_groups] for o in optimizers]
+    model = train._maybe_compile_model(config, model)
     losses = []
     shared_embedding_update_steps = 0
+    shared_embedding_rounding_only_steps = 0
     for step in range(steps):
         train._set_optimizer_lrs(optimizers, base_lrs,
                                 train._lr_schedule_multiplier(config, step + 1, None))
@@ -88,15 +90,38 @@ def update_probe(config, device, steps):
         train._clip_grad_norm(sparse, config.training.sparse_clip_norm)
         tables = list(iter_gset_tables(model))
         before = [table.weight.detach().clone() for table in tables]
+        expected_updates = []
+        for table in tables:
+            parameter = table.weight
+            owner = next((o, g) for o in optimizers for g in o.param_groups
+                         if any(p is parameter for p in g["params"]))
+            optimizer, group = owner
+            gradient = parameter.grad.coalesce()
+            rows, values = gradient.indices()[0], gradient.values().float()
+            state = optimizer.state[parameter]
+            accumulator = state["sum"].index_select(0, rows).float() + values.square().mean(1)
+            lr = group["lr"] / (1 + float(state["step"]) * group["lr_decay"])
+            original = parameter.detach().index_select(0, rows)
+            rounded = (original.float() - lr * values / (accumulator.sqrt() + group["eps"])[:, None]).to(parameter.dtype)
+            expected_updates.append((parameter, rows, rounded, torch.equal(original, rounded)))
         for optimizer in optimizers:
             optimizer.step()
+        for parameter, rows, expected, _unchanged in expected_updates:
+            torch.testing.assert_close(parameter.detach().index_select(0, rows), expected,
+                                       rtol=.01 if parameter.dtype == torch.bfloat16 else 1e-5, atol=1e-9)
         if any(not torch.equal(old, table.weight) for old, table in zip(before, tables)):
             shared_embedding_update_steps += 1
+        elif all(unchanged for _p, _r, _e, unchanged in expected_updates):
+            shared_embedding_rounding_only_steps += 1
+        else:
+            raise AssertionError("shared embedding update disappeared despite a representable reference update")
     result = {"losses": losses, "shared_embedding_update_steps": shared_embedding_update_steps,
+              "shared_embedding_rounding_only_steps": shared_embedding_rounding_only_steps,
+              "sparse_update_reference_checked": True,
               "shared_tables": [{"type": type(t).__name__, "rows": t.weight.size(0),
                                  "step": t.stats().current_step} for t in iter_gset_tables(model)]}
-    if shared_embedding_update_steps != steps:
-        raise AssertionError("shared embedding weights were not updated at every step")
+    if not shared_embedding_update_steps:
+        raise AssertionError("shared embeddings never changed: " + json.dumps(result))
     if not losses[-1] < losses[0]:
         raise AssertionError(f"synthetic loss did not decrease: {losses}")
     if config.model.name == "more":
@@ -135,12 +160,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--compile", action="store_true", help="Verify the dense-only compiled path")
     parser.add_argument("--models", nargs="+", choices=("uniformer", "more", "mixformer"),
                         default=("uniformer", "more"))
     parser.add_argument("--output", type=Path, required=True, help="New output directory")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(1)
+    if args.compile:
+        torch._inductor.config.compile_threads = 1
     device = torch.device(args.device)
     if device.type == "cuda":
         torch.cuda.set_device(device)
@@ -149,10 +177,11 @@ def main():
     manifest = generate_synthetic_agg_dataset(config, data, files=1, raw_rows_per_file=4,
         requests_per_agg=2, candidates_per_request=2,
         sequence_lengths={s.name: 8 for s in config.sequences}, physical_column_count=630)
-    results = {"device": str(device), "torch": torch.__version__, "data": asdict(manifest),
+    results = {"device": str(device), "compile": args.compile, "torch": torch.__version__, "data": asdict(manifest),
                "scope": "synthetic only; ordinary ID tables capped; dynamic rank table grows from test IDs; no production checkpoints", "models": {}}
     for name in args.models:
         config = config_for(name, args.device)
+        config = replace(config, runtime=replace(config.runtime, compile=args.compile))
         results["models"][name] = {"updates": update_probe(config, device, args.steps),
                                    "trainer": trainer_probe(config, data)}
         print(json.dumps(results["models"][name], default=str), flush=True)

@@ -21,6 +21,25 @@ from src.features import load_vocab_maps, plan_vocab_fit
 
 
 class ModelConfigOverlayTest(unittest.TestCase):
+    def test_all_production_configs_exclude_unverified_offline_columns(self) -> None:
+        from src.dataloader import required_columns_for_split
+
+        removed = {"ud_id_bin_hn", "compoergn_id_hn", "clk_8d_cnt_hn"}
+        root = Path(__file__).resolve().parents[1]
+        # Load inheritance as well as standalone coarse/fine files. Loading
+        # validates token references; check physical read requirements separately.
+        for path in sorted((root / "configs").glob("*.yaml")):
+            with self.subTest(config=path.name):
+                config = load_app_config(path)
+                for split in (config.data.train, config.data.test):
+                    if split is None:
+                        continue
+                    self.assertFalse(removed & set(required_columns_for_split(config, split)))
+                    if split.adapter is not None:
+                        self.assertFalse(removed & set(split.adapter.input_columns or ()))
+                        for option in ("item_features", "context_features", "multivalue_features"):
+                            self.assertFalse(removed & set(split.adapter.options.get(option, ())))
+
     def test_default_and_production_learning_rate_profile(self) -> None:
         defaults = TrainingConfig()
         self.assertEqual(defaults.lr_dense, 1.0e-4)

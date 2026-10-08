@@ -37,7 +37,7 @@ MASK64 = (1 << 64) - 1
 # incompatible with the available embedding-memory budget.
 DEFAULT_BUCKETS = tuple(1 << exponent for exponent in range(10, 37))
 # Must match the physical sample fixture / parquet profiler split (47 request
-# fields, remaining item fields). Production models consume the v3 43/82
+# fields, remaining item fields). Production models consume the offline v3 43/79
 # contract after ``materialize_v3_sample``.
 DEFAULT_CONTEXT_FEATURE_COUNT = 47
 DEFAULT_SKU_FIELDS = (

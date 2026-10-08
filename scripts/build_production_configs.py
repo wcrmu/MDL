@@ -69,10 +69,11 @@ from src.embeddings import (  # noqa: E402
 # split. Production models consume the v3 feature contract below.
 SAMPLE_CONTEXT_FEATURE_COUNT = 47
 # Physical fixture keeps the original 47/100 split, then appends v3-only names.
-SAMPLE_FEATURE_COUNT = 154
-# Online ``cvr_feature_glo_py_sr_sku_v3.yaml``: Context 43 + Item 72 + Creative 10.
+SAMPLE_FEATURE_COUNT = 151
+# Offline subset of the online v3 contract: 43 context + 79 item/creative fields.
+# Keep unverified online-only columns out of the offline reader and token groups.
 CONTEXT_FEATURE_COUNT = 43
-EXPECTED_FEATURE_COUNT = 125
+EXPECTED_FEATURE_COUNT = 122
 ITEM_FEATURE_COUNT = EXPECTED_FEATURE_COUNT - CONTEXT_FEATURE_COUNT
 # Main UPS streams from the same v3 yaml. The sample fixture may still list
 # ``semi_clk``; that column stays in parquet but is not consumed.
@@ -196,15 +197,12 @@ V3_ITEM_FEATURES = (
     "nfk_gmv_14d_hn",
     "nfk_sales_14d_hn",
     "nfk_price_14d_hn",
-    "ud_id_bin_hn",
-    "compoergn_id_hn",
     "f_goods_view_times_tg_l1_hn",
     "cart_hit_i2i_idx_hn",
     "us_ctr_price_dis50_hn",
     "multimodal_i2i_hit_cart_size_hn",
     "impr_clk_6h_cnt_hn",
     "auto_price_p10_dis_hn",
-    "clk_8d_cnt_hn",
     "cart_long_hit_samestyle_i2i_idx_hn",
     "clk_hit_i2i_idx_hn",
     "goods_name_bigram_hn",
@@ -245,7 +243,7 @@ V3_ITEM_FEATURES = (
 if len(V3_CONTEXT_FEATURES) != CONTEXT_FEATURE_COUNT:
     raise RuntimeError("V3_CONTEXT_FEATURES must list 43 context fields")
 if len(V3_ITEM_FEATURES) != ITEM_FEATURE_COUNT:
-    raise RuntimeError("V3_ITEM_FEATURES must list 82 item/creative fields")
+    raise RuntimeError("V3_ITEM_FEATURES must list 79 item/creative fields")
 if len(V3_CONTEXT_FEATURES) + len(V3_ITEM_FEATURES) != EXPECTED_FEATURE_COUNT:
     raise RuntimeError("v3 context+item must equal EXPECTED_FEATURE_COUNT")
 SUPPORTED_MODELS = (
@@ -335,7 +333,6 @@ ITEM_BAG_FIELDS = {
     "mid_goods_prc_list_dis",
     "mid_cmprc_diff_list_dis",
     "clk_cnt_1d_hn",
-    "clk_8d_cnt_hn",
     "cart_cnt_1d_hn",
     "cart_cnt_3d_hn",
     "q_hit_good_correct_unigram_hn",
@@ -372,7 +369,6 @@ OBSERVED_MULTIVALUE_MAX_LENGTHS = {
     "clk_1d_cat_cnt_hn": 1,
     "clk_3d_cnt_hn": 1,
     "clk_cnt_1d_hn": 1,
-    "clk_8d_cnt_hn": 1,
     "clk_1d_cat_cnt_hn": 1,
     "u_fst_ordr_cnt_mix_d_hn": 3,
     "price_after_promotion_div_hn": 5,
@@ -744,8 +740,6 @@ RANKMIXER_SEMANTIC_FEATURE_GROUPS = (
             "mall_id_hn",
             "sellr_type_hn",
             "site_x_asian_code_hn",
-            "ud_id_bin_hn",
-            "compoergn_id_hn",
         ),
     ),
     (
@@ -854,7 +848,6 @@ RANKMIXER_SEMANTIC_FEATURE_GROUPS = (
         (
             "idx_goods_creative_id_hn",
             "clk_cnt_1d_hn",
-            "clk_8d_cnt_hn",
             "cart_cnt_1d_hn",
             "cart_cnt_3d_hn",
         ),
@@ -1077,9 +1070,6 @@ def materialize_v3_sample(sample: Mapping[str, Any]) -> dict[str, Any]:
         "scene_clk_cnt_15d_hit_hn": "scene_impr_cnt_15d_hit_hn",
         "clk_7d_page_elsns_hn": "view_7d_page_elsns_hn",
         "ups_in_cart_2h_sku_cur_prices_hn": "ups_in_cart_tg_hn",
-        "ud_id_bin_hn": "sellr_type_hn",
-        "compoergn_id_hn": "sellr_type_hn",
-        "clk_8d_cnt_hn": "clk_cnt_1d_hn",
     }
     selected: list[Any] = []
     for name in (*V3_CONTEXT_FEATURES, *V3_ITEM_FEATURES):
@@ -1413,12 +1403,6 @@ def _ensure_v3_profile_shapes(
     shapes.setdefault(
         "clk_7d_page_elsns_hn",
         shapes.get("view_7d_page_elsns_hn", (8192, 16)),
-    )
-    shapes.setdefault("ud_id_bin_hn", (256, 8))
-    shapes.setdefault("compoergn_id_hn", (256, 8))
-    shapes.setdefault(
-        "clk_8d_cnt_hn",
-        shapes.get("clk_cnt_1d_hn", (1024, 16)),
     )
     return shapes
 

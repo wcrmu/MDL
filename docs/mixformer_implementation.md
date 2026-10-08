@@ -1,5 +1,8 @@
 # MixFormer and MDL-MixFormer implementation
 
+For the compiled-padding, empty-history DDP and strict Flash corrections and
+their validation scope, see [the repair report](mixformer_fix_20261005.md).
+
 ## Scope
 
 The implementation is based on MixFormer's published architecture. The
@@ -97,7 +100,7 @@ Set it only to force a specific even split.
 
 ## Current-data choices
 
-- The 144 active non-sequential inputs have a packed embedding width of 1936.
+- The 121 active non-sequential inputs (39 request-side, 82 candidate-side) have a packed embedding width of 1936.
   It divides exactly into `N=8` contiguous slices (242 values per head), so no
   padding or learned global pre-projection is used.
 - The eight main behavior streams remain raw event streams and retain their

@@ -38,6 +38,7 @@ from scripts.build_production_configs import (
     SCENARIO_IMPORTANT_FIELDS_BY_TOKEN,
     SCENARIO_IMPRESSION_PRIOR_FIELDS,
     SCENARIO_SHARED_PRIOR_UPS,
+    SUPPORTED_MODELS,
     TASK_IMPORTANT_FIELDS,
     TASK_IMPORTANT_FIELDS_BY_TASK,
     TASK_IMPORTANT_IDENTITY_SHAPES,
@@ -393,6 +394,32 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.sample = yaml.safe_load(SAMPLE_FIXTURE.read_text(encoding="utf-8"))
 
+    def test_regeneration_does_not_restore_unverified_offline_columns(self) -> None:
+        removed = {"ud_id_bin_hn", "compoergn_id_hn", "clk_8d_cnt_hn"}
+        # Exercise both an original sample and a stale fixture containing the
+        # old declarations, so neither the clone path nor selection restores them.
+        original = yaml.safe_load((ROOT / "sample.yaml").read_text(encoding="utf-8"))
+        stale = {
+            **self.sample,
+            "features": [
+                *self.sample["features"],
+                *({"name": name, "source": name, "kind": "categorical",
+                   "embedding_dim": 8} for name in sorted(removed)),
+            ],
+        }
+        for sample_name, sample in (("original", original), ("stale", stale)):
+            report = build_name_estimate_report(sample)
+            for model_name in SUPPORTED_MODELS:
+                with self.subTest(sample=sample_name, model=model_name):
+                    payload, summary = build_config(sample, report, model_name=model_name)
+                    self.assertEqual(summary["context_feature_count"], 43)
+                    self.assertEqual(summary["item_feature_count"], 79)
+                    for variant in (payload, derive_fine_payload(payload)):
+                        serialized = yaml.safe_dump(variant)
+                        for name in removed:
+                            self.assertNotIn(name, serialized)
+                        AppConfig.from_mapping(variant)
+
     def test_builds_valid_report_driven_production_config(self) -> None:
         report = _synthetic_report(self.sample)
         payload, summary = build_config(
@@ -423,7 +450,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
         )
         self.assertEqual(by_name["sku_spec_vids_hn"]["pooling"], "sum")
         self.assertEqual(by_name["sku_spec_vids_hn"]["max_length"], 256)
-        self.assertEqual(summary["bag_feature_count"], 67)
+        self.assertEqual(summary["bag_feature_count"], 66)
         self.assertEqual(
             set(MULTIVALUE_MAX_LENGTHS),
             set(OBSERVED_MULTIVALUE_MAX_LENGTHS),
@@ -435,7 +462,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             )
         )
         self.assertLessEqual(max(MULTIVALUE_MAX_LENGTHS.values()), 512)
-        self.assertEqual(sum(PACK_MULTIVALUE_MAX_LENGTHS.values()), 7770)
+        self.assertEqual(sum(PACK_MULTIVALUE_MAX_LENGTHS.values()), 7769)
         self.assertEqual(
             OBSERVED_MULTIVALUE_MAX_LENGTHS["cart_long_spec_vids_hn"],
             10005,
@@ -610,7 +637,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             "src.dataloader:adapt_mdl_rankmixer_parquet",
         )
         adapter_payload = payload["data"]["train"]["adapter"]
-        self.assertEqual(len(adapter_payload["input_columns"]), 228)
+        self.assertEqual(len(adapter_payload["input_columns"]), 225)
         self.assertEqual(len(adapter_payload["optional_input_columns"]), 11)
         self.assertEqual(
             len(payload["data"]["test"]["adapter"]["optional_input_columns"]),
@@ -672,7 +699,6 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             self.assertNotIn(name, adapter_options["item_features"])
         for name in (
             "clk_cnt_1d_hn",
-            "clk_8d_cnt_hn",
             "cart_cnt_1d_hn",
             "cart_cnt_3d_hn",
         ):
@@ -1081,7 +1107,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
             )
 
         mdl_onetrans = payloads["mdl_onetrans"]
-        self.assertEqual(len(mdl_onetrans["features"]), 162)
+        self.assertEqual(len(mdl_onetrans["features"]), 159)
         self.assertEqual(len(mdl_onetrans["sequences"]), 16)
         self.assertFalse(mdl_onetrans["tokenization"]["omit_scene_features"])
         self.assertTrue(
@@ -1752,7 +1778,7 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                     # Phase-2 keeps task/scenario-history priors independent;
                     # this now includes four candidate/query identity tables
                     # and one important table per task rather than per source.
-                    self.assertEqual(physical, 281)
+                    self.assertEqual(physical, 278)
                     if model_name == "mdl_onetrans":
                         self.assertEqual(len(config.sequences), 16)
                         # Every prior a task token reads must exist as a loaded
