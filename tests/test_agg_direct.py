@@ -1123,11 +1123,11 @@ class AxisSeparatedAdaptTest(unittest.TestCase):
             bundles.append(bundle)
             self.assertEqual(
                 bundle.sequence_features["impr_x_goods"][0].tolist(),
-                [-1, -2],
+                [-1],
             )
             self.assertEqual(
                 bundle.sequence_features["buy_x_goods"][0].tolist(),
-                [],
+                [-9],
             )
 
         np.testing.assert_array_equal(

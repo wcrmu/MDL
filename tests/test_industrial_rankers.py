@@ -77,12 +77,50 @@ class CurrentFeatureContractTest(unittest.TestCase):
                 self.assertTrue(config.resolved.mixformer_item_feature_inputs)
                 self.assertEqual(config.resolved.mixformer_user_head_count, 4)
                 self.assertEqual(config.resolved.tokenization.feature_token_count, 8)
+                self.assertEqual(config.data.train.reader.length_buckets, ())
+                self.assertEqual(config.data.test.reader.length_buckets, ())
+                if name == "uniformer":
+                    self.assertEqual(config.training.batch_size, 64)
                 self.assertTrue(
                     all(sequence.encoder == "raw" for sequence in config.sequences)
                 )
                 if shared_anchors is not None:
                     width = 8 + shared_anchors + len(config.task_names)
                     self.assertEqual(config.model.token_dim % width, 0)
+
+    def test_uniformer_keeps_the_mixformer_event_window(self) -> None:
+        limit = 3
+        config = _compact("uniformer")
+        config = replace(
+            config,
+            model=replace(config.model, global_sequence_max_length=limit),
+        )
+        model = build_model(config, _synthetic_vocab_maps(config), embedding_size_override=32)
+        _replace_id_embeddings_with_synthetic(model)
+        batch = _synthetic_feature_batch(
+            config,
+            torch.device("cpu"),
+            batch_size=4,
+            sequence_length=5,
+            seed=19,
+        )
+        _user, _item, sequences, _index = model.tokenizer.encode(batch.features)
+        rows = int(sequences.batch_lengths.shape[0])
+        kept = int(sequences.values.shape[0])
+        streams = len(model.tokenizer.sequence_groups)
+        self.assertEqual(sequences.role_lengths.shape[1], streams)
+        self.assertLessEqual(int(sequences.batch_lengths.max()), limit)
+        self.assertLessEqual(kept, limit * rows)
+        self.assertGreater(kept, 0)
+        self.assertLess(kept, 5 * streams * rows)
+        logits = model(batch.features, batch.scenario_id)["logits"]
+        logits.square().mean().backward()
+        missing = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        self.assertEqual(missing, [])
 
     def test_compact_models_match_candidate_labels(self) -> None:
         for name, model_type in (

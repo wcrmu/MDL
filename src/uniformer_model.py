@@ -12,6 +12,7 @@ import torch
 from torch import Tensor, nn
 
 from .model import FeatureEncoderBank, OneTransTokenizer, _consumed_scalar_feature_names
+from .modules.ragged import RaggedTokens
 from .modules.stca import SwiGLUFFN
 from .modules.uniformer import UniFormerRanker
 from .modules.uniformer import GroupedSwiGLUTokenizer
@@ -57,7 +58,12 @@ class _UniFormerTaskTokens(nn.Module):
 
 
 class UniFormerTokenizer(OneTransTokenizer):
-    """Request-axis and candidate-axis queries, plus one raw stream per behavior."""
+    """Request-axis and candidate-axis queries, plus the shared behavior budget.
+
+    The budget is ``global_sequence_max_length`` events per request. Each
+    behavior keeps the newest events inside its own share of that budget.
+    Stream identity stays on each event as its role.
+    """
 
     def __init__(self, config: Any, encoder_bank: FeatureEncoderBank) -> None:
         super().__init__(config, encoder_bank)
@@ -85,7 +91,7 @@ class UniFormerTokenizer(OneTransTokenizer):
     def encode(
         self,
         features: dict[str, Any],
-    ) -> tuple[Tensor, Tensor, list[tuple[Tensor, Tensor]], Tensor | None]:
+    ) -> tuple[Tensor, Tensor, RaggedTokens, Tensor | None]:
         self.encoder_bank.prepare_gset_batch(features)
         preencoded = self._preencode_inputs(
             features,
@@ -109,33 +115,12 @@ class UniFormerTokenizer(OneTransTokenizer):
                 dtype=torch.long,
                 device=item_heads.device,
             )
-        streams: list[tuple[Tensor, Tensor]] = []
-        for index, (group, projection) in enumerate(
-            zip(self.sequence_groups, self.sequence_projectors)
-        ):
-            tokens, mask, _temporal = self._sequence_group_tokens(
-                group,
-                projection,
-                features,
-                preencoded,
-            )
-            if self.sequence_type_embeddings is not None:
-                type_indicator = self.sequence_type_embeddings.weight[index].to(
-                    dtype=tokens.dtype
-                )
-                tokens = tokens + type_indicator.view(1, 1, -1)
-            if tokens.size(1) == 0:
-                tokens = tokens.new_zeros(tokens.size(0), 1, self.token_dim) + tokens.sum() * 0
-                mask = torch.zeros(
-                    tokens.size(0),
-                    1,
-                    dtype=torch.bool,
-                    device=tokens.device,
-                )
-            streams.append((tokens, mask))
-        if not streams:
+        if not self.sequence_groups:
             raise ValueError("UniFormer requires at least one behavior stream")
-        return user_heads, item_heads, streams, request_index
+        window = self._sequence_token_part(features, preencoded)
+        if window.sequences is None:
+            raise RuntimeError("UniFormer event window was not packed")
+        return user_heads, item_heads, window.sequences, request_index
 
 
 def _expansion(config: Any) -> int:
@@ -232,14 +217,12 @@ class UniFormerModel(nn.Module):
         del scenario_id
         if request_cache is not None:
             raise ValueError("UniFormer does not support cross-forward request caches")
-        user_heads, item_heads, streams, request_index = self.tokenizer.encode(features)
+        user_heads, item_heads, sequences, request_index = self.tokenizer.encode(features)
         candidate_batch = item_heads.size(0)
         user_heads = _align_candidates(user_heads, candidate_batch, request_index)
         ns_tokens = torch.cat([user_heads, item_heads], dim=1)
         task_tokens = self.task_tokens(user_heads.mean(dim=1))
-        sequences = [tokens for tokens, _mask in streams]
-        masks = [mask for _tokens, mask in streams]
-        sequence_batch = sequences[0].size(0)
+        sequence_batch = int(sequences.batch_lengths.shape[0])
         if request_index is None and sequence_batch == candidate_batch:
             sequence_index = None
         elif request_index is None or request_index.numel() != candidate_batch:
@@ -253,7 +236,6 @@ class UniFormerModel(nn.Module):
             ns_tokens,
             task_tokens,
             sequences,
-            masks,
             request_index=sequence_index,
         )
         return {"logits": output.logits}

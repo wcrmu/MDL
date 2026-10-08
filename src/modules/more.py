@@ -25,6 +25,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from .ragged import apply_masked_tokenwise
 from .stca import SwiGLUFFN
 from .ranking_utils import ProjectedCrossAttention, RequestLayout, SequenceMemory, token_swiglu
 
@@ -246,9 +247,9 @@ class MOREBlock(nn.Module):
         register: Tensor,
         sequence_mask: Tensor | None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        updated = self.seq_ffn(sequence)
-        key = self.w_k(updated)
-        value = self.w_v(updated)
+        updated = apply_masked_tokenwise(self.seq_ffn, sequence, sequence_mask)
+        key = apply_masked_tokenwise(self.w_k, updated, sequence_mask)
+        value = apply_masked_tokenwise(self.w_v, updated, sequence_mask)
         pooled = _masked_mean(updated, sequence_mask)
         register = self.register_norm(register + self.register_mlp(pooled))
         return updated, key, value, register

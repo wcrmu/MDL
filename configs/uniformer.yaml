@@ -2,7 +2,16 @@
 # Extends the MixFormer pack: same fields, same eight raw behavior streams,
 # same three labels. FIM depth is num_layers; TIM depth is uniformer_tim_layers.
 # Dense-only compile is available but stays off pending target-GPU measurement.
+# Sequences are ragged: one fixed batch_size, real tokens only. Length buckets
+# would only exist to shrink padding, and this model does not store padding.
 extends: mixformer.yaml
+data:
+  train:
+    reader:
+      length_buckets: []
+  test:
+    reader:
+      length_buckets: []
 training:
   checkpoint:
     run_name: uniformer_v2

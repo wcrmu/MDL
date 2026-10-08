@@ -1,4 +1,11 @@
 extends: mixformer_fine.yaml
+data:
+  train:
+    reader:
+      length_buckets: []
+  test:
+    reader:
+      length_buckets: []
 tokenization:
   # Whole-field semantic tokens: four request groups and four candidate groups.
   ns_tokens:

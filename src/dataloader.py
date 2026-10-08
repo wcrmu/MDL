@@ -27,7 +27,6 @@ import fnmatch
 from hashlib import sha256
 from itertools import chain, islice
 import glob
-import heapq
 import importlib
 import json
 import logging
@@ -5416,12 +5415,13 @@ def _select_global_recent_sequence_positions(
     max_length: int,
     raw_row: int,
     validate_contract: bool,
+    share_weights: Mapping[str, int] | None = None,
 ) -> dict[str, list[int]]:
-    """Select one newest-event window across heterogeneous UPS streams.
+    """Keep each behavior's share of the newest events.
 
-    Each input stream remains in its original newest-to-oldest physical order
-    after selection. Ties are deterministic: configured UPS order, then the
-    original position within that stream.
+    ``max_length`` is the total budget. A stream's share is proportional to
+    its configured length, and only that stream's newest events can fill it.
+    Streams stay in their original newest-to-oldest order.
     """
 
     normalized_times_by_type: dict[str, list[int | None]] = {}
@@ -5473,52 +5473,36 @@ def _select_global_recent_sequence_positions(
             previous_timestamp = timestamp
         normalized_times_by_type[ups] = normalized_times
 
-    # Every UPS is already newest-to-oldest, so this is a k-way merge rather
-    # than a sort of up to len(ups_types) * max_length Python tuples.
-    heap: list[tuple[int, int, int, str, int]] = []
+    # Each stream is already newest-to-oldest. Drop null timestamps, then keep
+    # the newest events that fit that stream's share of the budget.
+    from .model import proportional_integer_shares
 
-    def _push(ups: str, stream_order: int, local_order: int) -> None:
-        times = normalized_times_by_type[ups]
-        if local_order >= len(times):
-            return
-        timestamp = times[local_order]
-        if timestamp is None:
-            # An event without a timestamp cannot participate in a global
-            # chronological window. Nulls are required to be a suffix under
-            # validation, so there can be no later comparable event to push.
-            return
-        heapq.heappush(
-            heap,
-            (
-                -timestamp,
-                stream_order,
-                local_order,
-                ups,
-                int(positions_by_type[ups][local_order]),
-            ),
-        )
-
-    for stream_order, ups in enumerate(ups_types):
-        _push(ups, stream_order, 0)
-
-    selected_by_type: dict[str, list[tuple[int, int]]] = {
-        ups: [] for ups in ups_types
-    }
-    selected_count = 0
-    while heap and selected_count < max_length:
-        (
-            _newest_rank,
-            stream_order,
-            local_order,
-            ups,
-            position,
-        ) = heapq.heappop(heap)
-        selected_by_type[ups].append((local_order, position))
-        selected_count += 1
-        _push(ups, stream_order, local_order + 1)
+    timestamped: dict[str, list[tuple[int, int]]] = {}
+    for ups in ups_types:
+        kept: list[tuple[int, int]] = []
+        for local_order, timestamp in enumerate(normalized_times_by_type[ups]):
+            if timestamp is None:
+                continue
+            kept.append((local_order, int(positions_by_type[ups][local_order])))
+        timestamped[ups] = kept
+    available = [len(timestamped[ups]) for ups in ups_types]
+    if sum(available) <= max_length:
+        shares = available
+    else:
+        weights: list[int] = []
+        for ups, count in zip(ups_types, available):
+            configured = None if share_weights is None else share_weights.get(ups)
+            if type(configured) is int and configured > 0:
+                weights.append(configured)
+            else:
+                weights.append(count)
+        shares = proportional_integer_shares(weights, max_length)
     return {
-        ups: [position for _local_order, position in sorted(selected_by_type[ups])]
-        for ups in ups_types
+        ups: [
+            position
+            for _local_order, position in timestamped[ups][:share]
+        ]
+        for ups, share in zip(ups_types, shares)
     }
 
 
@@ -6605,6 +6589,7 @@ def build_arrow_axis_source(
                         max_length=plan.global_sequence_max_length,
                         raw_row=raw_row,
                         validate_contract=validate_structure,
+                        share_weights=plan.sequence_max_lengths,
                     )
                 else:
                     selected_by_type = {}
@@ -7246,6 +7231,7 @@ def adapt_mdl_rankmixer_parquet(table: Any, *, context: Any) -> Any:
                         max_length=global_sequence_max_length,
                         raw_row=raw_row,
                         validate_contract=validate_payload,
+                        share_weights=sequence_max_lengths,
                     )
                 )
             # Trusted + flattened UPS rows are NumPy views. Build one index

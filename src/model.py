@@ -31,6 +31,11 @@ from .embeddings import (
     lookup_id_embedding,
     plan_embedding_shards,
 )
+from .modules.ragged import (
+    RaggedTokens,
+    apply_masked_tokenwise,
+    pack_valid_rows,
+)
 from .modules.attention import (
     DomainAwareAttention,
     DomainFusedModule,
@@ -239,6 +244,85 @@ def _project_sequence_in_chunks(
     return projected.view(*values.shape[:-1], projected.size(-1))
 
 
+def _project_masked_sequence(
+    module: nn.Module,
+    values: Tensor,
+    mask: Tensor,
+    config: AppConfig | None,
+) -> Tensor:
+    """Project real events only, then scatter them back to ``[rows, length, dim]``.
+
+    Padding positions stay zero and never enter the MLP. An empty mask still
+    runs one dummy event so the projector stays in the autograd graph.
+    """
+
+    if values.ndim != 3 or mask.shape != values.shape[:2] or mask.dtype != torch.bool:
+        raise ValueError("masked projection expects [rows, length, dim] and a bool mask")
+    selected = values[mask]
+    rows, length, _width = values.shape
+    runtime = getattr(config, "runtime", None)
+    if runtime is None or not hasattr(runtime, "activation_checkpoint"):
+        # Lightweight test doubles omit the training runtime. Project directly.
+        config = None
+    if selected.size(0) == 0:
+        dummy = _project_sequence_in_chunks(
+            module,
+            values.new_zeros(1, values.size(-1)),
+            config,
+        )
+        output = dummy.new_zeros(rows, length, dummy.size(-1))
+        return output + dummy.sum() * 0
+    projected = _project_sequence_in_chunks(module, selected, config)
+    output = projected.new_zeros(rows, length, projected.size(-1))
+    output[mask] = projected
+    return output
+
+
+def proportional_integer_shares(weights: Sequence[int], budget: int) -> list[int]:
+    """Split ``budget`` across streams in proportion to ``weights``.
+
+    Largest remainder assigns the leftover events. Equal remainders go to the
+    heavier stream, then to the earlier stream. The shares sum to ``budget``.
+    """
+
+    count = len(weights)
+    if budget < 0:
+        raise ValueError("share budget must be non-negative")
+    if any(type(weight) is not int or weight < 0 for weight in weights):
+        raise ValueError("share weights must be non-negative integers")
+    if count == 0 or budget == 0 or sum(weights) == 0:
+        return [0] * count
+    total = sum(weights)
+    shares = [budget * weight // total for weight in weights]
+    remainder = budget - sum(shares)
+    ranking = sorted(
+        range(count),
+        key=lambda index: (
+            (budget * weights[index]) % total,
+            weights[index],
+            -index,
+        ),
+        reverse=True,
+    )
+    for index in ranking[:remainder]:
+        shares[index] += 1
+    return shares
+
+
+def _keep_newest_events(mask: Tensor, keys: Tensor, share: int) -> Tensor:
+    """Keep at most ``share`` valid events with the largest temporal keys."""
+
+    if share <= 0:
+        return torch.zeros_like(mask)
+    if mask.size(1) <= share:
+        return mask
+    ranked = keys.masked_fill(~mask, -torch.inf)
+    newest = torch.argsort(ranked, dim=1, stable=True)[:, -share:]
+    kept = torch.zeros_like(mask)
+    kept.scatter_(1, newest, True)
+    return mask & kept
+
+
 def _split_selected_events_by_stream(
     order: Tensor,
     output_mask: Tensor,
@@ -337,6 +421,7 @@ class OneTransRequestCache:
     s_tokens: Tensor
     s_valid_mask: Tensor
     layers: tuple[OneTransLayerCache, ...] = ()
+    sequences: RaggedTokens | None = None
 
 
 def _index_onetrans_request_cache(
@@ -353,6 +438,7 @@ def _index_onetrans_request_cache(
     return OneTransRequestCache(
         s_tokens=select(cache.s_tokens),
         s_valid_mask=select(cache.s_valid_mask),
+        sequences=None if cache.sequences is None else cache.sequences.index_rows(row_indices),
         layers=tuple(
             OneTransLayerCache(
                 s_input=select(layer.s_input),
@@ -1336,14 +1422,59 @@ class LongerSequenceAttentionBlock(nn.Module):
         )
         return output.transpose(1, 2)
 
-    def _finish_attention(self, query_tokens: Tensor, attended: Tensor) -> Tensor:
-        hidden = query_tokens + self.output_projection(self._merge_heads(attended))
-        return hidden + self.ffn(self.ffn_norm(hidden))
+    def _finish_attention(
+        self,
+        query_tokens: Tensor,
+        attended: Tensor,
+        query_mask: Tensor | None = None,
+    ) -> Tensor:
+        merged = self._merge_heads(attended)
+        if query_mask is None:
+            hidden = query_tokens + self.output_projection(merged)
+            return hidden + self.ffn(self.ffn_norm(hidden))
+        hidden = query_tokens + apply_masked_tokenwise(
+            self.output_projection,
+            merged,
+            query_mask,
+        )
+        return hidden + apply_masked_tokenwise(
+            self.ffn,
+            apply_masked_tokenwise(self.ffn_norm, hidden, query_mask),
+            query_mask,
+        )
 
-    def project_kv(self, key_tokens: Tensor) -> tuple[Tensor, Tensor]:
-        key_input = self.key_norm(key_tokens)
-        key, value = self.kv_projection(key_input).split(self.token_dim, dim=-1)
+    def project_kv(
+        self,
+        key_tokens: Tensor,
+        valid_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        if valid_mask is None:
+            key_input = self.key_norm(key_tokens)
+            projected = self.kv_projection(key_input)
+        else:
+            key_input = apply_masked_tokenwise(self.key_norm, key_tokens, valid_mask)
+            projected = apply_masked_tokenwise(
+                self.kv_projection,
+                key_input,
+                valid_mask,
+            )
+        key, value = projected.split(self.token_dim, dim=-1)
         return self._split_heads(key), self._split_heads(value)
+
+    def _project_queries(
+        self,
+        query_tokens: Tensor,
+        query_mask: Tensor | None = None,
+    ) -> Tensor:
+        if query_mask is None:
+            projected = self.query_projection(self.query_norm(query_tokens))
+        else:
+            projected = apply_masked_tokenwise(
+                self.query_projection,
+                apply_masked_tokenwise(self.query_norm, query_tokens, query_mask),
+                query_mask,
+            )
+        return self._split_heads(projected)
 
     def project_v(self, key_tokens: Tensor) -> Tensor:
         """Value-only projection for the single-token attention fast path."""
@@ -1398,8 +1529,8 @@ class LongerSequenceAttentionBlock(nn.Module):
             and query_valid_mask.size(1) == 1
             and key_valid_mask.size(1) == 1
         ):
-            return self._finish_attention(query_tokens, value)
-        query = self._split_heads(self.query_projection(self.query_norm(query_tokens)))
+            return self._finish_attention(query_tokens, value, query_valid_mask)
+        query = self._project_queries(query_tokens, query_valid_mask)
         if self.attention_backend == "flash":
             attended = self._flash_varlen_attention(
                 query,
@@ -1420,7 +1551,7 @@ class LongerSequenceAttentionBlock(nn.Module):
                     attn_mask=self._nonempty_mask(allowed).unsqueeze(1),
                     dropout_p=dropout_p,
                 )
-        return self._finish_attention(query_tokens, attended)
+        return self._finish_attention(query_tokens, attended, query_valid_mask)
 
     def forward_mixed_projected_kv(
         self,
@@ -1444,7 +1575,7 @@ class LongerSequenceAttentionBlock(nn.Module):
                 key_valid_mask,
             )
 
-        query = self._split_heads(self.query_projection(self.query_norm(query_tokens)))
+        query = self._project_queries(query_tokens, query_valid_mask)
         if self.attention_backend != "flash":
             allowed = self.mixed_allowed_mask(
                 key_valid_mask, query_valid_mask, global_query_count
@@ -1458,7 +1589,7 @@ class LongerSequenceAttentionBlock(nn.Module):
                     attn_mask=self._nonempty_mask(allowed).unsqueeze(1),
                     dropout_p=dropout_p,
                 )
-            return self._finish_attention(query_tokens, attended)
+            return self._finish_attention(query_tokens, attended, query_valid_mask)
 
         key_packing = _VarlenPacking.from_mask(key_valid_mask)
         compact = self.varlen_packing == "compact"
@@ -1504,7 +1635,7 @@ class LongerSequenceAttentionBlock(nn.Module):
                 )
             )
         attended = torch.cat(parts, dim=2) if parts else torch.zeros_like(query)
-        return self._finish_attention(query_tokens, attended)
+        return self._finish_attention(query_tokens, attended, query_valid_mask)
 
     def forward_full(
         self,
@@ -1512,8 +1643,8 @@ class LongerSequenceAttentionBlock(nn.Module):
         valid_mask: Tensor,
     ) -> Tensor:
         if tokens.size(1) == 1 and valid_mask.size(1) == 1:
-            return self._finish_attention(tokens, self.project_v(tokens))
-        key, value = self.project_kv(tokens)
+            return self._finish_attention(tokens, self.project_v(tokens), valid_mask)
+        key, value = self.project_kv(tokens, valid_mask)
         return self.forward_full_projected_kv(
             tokens, key, value, valid_mask, valid_mask
         )
@@ -1874,7 +2005,8 @@ class LongerSequenceEncoder(nn.Module):
                     current_key_mask: Tensor,
                 ) -> Tensor:
                     current_key, current_value = self.cross_block.project_kv(
-                        current_inputs
+                        current_inputs,
+                        current_key_mask,
                     )
                     return self.cross_block.forward_mixed_projected_kv(
                         current_queries,
@@ -1910,7 +2042,8 @@ class LongerSequenceEncoder(nn.Module):
                     current_key_mask: Tensor,
                 ) -> tuple[Tensor, Tensor, Tensor]:
                     current_key, current_value = self.cross_block.project_kv(
-                        current_inputs
+                        current_inputs,
+                        current_key_mask,
                     )
                     current_output = self.cross_block.forward_mixed_projected_kv(
                         current_queries,
@@ -1931,7 +2064,10 @@ class LongerSequenceEncoder(nn.Module):
                     use_reentrant=False,
                 )
         else:
-            cross_key, cross_value = self.cross_block.project_kv(cross_inputs)
+            cross_key, cross_value = self.cross_block.project_kv(
+            cross_inputs,
+            cross_key_mask,
+        )
             cross_output = self.cross_block.forward_mixed_projected_kv(
                 cross_queries,
                 cross_key,
@@ -1961,7 +2097,8 @@ class LongerSequenceEncoder(nn.Module):
                         current_block: LongerSequenceAttentionBlock = block,
                     ) -> Tensor:
                         current_key, current_value = current_block.project_kv(
-                            current_inputs
+                            current_inputs,
+                            current_mask,
                         )
                         return current_block.forward_mixed_projected_kv(
                             current_inputs,
@@ -1994,7 +2131,8 @@ class LongerSequenceEncoder(nn.Module):
                         current_block: LongerSequenceAttentionBlock = block,
                     ) -> tuple[Tensor, Tensor, Tensor]:
                         current_key, current_value = current_block.project_kv(
-                            current_inputs
+                            current_inputs,
+                            current_mask,
                         )
                         current_output = current_block.forward_mixed_projected_kv(
                             current_inputs,
@@ -2013,7 +2151,10 @@ class LongerSequenceEncoder(nn.Module):
                         use_reentrant=False,
                     )
             else:
-                cacheable_key, cacheable_value = block.project_kv(cacheable_inputs)
+                cacheable_key, cacheable_value = block.project_kv(
+                    cacheable_inputs,
+                    cacheable_mask,
+                )
                 cacheable_output = block.forward_mixed_projected_kv(
                     cacheable_inputs,
                     cacheable_key,
@@ -2101,7 +2242,10 @@ class LongerSequenceEncoder(nn.Module):
         cross_queries = torch.cat([user_global_tokens, recent_tokens], dim=1)
         cross_query_mask = torch.cat([user_mask, recent_mask], dim=1)
         cross_key_mask = torch.cat([user_mask, merged_mask], dim=1)
-        cross_key, cross_value = self.cross_block.project_kv(cross_inputs)
+        cross_key, cross_value = self.cross_block.project_kv(
+            cross_inputs,
+            cross_key_mask,
+        )
         cross_output = self.cross_block.forward_mixed_projected_kv(
             cross_queries,
             cross_key,
@@ -2124,7 +2268,7 @@ class LongerSequenceEncoder(nn.Module):
         for layer_index, block in enumerate(self.self_blocks):
             cacheable_inputs = torch.cat([current_user, current_recent], dim=1)
             cacheable_mask = torch.cat([user_mask, recent_mask], dim=1)
-            key, value = block.project_kv(cacheable_inputs)
+            key, value = block.project_kv(cacheable_inputs, cacheable_mask)
             if layer_index == final_layer:
                 # Only global tokens are returned in summary mode. They have
                 # full visibility, so this is exactly the global slice of the
@@ -2262,12 +2406,17 @@ class LongerSequenceEncoder(nn.Module):
                 cached_merged_mask: Tensor,
             ) -> Tensor:
                 candidate_key, candidate_value = self.cross_block.project_kv(
-                    current_candidate
+                    current_candidate,
+                    current_candidate_mask,
                 )
                 cached_inputs = torch.cat(
                     [cached_user_input, cached_merged_tokens], dim=1
                 )
-                cached_key, cached_value = self.cross_block.project_kv(cached_inputs)
+                cached_mask = torch.cat([cached_user_mask, cached_merged_mask], dim=1)
+                cached_key, cached_value = self.cross_block.project_kv(
+                    cached_inputs,
+                    cached_mask,
+                )
                 cross_key = torch.cat([candidate_key, cached_key], dim=2)
                 cross_value = torch.cat([candidate_value, cached_value], dim=2)
                 cross_key_mask = torch.cat(
@@ -2304,7 +2453,8 @@ class LongerSequenceEncoder(nn.Module):
                 )
         else:
             candidate_key, candidate_value = self.cross_block.project_kv(
-                candidate_global_tokens
+                candidate_global_tokens,
+                candidate_valid,
             )
             cross_key = torch.cat(
                 [candidate_key, sequence_cache.cross_cacheable_key], dim=2
@@ -2363,10 +2513,12 @@ class LongerSequenceEncoder(nn.Module):
                     current_block: LongerSequenceAttentionBlock = block,
                 ) -> Tensor:
                     candidate_key, candidate_value = current_block.project_kv(
-                        current_candidate
+                        current_candidate,
+                        current_candidate_mask,
                     )
                     cached_key, cached_value = current_block.project_kv(
-                        current_cacheable_inputs
+                        current_cacheable_inputs,
+                        current_cacheable_mask,
                     )
                     key = torch.cat([candidate_key, cached_key], dim=2)
                     value = torch.cat([candidate_value, cached_value], dim=2)
@@ -2398,7 +2550,10 @@ class LongerSequenceEncoder(nn.Module):
                         cacheable_mask,
                     )
             else:
-                candidate_key, candidate_value = block.project_kv(candidate_hidden)
+                candidate_key, candidate_value = block.project_kv(
+                    candidate_hidden,
+                    candidate_valid,
+                )
                 key = torch.cat([candidate_key, layer_cache.cacheable_key], dim=2)
                 value = torch.cat([candidate_value, layer_cache.cacheable_value], dim=2)
                 key_mask = torch.cat(
@@ -2553,7 +2708,7 @@ class UnifiedLongerReadout(nn.Module):
                 f"unified LONGER readout expected {expected_length} states, "
                 f"got {hidden.size(1)}"
             )
-        memory = self.memory_projection(hidden)
+        memory = apply_masked_tokenwise(self.memory_projection, hidden, valid_mask)
         queries = self.query_tokens.to(dtype=memory.dtype).expand(
             memory.size(0), -1, -1
         )
@@ -2569,7 +2724,7 @@ class UnifiedLongerReadout(nn.Module):
             dtype=torch.bool,
             device=memory.device,
         )
-        key, value = self.readout_block.project_kv(memory)
+        key, value = self.readout_block.project_kv(memory, valid_mask)
         return self.readout_block.forward_full_projected_kv(
             queries,
             key,
@@ -3728,9 +3883,10 @@ class FeatureEncoderBank(nn.Module):
                 value,
                 preencoded_inputs,
             )
-            tokens = _project_sequence_in_chunks(
+            tokens = _project_masked_sequence(
                 self.sequence_step_projectors[position_key],
                 projector_inputs,
+                mask,
                 getattr(self, "config", None),
             )
         else:
@@ -3745,9 +3901,10 @@ class FeatureEncoderBank(nn.Module):
             step_inputs, mask = self._align_sequence_inputs(
                 sequence, step_inputs, lengths
             )
-            tokens = _project_sequence_in_chunks(
+            tokens = _project_masked_sequence(
                 self.sequence_step_projectors[position_key],
                 step_inputs,
+                mask,
                 getattr(self, "config", None),
             )
             if (
@@ -3937,14 +4094,16 @@ class FeatureEncoderBank(nn.Module):
                 preencoded_inputs,
                 add_position=False,
             )
-            tokens = _project_sequence_in_chunks(
+            tokens = _project_masked_sequence(
                 self.sequence_step_projectors[self._module_key(name)],
                 projector_inputs,
+                mask,
                 self.config,
             )
-            tokens = tokens + type_embedding.weight[type_index].to(
+            type_indicator = type_embedding.weight[type_index].to(dtype=tokens.dtype)
+            tokens = tokens + type_indicator.view(1, 1, -1) * mask.unsqueeze(-1).to(
                 dtype=tokens.dtype
-            ).view(1, 1, -1)
+            )
             if batch_size is None:
                 batch_size = tokens.size(0)
             elif batch_size != tokens.size(0):
@@ -4406,7 +4565,12 @@ class FeatureEncoderBank(nn.Module):
                 with torch.profiler.record_function(
                     "longer::checkpointed_request_chunk"
                 ):
-                    chunk_tokens = projector(chunk_inputs)
+                    chunk_tokens = _project_masked_sequence(
+                        projector,
+                        chunk_inputs,
+                        chunk_mask,
+                        self.config,
+                    )
                     # LongerTokenMerger applies the validity mask once. An
                     # additional full-width multiply here only duplicates HBM IO.
                     summaries.append(
@@ -5640,6 +5804,19 @@ class OneTransTokenizer(nn.Module):
             for name in group.inputs
         )
 
+    def _behavior_share_weight(self, group: TokenGroupConfig) -> int:
+        """Configured length of this behavior. Transport caps are not weights."""
+
+        weights = [
+            int(sequence.max_length)
+            for name in group.inputs
+            if (sequence := self.sequence_by_name.get(name)) is not None
+            and sequence.max_length
+        ]
+        if not weights:
+            return 1
+        return max(weights)
+
     def request_row_indices(self, features: dict[str, Any]) -> Tensor | None:
         """Return the common request-to-candidate map for raw S sequences."""
 
@@ -5852,12 +6029,12 @@ class OneTransTokenizer(nn.Module):
             features,
             preencoded_inputs,
         )
-        tokens = _project_sequence_in_chunks(
+        tokens = _project_masked_sequence(
             projection,
             inputs,
+            mask,
             self.config,
         )
-        tokens = tokens * mask.unsqueeze(-1).to(tokens.dtype)
         return tokens, mask, temporal_sort_keys
 
     def _global_timestamp_sequence_token_part(
@@ -5865,14 +6042,13 @@ class OneTransTokenizer(nn.Module):
         features: dict[str, Any],
         preencoded_inputs: dict[str, Tensor] | None,
         global_limit: int,
-    ) -> OneTransRequestCache:
-        """Project only valid events in the globally selected time window.
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Project the newest events inside each behavior's share of the budget.
 
-        Per-stream dense widths are batch maximums. Once streams can borrow a
-        shared global capacity, those maximums may sum to many times that shared
-        capacity even though each request has at most ``global_limit`` events.
-        Sorting cheap temporal grids first and projecting selected events in
-        compact form keeps the expensive output at exactly ``[B, T, D]``.
+        Shares are proportional to the configured per-stream lengths and sum to
+        ``global_limit``. A stream cannot spend another stream's share. The
+        survivors are then placed in timestamp order, so the fused sequence is
+        still a timeline of at most ``global_limit`` events.
         """
 
         if self.sequence_type_embeddings is None:
@@ -5908,6 +6084,14 @@ class OneTransTokenizer(nn.Module):
 
         if batch_size is None:
             raise RuntimeError("global timestamp fusion has no sequence groups")
+        shares = proportional_integer_shares(
+            [self._behavior_share_weight(group) for group in self.sequence_groups],
+            global_limit,
+        )
+        group_masks = [
+            _keep_newest_events(mask, keys, share)
+            for mask, keys, share in zip(group_masks, temporal_keys, shares)
+        ]
         source_mask = torch.cat(group_masks, dim=1)
         source_keys = torch.cat(temporal_keys, dim=1)
         sort_values = source_keys.masked_fill(~source_mask, -torch.inf)
@@ -5944,6 +6128,7 @@ class OneTransTokenizer(nn.Module):
 
         projected_values: list[Tensor] = []
         flat_indices: list[Tensor] = []
+        role_ids: list[Tensor] = []
         empty_group_anchors: list[Tensor] = []
         offset = 0
         for group_index, (inputs, projection, count) in enumerate(
@@ -5978,6 +6163,14 @@ class OneTransTokenizer(nn.Module):
                 batch_indices[selected_slice] * output_width
                 + output_positions[selected_slice]
             )
+            role_ids.append(
+                torch.full(
+                    (count,),
+                    group_index,
+                    dtype=torch.int32,
+                    device=order.device,
+                )
+            )
 
         selected_values = torch.cat(projected_values, dim=0)
         selected_indices = torch.cat(flat_indices, dim=0)
@@ -6006,10 +6199,16 @@ class OneTransTokenizer(nn.Module):
             output_width,
             flat_tokens.size(-1),
         )
-        return OneTransRequestCache(
-            s_tokens=tokens,
-            s_valid_mask=output_mask,
+        flat_role = torch.zeros(
+            batch_size * output_width,
+            dtype=torch.int32,
+            device=order.device,
         )
+        present_roles = [item for item in role_ids if item.numel()]
+        if present_roles:
+            flat_role.index_copy_(0, selected_indices, torch.cat(present_roles))
+        role = flat_role.view(batch_size, output_width)
+        return tokens, output_mask, role
 
     def _ns_tokens_groupwise(self, encoded: dict[str, Tensor]) -> Tensor:
         tokens = []
@@ -6053,6 +6252,8 @@ class OneTransTokenizer(nn.Module):
         self,
         tokens: Tensor,
         mask: Tensor,
+        role: Tensor | None = None,
+        role_count: int | None = None,
     ) -> OneTransRequestCache:
         if self.require_compact_sequence_batches:
             if mask.size(1):
@@ -6067,7 +6268,17 @@ class OneTransTokenizer(nn.Module):
                     raise ValueError(message)
         elif self.trim_all_invalid_sequence_prefix:
             tokens, mask = self._trim_all_invalid_prefix(tokens, mask)
-        return OneTransRequestCache(s_tokens=tokens, s_valid_mask=mask)
+            if role is not None:
+                if tokens.size(1) == 0:
+                    role = role[:, :0]
+                elif role.size(1) != tokens.size(1):
+                    role = role[:, -tokens.size(1) :]
+        sequences = pack_valid_rows(tokens, mask, role, role_count)
+        return OneTransRequestCache(
+            s_tokens=tokens,
+            s_valid_mask=mask,
+            sequences=sequences,
+        )
 
     def _sequence_token_part(
         self,
@@ -6080,17 +6291,20 @@ class OneTransTokenizer(nn.Module):
                 raise RuntimeError(
                     "global sequence selection requires timestamp-aware fusion"
                 )
-            cache = self._global_timestamp_sequence_token_part(
+            tokens, mask, role = self._global_timestamp_sequence_token_part(
                 features,
                 preencoded_inputs,
                 global_limit,
             )
             return self._finalize_sequence_token_part(
-                cache.s_tokens,
-                cache.s_valid_mask,
+                tokens,
+                mask,
+                role,
+                role_count=len(self.sequence_groups),
             )
         sequence_tokens: list[Tensor] = []
         sequence_masks: list[Tensor] = []
+        sequence_roles: list[Tensor] = []
         sequence_temporal_sort_keys: list[Tensor] = []
         for index, (group, projection) in enumerate(
             zip(self.sequence_groups, self.sequence_projectors)
@@ -6113,6 +6327,9 @@ class OneTransTokenizer(nn.Module):
             tokens = tokens * mask.unsqueeze(-1).to(tokens.dtype)
             sequence_tokens.append(tokens)
             sequence_masks.append(mask)
+            sequence_roles.append(
+                torch.full(mask.shape, index, dtype=torch.int32, device=tokens.device)
+            )
             if self.sequence_fusion == "timestamp_aware":
                 if temporal_sort_keys is None:
                     raise RuntimeError(
@@ -6131,9 +6348,18 @@ class OneTransTokenizer(nn.Module):
                         tokens.size(0), 1, dtype=torch.bool, device=tokens.device
                     )
                 )
+                sequence_roles.append(
+                    torch.full(
+                        (tokens.size(0), 1),
+                        len(self.sequence_groups) + index,
+                        dtype=torch.int32,
+                        device=tokens.device,
+                    )
+                )
 
         tokens = torch.cat(sequence_tokens, dim=1)
         mask = torch.cat(sequence_masks, dim=1)
+        role = torch.cat(sequence_roles, dim=1)
         if self.sequence_fusion == "timestamp_aware":
             temporal_sort_keys = torch.cat(sequence_temporal_sort_keys, dim=1)
             sort_values = temporal_sort_keys.masked_fill(~mask, -torch.inf)
@@ -6142,9 +6368,20 @@ class OneTransTokenizer(nn.Module):
                 1, order.unsqueeze(-1).expand(-1, -1, tokens.size(-1))
             )
             mask = mask.gather(1, order)
+            role = role.gather(1, order)
         else:
+            order = torch.argsort(mask.to(torch.int64), dim=1, stable=True)
             tokens, mask = self._compact_valid_tokens(tokens, mask)
-        return self._finalize_sequence_token_part(tokens, mask)
+            role = role.gather(1, order)
+        role_count = len(self.sequence_groups)
+        if self.use_sep_tokens and self.sequence_fusion != "timestamp_aware":
+            role_count += len(self.sep_tokens)
+        return self._finalize_sequence_token_part(
+            tokens,
+            mask,
+            role,
+            role_count=role_count,
+        )
 
     def precompute_request_cache(
         self,
@@ -6396,7 +6633,8 @@ class MixFormerTokenizer(OneTransTokenizer):
     def compact_selected_history(
         tokens: Tensor,
         mask: Tensor,
-    ) -> tuple[Tensor, Tensor]:
+        role: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
         """Keep only selected actions; 8000 is a cap, not a padded width.
 
         Global timestamp fusion may still emit a wide tensor whose invalid
@@ -6407,7 +6645,10 @@ class MixFormerTokenizer(OneTransTokenizer):
         if mask.ndim != 2 or tokens.shape[:2] != mask.shape:
             raise ValueError("history tokens and mask must share [batch, length]")
         if mask.size(0) == 0 or mask.size(1) == 0:
-            return tokens, _mark_mixformer_history_density(mask, True)
+            marked = _mark_mixformer_history_density(mask, True)
+            if role is None:
+                return tokens, marked
+            return tokens, marked, role
         valid_counts = mask.sum(dim=1)
         min_valid, max_valid = (
             int(value)
@@ -6415,10 +6656,16 @@ class MixFormerTokenizer(OneTransTokenizer):
         )
         if max_valid == 0:
             empty_tokens, empty_mask = tokens[:, :0], mask[:, :0]
-            return empty_tokens, _mark_mixformer_history_density(empty_mask, True)
+            marked = _mark_mixformer_history_density(empty_mask, True)
+            if role is None:
+                return empty_tokens, marked
+            return empty_tokens, marked, role[:, :0]
         dense = min_valid == max_valid
         if dense and max_valid == mask.size(1):
-            return tokens, _mark_mixformer_history_density(mask, True)
+            marked = _mark_mixformer_history_density(mask, True)
+            if role is None:
+                return tokens, marked
+            return tokens, marked, role
         order = torch.argsort(
             mask.to(dtype=torch.int64),
             dim=1,
@@ -6432,15 +6679,29 @@ class MixFormerTokenizer(OneTransTokenizer):
         packed_mask = mask.gather(1, order)
         packed_tokens = packed_tokens[:, :max_valid]
         packed_mask = packed_mask[:, :max_valid]
-        return packed_tokens, _mark_mixformer_history_density(packed_mask, dense)
+        marked = _mark_mixformer_history_density(packed_mask, dense)
+        if role is None:
+            return packed_tokens, marked
+        packed_role = role.gather(1, order)[:, :max_valid]
+        return packed_tokens, marked, packed_role
 
     def _finalize_sequence_token_part(
         self,
         tokens: Tensor,
         mask: Tensor,
+        role: Tensor | None = None,
+        role_count: int | None = None,
     ) -> OneTransRequestCache:
+        compacted = self.compact_selected_history(tokens, mask, role)
+        if role is None:
+            tokens, mask = compacted
+        else:
+            tokens, mask, role = compacted
         return super()._finalize_sequence_token_part(
-            *self.compact_selected_history(tokens, mask)
+            tokens,
+            mask,
+            role,
+            role_count,
         )
 
     def forward(
@@ -6945,7 +7206,11 @@ class OneTransBlock(nn.Module):
             )
             residual = s_tokens[:, -query_s_count:, :]
             hidden = residual + attended
-            output = hidden + self.ffn.s_ffn(self.norm_ffn(hidden))
+            output = hidden + apply_masked_tokenwise(
+                self.ffn.s_ffn,
+                apply_masked_tokenwise(self.norm_ffn, hidden, output_mask),
+                output_mask,
+            )
         if cache_kv:
             cached_key = s_key
             cached_value = s_value
@@ -7053,7 +7318,11 @@ class OneTransBlock(nn.Module):
             )
             residual = s_tokens[:, -query_s_count:, :]
             hidden = residual + attended
-            output = hidden + self.ffn.s_ffn(self.norm_ffn(hidden))
+            output = hidden + apply_masked_tokenwise(
+                self.ffn.s_ffn,
+                apply_masked_tokenwise(self.norm_ffn, hidden, output_mask),
+                output_mask,
+            )
         return OneTransLayerCache(
             s_input=s_tokens,
             s_input_start=input_start,
@@ -7133,8 +7402,27 @@ class OneTransBlock(nn.Module):
         residual = tokens[:, query_start:, :]
         attended = self.attention(normalized, s_count, query_s_count, valid_mask)
         hidden = residual + attended
-        output = hidden + self.ffn(self.norm_ffn(hidden), query_s_count)
-        return output, valid_mask[:, query_start:]
+        query_mask = valid_mask[:, query_start:]
+        s_hidden = hidden[:, :query_s_count]
+        ns_hidden = hidden[:, query_s_count:]
+        if query_s_count:
+            s_hidden = s_hidden + apply_masked_tokenwise(
+                self.ffn.s_ffn,
+                apply_masked_tokenwise(
+                    self.norm_ffn,
+                    s_hidden,
+                    query_mask[:, :query_s_count],
+                ),
+                query_mask[:, :query_s_count],
+            )
+        if ns_hidden.size(1) == 0:
+            output = s_hidden
+        else:
+            output = torch.cat(
+                [s_hidden, ns_hidden + self.ffn(self.norm_ffn(ns_hidden), 0)],
+                dim=1,
+            )
+        return output, query_mask
 
 
 def _mdl_onetrans_sequence_summary_names(config: AppConfig) -> set[str]:

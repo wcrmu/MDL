@@ -1389,9 +1389,9 @@ class SequenceConfig(_DeeplyImmutableConfig):
     def tensor_max_length(self) -> int | None:
         """Physical cap used by data transport/tensorization.
 
-        Normally this is the sequence's own max_length. A globally truncated
-        MixFormer event stream replaces it with the shared global capacity so
-        an active stream can borrow capacity left unused by other streams.
+        Normally this is the sequence's own max_length. A shared behavior
+        budget replaces it with that budget. Each stream still only keeps its
+        proportional share of the budget; the transport cap is the upper bound.
         """
 
         if self._transport_max_length is not None:

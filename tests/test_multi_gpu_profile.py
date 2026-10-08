@@ -38,15 +38,9 @@ class MultiGpuProfileTest(unittest.TestCase):
         updated = _apply_world_size_training_profile(config, world_size=8)
         self.assertEqual(updated.data.train.reader.pack_unit, "agg_rows")
         self.assertEqual(updated.training.batch_size, 64)
-        self.assertEqual(
-            [bucket.batch_size for bucket in updated.data.train.reader.length_buckets],
-            [64, 64, 64, 64, 64],
-        )
+        self.assertEqual(updated.data.train.reader.length_buckets, ())
+        self.assertEqual(updated.data.test.reader.length_buckets, ())
         self.assertEqual(updated.training.gradient_accumulation_steps, 64)
-        self.assertLess(
-            updated.data.test.reader.length_buckets[0].batch_size,
-            config.data.test.reader.length_buckets[0].batch_size,
-        )
 
     def test_apply_profile_derates_eight_gpu_batches(self) -> None:
         os.environ.pop("MDL_LOCAL_BATCH_SCALE", None)
@@ -59,8 +53,7 @@ class MultiGpuProfileTest(unittest.TestCase):
         ), mock.patch("src.train._small_hbm_cuda_device", return_value=True):
             updated = _apply_world_size_training_profile(config, world_size=8)
         self.assertEqual(updated.training.batch_size, 960)  # 1280 * 0.75
-        train_buckets = updated.data.train.reader.length_buckets
-        self.assertEqual(train_buckets[0].batch_size, 960)
+        self.assertEqual(updated.data.train.reader.length_buckets, ())
         self.assertEqual(updated.data.train.reader.device_prefetch_batches, 0)
         self.assertGreaterEqual(
             updated.data.train.reader.host_prepare_prefetch, 4
@@ -94,7 +87,7 @@ class MultiGpuProfileTest(unittest.TestCase):
             updated = _apply_world_size_training_profile(config, world_size=4)
         # 1280 * 1.20 — NVLink/large-HBM fills activation headroom for sps.
         self.assertEqual(updated.training.batch_size, 1536)
-        self.assertEqual(updated.data.train.reader.length_buckets[0].batch_size, 1536)
+        self.assertEqual(updated.data.train.reader.length_buckets, ())
         self.assertEqual(updated.data.train.reader.device_prefetch_batches, 2)
         self.assertGreaterEqual(
             updated.data.train.reader.host_prepare_prefetch, 10

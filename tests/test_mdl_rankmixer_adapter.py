@@ -564,7 +564,7 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
         self.assertEqual(actual["impr_x_goods_id_hn"], [[-1, -2]])
         self.assertEqual(actual["impr_x_time_delta_ms"], [[100.0, 1000.0]])
 
-    def test_req_global_recent_window_allows_stream_capacity_borrowing(self) -> None:
+    def test_req_global_window_keeps_each_stream_share(self) -> None:
         table = pa.table(
             {
                 "ctx_scalar_hn": [[101]],
@@ -597,9 +597,8 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
                     "impr": "impr_x_time_delta_ms",
                     "buy": "buy_x_time_delta_ms",
                 },
-                # The old policy would keep one event from each stream. The
-                # global policy keeps both newest events, even though both are
-                # impressions.
+                # Equal configured lengths split the budget. The older buy
+                # event keeps its share instead of losing it to a newer impression.
                 "sequence_max_lengths": {"impr": 1, "buy": 1},
                 "global_sequence_max_length": 2,
             }
@@ -607,10 +606,10 @@ class MDLRankMixerParquetAdapterTest(unittest.TestCase):
 
         actual = adapt(table, context=context).to_pydict()
 
-        self.assertEqual(actual["impr_x_goods_id_hn"], [[-1, -2]])
-        self.assertEqual(actual["impr_x_time_delta_ms"], [[100.0, 200.0]])
-        self.assertEqual(actual["buy_x_goods_id_hn"], [[]])
-        self.assertEqual(actual["buy_x_time_delta_ms"], [[]])
+        self.assertEqual(actual["impr_x_goods_id_hn"], [[-1]])
+        self.assertEqual(actual["impr_x_time_delta_ms"], [[100.0]])
+        self.assertEqual(actual["buy_x_goods_id_hn"], [[-9]])
+        self.assertEqual(actual["buy_x_time_delta_ms"], [[4000.0]])
 
     def test_req_accepts_optional_single_request_axis_on_context(self) -> None:
         table = pa.table(

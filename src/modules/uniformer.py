@@ -26,7 +26,8 @@ from torch.nn import functional as F
 
 from .stca import SwiGLUFFN
 from .attention import _sdpa_context
-from .ranking_utils import (ProjectedCrossAttention, RequestLayout, SequenceMemory,
+from .ragged import RaggedTokens, pack_masked_sequences, read_ragged_role
+from .ranking_utils import (ProjectedCrossAttention, RequestLayout,
                             RankingRMSNorm, token_swiglu)
 
 
@@ -116,6 +117,23 @@ class MultiHeadSelfAttention(nn.Module):
 class QueryCrossAttention(ProjectedCrossAttention):
     """Request-shared attention with strict backend dispatch."""
 
+    def read_role(
+        self,
+        query: Tensor,
+        memory: RaggedTokens,
+        role_id: int,
+        layout: RequestLayout | None = None,
+    ) -> Tensor:
+        context = read_ragged_role(
+            self.q_proj(query),
+            memory,
+            role_id,
+            self.num_heads,
+            self.attention_backend,
+            layout,
+        )
+        return self.out_proj(context)
+
 
 class LazySequenceMemory(nn.Module):
     """Tokenize each behavior sequence once and share KV across FIM layers.
@@ -141,25 +159,35 @@ class LazySequenceMemory(nn.Module):
         )
         self.k_norm = nn.ModuleList([RankingRMSNorm(d_model) for _ in range(num_sequences)])
 
-    def forward(
-        self,
-        sequences: list[Tensor],
-    ) -> list[tuple[Tensor, Tensor]]:
-        if len(sequences) != self.num_sequences:
+    def forward(self, tokens: RaggedTokens) -> RaggedTokens:
+        """SwiGLU each role on its real tokens. K and V stay this same tensor."""
+
+        if tokens.role_lengths.shape[1] != self.num_sequences:
             raise ValueError(
-                f"expected {self.num_sequences} sequences, got {len(sequences)}"
+                f"expected {self.num_sequences} roles, got {tokens.role_lengths.shape[1]}"
             )
-        memories: list[tuple[Tensor, Tensor]] = []
-        for index, sequence in enumerate(sequences):
-            if sequence.ndim != 3 or sequence.size(-1) != self.d_model:
-                raise ValueError(
-                    f"sequence {index} must have shape [batch, length, {self.d_model}], "
-                    f"got {tuple(sequence.shape)}"
-                )
-            hidden = self.ffn[index](sequence)
-            key = self.k_norm[index](hidden)
-            memories.append((key, key))
-        return memories
+        if tokens.values.numel() and tokens.values.size(-1) != self.d_model:
+            raise ValueError(
+                f"ragged tokens must end in dim {self.d_model}, got {tokens.values.size(-1)}"
+            )
+        keys = tokens.values.new_zeros(tokens.values.shape)
+        anchor = tokens.values.sum() * 0
+        for index, feedforward in enumerate(self.ffn):
+            # An empty role still has to touch its parameters. DDP runs with
+            # find_unused_parameters=False.
+            unused = self.k_norm[index](feedforward(tokens.values.new_zeros(1, self.d_model)))
+            anchor = anchor + unused.sum() * 0
+            selected = tokens.role == index
+            if tokens.role.numel() and bool(selected.any()):
+                hidden = self.k_norm[index](feedforward(tokens.values[selected]))
+                keys[selected] = hidden
+        return RaggedTokens(
+            keys + anchor,
+            tokens.batch_lengths,
+            tokens.batch_lengths_added,
+            tokens.role,
+            tokens.role_lengths,
+        )
 
 
 class TargetAttentionTokenizer(nn.Module):
@@ -285,8 +313,7 @@ class FeatureInteractionLayer(nn.Module):
         self,
         query_cross: Tensor,
         query_self: Tensor,
-        memories: list[SequenceMemory],
-        sequence_masks: list[Tensor | None],
+        memory: RaggedTokens,
         layout: RequestLayout | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         if query_cross.shape != query_self.shape:
@@ -296,11 +323,12 @@ class FeatureInteractionLayer(nn.Module):
                 f"expected {self.num_ns_tokens} query tokens, got {query_cross.size(1)}"
             )
         sequence_states = []
-        for index, memory in enumerate(memories):
-            attended = self.cross_attn[index](
+        for index in range(self.num_sequences):
+            attended = self.cross_attn[index].read_role(
                 self.cross_norm[index](query_cross),
                 memory,
-                layout=layout,
+                index,
+                layout,
             )
             attended = attended + query_cross
             sequence_states.append(self.s_ffn[index](attended) + attended)
@@ -472,26 +500,16 @@ class UniFormerRanker(nn.Module):
         self,
         ns_tokens: Tensor,
         task_tokens: Tensor,
-        sequences: list[Tensor],
+        sequences: list[Tensor] | RaggedTokens,
         sequence_masks: list[Tensor | None] | None = None,
         request_index: Tensor | None = None,
     ) -> UniFormerOutput:
-        self._check_inputs(
-            ns_tokens,
-            task_tokens,
-            sequences,
-            sequence_masks,
-            request_index,
-        )
-        masks: list[Tensor | None]
-        if sequence_masks is None:
-            masks = [None] * len(sequences)
-        else:
-            masks = list(sequence_masks)
-        memories = [SequenceMemory(key, value, mask)
-                    for (key, value), mask in zip(self.memory(sequences), masks)]
+        ragged = self._as_ragged(sequences, sequence_masks)
+        self._check_inputs(ns_tokens, task_tokens, ragged, request_index)
+        memory = self.memory(ragged)
+        requests = int(ragged.batch_lengths.shape[0])
         layout = None if request_index is None else RequestLayout.build(
-            request_index.to(device=sequences[0].device, dtype=torch.long), sequences[0].size(0))
+            request_index.to(device=ns_tokens.device, dtype=torch.long), requests)
         query_cross = ns_tokens
         query_self = ns_tokens
         feature = ns_tokens
@@ -499,8 +517,7 @@ class UniFormerRanker(nn.Module):
             feature, query_cross, query_self = layer(
                 query_cross,
                 query_self,
-                memories,
-                masks,
+                memory,
                 layout,
             )
         tasks = task_tokens
@@ -517,12 +534,25 @@ class UniFormerRanker(nn.Module):
             task_tokens=tasks,
         )
 
+    def _as_ragged(
+        self,
+        sequences: list[Tensor] | RaggedTokens,
+        sequence_masks: list[Tensor | None] | None,
+    ) -> RaggedTokens:
+        if isinstance(sequences, RaggedTokens):
+            if sequence_masks is not None:
+                raise ValueError("ragged tokens already dropped padding; do not pass masks")
+            return sequences
+        masks = [None] * len(sequences) if sequence_masks is None else list(sequence_masks)
+        if len(masks) != len(sequences):
+            raise ValueError("sequence_masks must align with sequences")
+        return pack_masked_sequences(sequences, masks)
+
     def _check_inputs(
         self,
         ns_tokens: Tensor,
         task_tokens: Tensor,
-        sequences: list[Tensor],
-        sequence_masks: list[Tensor | None] | None,
+        sequences: RaggedTokens,
         request_index: Tensor | None,
     ) -> None:
         batch = ns_tokens.size(0)
@@ -534,13 +564,11 @@ class UniFormerRanker(nn.Module):
             raise ValueError(
                 f"task_tokens must have shape {expected_tasks}, got {tuple(task_tokens.shape)}"
             )
-        if len(sequences) != self.num_sequences:
+        if sequences.role_lengths.shape[1] != self.num_sequences:
             raise ValueError(
-                f"expected {self.num_sequences} sequences, got {len(sequences)}"
+                f"expected {self.num_sequences} roles, got {sequences.role_lengths.shape[1]}"
             )
-        if sequence_masks is not None and len(sequence_masks) != len(sequences):
-            raise ValueError("sequence_masks must align with sequences")
-        sequence_batch = sequences[0].size(0) if sequences else batch
+        sequence_batch = int(sequences.batch_lengths.shape[0])
         if request_index is None:
             if sequence_batch != batch:
                 raise ValueError(
@@ -549,16 +577,10 @@ class UniFormerRanker(nn.Module):
                 )
         elif request_index.ndim != 1 or request_index.numel() != batch:
             raise ValueError("request_index must have one entry per candidate")
-        for index, sequence in enumerate(sequences):
-            if (
-                sequence.ndim != 3
-                or sequence.size(0) != sequence_batch
-                or sequence.size(-1) != self.d_model
-            ):
-                raise ValueError(
-                    f"sequence {index} must have shape "
-                    f"[{sequence_batch}, length, {self.d_model}]"
-                )
+        if sequences.values.numel() and sequences.values.size(-1) != self.d_model:
+            raise ValueError(
+                f"ragged tokens must end in dim {self.d_model}, got {sequences.values.size(-1)}"
+            )
 
 
 def _safe_key_mask(key_mask: Tensor) -> tuple[Tensor, Tensor]:

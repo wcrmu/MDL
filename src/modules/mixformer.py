@@ -36,6 +36,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from .ragged import apply_masked_tokenwise
 from .attention import (
     _call_varlen_attention,
     ensure_contiguous,
@@ -712,19 +713,30 @@ class MixFormerCrossAttention(nn.Module):
             context = context.squeeze(1)
         return context
 
-    def _transform_sequence(self, sequence: Tensor) -> Tensor:
-        return self._transform_sequence_slice(sequence, 0, sequence.size(1))
+    def _transform_sequence(
+        self,
+        sequence: Tensor,
+        valid_mask: Tensor | None = None,
+    ) -> Tensor:
+        return self._transform_sequence_slice(
+            sequence,
+            0,
+            sequence.size(1),
+            valid_mask,
+        )
 
     def _transform_sequence_slice(
         self,
         sequence: Tensor,
         start: int,
         end: int,
+        valid_mask: Tensor | None = None,
     ) -> Tensor:
         """SwiGLU residual on ``sequence[:, start:end]`` → ``[R, L', H, D]``.
 
         Called from length-chunked attention so the full ``[R, L, N·D]`` history
-        activation never coexists with score workspaces.
+        activation never coexists with score workspaces. When ``valid_mask`` is
+        set, padding never enters the norm or SwiGLU.
         """
 
         chunk = sequence[:, start:end]
@@ -732,6 +744,20 @@ class MixFormerCrossAttention(nn.Module):
             return chunk.new_empty(
                 chunk.size(0),
                 0,
+                self.num_heads,
+                self.dim,
+            )
+        if valid_mask is not None:
+            if valid_mask.shape != chunk.shape[:2]:
+                raise ValueError("sequence mask must match the transformed slice")
+
+            def _residual(values: Tensor) -> Tensor:
+                return values + self.sequence_ffn(self.sequence_norm(values))
+
+            updated = apply_masked_tokenwise(_residual, chunk, valid_mask)
+            return updated.view(
+                chunk.size(0),
+                chunk.size(1),
                 self.num_heads,
                 self.dim,
             )
@@ -947,8 +973,8 @@ class MixFormerCrossAttention(nn.Module):
         )
         for start in range(0, length, length_chunk):
             end = min(length, start + length_chunk)
-            hist = self._transform_sequence_slice(sequence, start, end)
             mask = valid_mask[:, start:end]
+            hist = self._transform_sequence_slice(sequence, start, end, mask)
             scores = (
                 torch.einsum("bnd,blnd->bnl", score_query, hist) * self.scale
             ).float()
@@ -1000,8 +1026,8 @@ class MixFormerCrossAttention(nn.Module):
         )
         for start in range(0, length, length_chunk):
             end = min(length, start + length_chunk)
-            hist = self._transform_sequence_slice(sequence, start, end)
             mask = valid_mask[:, start:end]
+            hist = self._transform_sequence_slice(sequence, start, end, mask)
             scores = (
                 torch.einsum("rmnd,rlnd->rmnl", grouped_query, hist) * self.scale
             ).float()
@@ -1046,7 +1072,7 @@ class MixFormerCrossAttention(nn.Module):
                 length_chunk,
             )
         else:
-            history = self._transform_sequence(sequence)
+            history = self._transform_sequence(sequence, valid_mask)
             context = self._context_from_aligned_scores(
                 score_query,
                 history,
@@ -1071,7 +1097,7 @@ class MixFormerCrossAttention(nn.Module):
             sequence_length=sequence.size(1),
         )
         if request_chunk >= layout.request_count and length_chunk >= sequence.size(1):
-            history = self._transform_sequence(sequence)
+            history = self._transform_sequence(sequence, valid_mask)
             return self._project_context(
                 self._grouped_context_from_history(
                     score_query,
@@ -1104,7 +1130,7 @@ class MixFormerCrossAttention(nn.Module):
                         length_chunk,
                     )
                 else:
-                    hist_slice = self._transform_sequence(seq_slice)
+                    hist_slice = self._transform_sequence(seq_slice, mask_slice)
                     grouped_context[start:end] = self._context_from_grouped_scores(
                         query_slice,
                         hist_slice,
@@ -1119,7 +1145,7 @@ class MixFormerCrossAttention(nn.Module):
                 length_chunk,
             )
         else:
-            history = self._transform_sequence(sequence)
+            history = self._transform_sequence(sequence, valid_mask)
             grouped_context = self._context_from_grouped_scores(
                 grouped_query,
                 history,
@@ -1421,7 +1447,7 @@ class MixFormerCrossAttention(nn.Module):
                 length_chunk,
                 user_head_count,
             )
-        history = self._transform_sequence(sequence)
+        history = self._transform_sequence(sequence, valid_mask)
         user_context = self._context_from_aligned_scores(
             user_score,
             history[:, :, :user_head_count],
@@ -1453,8 +1479,8 @@ class MixFormerCrossAttention(nn.Module):
         length = sequence.size(1)
         for start in range(0, length, length_chunk):
             end = min(length, start + length_chunk)
-            hist = self._transform_sequence_slice(sequence, start, end)
             mask = valid_mask[:, start:end]
+            hist = self._transform_sequence_slice(sequence, start, end, mask)
             user_state = self._step_aligned_online(
                 user_state,
                 user_score,
@@ -1559,7 +1585,7 @@ class MixFormerCrossAttention(nn.Module):
                 length_chunk,
                 request_chunk,
             )
-        history = self._transform_sequence(sequence)
+        history = self._transform_sequence(sequence, valid_mask)
         user_context = self._context_from_aligned_scores(
             user_score,
             history[:, :, :user_head_count],
@@ -1611,7 +1637,7 @@ class MixFormerCrossAttention(nn.Module):
                     user_head_count,
                 )
             else:
-                history = self._transform_sequence(seq_slice)
+                history = self._transform_sequence(seq_slice, mask_slice)
                 user_part = self._context_from_aligned_scores(
                     user_slice,
                     history[:, :, :user_head_count],
@@ -1659,8 +1685,8 @@ class MixFormerCrossAttention(nn.Module):
         length = sequence.size(1)
         for start in range(0, length, length_chunk):
             end = min(length, start + length_chunk)
-            hist = self._transform_sequence_slice(sequence, start, end)
             mask = valid_mask[:, start:end]
+            hist = self._transform_sequence_slice(sequence, start, end, mask)
             user_state = self._step_aligned_online(
                 user_state,
                 user_score,
@@ -1715,7 +1741,7 @@ class MixFormerCrossAttention(nn.Module):
         )
         if sequence.size(1) == 0:
             return query
-        history = self._transform_sequence(sequence)
+        history = self._transform_sequence(sequence, valid_mask)
         if sequence_row_indices is not None:
             history = history.index_select(0, sequence_row_indices)
             valid_mask = valid_mask.index_select(0, sequence_row_indices)

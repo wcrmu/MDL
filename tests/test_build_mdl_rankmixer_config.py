@@ -1643,11 +1643,6 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         131072 if model_name == "mdl_rankmixer" else 32768
                     )
                     expected_batch = 1536 if model_name == "mdl_rankmixer" else 1024
-                    expected_buckets = (
-                        [1536, 960, 640, 480, 768]
-                        if model_name == "mdl_rankmixer"
-                        else [1024, 640, 416, 320, 512]
-                    )
                     self.assertEqual(
                         config.runtime.sequence_projection_chunk_tokens,
                         expected_proj_chunk,
@@ -1670,13 +1665,8 @@ class BuildMDLRankMixerConfigTest(unittest.TestCase):
                         config.training.dense_optimizer_foreach_bucket_mb,
                         128,
                     )
-                    self.assertEqual(
-                        [
-                            bucket.batch_size
-                            for bucket in config.data.train.reader.length_buckets
-                        ],
-                        expected_buckets,
-                    )
+                    self.assertEqual(config.data.train.reader.length_buckets, ())
+                    self.assertEqual(config.data.test.reader.length_buckets, ())
                 self.assertTrue(config.training.fixed_test_eval.enabled)
                 self.assertEqual(config.training.fixed_test_eval.every_steps, 5000)
                 self.assertEqual(config.training.fixed_test_eval.files_per_rank, 4)

@@ -649,14 +649,9 @@ class ModelConfigOverlayTest(unittest.TestCase):
         self.assertEqual(longer.runtime.compile_mode, "default")
         self.assertTrue(onetrans.runtime.require_compact_sequence_batches)
         self.assertFalse(longer.runtime.require_compact_sequence_batches)
-        self.assertEqual(
-            [bucket.batch_size for bucket in onetrans.data.train.reader.length_buckets],
-            [2048, 1024, 512, 384, 320, 128],
-        )
-        self.assertEqual(
-            [bucket.batch_size for bucket in longer.data.train.reader.length_buckets],
-            [3072, 1536, 768, 512, 512, 192],
-        )
+        self.assertEqual(mdl.data.train.reader.length_buckets, ())
+        self.assertEqual(onetrans.data.train.reader.length_buckets, ())
+        self.assertEqual(longer.data.train.reader.length_buckets, ())
         for config in (mdl, onetrans, longer):
             with self.subTest(model=config.model.name):
                 self.assertTrue(config.training.ddp.static_graph)

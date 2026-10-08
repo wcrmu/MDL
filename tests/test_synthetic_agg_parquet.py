@@ -82,14 +82,9 @@ class SyntheticAggParquetTest(unittest.TestCase):
 
         override, bucket = _recommended_yaml_override(path, 40, lengths)
 
-        self.assertIsNotNone(bucket)
-        # Independent scenario/task priors have their own encoders and
-        # activations, so the sum-based memory bucket must count them rather
-        # than only the eight backbone histories.
-        self.assertEqual(bucket["workload_length"], 12518)
-        self.assertIsNone(bucket["max_length"])
-        rendered = override["data"]["train"]["reader"]["length_buckets"]
-        self.assertEqual(rendered[bucket["bucket_index"]]["batch_size"], 40)
+        self.assertIsNone(bucket)
+        self.assertEqual(override["training"]["batch_size"], 40)
+        self.assertNotIn("length_buckets", str(override))
 
     def test_hdfs_sensitivity_uses_projected_bytes_not_full_file_size(self) -> None:
         manifest = SyntheticAggManifest(

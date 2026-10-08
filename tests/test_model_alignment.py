@@ -1889,11 +1889,11 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
 
         torch.testing.assert_close(
             cache.s_tokens[:, :, 0],
-            torch.tensor([[1.0, 3.0], [2.0, 4.0]]),
+            torch.tensor([[3.0], [4.0]]),
         )
         self.assertEqual(
             [projector.projected_rows for projector in projectors],
-            [[2], [2]],
+            [[1], [1]],
         )
 
     def test_global_window_keeps_empty_stream_projector_in_backward(self) -> None:

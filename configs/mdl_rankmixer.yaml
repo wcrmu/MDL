@@ -63,17 +63,7 @@ data:
       hdfs_pre_buffer: true
       hdfs_close_timeout: 5
       length_bucket_metric: sum
-      length_buckets:
-      - max_length: 2048
-        batch_size: 1536
-      - max_length: 4096
-        batch_size: 960
-      - max_length: 6144
-        batch_size: 640
-      - max_length: 8192
-        batch_size: 480
-      - max_length: null
-        batch_size: 768
+      length_buckets: []
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
       input_columns:
@@ -726,17 +716,7 @@ data:
       hdfs_pre_buffer: true
       hdfs_close_timeout: 5
       length_bucket_metric: sum
-      length_buckets:
-      - max_length: 2048
-        batch_size: 72
-      - max_length: 4096
-        batch_size: 48
-      - max_length: 6144
-        batch_size: 32
-      - max_length: 8192
-        batch_size: 24
-      - max_length: null
-        batch_size: 48
+      length_buckets: []
     adapter:
       callable: src.dataloader:adapt_mdl_rankmixer_parquet
       input_columns:

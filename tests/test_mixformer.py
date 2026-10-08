@@ -907,7 +907,9 @@ class MixFormerIntegrationTest(unittest.TestCase):
                     config.model.sequence_fusion,
                     "timestamp_aware",
                 )
-                expected_global_limit = 8000
+                expected_global_limit = (
+                    8000 if config_name.startswith("mdl_") else 2000
+                )
                 self.assertEqual(
                     config.model.global_sequence_max_length,
                     expected_global_limit,
@@ -915,7 +917,7 @@ class MixFormerIntegrationTest(unittest.TestCase):
                 for name in active_sequence_names:
                     self.assertEqual(
                         sequence_by_name[name].tensor_max_length,
-                        8000,
+                        2000,
                     )
                 for split in (config.data.train, config.data.test):
                     assert split is not None and split.adapter is not None
@@ -931,9 +933,8 @@ class MixFormerIntegrationTest(unittest.TestCase):
                         for name in active_sequence_names
                     )
                 )
-                # Per-stream v3 windows sum to 41100. Timestamp-aware fusion
-                # merges into an 8000 global window so a busy stream can borrow
-                # unused capacity from empty ones.
+                # Per-stream v3 windows sum to 41100. The shared budget is 2000,
+                # split across behaviors in proportion to those windows.
                 self.assertEqual(active_sequence_capacity, 41100)
                 self.assertEqual(
                     config.model.token_dim
@@ -952,10 +953,8 @@ class MixFormerIntegrationTest(unittest.TestCase):
                     self.assertEqual(config.data.train.reader.pack_unit, "agg_rows")
                     self.assertEqual(config.training.batch_size, 64)
                     self.assertEqual(config.training.gradient_accumulation_steps, 64)
-                    self.assertEqual(
-                        [bucket.batch_size for bucket in config.data.train.reader.length_buckets],
-                        [64, 64, 64, 64, 64],
-                    )
+                    self.assertEqual(config.data.train.reader.length_buckets, ())
+                    self.assertEqual(config.data.test.reader.length_buckets, ())
                     for split in (config.data.train, config.data.test):
                         assert split is not None and split.adapter is not None
                         self.assertTrue(
