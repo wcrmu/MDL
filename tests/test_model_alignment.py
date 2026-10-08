@@ -1998,6 +1998,28 @@ class OneTransTokenizerAlignmentTest(unittest.TestCase):
             torch.tensor([1.0, 3.0, 9.0, 2.0, 4.0]),
         )
 
+    def test_share_window_width_is_the_longest_surviving_row(self) -> None:
+        tokenizer = self._fusion_tokenizer("timestamp_aware")
+        tokenizer.require_compact_sequence_batches = True
+        tokenizer.config = replace(
+            tokenizer.config,
+            model=replace(
+                tokenizer.config.model,
+                global_sequence_max_length=4,
+            ),
+        )
+        features = self._fusion_features()
+        features["a"]["mask"] = torch.tensor([[False, True]])
+        features["b"]["mask"] = torch.tensor([[False, True]])
+        features["a"]["lengths"] = torch.tensor([1])
+        features["b"]["lengths"] = torch.tensor([1])
+
+        cache = tokenizer.precompute_request_cache(features)
+
+        self.assertEqual(tuple(cache.s_tokens.shape), (1, 2, 4))
+        self.assertTrue(bool(cache.s_valid_mask[:, 0].any()))
+        self.assertTrue(bool(cache.s_valid_mask.all()))
+
     def test_compact_sequence_contract_rejects_global_padding_prefix(self) -> None:
         tokenizer = self._fusion_tokenizer("intent_ordered")
         tokenizer.require_compact_sequence_batches = True

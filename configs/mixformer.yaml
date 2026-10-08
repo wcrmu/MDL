@@ -4,7 +4,7 @@
 # MixFormer cross-attention uses N from num_feature_tokens, not this field.
 # This file is self-contained and does not extend onetrans.yaml.
 # compile: true fuses MixFormer blocks only (GSET / embeddings stay eager).
-# 8000 is a cap on selected real actions, not a padded width; inductor
+# 2000 is a cap on selected real actions, not a padded width; inductor
 # recaptures if a batch's longest real history changes.
 # Train grain: pack_unit=agg_rows. Each rank microbatch is 64 complete physical
 # agg rows; optimizer steps after gradient_accumulation_steps=64 microbatches.

@@ -6096,10 +6096,20 @@ class OneTransTokenizer(nn.Module):
         source_keys = torch.cat(temporal_keys, dim=1)
         sort_values = source_keys.masked_fill(~source_mask, -torch.inf)
         order = torch.argsort(sort_values, dim=1, stable=True)
-        output_width = min(source_width, global_limit)
-        if order.size(1) > output_width:
-            order = order[:, -output_width:]
-        output_mask = source_mask.gather(1, order)
+        # The compact-batch contract requires the widest row to fill column 0.
+        # Share caps leave almost every row shorter than the budget, so the
+        # window is the longest surviving row in this batch, not global_limit.
+        if source_mask.numel() == 0:
+            output_width = 0
+        else:
+            output_width = int(source_mask.sum(dim=1).max().item())
+        if output_width == 0:
+            order = order[:, :0]
+            output_mask = source_mask.new_zeros(batch_size, 0)
+        else:
+            if order.size(1) > output_width:
+                order = order[:, -output_width:]
+            output_mask = source_mask.gather(1, order)
 
         group_count = len(group_inputs)
         source_starts = torch.tensor(
