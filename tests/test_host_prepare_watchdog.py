@@ -238,6 +238,19 @@ class HostPrepareWatchdogTest(unittest.TestCase):
         self.assertEqual(order, ["queue", "terminate"])
         self.assertTrue(iterator._closed)
 
+    def test_forkserver_warms_before_cuda(self) -> None:
+        import torch
+
+        from src.train import (
+            _host_prepare_mp_context,
+            _warm_host_prepare_start_context,
+        )
+
+        if torch.cuda.is_initialized():
+            self.skipTest("CUDA already initialized in this process")
+        _warm_host_prepare_start_context()
+        self.assertEqual(_host_prepare_mp_context().get_start_method(), "forkserver")
+
 
 if __name__ == "__main__":
     unittest.main()

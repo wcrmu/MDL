@@ -1449,8 +1449,90 @@ def _resolve_process_group_backend(device: torch.device) -> str:
     return "nccl"
 
 
+_HOST_PREPARE_MP_CONTEXT: Any | None = None
+
+
+def _host_prepare_forkserver_noop() -> None:
+    """Picklable target used only to finish forkserver startup."""
+
+
+def _host_prepare_mp_context() -> Any:
+    """Multiprocessing context shared by the host-prepare child and its IPC.
+
+    Queue, Pipe, the scan-cursor Array, and the child must use one context.
+    Mixing spawn with forkserver breaks DupFd passing.
+    """
+
+    if _HOST_PREPARE_MP_CONTEXT is not None:
+        return _HOST_PREPARE_MP_CONTEXT
+    return mp.get_context("spawn")
+
+
+def _warm_host_prepare_start_context() -> None:
+    """Start the forkserver before this process initializes CUDA.
+
+    Linux spawn launches the child with ``vfork``. ``vfork`` freezes every
+    thread in the caller until the child execs. Host-prepare used to call that
+    from the training process after NCCL, the checkpoint uploader, and the
+    step watchdog were already running. A lock held by any of those threads
+    then sticks the whole process: ``Process.start()`` never returns, and the
+    watchdog cannot print, so the log stops on the host-prepare IPC line.
+
+    The forkserver is a separate interpreter that has not touched CUDA. Later
+    children are ordinary ``fork``s inside that server, so the training process
+    does not ``vfork``. Adapter pools reuse this same server.
+    """
+
+    global _HOST_PREPARE_MP_CONTEXT
+    if _HOST_PREPARE_MP_CONTEXT is not None:
+        return
+    cuda_already = torch.cuda.is_initialized()
+    forkserver_ok = "forkserver" in mp.get_all_start_methods()
+    if cuda_already or not forkserver_ok:
+        _HOST_PREPARE_MP_CONTEXT = mp.get_context("spawn")
+        if is_main_process():
+            reason = (
+                "cuda-already-initialized"
+                if cuda_already
+                else "forkserver-unavailable"
+            )
+            print(
+                f"host-prepare start method=spawn reason={reason}",
+                flush=True,
+            )
+        return
+    # Conda mkl-service aborts a forkserver child after the parent has loaded
+    # a libgomp extension. Set this before the server interpreter starts.
+    os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
+    ctx = mp.get_context("forkserver")
+    if is_main_process():
+        print("host-prepare start method=forkserver warming", flush=True)
+    proc = ctx.Process(
+        target=_host_prepare_forkserver_noop,
+        name="mdl-forkserver-warmup",
+    )
+    proc.start()
+    proc.join(timeout=300)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=5)
+        raise RuntimeError(
+            "forkserver warmup did not finish within 300s"
+        )
+    if proc.exitcode != 0:
+        raise RuntimeError(
+            f"forkserver warmup exited {proc.exitcode}"
+        )
+    _HOST_PREPARE_MP_CONTEXT = ctx
+    if is_main_process():
+        print("host-prepare start method=forkserver ready", flush=True)
+
+
 def _setup_distributed(config: AppConfig) -> DistributedContext:
     global _CONTROL_PROCESS_GROUP
+    # Before _select_device. A forkserver started after CUDA falls back into
+    # the same vfork this warmup exists to avoid.
+    _warm_host_prepare_start_context()
     world_size = _env_int("WORLD_SIZE", 1)
     rank = _env_int("RANK", 0)
     local_rank = _env_int("LOCAL_RANK", 0)
@@ -4408,7 +4490,7 @@ def _close_process_queue(ipc_queue: Any) -> None:
 
 
 class _ProcessHostPrepareIterator:
-    """Yield FeatureBatches prepared in a spawn child.
+    """Yield FeatureBatches prepared in a child process.
 
     IPC auto-selects by ``/dev/shm`` size (see ``_host_prepare_ipc_mode``):
 
@@ -4477,7 +4559,7 @@ class _ProcessHostPrepareIterator:
         # discover / footer / adapt work so slow-but-alive startup is not
         # mistaken for a JNI hang (which would stop heartbeats too once the
         # child can no longer run Python).
-        self._ctx = mp.get_context("spawn")
+        self._ctx = _host_prepare_mp_context()
         self._progress_mtime = self._ctx.Value("d", time())
         # Reader lives in the child, so the checkpointer reads its scan position
         # out of shared memory rather than through the batch queue.
@@ -4499,6 +4581,7 @@ class _ProcessHostPrepareIterator:
         # not the Python logging handlers — print so IPC mode is searchable.
         ipc_message = (
             f"host-prepare IPC mode={self._ipc_mode} "
+            f"start_method={self._ctx.get_start_method()} "
             f"compact_share={int(_compact_share_ipc_enabled())} "
             f"direct_shared={int(_host_prepare_direct_shared_enabled())} "
             f"pipeline_depth={_host_prepare_pipeline_depth()} "
@@ -6806,7 +6889,7 @@ class _CheckpointCoordinator:
             uploader,
             context,
             scan_cursor=(
-                ScanCursorChannel.shared(mp.get_context("spawn"))
+                ScanCursorChannel.shared(_host_prepare_mp_context())
                 if settings.data_resume
                 else None
             ),
