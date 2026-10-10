@@ -41,6 +41,12 @@ def _bootstrap_import_path() -> None:
 
 _bootstrap_import_path()
 
+# Before torch. A server started later is a vfork from a process that already
+# has NCCL threads, and that vfork never returns.
+from src.mp_warmup import warm_forkserver_before_imports
+
+warm_forkserver_before_imports()
+
 from src.benchmark import BenchmarkOptions, run_benchmark, write_benchmark_report
 from src.checkpoint import (
     latest_committed_checkpoint,

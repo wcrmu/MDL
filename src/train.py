@@ -1452,10 +1452,6 @@ def _resolve_process_group_backend(device: torch.device) -> str:
 _HOST_PREPARE_MP_CONTEXT: Any | None = None
 
 
-def _host_prepare_forkserver_noop() -> None:
-    """Picklable target used only to finish forkserver startup."""
-
-
 def _host_prepare_mp_context() -> Any:
     """Multiprocessing context shared by the host-prepare child and its IPC.
 
@@ -1465,67 +1461,20 @@ def _host_prepare_mp_context() -> Any:
 
     if _HOST_PREPARE_MP_CONTEXT is not None:
         return _HOST_PREPARE_MP_CONTEXT
-    return mp.get_context("spawn")
+    from src.mp_warmup import warm_forkserver
+
+    return warm_forkserver()
 
 
 def _warm_host_prepare_start_context() -> None:
-    """Start the forkserver before this process initializes CUDA.
-
-    Linux spawn launches the child with ``vfork``. ``vfork`` freezes every
-    thread in the caller until the child execs. Host-prepare used to call that
-    from the training process after NCCL, the checkpoint uploader, and the
-    step watchdog were already running. A lock held by any of those threads
-    then sticks the whole process: ``Process.start()`` never returns, and the
-    watchdog cannot print, so the log stops on the host-prepare IPC line.
-
-    The forkserver is a separate interpreter that has not touched CUDA. Later
-    children are ordinary ``fork``s inside that server, so the training process
-    does not ``vfork``. Adapter pools reuse this same server.
-    """
+    """Start the forkserver before ``_select_device`` creates a CUDA context."""
 
     global _HOST_PREPARE_MP_CONTEXT
     if _HOST_PREPARE_MP_CONTEXT is not None:
         return
-    cuda_already = torch.cuda.is_initialized()
-    forkserver_ok = "forkserver" in mp.get_all_start_methods()
-    if cuda_already or not forkserver_ok:
-        _HOST_PREPARE_MP_CONTEXT = mp.get_context("spawn")
-        if is_main_process():
-            reason = (
-                "cuda-already-initialized"
-                if cuda_already
-                else "forkserver-unavailable"
-            )
-            print(
-                f"host-prepare start method=spawn reason={reason}",
-                flush=True,
-            )
-        return
-    # Conda mkl-service aborts a forkserver child after the parent has loaded
-    # a libgomp extension. Set this before the server interpreter starts.
-    os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
-    ctx = mp.get_context("forkserver")
-    if is_main_process():
-        print("host-prepare start method=forkserver warming", flush=True)
-    proc = ctx.Process(
-        target=_host_prepare_forkserver_noop,
-        name="mdl-forkserver-warmup",
-    )
-    proc.start()
-    proc.join(timeout=300)
-    if proc.is_alive():
-        proc.kill()
-        proc.join(timeout=5)
-        raise RuntimeError(
-            "forkserver warmup did not finish within 300s"
-        )
-    if proc.exitcode != 0:
-        raise RuntimeError(
-            f"forkserver warmup exited {proc.exitcode}"
-        )
-    _HOST_PREPARE_MP_CONTEXT = ctx
-    if is_main_process():
-        print("host-prepare start method=forkserver ready", flush=True)
+    from src.mp_warmup import warm_forkserver
+
+    _HOST_PREPARE_MP_CONTEXT = warm_forkserver()
 
 
 def _setup_distributed(config: AppConfig) -> DistributedContext:
@@ -4015,6 +3964,69 @@ def _wait_for_host_prepare_terminal_ack(conn: Any | None) -> None:
         return
 
 
+def _host_prepare_process_main_from_spec(
+    spec_path: str,
+    queue: Any,
+    progress_mtime: Any | None = None,
+    fd_conn: Any | None = None,
+    parent_pid: int | None = None,
+    terminal_ack_conn: Any | None = None,
+    scan_cursor_storage: Any | None = None,
+) -> None:
+    """Load the heavy launch spec from disk, then run the host-prepare child.
+
+    The config and vocab maps are larger than a Linux pipe buffer. Putting
+    them in the ``Process`` pickle makes ``start()`` block until this child
+    finishes re-importing the training program and reads the rest. The parent
+    is stuck on the host-prepare IPC line for that whole import, and a
+    ``vfork`` in that window also freezes the step watchdog.
+    """
+
+    with open(spec_path, "rb") as handle:
+        spec = pickle.load(handle)
+    try:
+        os.unlink(spec_path)
+    except OSError:
+        pass
+    _host_prepare_process_main(
+        queue,
+        spec["config"],
+        spec["split_name"],
+        spec["vocab_maps"],
+        require_labels=bool(spec["require_labels"]),
+        shard_rank=int(spec["shard_rank"]),
+        shard_world_size=int(spec["shard_world_size"]),
+        coalesce_tensors=bool(spec["coalesce_tensors"]),
+        include_group_id=bool(spec["include_group_id"]),
+        ipc_mode=str(spec["ipc_mode"]),
+        pin_memory=bool(spec["pin_memory"]),
+        progress_mtime=progress_mtime,
+        fd_conn=fd_conn,
+        parent_pid=parent_pid,
+        terminal_ack_conn=terminal_ack_conn,
+        scan_cursor_storage=scan_cursor_storage,
+        scan_resume_plan=spec["scan_resume_plan"],
+        scan_cursor_split_key=spec["scan_cursor_split_key"],
+        rank_cpu_cores=tuple(spec["rank_cpu_cores"]),
+    )
+
+
+def _write_host_prepare_spec(spec: dict[str, Any]) -> str:
+    fd, path = tempfile.mkstemp(
+        prefix=f"mdl-host-prepare-{os.getpid()}-", suffix=".pkl"
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            pickle.dump(spec, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
 def _host_prepare_process_main(
     queue: Any,
     config: AppConfig,
@@ -4615,10 +4627,8 @@ class _ProcessHostPrepareIterator:
             terminal_ack_recv, self._terminal_ack_send = self._ctx.Pipe(
                 duplex=False
             )
-        self._process = self._ctx.Process(
-            target=_host_prepare_process_main,
-            kwargs={
-                "queue": self._queue,
+        spec_path = _write_host_prepare_spec(
+            {
                 "config": config,
                 "split_name": split_name,
                 "vocab_maps": vocab_maps,
@@ -4629,13 +4639,6 @@ class _ProcessHostPrepareIterator:
                 "include_group_id": include_group_id,
                 "ipc_mode": self._ipc_mode,
                 "pin_memory": self._pin_memory,
-                "progress_mtime": self._progress_mtime,
-                "fd_conn": fd_send,
-                "parent_pid": parent_pid,
-                "terminal_ack_conn": terminal_ack_recv,
-                "scan_cursor_storage": (
-                    None if self._scan_cursor is None else self._scan_cursor.storage
-                ),
                 "scan_resume_plan": scan_resume_plan,
                 "scan_cursor_split_key": (
                     None
@@ -4647,11 +4650,38 @@ class _ProcessHostPrepareIterator:
                     )
                 ),
                 "rank_cpu_cores": rank_cpu_cores,
+            }
+        )
+        self._spec_path = spec_path
+        self._process = self._ctx.Process(
+            target=_host_prepare_process_main_from_spec,
+            kwargs={
+                "spec_path": spec_path,
+                "queue": self._queue,
+                "progress_mtime": self._progress_mtime,
+                "fd_conn": fd_send,
+                "parent_pid": parent_pid,
+                "terminal_ack_conn": terminal_ack_recv,
+                "scan_cursor_storage": (
+                    None if self._scan_cursor is None else self._scan_cursor.storage
+                ),
             },
             name=f"mdl-host-prepare-{split_name}",
             daemon=False,
         )
-        self._process.start()
+        try:
+            self._process.start()
+        except Exception:
+            try:
+                os.unlink(spec_path)
+            except OSError:
+                pass
+            raise
+        if is_main_process():
+            print(
+                f"host-prepare child pid={self._process.pid}",
+                flush=True,
+            )
         # Parent only needs the recv end; close our copy of the send end so the
         # pipe drains / EOFs when the child exits.
         if fd_send is not None:
@@ -4955,6 +4985,12 @@ class _ProcessHostPrepareIterator:
             kill_grace_sec=0.5,
             label="host-prepare",
         )
+        spec_path = getattr(self, "_spec_path", None)
+        if spec_path:
+            try:
+                os.unlink(spec_path)
+            except OSError:
+                pass
 
     def __del__(self) -> None:
         try:
