@@ -3972,6 +3972,8 @@ def _host_prepare_process_main_from_spec(
     parent_pid: int | None = None,
     terminal_ack_conn: Any | None = None,
     scan_cursor_storage: Any | None = None,
+    *,
+    reuse_ipc: bool = False,
 ) -> None:
     """Load the heavy launch spec from disk, then run the host-prepare child.
 
@@ -4008,6 +4010,7 @@ def _host_prepare_process_main_from_spec(
         scan_resume_plan=spec["scan_resume_plan"],
         scan_cursor_split_key=spec["scan_cursor_split_key"],
         rank_cpu_cores=tuple(spec["rank_cpu_cores"]),
+        reuse_ipc=reuse_ipc,
     )
 
 
@@ -4048,6 +4051,7 @@ def _host_prepare_process_main(
     scan_resume_plan: ScanResumePlan | None = None,
     scan_cursor_split_key: str | None = None,
     rank_cpu_cores: tuple[int, ...] | None = None,
+    reuse_ipc: bool = False,
 ) -> None:
     """Child entry: pack+tensorize and push FeatureBatches to the train process.
 
@@ -4111,16 +4115,18 @@ def _host_prepare_process_main(
         set_io_progress_hook(None)
         set_scan_cursor_channel(None)
         set_scan_resume_plan(None)
-        if fd_conn is not None:
-            try:
-                fd_conn.close()
-            except Exception:
-                pass
-        if terminal_ack_conn is not None:
-            try:
-                terminal_ack_conn.close()
-            except Exception:
-                pass
+        # A long-lived service waits for the next data window on these pipes.
+        if not reuse_ipc:
+            if fd_conn is not None:
+                try:
+                    fd_conn.close()
+                except Exception:
+                    pass
+            if terminal_ack_conn is not None:
+                try:
+                    terminal_ack_conn.close()
+                except Exception:
+                    pass
 
 
 def _host_prepare_process_body(
@@ -4501,6 +4507,272 @@ def _close_process_queue(ipc_queue: Any) -> None:
                 pass
 
 
+@dataclass
+class _HostPrepareService:
+    """One host-prepare process started before NCCL threads exist.
+
+    ``Process.start()`` from the training process pickles the launch message
+    into a pipe and, if the forkserver has died, ``vfork``s a new one. Either
+    one sticks the rank on the host-prepare IPC line and freezes the step
+    watchdog. This process is started once, with a small pickle, and later
+    jobs only send a spec-file path.
+    """
+
+    process: Any
+    command: Any
+    queue: Any
+    queue_size: int
+    progress: Any
+    fd_recv: Any | None
+    terminal_ack_send: Any | None
+    scan_channel: ScanCursorChannel
+    busy: bool = False
+
+
+_HOST_PREPARE_SERVICES: list[_HostPrepareService] = []
+
+
+def _forkserver_alive() -> bool:
+    """True when the already-started forkserver is still a live child.
+
+    A dead server makes the next ``Process.start()`` relaunch it with
+    ``vfork``. Reap a zombie here so that relaunch is not attempted.
+    """
+
+    import multiprocessing.forkserver as forkserver_mod
+
+    server = forkserver_mod._forkserver
+    pid = getattr(server, "_forkserver_pid", None)
+    if not pid:
+        return False
+    try:
+        got, _status = os.waitpid(int(pid), os.WNOHANG)
+    except ChildProcessError:
+        return False
+    return not got
+
+
+def _require_forkserver() -> None:
+    if _forkserver_alive():
+        return
+    raise RuntimeError(
+        "host-prepare forkserver is not running. Refusing to start it from "
+        "the training process, because that vfork freezes NCCL and the step "
+        "watchdog."
+    )
+
+
+def _host_prepare_service_main(
+    command: Any,
+    queue: Any,
+    progress_mtime: Any,
+    fd_conn: Any | None,
+    parent_pid: int,
+    terminal_ack_conn: Any | None,
+    scan_cursor_storage: Any | None,
+) -> None:
+    """Wait for spec paths and run one host-prepare job per path."""
+
+    # Before any job, leave the training process group. killpg() on this pid
+    # must not signal the rank that is blocked in NCCL.
+    try:
+        os.setsid()
+    except OSError:
+        try:
+            os.setpgrp()
+        except OSError:
+            pass
+    _install_host_prepare_shutdown_handlers()
+    while True:
+        try:
+            spec_path = command.recv()
+        except (EOFError, OSError):
+            return
+        if spec_path is None:
+            return
+        try:
+            _host_prepare_process_main_from_spec(
+                spec_path,
+                queue,
+                progress_mtime,
+                fd_conn,
+                parent_pid,
+                terminal_ack_conn,
+                scan_cursor_storage,
+                reuse_ipc=True,
+            )
+        except Exception as error:
+            import traceback
+
+            try:
+                queue.put(
+                    RuntimeError(
+                        f"{type(error).__name__}: {error}\n{traceback.format_exc()}"
+                    )
+                )
+            except Exception:
+                pass
+            return
+
+
+def _start_host_prepare_service(queue_size: int) -> _HostPrepareService:
+    """Fork one idle host-prepare process. The launch pickle stays small."""
+
+    _require_forkserver()
+    ctx = _host_prepare_mp_context()
+    if is_main_process():
+        print(
+            f"host-prepare service starting queue={int(queue_size)}",
+            flush=True,
+        )
+    batch_queue = ctx.Queue(maxsize=int(queue_size))
+    progress = ctx.Value("d", time())
+    # duplex=False yields (readable, writable). The child reads spec paths.
+    child_command, parent_command = ctx.Pipe(duplex=False)
+    fd_recv, fd_send = _memfd_handle_channel(ctx)
+    terminal_ack_recv, terminal_ack_send = ctx.Pipe(duplex=False)
+    scan_channel = ScanCursorChannel.shared(ctx)
+    process = ctx.Process(
+        target=_host_prepare_service_main,
+        args=(
+            child_command,
+            batch_queue,
+            progress,
+            fd_send,
+            int(os.getpid()),
+            terminal_ack_recv,
+            scan_channel.storage,
+        ),
+        name="mdl-host-prepare-service",
+        daemon=False,
+    )
+    process.start()
+    for endpoint in (child_command, fd_send, terminal_ack_recv):
+        try:
+            endpoint.close()
+        except Exception:
+            pass
+    service = _HostPrepareService(
+        process=process,
+        command=parent_command,
+        queue=batch_queue,
+        queue_size=int(queue_size),
+        progress=progress,
+        fd_recv=fd_recv,
+        terminal_ack_send=terminal_ack_send,
+        scan_channel=scan_channel,
+    )
+    _HOST_PREPARE_SERVICES.append(service)
+    if is_main_process():
+        print(f"host-prepare service pid={process.pid}", flush=True)
+    return service
+
+
+def _checkout_host_prepare_service(queue_size: int) -> _HostPrepareService:
+    needed = int(queue_size)
+    for service in _HOST_PREPARE_SERVICES:
+        alive = False
+        try:
+            alive = bool(service.process.is_alive())
+        except Exception:
+            alive = False
+        if service.busy or service.queue_size < needed or not alive:
+            continue
+        service.busy = True
+        try:
+            service.progress.value = time()
+        except Exception:
+            pass
+        return service
+    service = _start_host_prepare_service(needed)
+    service.busy = True
+    return service
+
+
+def _prestart_host_prepare_service(config: AppConfig) -> None:
+    """Start the service before the model build, while its import can overlap."""
+
+    depth = 0
+    for split in (config.data.train, config.data.test):
+        if split is None:
+            continue
+        depth = max(depth, int(split.reader.host_prepare_prefetch))
+    if depth <= 0:
+        return
+    for service in _HOST_PREPARE_SERVICES:
+        try:
+            alive = bool(service.process.is_alive())
+        except Exception:
+            alive = False
+        if alive and service.queue_size >= depth:
+            return
+    _start_host_prepare_service(depth)
+
+
+def _host_prepare_scan_channel() -> ScanCursorChannel | None:
+    for service in _HOST_PREPARE_SERVICES:
+        try:
+            alive = bool(service.process.is_alive())
+        except Exception:
+            alive = False
+        if alive:
+            return service.scan_channel
+    return None
+
+
+def _kill_host_prepare_pid(pid: int) -> None:
+    """SIGKILL the child tree without signaling the training process group."""
+
+    import signal
+
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = None
+    if pgid is not None and pgid != os.getpgrp():
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _shutdown_host_prepare_services() -> None:
+    for service in list(_HOST_PREPARE_SERVICES):
+        _release_host_prepare_service(service, kill=True)
+
+
+def _release_host_prepare_service(
+    service: _HostPrepareService, *, kill: bool
+) -> None:
+    service.busy = False
+    if not kill:
+        return
+    pid = getattr(service.process, "pid", None)
+    if pid is not None:
+        _kill_host_prepare_pid(int(pid))
+    try:
+        service.process.join(timeout=0.2)
+    except Exception:
+        pass
+    _close_process_queue(service.queue)
+    for endpoint in (service.command, service.fd_recv, service.terminal_ack_send):
+        if endpoint is None:
+            continue
+        try:
+            endpoint.close()
+        except Exception:
+            pass
+    try:
+        _HOST_PREPARE_SERVICES.remove(service)
+    except ValueError:
+        pass
+
+
 class _ProcessHostPrepareIterator:
     """Yield FeatureBatches prepared in a child process.
 
@@ -4567,12 +4839,16 @@ class _ProcessHostPrepareIterator:
         self._started_at = perf_counter()
         self._last_progress_at = self._started_at
         self._received_item = False
-        # Wall-clock heartbeat shared with the child. Updated during HDFS
-        # discover / footer / adapt work so slow-but-alive startup is not
-        # mistaken for a JNI hang (which would stop heartbeats too once the
-        # child can no longer run Python).
+        self._completed = False
+        # The service process already exists. Checking it out does not
+        # Process.start(), so this cannot vfork or block on the launch pipe.
+        self._service = _checkout_host_prepare_service(int(queue_size))
         self._ctx = _host_prepare_mp_context()
-        self._progress_mtime = self._ctx.Value("d", time())
+        self._progress_mtime = self._service.progress
+        self._queue = self._service.queue
+        self._process = self._service.process
+        self._fd_recv = self._service.fd_recv
+        self._terminal_ack_send = self._service.terminal_ack_send
         # Reader lives in the child, so the checkpointer reads its scan position
         # out of shared memory rather than through the batch queue.
         self._scan_cursor = scan_cursor
@@ -4608,92 +4884,55 @@ class _ProcessHostPrepareIterator:
         logger.info("%s", ipc_message)
         if is_main_process():
             print(ipc_message, flush=True)
-        self._queue: Any = self._ctx.Queue(maxsize=int(queue_size))
-        # memfd fds travel on this Pipe via send_handle/recv_handle so we never
-        # depend on the child's multiprocessing.resource_sharer socket.
-        self._fd_recv: Any | None = None
-        fd_send: Any | None = None
-        parent_pid: int | None = None
-        if self._ipc_mode == "memfd":
-            self._fd_recv, fd_send = _memfd_handle_channel(self._ctx)
-            parent_pid = int(os.getpid())
-        # file_system share handles are owned by the producer's torch-shm
-        # manager. Keep that producer alive until the parent has consumed the
-        # FIFO terminal item, which proves all earlier batches were unpickled
-        # and privatized.
-        terminal_ack_recv: Any | None = None
-        self._terminal_ack_send: Any | None = None
-        if self._ipc_mode == "share":
-            terminal_ack_recv, self._terminal_ack_send = self._ctx.Pipe(
-                duplex=False
-            )
-        spec_path = _write_host_prepare_spec(
-            {
-                "config": config,
-                "split_name": split_name,
-                "vocab_maps": vocab_maps,
-                "require_labels": require_labels,
-                "shard_rank": shard_rank,
-                "shard_world_size": shard_world_size,
-                "coalesce_tensors": True,
-                "include_group_id": include_group_id,
-                "ipc_mode": self._ipc_mode,
-                "pin_memory": self._pin_memory,
-                "scan_resume_plan": scan_resume_plan,
-                "scan_cursor_split_key": (
-                    None
-                    if split is None
-                    else scan_split_key(
-                        split,
-                        shard_rank=shard_rank,
-                        shard_world_size=shard_world_size,
-                    )
-                ),
-                "rank_cpu_cores": rank_cpu_cores,
-            }
-        )
-        self._spec_path = spec_path
-        self._process = self._ctx.Process(
-            target=_host_prepare_process_main_from_spec,
-            kwargs={
-                "spec_path": spec_path,
-                "queue": self._queue,
-                "progress_mtime": self._progress_mtime,
-                "fd_conn": fd_send,
-                "parent_pid": parent_pid,
-                "terminal_ack_conn": terminal_ack_recv,
-                "scan_cursor_storage": (
-                    None if self._scan_cursor is None else self._scan_cursor.storage
-                ),
-            },
-            name=f"mdl-host-prepare-{split_name}",
-            daemon=False,
-        )
-        try:
-            self._process.start()
-        except Exception:
-            try:
-                os.unlink(spec_path)
-            except OSError:
-                pass
-            raise
-        if is_main_process():
             print(
                 f"host-prepare child pid={self._process.pid}",
                 flush=True,
             )
-        # Parent only needs the recv end; close our copy of the send end so the
-        # pipe drains / EOFs when the child exits.
-        if fd_send is not None:
+        spec_path: str | None = None
+        try:
+            spec_path = _write_host_prepare_spec(
+                {
+                    "config": config,
+                    "split_name": split_name,
+                    "vocab_maps": vocab_maps,
+                    "require_labels": require_labels,
+                    "shard_rank": shard_rank,
+                    "shard_world_size": shard_world_size,
+                    "coalesce_tensors": True,
+                    "include_group_id": include_group_id,
+                    "ipc_mode": self._ipc_mode,
+                    "pin_memory": self._pin_memory,
+                    "scan_resume_plan": scan_resume_plan,
+                    "scan_cursor_split_key": (
+                        None
+                        if split is None
+                        else scan_split_key(
+                            split,
+                            shard_rank=shard_rank,
+                            shard_world_size=shard_world_size,
+                        )
+                    ),
+                    "rank_cpu_cores": rank_cpu_cores,
+                }
+            )
+            self._spec_path = spec_path
             try:
-                fd_send.close()
+                self._service.progress.value = time()
             except Exception:
                 pass
-        if terminal_ack_recv is not None:
-            try:
-                terminal_ack_recv.close()
-            except Exception:
-                pass
+            self._service.command.send(spec_path)
+        except Exception:
+            self._service.busy = False
+            self._service = None
+            self._closed = True
+            if spec_path:
+                try:
+                    os.unlink(spec_path)
+                except OSError:
+                    pass
+            raise
+        if is_main_process():
+            print("host-prepare job sent", flush=True)
         # Train parent keeps the complementary slice of this LOCAL_RANK's CPUs.
         _apply_local_rank_cpu_affinity("train")
 
@@ -4790,6 +5029,12 @@ class _ProcessHostPrepareIterator:
         # Watchdog abort must not spend seconds on graceful SIGTERM: close the
         # IPC, SIGKILL immediately, then hard-exit the rank.
         self._closed = True
+        service = getattr(self, "_service", None)
+        if service is not None:
+            _release_host_prepare_service(service, kill=True)
+            self._service = None
+            abort_rank_for_remote_io_stall(error)
+            return
         try:
             _close_process_queue(self._queue)
         except Exception:
@@ -4853,6 +5098,7 @@ class _ProcessHostPrepareIterator:
             break
         self._mark_progress()
         if item is self._SENTINEL:
+            self._completed = True
             self._ack_share_terminal()
             self.close()
             raise StopIteration
@@ -4945,12 +5191,14 @@ class _ProcessHostPrepareIterator:
             conn.send_bytes(b"done")
         except (BrokenPipeError, EOFError, OSError):
             pass
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            self._terminal_ack_send = None
+        # The service reuses this pipe for the next data window.
+        if getattr(self, "_service", None) is not None:
+            return
+        try:
+            conn.close()
+        except Exception:
+            pass
+        self._terminal_ack_send = None
         # This is the clean terminal path. Give the child a short opportunity
         # to exit normally before close() applies the bounded kill policy.
         try:
@@ -4962,6 +5210,19 @@ class _ProcessHostPrepareIterator:
         if self._closed:
             return
         self._closed = True
+        service = getattr(self, "_service", None)
+        if service is not None:
+            spec_path = getattr(self, "_spec_path", None)
+            if spec_path:
+                try:
+                    os.unlink(spec_path)
+                except OSError:
+                    pass
+            _release_host_prepare_service(
+                service, kill=not getattr(self, "_completed", False)
+            )
+            self._service = None
+            return
         terminal_ack_send = getattr(self, "_terminal_ack_send", None)
         if terminal_ack_send is not None:
             try:
@@ -6925,7 +7186,8 @@ class _CheckpointCoordinator:
             uploader,
             context,
             scan_cursor=(
-                ScanCursorChannel.shared(_host_prepare_mp_context())
+                _host_prepare_scan_channel()
+                or ScanCursorChannel.shared(_host_prepare_mp_context())
                 if settings.data_resume
                 else None
             ),
@@ -7560,6 +7822,9 @@ def train_mdl(
     _apply_local_rank_cpu_affinity("train")
     # World-size-aware batch/prefetch/NCCL headroom before model+reader start.
     config = _apply_world_size_training_profile(config, context.world_size)
+    # Before the model build. The child reimports the training program in the
+    # background; the IPC line later only sends a path to this process.
+    _prestart_host_prepare_service(config)
     batch_iterator: Iterator[FeatureBatch] | None = None
     step_watchdog: _StepWatchdog | None = None
     checkpointing: _CheckpointCoordinator | None = None
@@ -8642,6 +8907,7 @@ def train_mdl(
                 if callable(close):
                     close()
         finally:
+            _shutdown_host_prepare_services()
             if step_watchdog is not None:
                 step_watchdog.stop()
             if checkpointing is not None:
